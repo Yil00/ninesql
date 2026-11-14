@@ -7,3 +7,6 @@
 /crates/ninesql-dbeaver/ @Yil00
 /deny.toml @Yil00
 /.github/ @Yil00
+# Patched third-party crates and the root Cargo.toml that holds the [patch] section (ADR-0018).
+/crates/patches/ @Yil00
+/Cargo.toml @Yil00
