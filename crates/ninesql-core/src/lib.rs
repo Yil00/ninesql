@@ -5,6 +5,7 @@
 pub mod connection;
 pub mod connection_type;
 mod error;
+pub mod properties;
 pub mod workspace;
 
 pub use connection::{
@@ -13,7 +14,10 @@ pub use connection::{
 };
 pub use connection_type::{Color, ConnectionType, ConnectionTypeId, ConnectionTypes, SafetyPolicy};
 pub use error::{ConnectionError, WorkspaceError};
-pub use workspace::{ConnectionTypesFile, Connections, ConnectionsFile, ProjectFile, Workspace};
+pub use workspace::{
+    ConnectionTypesFile, Connections, ConnectionsFile, LoadIssue, LoadedConnections, ProjectFile,
+    Workspace,
+};
 
 // Dependency graph of docs/02-architecture.md, made explicit until real code uses these crates.
 pub use ninesql_dbeaver as dbeaver;

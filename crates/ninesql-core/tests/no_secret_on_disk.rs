@@ -2,10 +2,11 @@
 //! the create / save / load / remove flows. Also checks `0700` / `0600` on everything written.
 #![allow(clippy::unwrap_used, clippy::expect_used)] // Tests may panic (AGENTS.md).
 
+use std::fmt::Write as _;
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use ninesql_core::{
     Auth, ClientCertificate, Connection, ConnectionTypeId, ConnectionTypes, Connections, Endpoint,
@@ -14,6 +15,71 @@ use ninesql_core::{
 use ninesql_secrets::{ExposeSecret, MemoryStore, SecretStores, SecretString, StoreKind};
 use ninesql_storage::{Paths, ProjectName, XdgDirs};
 use proptest::prelude::*;
+
+/// Minimal tracing subscriber that records every span and event field, at every level, as text.
+#[derive(Clone, Default)]
+struct Capture(Arc<Mutex<String>>);
+
+struct Visitor<'a>(&'a mut String);
+
+impl tracing::field::Visit for Visitor<'_> {
+    fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+        let _ = write!(self.0, " {}={:?}", field.name(), value);
+    }
+}
+
+impl tracing::Subscriber for Capture {
+    fn enabled(&self, _: &tracing::Metadata<'_>) -> bool {
+        true
+    }
+    fn new_span(&self, span: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+        span.record(&mut Visitor(&mut self.0.lock().unwrap()));
+        tracing::span::Id::from_u64(1)
+    }
+    fn record(&self, _: &tracing::span::Id, values: &tracing::span::Record<'_>) {
+        values.record(&mut Visitor(&mut self.0.lock().unwrap()));
+    }
+    fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+    fn event(&self, event: &tracing::Event<'_>) {
+        let mut buf = self.0.lock().unwrap();
+        buf.push('\n');
+        buf.push_str(event.metadata().target());
+        event.record(&mut Visitor(&mut buf));
+    }
+    fn enter(&self, _: &tracing::span::Id) {}
+    fn exit(&self, _: &tracing::span::Id) {}
+}
+
+impl Capture {
+    fn text(&self) -> String {
+        self.0.lock().unwrap().clone()
+    }
+}
+
+/// Runs `f` with every tracing event captured, then checks no secret reached the logs.
+fn without_secret_in_logs<T>(secrets: &[&str], f: impl FnOnce() -> T) -> T {
+    let capture = Capture::default();
+    let out = tracing::subscriber::with_default(capture.clone(), f);
+    let logs = capture.text();
+    assert!(!logs.is_empty(), "the capture saw no event at all");
+    for secret in secrets {
+        for form in forms(secret) {
+            assert!(!logs.contains(&form), "a secret reached the logs");
+        }
+    }
+    out
+}
+
+/// The raw secret and its JSON-escaped form (quotes, backslashes, control characters).
+fn forms(secret: &str) -> Vec<String> {
+    let json = serde_json::to_string(secret).unwrap();
+    let escaped = json[1..json.len() - 1].to_owned();
+    let mut forms = vec![secret.to_owned()];
+    if escaped != secret {
+        forms.push(escaped);
+    }
+    forms
+}
 
 struct Env {
     _tmp: tempfile::TempDir,
@@ -157,6 +223,11 @@ fn secrets() -> Vec<(SecretSlot, SecretString)> {
 
 #[test]
 fn create_save_load_remove_never_writes_a_secret() {
+    let all = [DB_PASSWORD, SSH_PASSWORD, KEY_PASSPHRASE, TLS_PASSPHRASE];
+    without_secret_in_logs(&all, create_save_load_remove);
+}
+
+fn create_save_load_remove() {
     let env = env();
     let mut connections = Connections::default();
     let id = env
@@ -176,6 +247,8 @@ fn create_save_load_remove_never_writes_a_secret() {
     // Secrets are in the store, behind the references written to the file.
     assert_eq!(env.keyring.len(), 4);
     let loaded = env.workspace.load_connections().unwrap();
+    assert!(loaded.issues.is_empty());
+    let loaded = loaded.connections;
     assert_eq!(loaded, connections);
     let c = loaded.get(id).unwrap();
     let resolved: Vec<String> = c
@@ -206,7 +279,13 @@ fn create_save_load_remove_never_writes_a_secret() {
         .remove_connection(&mut connections, id, &env.stores)
         .unwrap();
     assert!(env.keyring.is_empty());
-    assert!(env.workspace.load_connections().unwrap().is_empty());
+    assert!(
+        env.workspace
+            .load_connections()
+            .unwrap()
+            .connections
+            .is_empty()
+    );
     assert_no_secret_on_disk(&env.root, &all);
 }
 
@@ -299,11 +378,60 @@ fn secret_like_driver_property_is_refused() {
     assert_no_secret_on_disk(&env.root, &[DB_PASSWORD]);
 }
 
+/// A hand-edited `connections.json` holding secrets in unknown keys, driver properties and init
+/// SQL: the load keeps the project usable, reports the connection, and the next save leaves no
+/// secret on disk or in the logs. (`connections.json` has no older schema yet; the `.bak` written
+/// on migration is covered in `ninesql-storage/tests/migrations.rs`.)
+#[test]
+fn hand_edited_secrets_are_reported_and_dropped() {
+    const SECRET: &str = "Hand\"Edited\\Secret-9b2e";
+    let env = env();
+    let good = Connection::new(
+        "Good",
+        EngineId::new("sqlite").unwrap(),
+        Endpoint::File {
+            path: "/tmp/g.db".into(),
+        },
+        Auth::None,
+        ConnectionTypeId::dev(),
+    );
+    let mut bad = serde_json::to_value(full_connection()).unwrap();
+    bad["auth"]["password"] = SECRET.into();
+    bad["properties"] = serde_json::json!({
+        "sslpassword": SECRET,
+        "url": format!("postgres://app:{SECRET}@db/x"),
+        "application_name": "NineSQL"
+    });
+    bad["init_sql"] = serde_json::json!([format!("ALTER USER app PASSWORD '{SECRET}'")]);
+    let file = serde_json::json!({ "schema_version": 1, "connections": [good, bad] });
+    let path = env.workspace.project_paths().connections_file();
+    fs::write(&path, serde_json::to_vec_pretty(&file).unwrap()).unwrap();
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+
+    let loaded = without_secret_in_logs(&[SECRET], || env.workspace.load_connections().unwrap());
+    assert_eq!(loaded.connections.len(), 2);
+    assert_eq!(loaded.issues.len(), 3, "{:?}", loaded.issues);
+    assert_eq!(
+        loaded.secret_like_keys,
+        [
+            "connections[1].auth.password",
+            "connections[1].properties.sslpassword"
+        ]
+    );
+    assert!(!format!("{:?}", loaded.issues).contains("Hand"));
+
+    without_secret_in_logs(&[SECRET], || {
+        env.workspace.save_connections(&loaded.connections).unwrap();
+    });
+    assert_no_secret_on_disk(&env.root, &[SECRET]);
+}
+
 proptest! {
     #![proptest_config(ProptestConfig::with_cases(16))]
     /// Whatever the password, it ends up in the store and never in a file.
     #[test]
     fn arbitrary_passwords_never_reach_disk(password in "[!-~]{12,48}") {
+        // `forms` also checks the JSON-escaped form (quotes and backslashes are in the range).
         let env = env();
         let mut connections = Connections::default();
         env.workspace

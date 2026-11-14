@@ -142,6 +142,28 @@ impl Connections {
     }
 }
 
+/// Data removed from one connection while loading (see [`Workspace::load_connections`]).
+#[derive(Debug)]
+pub struct LoadIssue {
+    /// Connection concerned.
+    pub connection: ConnectionId,
+    /// Its name, for the report.
+    pub name: String,
+    /// What was removed and why (never the value).
+    pub problem: ConnectionError,
+}
+
+/// Result of [`Workspace::load_connections`].
+#[derive(Debug, Default)]
+pub struct LoadedConnections {
+    /// The connections, sanitized and valid.
+    pub connections: Connections,
+    /// Data removed per connection, to show to the user.
+    pub issues: Vec<LoadIssue>,
+    /// Unknown keys that looked like secrets (paths only); dropped on the next save.
+    pub secret_like_keys: Vec<String>,
+}
+
 /// One project of the NineSQL workspace on disk.
 #[derive(Debug, Clone)]
 pub struct Workspace {
@@ -203,25 +225,44 @@ impl Workspace {
         &self.project_paths
     }
 
-    /// Loads `connections.json` (empty when missing), migrating it if needed, and validates it.
+    /// Loads `connections.json` (empty when missing), migrating it if needed.
+    ///
+    /// Each connection is [sanitized](Connection::sanitize): secret-bearing or reserved driver
+    /// properties and init SQL with password literals are removed and reported in
+    /// [`LoadedConnections::issues`], so one bad connection does not block the project. The next
+    /// save drops them from disk. Any other invalid data fails the load.
     ///
     /// # Errors
     /// Storage errors, invalid or duplicate connections. The file is left untouched on error.
-    pub fn load_connections(&self) -> Result<Connections, WorkspaceError> {
+    pub fn load_connections(&self) -> Result<LoadedConnections, WorkspaceError> {
         let path = self.project_paths.connections_file();
         let Some(loaded) = document::load::<ConnectionsFile>(&path)? else {
-            return Ok(Connections::default());
+            return Ok(LoadedConnections::default());
         };
-        for c in &loaded.document.connections {
+        let mut issues = Vec::new();
+        let mut items = loaded.document.connections;
+        for c in &mut items {
+            for problem in c.sanitize() {
+                tracing::warn!(connection = %c.id, problem = %problem, "removed unsafe connection data on load");
+                issues.push(LoadIssue {
+                    connection: c.id,
+                    name: c.name.clone(),
+                    problem,
+                });
+            }
             c.validate()
                 .map_err(|source| WorkspaceError::InvalidConnection {
                     name: c.name.clone(),
                     source,
                 })?;
         }
-        let set = Connections::from_vec(loaded.document.connections)?;
-        tracing::debug!(project = %self.project, count = set.len(), "loaded connections");
-        Ok(set)
+        let connections = Connections::from_vec(items)?;
+        tracing::debug!(project = %self.project, count = connections.len(), "loaded connections");
+        Ok(LoadedConnections {
+            connections,
+            issues,
+            secret_like_keys: loaded.secret_like_keys,
+        })
     }
 
     /// Validates and atomically writes `connections.json`.

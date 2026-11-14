@@ -19,7 +19,7 @@ use ninesql_secrets::{SecretKind, SecretRef};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use crate::connection_type::{ConnectionType, ConnectionTypeId};
+use crate::connection_type::{ConnectionTypeId, ConnectionTypes, SafetyPolicy};
 use crate::error::ConnectionError;
 
 /// Stable identifier of a connection (UUID v4), also used to name its secrets.
@@ -75,9 +75,7 @@ impl EngineId {
         if valid {
             Ok(Self(id))
         } else {
-            Err(ConnectionError::InvalidEngineId(
-                id.escape_debug().to_string(),
-            ))
+            Err(ConnectionError::InvalidEngineId)
         }
     }
 
@@ -503,10 +501,15 @@ impl Connection {
                 return Err(self.invalid("folder", "segments cannot contain `/`"));
             }
         }
-        for key in self.properties.keys() {
+        for (key, value) in &self.properties {
             short_text("properties", key, false)?;
-            if ninesql_storage::hygiene::is_secret_like_key(key) {
-                return Err(ConnectionError::SecretInProperties { key: key.clone() });
+            if let Some(problem) = property_problem(key, value) {
+                return Err(problem);
+            }
+        }
+        for (index, sql) in self.init_sql.iter().enumerate() {
+            if crate::properties::sql_carries_secret(sql) {
+                return Err(ConnectionError::SecretInInitSql { index });
             }
         }
         if let Origin::Dbeaver { dbeaver_id, .. } = &self.origin {
@@ -520,6 +523,32 @@ impl Connection {
             field: field.to_owned(),
             reason,
         }
+    }
+
+    /// Removes what must never be kept in a workspace file — properties that hold or look like a
+    /// secret, properties that shadow a typed field (TLS, endpoint, user, read-only), init SQL
+    /// with a password literal — and returns one issue per removal. Used on load so that one bad
+    /// connection does not block the whole project and the next save drops the offending data.
+    pub fn sanitize(&mut self) -> Vec<ConnectionError> {
+        let mut issues = Vec::new();
+        self.properties
+            .retain(|key, value| match property_problem(key, value) {
+                Some(problem) => {
+                    issues.push(problem);
+                    false
+                }
+                None => true,
+            });
+        let mut index = 0;
+        self.init_sql.retain(|sql| {
+            let keep = !crate::properties::sql_carries_secret(sql);
+            if !keep {
+                issues.push(ConnectionError::SecretInInitSql { index });
+            }
+            index += 1;
+            keep
+        });
+        issues
     }
 
     /// Weakened security settings of this connection, for the warning badge (I5).
@@ -536,10 +565,26 @@ impl Connection {
         }
     }
 
-    /// Whether sessions of this connection are read-only (enforced engine-side by drivers, I3).
+    /// Effective safety rules of this connection: its type resolved through
+    /// [`ConnectionTypes::resolve`] (an unknown type gets production rules), then the
+    /// connection's `read_only` override. On a production type the override can only tighten:
+    /// `read_only: false` never weakens a read-only production type (I3).
     #[must_use]
-    pub fn effective_read_only(&self, connection_type: &ConnectionType) -> bool {
-        self.read_only.unwrap_or(connection_type.read_only)
+    pub fn policy(&self, types: &ConnectionTypes) -> SafetyPolicy {
+        let mut policy = types.resolve(&self.connection_type).policy();
+        policy.read_only = match self.read_only {
+            Some(true) => true,
+            Some(false) if !policy.production => false,
+            Some(false) | None => policy.read_only,
+        };
+        policy
+    }
+
+    /// Whether sessions of this connection are read-only (enforced engine-side by drivers, I3).
+    /// Shortcut for `self.policy(types).read_only`.
+    #[must_use]
+    pub fn effective_read_only(&self, types: &ConnectionTypes) -> bool {
+        self.policy(types).read_only
     }
 
     /// Every saved secret reference of this connection, with its kind.
@@ -649,6 +694,27 @@ impl Connection {
             }
         }
     }
+}
+
+/// Why a driver property cannot be kept, if it cannot. Never includes the value.
+fn property_problem(key: &str, value: &str) -> Option<ConnectionError> {
+    if ninesql_storage::hygiene::is_secret_like_key(key) {
+        return Some(ConnectionError::SecretInProperties {
+            key: key.to_owned(),
+        });
+    }
+    if let Some(reserved) = crate::properties::reserved(key) {
+        return Some(ConnectionError::ReservedProperty {
+            key: key.to_owned(),
+            use_instead: reserved.model_field(),
+        });
+    }
+    if crate::properties::value_carries_secret(value) {
+        return Some(ConnectionError::SecretInPropertyValue {
+            key: key.to_owned(),
+        });
+    }
+    None
 }
 
 fn short_text(field: &str, value: &str, allow_empty: bool) -> Result<(), ConnectionError> {

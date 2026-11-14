@@ -6,15 +6,21 @@ use crate::connection::{ConnectionId, SecretSlot};
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum ConnectionError {
-    /// Engine identifier with characters outside `[a-z0-9_-]`.
-    #[error("invalid engine identifier `{0}`")]
-    InvalidEngineId(String),
-    /// Connection type identifier with characters outside `[a-z0-9_-]`.
-    #[error("invalid connection type identifier `{0}`")]
-    InvalidConnectionTypeId(String),
+    // The three variants below never echo the rejected text: it comes from a file and could be a
+    // misplaced secret (I1).
+    /// Engine identifier breaking its rule.
+    #[error(
+        "invalid engine identifier: a lower-case letter, then up to 63 lower-case letters, digits, hyphens or underscores"
+    )]
+    InvalidEngineId,
+    /// Connection type identifier breaking its rule.
+    #[error(
+        "invalid connection type identifier: up to 64 lower-case letters, digits, hyphens or underscores, starting with a letter or digit"
+    )]
+    InvalidConnectionTypeId,
     /// Color not in `#RRGGBB` form.
-    #[error("invalid color `{0}`: `#RRGGBB` expected")]
-    InvalidColor(String),
+    #[error("invalid color: #RRGGBB expected")]
+    InvalidColor,
     /// A field breaks a rule.
     #[error("`{field}` {reason}")]
     InvalidField {
@@ -30,6 +36,27 @@ pub enum ConnectionError {
     SecretInProperties {
         /// Property key.
         key: String,
+    },
+    /// A driver property that shadows a typed field (TLS, endpoint, user, read-only).
+    #[error("the driver property `{key}` is not allowed; set it with `{use_instead}` instead")]
+    ReservedProperty {
+        /// Property key.
+        key: String,
+        /// Model field to use instead.
+        use_instead: &'static str,
+    },
+    /// A driver property whose value embeds a credential (URL user info, `password=`). The value
+    /// is never shown.
+    #[error("the driver property `{key}` contains a credential; secrets go to the keyring")]
+    SecretInPropertyValue {
+        /// Property key.
+        key: String,
+    },
+    /// An init SQL statement with a password literal. The statement is never shown.
+    #[error("init SQL statement #{index} contains a password literal; it cannot be saved")]
+    SecretInInitSql {
+        /// Index in `init_sql`.
+        index: usize,
     },
     /// The connection has no credential at that slot.
     #[error("the connection has no credential field for {0:?}")]

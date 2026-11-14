@@ -39,9 +39,7 @@ impl ConnectionTypeId {
         if valid {
             Ok(Self(id))
         } else {
-            Err(ConnectionError::InvalidConnectionTypeId(
-                id.escape_debug().to_string(),
-            ))
+            Err(ConnectionError::InvalidConnectionTypeId)
         }
     }
 
@@ -113,7 +111,7 @@ impl Color {
     /// # Errors
     /// [`ConnectionError::InvalidColor`].
     pub fn parse(text: &str) -> Result<Self, ConnectionError> {
-        let err = || ConnectionError::InvalidColor(text.escape_debug().to_string());
+        let err = || ConnectionError::InvalidColor;
         let hex = text.strip_prefix('#').ok_or_else(err)?;
         if hex.len() != 6 || !hex.bytes().all(|b| b.is_ascii_hexdigit()) {
             return Err(err());

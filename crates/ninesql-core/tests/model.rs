@@ -6,8 +6,8 @@ use std::path::Path;
 
 use ninesql_core::{
     Auth, ClientCertificate, Connection, ConnectionError, ConnectionId, ConnectionType,
-    ConnectionTypeId, ConnectionsFile, Endpoint, EngineId, Origin, SecretSlot, SecretSource,
-    SecurityWarning, SshAuth, SshHop, SshTunnel, TlsConfig, TlsMode,
+    ConnectionTypeId, ConnectionTypes, ConnectionsFile, Endpoint, EngineId, Origin, SecretSlot,
+    SecretSource, SecurityWarning, SshAuth, SshHop, SshTunnel, TlsConfig, TlsMode,
 };
 use ninesql_secrets::{SecretId, SecretKind, SecretRef, StoreKind};
 use ninesql_storage::document;
@@ -205,13 +205,100 @@ fn set_secret_ref_matches_slots() {
 
 #[test]
 fn read_only_comes_from_type_unless_overridden() {
-    let mut ro = ConnectionType::production();
-    ro.read_only = true;
-    let mut c = basic();
-    assert!(c.effective_read_only(&ro));
-    assert!(!c.effective_read_only(&ConnectionType::development()));
+    let mut ro_dev = ConnectionType::development();
+    ro_dev.read_only = true;
+    let mut types = ConnectionTypes::default();
+    types.upsert(ro_dev);
+    let mut c = basic(); // type dev
+    assert!(c.effective_read_only(&types));
+    // Non-production types accept a weakening override.
+    c.read_only = Some(false);
+    assert!(!c.effective_read_only(&types));
     c.read_only = Some(true);
-    assert!(c.effective_read_only(&ConnectionType::development()));
+    assert!(c.effective_read_only(&ConnectionTypes::default()));
+}
+
+#[test]
+fn production_read_only_cannot_be_weakened() {
+    let mut ro_prod = ConnectionType::production();
+    ro_prod.read_only = true;
+    let mut types = ConnectionTypes::default();
+    types.upsert(ro_prod);
+    let mut c = basic();
+    c.connection_type = ConnectionTypeId::prod();
+    c.read_only = Some(false);
+    let policy = c.policy(&types);
+    assert!(policy.read_only);
+    assert!(policy.production);
+    assert!(!policy.log_query_text);
+    // But it can be tightened on a writable production type.
+    let mut c2 = basic();
+    c2.connection_type = ConnectionTypeId::prod();
+    assert!(!c2.effective_read_only(&ConnectionTypes::default()));
+    c2.read_only = Some(true);
+    assert!(c2.effective_read_only(&ConnectionTypes::default()));
+}
+
+#[test]
+fn unknown_type_policy_is_production() {
+    let mut c = basic();
+    c.connection_type = ConnectionTypeId::new("deleted-type").unwrap();
+    c.read_only = Some(false);
+    let policy = c.policy(&ConnectionTypes::default());
+    assert!(policy.production);
+    assert!(policy.confirm_destructive);
+    assert!(!policy.log_query_text);
+}
+
+#[test]
+fn reserved_and_secret_bearing_properties_are_refused() {
+    for (key, value) in [
+        ("sslmode", "disable"),
+        ("useSSL", "false"),
+        ("trustServerCertificate", "true"),
+        ("host", "other.example.test"),
+        ("user", "root"),
+        ("readOnly", "false"),
+        ("url", "postgres://app:Hunter2@db/x"),
+        ("options", "Server=h;Password=Hunter2"),
+    ] {
+        let mut c = basic();
+        c.properties.insert(key.into(), value.into());
+        let err = c.validate().unwrap_err();
+        assert!(!err.to_string().contains("Hunter2"), "{err}");
+        assert!(
+            matches!(
+                err,
+                ConnectionError::ReservedProperty { .. }
+                    | ConnectionError::SecretInPropertyValue { .. }
+            ),
+            "{key}: {err}"
+        );
+    }
+    let mut c = basic();
+    c.init_sql = vec!["ALTER USER app IDENTIFIED BY Hunter2".into()];
+    let err = c.validate().unwrap_err();
+    assert!(matches!(err, ConnectionError::SecretInInitSql { index: 0 }));
+    assert!(!err.to_string().contains("Hunter2"));
+}
+
+#[test]
+fn sanitize_removes_only_the_offending_data() {
+    let mut c = basic();
+    c.properties
+        .insert("application_name".into(), "NineSQL".into());
+    c.properties.insert("sslmode".into(), "disable".into());
+    c.properties.insert("password".into(), "Hunter2".into());
+    c.init_sql = vec![
+        "SET search_path TO app".into(),
+        "ALTER ROLE app PASSWORD 'Hunter2'".into(),
+    ];
+    let issues = c.sanitize();
+    assert_eq!(issues.len(), 3);
+    assert_eq!(c.properties.len(), 1);
+    assert_eq!(c.init_sql, ["SET search_path TO app"]);
+    c.validate().unwrap();
+    assert!(!format!("{issues:?}").contains("Hunter2"));
 }
 
 // ---- Property-based serde round trip ----
@@ -344,7 +431,10 @@ prop_compose! {
         c.folder = folder;
         c.properties = properties
             .into_iter()
-            .filter(|(k, _)| !ninesql_storage::hygiene::is_secret_like_key(k))
+            .filter(|(k, _)| {
+                !ninesql_storage::hygiene::is_secret_like_key(k)
+                    && ninesql_core::properties::reserved(k).is_none()
+            })
             .collect::<BTreeMap<_, _>>();
         c.init_sql = init_sql;
         c.enabled = enabled;
