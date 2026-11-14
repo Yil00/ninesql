@@ -1,0 +1,397 @@
+//! View-model tests on GPUI's `TestAppContext` (AGENTS.md: no pixel tests): actions and their
+//! default bindings, key binding overrides, tabs and splits, the navigator dock, the command
+//! palette, multiple windows, theme switching, fonts and contrast.
+
+use gpui::{
+    Action as _, AnyWindowHandle, Entity, Focusable as _, TestAppContext, VisualTestContext,
+};
+use gpui_kit::component::{ActiveTheme as _, Theme, ThemeMode, WindowExt as _};
+
+use crate::actions::{self, ACTIONS, CloseWindow, NewEditorTab, NewWindow};
+use crate::app;
+use crate::appearance::{AppearanceState, contrast_ratio};
+use crate::layout::Node;
+use crate::settings::{self, SettingsState};
+use crate::workspace::Workspace;
+
+fn init(cx: &mut TestAppContext, settings_toml: &str) {
+    let (settings, diagnostics) = settings::parse(settings_toml);
+    cx.update(|cx| {
+        app::init(
+            SettingsState {
+                path: None,
+                settings,
+                diagnostics,
+            },
+            cx,
+        );
+    });
+}
+
+fn open(cx: &mut TestAppContext) -> (AnyWindowHandle, Entity<Workspace>, VisualTestContext) {
+    let opened = cx.update(app::open_window);
+    let Some((window, workspace)) = opened else {
+        panic!("the test platform opens windows");
+    };
+    let vcx = VisualTestContext::from_window(window, cx);
+    vcx.run_until_parked();
+    (window, workspace, vcx)
+}
+
+fn tab_count(ws: &Entity<Workspace>, cx: &mut VisualTestContext) -> usize {
+    ws.read_with(cx, |ws, _| ws.layout().all_tabs().len())
+}
+
+fn pane_count(ws: &Entity<Workspace>, cx: &mut VisualTestContext) -> usize {
+    ws.read_with(cx, |ws, _| ws.layout().pane_count())
+}
+
+#[gpui::test]
+fn every_registered_action_is_known_to_gpui(cx: &mut TestAppContext) {
+    init(cx, "");
+    let names: Vec<&'static str> = cx.update(|cx| {
+        cx.all_action_names()
+            .iter()
+            .copied()
+            .filter(|n| n.starts_with("ninesql::"))
+            .collect()
+    });
+    for spec in ACTIONS {
+        assert!(
+            names.contains(&spec.name()),
+            "{} not registered",
+            spec.name()
+        );
+    }
+    assert_eq!(
+        names.len(),
+        ACTIONS.len(),
+        "an action is missing from the registry"
+    );
+}
+
+#[gpui::test]
+fn default_bindings_are_installed(cx: &mut TestAppContext) {
+    init(cx, "");
+    cx.update(|cx| {
+        let keymap = cx.key_bindings();
+        let keymap = keymap.borrow();
+        for spec in ACTIONS {
+            let action = (spec.build)();
+            let bound = keymap.bindings_for_action(action.as_ref()).count();
+            assert_eq!(bound, spec.default_keys.len(), "{}", spec.name());
+        }
+    });
+    let problems = cx.read_global::<SettingsState, _>(|s, _| s.diagnostics.len());
+    assert_eq!(problems, 0);
+}
+
+#[gpui::test]
+fn window_opens_with_one_editor_and_the_navigator(cx: &mut TestAppContext) {
+    init(cx, "");
+    let (_, ws, mut vcx) = open(cx);
+    assert_eq!(tab_count(&ws, &mut vcx), 1);
+    ws.read_with(&vcx, |ws, cx| {
+        assert!(ws.navigator_visible());
+        assert!(ws.navigator().read(cx).is_empty(cx));
+        assert_eq!(ws.active_title(cx).as_deref(), Some("Script-1"));
+    });
+    assert_eq!(vcx.window_title().as_deref(), Some("Script-1 - NineSQL"));
+}
+
+#[gpui::test]
+fn tabs_through_key_bindings(cx: &mut TestAppContext) {
+    init(cx, "");
+    let (_, ws, mut vcx) = open(cx);
+    vcx.simulate_keystrokes("ctrl-t ctrl-t");
+    assert_eq!(tab_count(&ws, &mut vcx), 3);
+    ws.read_with(&vcx, |ws, cx| {
+        assert_eq!(ws.active_title(cx).as_deref(), Some("Script-3"));
+    });
+    vcx.simulate_keystrokes("ctrl-tab");
+    ws.read_with(&vcx, |ws, cx| {
+        assert_eq!(ws.active_title(cx).as_deref(), Some("Script-1"));
+    });
+    vcx.simulate_keystrokes("ctrl-shift-tab ctrl-pageup");
+    ws.read_with(&vcx, |ws, cx| {
+        assert_eq!(ws.active_title(cx).as_deref(), Some("Script-2"));
+    });
+    vcx.simulate_keystrokes("ctrl-w");
+    assert_eq!(tab_count(&ws, &mut vcx), 2);
+    ws.read_with(&vcx, |ws, cx| {
+        assert_eq!(
+            ws.tab_titles(cx)
+                .iter()
+                .map(|t| t.as_ref())
+                .collect::<Vec<_>>(),
+            ["Script-1", "Script-3"]
+        );
+    });
+    vcx.simulate_keystrokes("ctrl-w ctrl-w");
+    assert_eq!(tab_count(&ws, &mut vcx), 0);
+    assert_eq!(pane_count(&ws, &mut vcx), 1);
+    assert_eq!(vcx.window_title().as_deref(), Some("NineSQL"));
+    // The empty workspace keeps focus, so its bindings still work.
+    vcx.simulate_keystrokes("ctrl-t");
+    assert_eq!(tab_count(&ws, &mut vcx), 1);
+}
+
+#[gpui::test]
+fn splits_through_key_bindings(cx: &mut TestAppContext) {
+    init(cx, "");
+    let (_, ws, mut vcx) = open(cx);
+    vcx.simulate_keystrokes("ctrl-\\");
+    assert_eq!(pane_count(&ws, &mut vcx), 2);
+    vcx.simulate_keystrokes("ctrl-k ctrl-\\");
+    assert_eq!(pane_count(&ws, &mut vcx), 3);
+    ws.read_with(&vcx, |ws, _| {
+        let Node::Split { children, .. } = ws.layout().root() else {
+            panic!("expected a split");
+        };
+        assert_eq!(children.len(), 2);
+        assert!(
+            matches!(children[1], Node::Split { .. }),
+            "split down nests"
+        );
+    });
+    let active = ws.read_with(&vcx, |ws, _| ws.layout().active_pane_id());
+    vcx.simulate_keystrokes("ctrl-k ctrl-right");
+    let first = ws.read_with(&vcx, |ws, _| ws.layout().pane_order()[0]);
+    assert_eq!(
+        ws.read_with(&vcx, |ws, _| ws.layout().active_pane_id()),
+        first,
+        "focus wraps to the first pane"
+    );
+    vcx.simulate_keystrokes("ctrl-k ctrl-left");
+    assert_eq!(
+        ws.read_with(&vcx, |ws, _| ws.layout().active_pane_id()),
+        active
+    );
+    // Closing the only tab of a split pane removes the pane.
+    vcx.simulate_keystrokes("ctrl-w");
+    assert_eq!(pane_count(&ws, &mut vcx), 2);
+    assert_eq!(tab_count(&ws, &mut vcx), 2);
+}
+
+#[gpui::test]
+fn navigator_dock_toggles(cx: &mut TestAppContext) {
+    init(cx, "");
+    let (_, ws, mut vcx) = open(cx);
+    vcx.simulate_keystrokes("ctrl-b");
+    assert!(!ws.read_with(&vcx, |ws, _| ws.navigator_visible()));
+    vcx.simulate_keystrokes("ctrl-b");
+    assert!(ws.read_with(&vcx, |ws, _| ws.navigator_visible()));
+    vcx.simulate_keystrokes("ctrl-b ctrl-k ctrl-n");
+    let focused = ws.update_in(&mut vcx, |ws, window, cx| {
+        ws.navigator().focus_handle(cx).is_focused(window)
+    });
+    assert!(focused, "focus navigator shows and focuses it");
+    assert!(ws.read_with(&vcx, |ws, _| ws.navigator_visible()));
+    // Workspace bindings still apply from the navigator.
+    vcx.simulate_keystrokes("ctrl-t");
+    assert_eq!(tab_count(&ws, &mut vcx), 2);
+}
+
+#[gpui::test]
+fn overrides_replace_default_bindings(cx: &mut TestAppContext) {
+    init(
+        cx,
+        r#"
+[keybindings]
+NewEditorTab = "alt-n"
+ToggleNavigator = []
+"ninesql::SplitRight" = ["ctrl-alt-s", "f6"]
+"#,
+    );
+    let (_, ws, mut vcx) = open(cx);
+    vcx.simulate_keystrokes("ctrl-t");
+    assert_eq!(tab_count(&ws, &mut vcx), 1, "the default binding is gone");
+    vcx.simulate_keystrokes("alt-n");
+    assert_eq!(tab_count(&ws, &mut vcx), 2);
+    vcx.simulate_keystrokes("ctrl-b");
+    assert!(
+        ws.read_with(&vcx, |ws, _| ws.navigator_visible()),
+        "unbound"
+    );
+    vcx.simulate_keystrokes("f6");
+    assert_eq!(pane_count(&ws, &mut vcx), 2);
+    vcx.simulate_keystrokes("ctrl-\\");
+    assert_eq!(
+        pane_count(&ws, &mut vcx),
+        2,
+        "the default split binding is gone"
+    );
+}
+
+#[gpui::test]
+fn invalid_overrides_are_reported_and_defaults_kept(cx: &mut TestAppContext) {
+    init(
+        cx,
+        r#"
+[keybindings]
+NewEditorTab = "ctrl-nope"
+Frobnicate = "ctrl-f"
+"#,
+    );
+    let problems = cx.read_global::<SettingsState, _>(|s, _| s.diagnostics.len());
+    assert_eq!(problems, 2);
+    let (_, ws, mut vcx) = open(cx);
+    vcx.simulate_keystrokes("ctrl-t");
+    assert_eq!(
+        tab_count(&ws, &mut vcx),
+        2,
+        "defaults kept for the invalid override"
+    );
+    // The problems are listed on demand.
+    vcx.simulate_keystrokes("ctrl-k ctrl-e");
+    assert!(vcx.update(|window, cx| window.has_active_dialog(cx)));
+}
+
+#[gpui::test]
+fn command_palette_runs_actions(cx: &mut TestAppContext) {
+    init(cx, "");
+    let (_, ws, mut vcx) = open(cx);
+    vcx.simulate_keystrokes("ctrl-shift-p");
+    assert!(vcx.update(|window, cx| window.has_active_dialog(cx)));
+    vcx.simulate_input("split editor right");
+    vcx.simulate_keystrokes("enter");
+    assert!(!vcx.update(|window, cx| window.has_active_dialog(cx)));
+    assert_eq!(pane_count(&ws, &mut vcx), 2);
+    // Escape leaves the palette without running anything.
+    vcx.simulate_keystrokes("f1");
+    assert!(vcx.update(|window, cx| window.has_active_dialog(cx)));
+    vcx.simulate_keystrokes("escape");
+    assert!(!vcx.update(|window, cx| window.has_active_dialog(cx)));
+    assert_eq!(pane_count(&ws, &mut vcx), 2);
+}
+
+#[gpui::test]
+fn perform_covers_every_action(cx: &mut TestAppContext) {
+    init(cx, "");
+    let (_, ws, mut vcx) = open(cx);
+    for spec in ACTIONS {
+        let name = spec.name();
+        if matches!(
+            name,
+            "ninesql::Quit" | "ninesql::CloseWindow" | "ninesql::NewWindow"
+        ) {
+            continue;
+        }
+        let handled = ws.update_in(&mut vcx, |ws, window, cx| {
+            ws.perform((spec.build)().as_ref(), window, cx)
+        });
+        assert!(handled, "{name} is not handled");
+        vcx.update(|window, cx| window.close_all_dialogs(cx));
+        vcx.run_until_parked();
+    }
+    assert!(!ws.update_in(&mut vcx, |ws, window, cx| ws.perform(
+        &gpui::NoAction,
+        window,
+        cx
+    )));
+}
+
+#[gpui::test]
+fn multiple_windows(cx: &mut TestAppContext) {
+    init(cx, "");
+    let (window, ws, mut vcx) = open(cx);
+    cx.dispatch_action(window, NewWindow);
+    cx.run_until_parked();
+    assert_eq!(cx.windows().len(), 2);
+    // Each window has its own workspace.
+    vcx.simulate_keystrokes("ctrl-t");
+    assert_eq!(tab_count(&ws, &mut vcx), 2);
+    let others: Vec<_> = cx.windows().into_iter().filter(|w| *w != window).collect();
+    assert_eq!(others.len(), 1);
+    cx.dispatch_action(others[0], CloseWindow);
+    cx.run_until_parked();
+    assert_eq!(cx.windows().len(), 1);
+    assert_eq!(cx.windows()[0], window);
+}
+
+#[gpui::test]
+fn theme_switching_keeps_font_settings(cx: &mut TestAppContext) {
+    init(
+        cx,
+        r#"
+[appearance]
+theme = "dark"
+ui_font_size = 15
+mono_font_size = 14
+mono_font_family = "DejaVu Sans Mono"
+"#,
+    );
+    let (_, _ws, mut vcx) = open(cx);
+    let read = |vcx: &mut VisualTestContext| {
+        vcx.update(|_, cx| {
+            let t = cx.theme();
+            (t.mode, f32::from(t.font_size), f32::from(t.mono_font_size))
+        })
+    };
+    // The test platform has no fonts, so gpui-component falls back from the configured family
+    // at render time; the configured family is checked in the appearance state.
+    let family = vcx.update(|_, cx| {
+        cx.global::<AppearanceState>()
+            .settings
+            .mono_font_family
+            .clone()
+    });
+    assert_eq!(family.as_deref(), Some("DejaVu Sans Mono"));
+    assert_eq!(read(&mut vcx), (ThemeMode::Dark, 15.0, 14.0));
+    vcx.simulate_keystrokes("ctrl-k ctrl-t");
+    assert_eq!(read(&mut vcx), (ThemeMode::Light, 15.0, 14.0));
+    vcx.simulate_keystrokes("ctrl-= ctrl-=");
+    assert_eq!(read(&mut vcx).1, 17.0);
+    assert_eq!(read(&mut vcx).2, 16.0);
+    vcx.simulate_keystrokes("ctrl-k ctrl-t");
+    assert_eq!(read(&mut vcx).0, ThemeMode::Dark);
+    assert_eq!(read(&mut vcx).2, 16.0, "zoom survives a theme switch");
+    vcx.simulate_keystrokes("ctrl--");
+    assert_eq!(read(&mut vcx).2, 15.0);
+    vcx.simulate_keystrokes("ctrl-0");
+    assert_eq!(read(&mut vcx).1, 15.0);
+    assert_eq!(read(&mut vcx).2, 14.0);
+}
+
+#[gpui::test]
+fn text_contrast_meets_wcag_aa_in_both_themes(cx: &mut TestAppContext) {
+    init(cx, "");
+    for mode in [ThemeMode::Light, ThemeMode::Dark] {
+        cx.update(|cx| crate::appearance::set_mode(mode, cx));
+        cx.update(|cx| {
+            let t = cx.theme();
+            let pairs = [
+                ("foreground / background", t.foreground, t.background),
+                ("muted / background", t.muted_foreground, t.background),
+                (
+                    "muted / status bar",
+                    t.muted_foreground,
+                    *t.tokens.status_bar,
+                ),
+                ("sidebar text / sidebar", t.sidebar_foreground, t.sidebar),
+                ("muted / sidebar", t.muted_foreground, t.sidebar),
+            ];
+            for (what, fg, bg) in pairs {
+                let ratio = contrast_ratio(fg, bg);
+                assert!(ratio >= 4.5, "{mode:?} {what}: {ratio:.2} < 4.5");
+            }
+        });
+    }
+    // Theme state is global: switching does not need a window.
+    assert!(cx.update(|cx| Theme::global(cx).mode.is_dark()));
+}
+
+#[gpui::test]
+fn every_action_has_a_name_gpui_can_build(cx: &mut TestAppContext) {
+    init(cx, "");
+    cx.update(|cx| {
+        for spec in ACTIONS {
+            let built = cx.build_action(spec.name(), None);
+            assert!(built.is_ok(), "{}", spec.name());
+        }
+    });
+    assert_eq!(
+        actions::find("NewEditorTab").map(|s| s.name()),
+        Some(NewEditorTab.name())
+    );
+}

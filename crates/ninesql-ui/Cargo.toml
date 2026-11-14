@@ -16,12 +16,11 @@ workspace = true
 ninesql-core.workspace = true
 ninesql-grid.workspace = true
 ninesql-editor.workspace = true
-
-[[bin]]
-name = "ninesql"
-path = "src/main.rs"
-
-[dev-dependencies]
+toml.workspace = true
+tracing.workspace = true
+# GPUI and gpui-component through gpui-kit, a normal dependency since P1-A (ADR-0013: controls
+# 1-5 and 7 in place, audit trail in docs/audits/gpui-snapshot.md). Never enable `hot-reload`,
+# `tracy`, `inspector` or `gpui-fast`.
 gpui-kit = { workspace = true, features = ["component", "assets", "tree-sitter-sql"] }
 # Exact pins of the gpui-kit family (root Cargo.toml, ADR-0013): listed so `=0.9.1` constrains
 # resolution; gpui-kit itself only asks for "0.9.1" (caret).
@@ -29,3 +28,11 @@ gpui-base.workspace = true
 gpui-component.workspace = true
 gpui-component-macros.workspace = true
 gpui-kit-assets.workspace = true
+
+[[bin]]
+name = "ninesql"
+path = "src/main.rs"
+
+[dev-dependencies]
+# TestAppContext for view-model tests (AGENTS.md): GPUI's own `test-support`, see root Cargo.toml.
+gpui-pre = { workspace = true, features = ["test-support"] }
