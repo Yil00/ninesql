@@ -50,6 +50,15 @@ jobs:
         with:
           tool: cargo-deny@0.20.2
       - run: cargo deny --locked check
+      # ADR-0013 (security review of P0-A): GPUI must never get an HTTP client (I2), and
+      # GPUI's credential API must not be used: secrets go through ninesql-secrets (I1).
+      - name: Forbidden GPUI APIs under crates/
+        run: |
+          pattern='set_http_client|with_http_client|read_credentials|write_credentials|delete_credentials'
+          if git grep -nE "$pattern" -- crates/; then
+            echo "::error::Forbidden GPUI API used under crates/ (ADR-0013): $pattern"
+            exit 1
+          fi
 
   docs:
     name: Documentation links
