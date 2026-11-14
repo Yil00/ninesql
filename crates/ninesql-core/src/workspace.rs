@@ -1,26 +1,80 @@
 //! Workspace files of a project and the connection flows that touch secrets (ADR-0008, I1).
 //!
-//! On-disk documents (all `schema_version` 1):
-//! - `project.json`: [`ProjectFile`]
-//! - `connections.json`: [`ConnectionsFile`]
-//! - `connection-types.json`: [`ConnectionTypesFile`]
+//! On-disk documents:
+//! - `project.json`: [`ProjectFile`] (`schema_version` 2)
+//! - `connections.json`: [`ConnectionsFile`] (`schema_version` 1)
+//! - `connection-types.json`: [`ConnectionTypesFile`] (`schema_version` 1)
 //!
 //! Secrets given to [`Workspace::create_connection`] go to the secret store; only their
 //! [`SecretRef`] reaches `connections.json`.
+//!
+//! An open [`Workspace`] holds the advisory workspace lock ([`ninesql_storage::lock`]): a second
+//! NineSQL process gets [`ninesql_storage::StorageError::Locked`] instead of writing the same
+//! files at the same time.
+
+use std::fmt;
+use std::sync::Arc;
 
 use ninesql_secrets::{SecretId, SecretMeta, SecretRef, SecretStores, SecretString, StoreKind};
 use ninesql_storage::document::{self, Document, Format, Migration};
 use ninesql_storage::fs::ensure_private_dir;
-use ninesql_storage::{Paths, ProjectName, ProjectPaths};
+use ninesql_storage::hygiene::zeroize_value;
+use ninesql_storage::{DirLock, Paths, ProjectName, ProjectPaths};
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
+use uuid::Uuid;
 
 use crate::connection::{Connection, ConnectionId, SecretSlot};
 use crate::connection_type::{ConnectionType, ConnectionTypes};
 use crate::error::{ConnectionError, WorkspaceError};
 
+/// Stable identifier of a project (UUID v4), stored in `project.json`.
+///
+/// Unlike the project name, it does not change when the project is renamed. It is the value of
+/// the `project` attribute of the project's Secret Service items (review item N6), so renaming a
+/// project keeps its saved secrets.
+///
+/// Copying a project directory copies its `project.json` and so its identifier: the copy then
+/// shares the original's keyring items (same project id, same connection ids). Give the copy a
+/// new identifier ([`ProjectId::new_random`]) when duplicating a project.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct ProjectId(Uuid);
+
+impl ProjectId {
+    /// A new random identifier.
+    #[must_use]
+    pub fn new_random() -> Self {
+        Self(Uuid::new_v4())
+    }
+
+    /// Wraps an existing UUID.
+    #[must_use]
+    pub const fn from_uuid(uuid: Uuid) -> Self {
+        Self(uuid)
+    }
+
+    /// The UUID.
+    #[must_use]
+    pub const fn as_uuid(&self) -> &Uuid {
+        &self.0
+    }
+}
+
+impl fmt::Display for ProjectId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0.hyphenated().fmt(f)
+    }
+}
+
 /// `project.json`.
+///
+/// Schema history: version 1 had `name` and `description`; version 2 adds `id` (fixture
+/// `tests/fixtures/project/v1.json`).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProjectFile {
+    /// Stable project identifier (since schema version 2).
+    pub id: ProjectId,
     /// Project name (same as its directory name).
     pub name: ProjectName,
     /// Free text.
@@ -28,10 +82,31 @@ pub struct ProjectFile {
     pub description: Option<String>,
 }
 
+/// `project.json` 1 → 2: give the project a stable random identifier.
+fn project_v1_to_v2(doc: &mut Value) -> Result<(), String> {
+    let obj = doc
+        .as_object_mut()
+        .ok_or_else(|| "the project file must be an object".to_owned())?;
+    obj.insert(
+        "id".to_owned(),
+        Value::String(ProjectId::new_random().to_string()),
+    );
+    Ok(())
+}
+
+const PROJECT_MIGRATIONS: &[Migration] = &[Migration {
+    from: 1,
+    description: "add a stable project id",
+    apply: project_v1_to_v2,
+}];
+
 impl Document for ProjectFile {
     const NAME: &'static str = "project";
     const FORMAT: Format = Format::Json;
-    const SCHEMA_VERSION: u32 = 1;
+    const SCHEMA_VERSION: u32 = 2;
+    fn migrations() -> &'static [Migration] {
+        PROJECT_MIGRATIONS
+    }
 }
 
 /// `connections.json`: the saved connections of a project, without secrets.
@@ -50,6 +125,44 @@ impl Document for ConnectionsFile {
     const SCHEMA_VERSION: u32 = 1;
     fn migrations() -> &'static [Migration] {
         &[]
+    }
+
+    /// Applies the rules of [`Connection::sanitize`] to the raw file (any schema version): every
+    /// driver property that is secret-like, reserved or carries a credential, and every init SQL
+    /// statement with a credential, is removed and zeroized. Non-string property values and init
+    /// SQL entries are removed too (they would not load anyway). Unknown layouts are left alone:
+    /// secret-looking keys are stripped by the storage layer in any case.
+    fn scrub(value: &mut Value, _schema_version: u32) {
+        let Some(connections) = value.get_mut("connections").and_then(Value::as_array_mut) else {
+            return;
+        };
+        for connection in connections {
+            if let Some(props) = connection
+                .get_mut("properties")
+                .and_then(Value::as_object_mut)
+            {
+                props.retain(|key, v| {
+                    let keep = v
+                        .as_str()
+                        .is_some_and(|s| crate::connection::property_problem(key, s).is_none());
+                    if !keep {
+                        zeroize_value(v);
+                    }
+                    keep
+                });
+            }
+            if let Some(init) = connection.get_mut("init_sql").and_then(Value::as_array_mut) {
+                init.retain_mut(|v| {
+                    let keep = v
+                        .as_str()
+                        .is_some_and(|s| !crate::properties::sql_carries_secret(s));
+                    if !keep {
+                        zeroize_value(v);
+                    }
+                    keep
+                });
+            }
+        }
     }
 }
 
@@ -165,19 +278,30 @@ pub struct LoadedConnections {
     pub secret_like_keys: Vec<String>,
 }
 
-/// One project of the NineSQL workspace on disk.
+/// One project of the NineSQL workspace on disk. Holds the workspace lock while any clone is
+/// alive.
 #[derive(Debug, Clone)]
 pub struct Workspace {
     paths: Paths,
     project: ProjectName,
+    project_id: ProjectId,
     project_paths: ProjectPaths,
+    _lock: Arc<DirLock>,
 }
 
 impl Workspace {
-    /// Opens a project, creating the NineSQL directories (`0700`) and `project.json` if missing.
+    /// Opens a project: creates the NineSQL directories (`0700`, owned by the current user,
+    /// never through a symbolic link), takes the workspace lock, then reads `project.json`
+    /// (migrating it) or creates it with a new [`ProjectId`].
+    ///
+    /// Several `Workspace` values of one process share the lock; another process gets
+    /// [`ninesql_storage::StorageError::Locked`].
     ///
     /// # Errors
-    /// Storage errors.
+    /// Storage errors, including [`ninesql_storage::StorageError::Locked`],
+    /// [`ninesql_storage::StorageError::NotOwned`] and
+    /// [`ninesql_storage::StorageError::WrongFileType`] (a symbolic link in place of a NineSQL
+    /// directory).
     pub fn open(paths: Paths, project: ProjectName) -> Result<Self, WorkspaceError> {
         let project_paths = paths.project(&project);
         for dir in [
@@ -191,21 +315,35 @@ impl Workspace {
         ] {
             ensure_private_dir(&dir)?;
         }
+        let lock = DirLock::acquire(&paths.lock_file())?;
         let project_file = project_paths.project_file();
-        if document::load::<ProjectFile>(&project_file)?.is_none() {
-            document::save(
-                &project_file,
-                &ProjectFile {
+        let project_id = match document::load::<ProjectFile>(&project_file)? {
+            Some(loaded) => loaded.document.id,
+            None => {
+                let file = ProjectFile {
+                    id: ProjectId::new_random(),
                     name: project.clone(),
                     description: None,
-                },
-            )?;
-        }
+                };
+                document::save(&project_file, &file)?;
+                file.id
+            }
+        };
         Ok(Self {
             paths,
             project,
+            project_id,
             project_paths,
+            _lock: lock,
         })
+    }
+
+    /// Stable identifier of the project, from `project.json`. Secret Service stores of this
+    /// project are scoped with it (`SecretServiceStore::new(&workspace.project_id().to_string())`),
+    /// never with the mutable project name (N6).
+    #[must_use]
+    pub fn project_id(&self) -> ProjectId {
+        self.project_id
     }
 
     /// NineSQL paths.
@@ -230,11 +368,15 @@ impl Workspace {
     ///
     /// Each connection is [sanitized](Connection::sanitize): secret-bearing or reserved driver
     /// properties and init SQL with password literals are removed and reported in
-    /// [`LoadedConnections::issues`], so one bad connection does not block the project. The next
-    /// save drops them from disk. Any other invalid data fails the load.
+    /// [`LoadedConnections::issues`], so one bad connection does not block the project. When
+    /// anything was removed, the file is rewritten at once without it (atomic, `0600`), not at
+    /// the next save (N7.2); so are unknown secret-looking keys (by the storage layer). Any other
+    /// invalid data fails the load.
     ///
     /// # Errors
-    /// Storage errors, invalid or duplicate connections. The file is left untouched on error.
+    /// Storage errors, invalid or duplicate connections. On a validation error the file keeps its
+    /// invalid data for the user to fix, but secret-bearing properties, init SQL and
+    /// secret-looking keys are removed from it first (atomic rewrite of the raw file).
     #[must_use = "load issues (removed connection data) must be shown to the user"]
     pub fn load_connections(&self) -> Result<LoadedConnections, WorkspaceError> {
         let path = self.project_paths.connections_file();
@@ -252,19 +394,53 @@ impl Workspace {
                     problem,
                 });
             }
-            c.validate()
-                .map_err(|source| WorkspaceError::InvalidConnection {
-                    name: c.name.clone(),
-                    source,
-                })?;
+            if let Err(source) = c.validate() {
+                let name = c.name.clone();
+                self.scrub_after_failed_load(&path);
+                return Err(WorkspaceError::InvalidConnection { name, source });
+            }
         }
-        let connections = Connections::from_vec(items)?;
+        let connections = match Connections::from_vec(items) {
+            Ok(connections) => connections,
+            Err(e) => {
+                self.scrub_after_failed_load(&path);
+                return Err(e.into());
+            }
+        };
+        if !issues.is_empty() {
+            self.save_connections(&connections)?;
+            tracing::warn!(
+                project = %self.project,
+                removed = issues.len(),
+                "rewrote connections.json without the removed connection data"
+            );
+        }
         tracing::debug!(project = %self.project, count = connections.len(), "loaded connections");
         Ok(LoadedConnections {
             connections,
             issues,
             secret_like_keys: loaded.secret_like_keys,
         })
+    }
+
+    /// After a load that parsed but failed validation, removes secret-looking data from the file
+    /// as it is on disk ([`document::scrub_file`] with [`ConnectionsFile::scrub`]), so a secret in
+    /// another connection does not stay on disk until the user fixes the invalid data (I1). The
+    /// invalid data itself is kept for the user to fix. Failures are logged: the validation error
+    /// is what the caller reports.
+    fn scrub_after_failed_load(&self, path: &std::path::Path) {
+        match document::scrub_file::<ConnectionsFile>(path) {
+            Ok(true) => tracing::warn!(
+                project = %self.project,
+                "removed secret-looking data from connections.json, which has invalid data"
+            ),
+            Ok(false) => {}
+            Err(e) => tracing::warn!(
+                project = %self.project,
+                error = %e,
+                "could not remove secret-looking data from connections.json"
+            ),
+        }
     }
 
     /// Validates and atomically writes `connections.json`.

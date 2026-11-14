@@ -12,13 +12,31 @@
 //!
 //! Items go to the default collection with attributes `xdg:schema = "org.ninesql.Secret"`,
 //! `service = "ninesql"`, `project`, `secret_id`, `connection_id` and `kind`. Lookups use
-//! `xdg:schema` + `service` + `project` + `secret_id`, so a project copied elsewhere (same
-//! connection ids) never reads or overwrites another project's secrets.
+//! `xdg:schema` + `service` + `project` + `secret_id`.
+//!
+//! The **`project` attribute holds the project's stable UUID** (the `id` of `project.json`,
+//! `ninesql_core::ProjectId`), never the project name: a renamed project keeps its secrets, and
+//! two projects with different ids (same connection ids) never read or overwrite each other's
+//! secrets (review item N6). [`SecretServiceStore::new`] refuses anything that is not a UUID.
+//! Items written by earlier development builds under the project *name* are not migrated: the
+//! backend never shipped (it is a spike behind a feature flag).
 //!
 //! Writing stores the new item first (replacing one with the same attributes), then deletes the
 //! other items under the same id, such as a stale duplicate with an older `connection_id` /
 //! `kind`. A failed write therefore never loses the previous credential, and a stale duplicate
-//! that cannot be deleted (locked, prompt dismissed) is logged, not fatal.
+//! that cannot be deleted (locked, prompt dismissed) is logged, not fatal. If the new item is not
+//! among the items found under the id afterwards, nothing is deleted (the search result cannot be
+//! trusted to tell stale items from the new one).
+//!
+//! Reading with duplicates under one id (a stale item that could not be deleted) picks the single
+//! item that is in the default collection **and** whose `connection_id` / `kind` attributes match
+//! the id (`<connection uuid>:<slot>`, kind allowed for the slot); if there is not exactly one,
+//! the read fails with [`SecretError::Ambiguous`] rather than guess.
+//!
+//! Deleting removes every item stored under the id in this project, duplicates included; it
+//! fails only if the default-collection item (the one reads use) could not be deleted, or if
+//! nothing could be deleted. If the default collection cannot be looked up, every item is
+//! treated as non-default and deletion still proceeds.
 //!
 //! Calls block the current thread (zbus runs its own executor); run them on a blocking thread,
 //! never on the GPUI foreground.
@@ -47,16 +65,37 @@ const ATTR_KIND: &str = "kind";
 /// [`SecretStore`] backed by the freedesktop Secret Service, scoped to one workspace project.
 #[derive(Debug, Clone)]
 pub struct SecretServiceStore {
+    /// Project UUID, lower-case hyphenated: value of the `project` attribute.
     project: String,
 }
 
+/// Error returned when [`SecretServiceStore::new`] is not given a project UUID.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error("invalid project identifier: a hyphenated UUID (from project.json) is expected")]
+pub struct InvalidProjectId;
+
 impl SecretServiceStore {
-    /// A handle on the session's Secret Service for the items of `project` (the workspace
-    /// project name, not secret). Connects on each call.
-    #[must_use]
-    pub fn new(project: impl Into<String>) -> Self {
-        Self {
-            project: project.into(),
+    /// A handle on the session's Secret Service for the items of one project, identified by its
+    /// stable UUID from `project.json` (`workspace.project_id().to_string()`), **not** its name.
+    /// The UUID becomes the `project` attribute of every item, lower-cased. Connects on each
+    /// call.
+    ///
+    /// # Errors
+    /// [`InvalidProjectId`] unless `project_id` is a hyphenated UUID (`8-4-4-4-12` hex digits),
+    /// so a project name cannot be passed by mistake.
+    pub fn new(project_id: &str) -> Result<Self, InvalidProjectId> {
+        let groups: Vec<&str> = project_id.split('-').collect();
+        let valid = groups.len() == 5
+            && groups
+                .iter()
+                .zip([8, 4, 4, 4, 12])
+                .all(|(g, len)| g.len() == len && g.bytes().all(|b| b.is_ascii_hexdigit()));
+        if valid {
+            Ok(Self {
+                project: project_id.to_ascii_lowercase(),
+            })
+        } else {
+            Err(InvalidProjectId)
         }
     }
 
@@ -85,19 +124,88 @@ impl SecretServiceStore {
         SecretService::connect(EncryptionType::Dh).map_err(map_error)
     }
 
-    /// The single item stored under `id`, if any.
-    fn find<'a>(
+    /// The item to read under `id`: the only one, or among duplicates the single one that
+    /// [`pick_duplicate`] accepts.
+    fn find_for_read<'a>(
         &self,
         ss: &'a SecretService<'a>,
         id: &SecretId,
     ) -> Result<Option<Item<'a>>, SecretError> {
         let mut items = self.search(ss, id)?;
-        match items.len() {
-            0 => Ok(None),
-            1 => Ok(items.pop()),
-            _ => Err(SecretError::Ambiguous(id.clone())),
+        if items.len() <= 1 {
+            return Ok(items.pop());
+        }
+        let in_default: Vec<String> = ss
+            .get_default_collection()
+            .and_then(|c| {
+                c.search_items(self.lookup(id))
+                    .map(|found| found.iter().map(|i| i.item_path.to_string()).collect())
+            })
+            .map_err(map_error)?;
+        let candidates: Vec<Candidate> = items
+            .iter()
+            .map(|item| Candidate {
+                in_default_collection: in_default.contains(&item.item_path.to_string()),
+                // An item whose attributes cannot be read is never picked.
+                attributes: item.get_attributes().unwrap_or_default(),
+            })
+            .collect();
+        match pick_duplicate(id, &candidates) {
+            Some(index) => {
+                tracing::warn!(id = %id, duplicates = items.len(), "several secret items share an id; reading the default-collection item that matches it");
+                Ok(Some(items.swap_remove(index)))
+            }
+            None => Err(SecretError::Ambiguous(id.clone())),
         }
     }
+}
+
+/// What [`pick_duplicate`] knows of one item found under a secret id.
+#[derive(Debug, Default)]
+struct Candidate {
+    /// The item is in the default collection (where NineSQL writes).
+    in_default_collection: bool,
+    /// Its attributes.
+    attributes: HashMap<String, String>,
+}
+
+/// Kinds a slot of a connection secret id (`<connection uuid>:<slot>`) can hold.
+fn kinds_for_slot(slot: &str) -> &'static [&'static str] {
+    use crate::reference::SecretKind as K;
+    const AUTH: &[&str] = &[K::Password.as_str(), K::Token.as_str()];
+    const SSH: &[&str] = &[K::SshPassword.as_str(), K::SshKeyPassphrase.as_str()];
+    const TLS: &[&str] = &[K::ClientKeyPassphrase.as_str()];
+    const PROXY: &[&str] = &[K::ProxyPassword.as_str()];
+    match slot {
+        "auth" => AUTH,
+        "ssh" => SSH,
+        "tls-client-key" => TLS,
+        "proxy" => PROXY,
+        s if s
+            .strip_prefix("ssh-jump-")
+            .is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit())) =>
+        {
+            SSH
+        }
+        _ => &[],
+    }
+}
+
+/// Among several items stored under `id`, the index of the single one that is in the default
+/// collection and whose `connection_id` and `kind` attributes match the id; `None` when there is
+/// not exactly one (the caller reports [`SecretError::Ambiguous`]).
+fn pick_duplicate(id: &SecretId, candidates: &[Candidate]) -> Option<usize> {
+    let (connection_id, slot) = id.as_str().split_once(':')?;
+    let kinds = kinds_for_slot(slot);
+    let mut matching = candidates.iter().enumerate().filter(|(_, c)| {
+        c.in_default_collection
+            && c.attributes.get(ATTR_CONNECTION_ID).map(String::as_str) == Some(connection_id)
+            && c.attributes
+                .get(ATTR_KIND)
+                .is_some_and(|k| kinds.contains(&k.as_str()))
+    });
+    let (index, _) = matching.next()?;
+    matching.next().is_none().then_some(index)
 }
 
 impl SecretStore for SecretServiceStore {
@@ -108,7 +216,7 @@ impl SecretStore for SecretServiceStore {
     fn get(&self, id: &SecretId) -> Result<SecretString, SecretError> {
         let ss = Self::connect()?;
         let item = self
-            .find(&ss, id)?
+            .find_for_read(&ss, id)?
             .ok_or_else(|| SecretError::NotFound(id.clone()))?;
         item.ensure_unlocked().map_err(map_error)?;
         let bytes = Zeroizing::new(item.get_secret().map_err(map_error)?);
@@ -139,15 +247,65 @@ impl SecretStore for SecretServiceStore {
         write_then_prune(&mut ops, id)
     }
 
+    /// Deletes **every** item stored under `id` in this project (stale duplicates included).
+    /// See [`delete_matches`] for the outcome when some deletions fail.
     fn delete(&self, id: &SecretId) -> Result<bool, SecretError> {
         let ss = Self::connect()?;
-        match self.find(&ss, id)? {
-            Some(item) => {
-                item.delete().map_err(map_error)?;
-                Ok(true)
-            }
-            None => Ok(false),
+        let items = self.search(&ss, id)?;
+        if items.is_empty() {
+            return Ok(false);
         }
+        // Without the default collection (no `default` alias, lookup failure) every item is
+        // treated as non-default and still deleted: a failed lookup must not keep secrets.
+        let in_default: Vec<String> = match ss.get_default_collection().and_then(|c| {
+            c.search_items(self.lookup(id))
+                .map(|found| found.iter().map(|i| i.item_path.to_string()).collect())
+        }) {
+            Ok(paths) => paths,
+            Err(e) => {
+                tracing::warn!(id = %id, error = %map_error(e), "cannot look up the default secret collection; deleting every item under the id");
+                Vec::new()
+            }
+        };
+        let flagged: Vec<(&Item<'_>, bool)> = items
+            .iter()
+            .map(|item| (item, in_default.contains(&item.item_path.to_string())))
+            .collect();
+        delete_matches(id, &flagged, |item| item.delete().map_err(map_error))
+    }
+}
+
+/// Deletes every item found under `id`, logging each failure. Returns:
+/// - `Ok(false)` when there is no item;
+/// - the error of a default-collection item that could not be deleted (the credential NineSQL
+///   reads is still there);
+/// - otherwise `Ok(true)` if at least one item was deleted, else the first error.
+fn delete_matches<P>(
+    id: &SecretId,
+    items: &[(P, bool)],
+    mut delete: impl FnMut(&P) -> Result<(), SecretError>,
+) -> Result<bool, SecretError> {
+    let mut deleted_any = false;
+    let mut default_failure = None;
+    let mut first_failure = None;
+    for (item, in_default) in items {
+        match delete(item) {
+            Ok(()) => deleted_any = true,
+            Err(e) => {
+                tracing::warn!(id = %id, in_default_collection = in_default, error = %e, "could not delete a secret item");
+                if *in_default && default_failure.is_none() {
+                    default_failure = Some(e);
+                } else if first_failure.is_none() {
+                    first_failure = Some(e);
+                }
+            }
+        }
+    }
+    match (default_failure, first_failure) {
+        (Some(e), _) => Err(e),
+        (None, _) if deleted_any => Ok(true),
+        (None, Some(e)) => Err(e),
+        (None, None) => Ok(false),
     }
 }
 
@@ -166,10 +324,15 @@ trait ItemOps {
 /// Writes the new secret **first**, then deletes the other items stored under the same id
 /// (stale duplicates with older attributes, other collections). If the write fails, the previous
 /// credential is untouched. Failing to delete a stale duplicate (locked collection, dismissed
-/// prompt) is logged, not fatal: the new secret is already stored.
+/// prompt) is logged, not fatal: the new secret is already stored. If the created item is not
+/// among the matches, nothing is deleted: the search cannot be trusted to tell the new item from
+/// stale ones.
 fn write_then_prune<O: ItemOps>(ops: &mut O, id: &SecretId) -> Result<(), SecretError> {
     let created = ops.create()?;
     match ops.matching() {
+        Ok(paths) if !paths.contains(&created) => {
+            tracing::warn!(id = %id, item = ?created, "the new secret item is not among the items found under its id; stale duplicates are left in place");
+        }
         Ok(paths) => {
             for stale in paths.iter().filter(|p| **p != created) {
                 if let Err(e) = ops.delete(stale) {
@@ -370,14 +533,136 @@ mod tests {
         assert_eq!(fake.log, ["create", "matching"]);
     }
 
+    /// Security review L8: delete removes every match and succeeds unless the default-collection
+    /// item stays.
+    #[test]
+    fn delete_removes_every_match() {
+        let id = id();
+        let mut seen = Vec::new();
+        let items = [(1u32, false), (2, true), (3, false)];
+        let ok = delete_matches(&id, &items, |p| {
+            seen.push(*p);
+            if *p == 3 {
+                Err(SecretError::Locked(StoreKind::Keyring))
+            } else {
+                Ok(())
+            }
+        });
+        assert!(ok.unwrap());
+        assert_eq!(seen, [1, 2, 3]);
+        // The default-collection item could not be deleted: error, after trying the others.
+        let mut seen = Vec::new();
+        let err = delete_matches(&id, &items, |p| {
+            seen.push(*p);
+            if *p == 2 {
+                Err(SecretError::Locked(StoreKind::Keyring))
+            } else {
+                Ok(())
+            }
+        });
+        assert!(matches!(err, Err(SecretError::Locked(_))));
+        assert_eq!(seen, [1, 2, 3]);
+        // Nothing deleted at all: the first error.
+        let err = delete_matches(&id, &[(1u32, false)], |_| {
+            Err(SecretError::Locked(StoreKind::Keyring))
+        });
+        assert!(matches!(err, Err(SecretError::Locked(_))));
+        assert!(!delete_matches(&id, &[] as &[(u32, bool)], |_| Ok(())).unwrap());
+    }
+
+    #[test]
+    fn prune_is_skipped_when_the_created_item_is_not_found() {
+        let mut fake = Fake::new(vec![3, 5]);
+        write_then_prune(&mut fake, &id()).unwrap();
+        assert_eq!(fake.log, ["create", "matching"]);
+    }
+
+    const PROJECT: &str = "3F2A6C1E-0B7D-4C51-9E2A-6D8F0A1B2C3D";
+    const CONN: &str = "8a6e0f62-6b0c-4d8e-9f1e-2a4b6c8d0e1f";
+
+    fn candidate(in_default: bool, connection_id: &str, kind: &str) -> Candidate {
+        Candidate {
+            in_default_collection: in_default,
+            attributes: HashMap::from([
+                (ATTR_CONNECTION_ID.to_owned(), connection_id.to_owned()),
+                (ATTR_KIND.to_owned(), kind.to_owned()),
+            ]),
+        }
+    }
+
+    #[test]
+    fn duplicates_resolve_to_the_matching_default_collection_item() {
+        let id = SecretId::new(format!("{CONN}:auth")).unwrap();
+        let other = "00000000-0000-4000-8000-000000000000";
+        // A stale copy in another collection and one with a foreign connection id lose.
+        let found = [
+            candidate(false, CONN, "password"),
+            candidate(true, other, "password"),
+            candidate(true, CONN, "password"),
+        ];
+        assert_eq!(pick_duplicate(&id, &found), Some(2));
+        // A kind that does not fit the slot loses.
+        let found = [
+            candidate(true, CONN, "ssh_password"),
+            candidate(true, CONN, "token"),
+        ];
+        assert_eq!(pick_duplicate(&id, &found), Some(1));
+        // Two plausible items, or none: ambiguous.
+        let found = [
+            candidate(true, CONN, "password"),
+            candidate(true, CONN, "token"),
+        ];
+        assert_eq!(pick_duplicate(&id, &found), None);
+        let found = [
+            candidate(false, CONN, "password"),
+            candidate(false, CONN, "password"),
+        ];
+        assert_eq!(pick_duplicate(&id, &found), None);
+        // Unreadable attributes are never picked.
+        let found = [Candidate::default(), candidate(true, CONN, "password")];
+        assert_eq!(pick_duplicate(&id, &found), Some(1));
+        // Jump hosts and other slots.
+        let jump = SecretId::new(format!("{CONN}:ssh-jump-2")).unwrap();
+        let found = [
+            candidate(true, CONN, "password"),
+            candidate(true, CONN, "ssh_key_passphrase"),
+        ];
+        assert_eq!(pick_duplicate(&jump, &found), Some(1));
+        let odd = SecretId::new(format!("{CONN}:ssh-jump-x")).unwrap();
+        assert_eq!(pick_duplicate(&odd, &found), None);
+        assert_eq!(
+            pick_duplicate(&SecretId::new("no-slot").unwrap(), &found),
+            None
+        );
+    }
+
+    #[test]
+    fn project_must_be_a_uuid() {
+        assert!(SecretServiceStore::new(PROJECT).is_ok());
+        for bad in [
+            "General",
+            "",
+            "3f2a6c1e0b7d4c519e2a6d8f0a1b2c3d",
+            "3f2a6c1e-0b7d-4c51-9e2a-6d8f0a1b2c3",
+            "3f2a6c1e-0b7d-4c51-9e2a-6d8f0a1b2c3g",
+            "3f2a6c1e-0b7d-4c51-9e2a-6d8f0a1b2c3d-",
+        ] {
+            assert!(SecretServiceStore::new(bad).is_err(), "{bad:?}");
+        }
+    }
+
     #[test]
     fn lookup_attributes() {
         let id = id();
-        let store = SecretServiceStore::new("General");
+        let store = SecretServiceStore::new(PROJECT).unwrap();
         let attrs = store.lookup(&id);
         assert_eq!(attrs.get("xdg:schema"), Some(&"org.ninesql.Secret"));
         assert_eq!(attrs.get("service"), Some(&"ninesql"));
-        assert_eq!(attrs.get("project"), Some(&"General"));
+        // The project UUID, lower-cased, never a project name.
+        assert_eq!(
+            attrs.get("project"),
+            Some(&"3f2a6c1e-0b7d-4c51-9e2a-6d8f0a1b2c3d")
+        );
         assert_eq!(attrs.get("secret_id"), Some(&"spike:password"));
         assert_eq!(attrs.len(), 4);
     }
@@ -387,7 +672,7 @@ mod tests {
     #[test]
     #[ignore = "needs a session bus with a Secret Service (GNOME Keyring, KWallet, KeePassXC)"]
     fn round_trip_on_a_real_secret_service() {
-        let store = SecretServiceStore::new("ninesql-spike-test");
+        let store = SecretServiceStore::new("00000000-0000-4000-8000-00000000c0de").unwrap();
         let id = SecretId::new("ninesql-spike-test:password").unwrap();
         let meta = SecretMeta {
             connection_id: "ninesql-spike-test".into(),
@@ -418,7 +703,10 @@ mod tests {
         {
             return;
         }
-        let err = SecretServiceStore::new("General").get(&id()).unwrap_err();
+        let err = SecretServiceStore::new(PROJECT)
+            .unwrap()
+            .get(&id())
+            .unwrap_err();
         assert!(matches!(err, SecretError::Unavailable { .. }), "{err:?}");
     }
 }

@@ -2,7 +2,7 @@
 
 use std::fs::{self, DirBuilder, File, OpenOptions};
 use std::io::{self, Read, Write};
-use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
+use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -18,25 +18,82 @@ pub const DEFAULT_READ_LIMIT: u64 = 64 * 1024 * 1024;
 /// Group and other permission bits.
 const GROUP_OTHER: u32 = 0o077;
 
-/// Creates `dir` and its missing parents with mode `0700`. If `dir` already exists with group or
-/// other permissions, they are removed (a warning is logged). Existing parents are left alone.
+/// Creates `dir` and its missing parents with mode `0700`, then checks `dir` itself:
+///
+/// - it must be a real directory: a symbolic link in place of `dir` is refused, never followed
+///   (the check and every later step go through a descriptor opened with `O_NOFOLLOW`);
+/// - it must be owned by the current (effective) user, otherwise [`StorageError::NotOwned`];
+/// - group / other permission bits are removed through that descriptor (a warning is logged).
+///
+/// Existing parents are left alone and may be symbolic links (a symlinked `$HOME` is common):
+/// callers check each NineSQL directory of a path in turn, outermost first.
 ///
 /// # Errors
-/// I/O errors, or [`StorageError::WrongFileType`] if `dir` exists and is not a directory.
+/// I/O errors, [`StorageError::WrongFileType`] if `dir` exists and is not a directory (or is a
+/// symbolic link), [`StorageError::NotOwned`].
 pub fn ensure_private_dir(dir: &Path) -> Result<(), StorageError> {
-    DirBuilder::new()
-        .recursive(true)
-        .mode(DIR_MODE)
-        .create(dir)
-        .map_err(|e| StorageError::io(dir, e))?;
-    let meta = fs::metadata(dir).map_err(|e| StorageError::io(dir, e))?;
-    if !meta.is_dir() {
-        return Err(StorageError::WrongFileType {
-            path: dir.to_path_buf(),
-            expected: "directory",
-        });
+    match fs::symlink_metadata(dir) {
+        Ok(_) => {}
+        Err(e) if e.kind() == io::ErrorKind::NotFound => DirBuilder::new()
+            .recursive(true)
+            .mode(DIR_MODE)
+            .create(dir)
+            .map_err(|e| StorageError::io(dir, e))?,
+        Err(e) => return Err(StorageError::io(dir, e)),
     }
-    restrict_mode(dir, meta.permissions().mode(), DIR_MODE)
+    let handle = match OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(dir)
+    {
+        Ok(handle) => handle,
+        Err(e) if matches!(e.raw_os_error(), Some(libc::ELOOP | libc::ENOTDIR)) => {
+            return Err(not_a_directory(dir));
+        }
+        Err(e) => return Err(StorageError::io(dir, e)),
+    };
+    let meta = handle.metadata().map_err(|e| StorageError::io(dir, e))?;
+    if !meta.is_dir() {
+        return Err(not_a_directory(dir));
+    }
+    check_owner(dir, meta.uid(), current_uid())?;
+    let mode = meta.permissions().mode();
+    if mode & GROUP_OTHER != 0 {
+        tracing::warn!(
+            path = %dir.display(),
+            mode = format_args!("{:o}", mode & 0o7777),
+            "tightening permissions of a NineSQL directory"
+        );
+        handle
+            .set_permissions(fs::Permissions::from_mode(DIR_MODE))
+            .map_err(|e| StorageError::io(dir, e))?;
+    }
+    Ok(())
+}
+
+fn not_a_directory(path: &Path) -> StorageError {
+    StorageError::WrongFileType {
+        path: path.to_path_buf(),
+        expected: "directory (symbolic links are refused)",
+    }
+}
+
+/// Effective user id of this process.
+#[must_use]
+pub fn current_uid() -> u32 {
+    rustix::process::geteuid().as_raw()
+}
+
+/// [`StorageError::NotOwned`] unless `owner` is `current`.
+pub(crate) fn check_owner(path: &Path, owner: u32, current: u32) -> Result<(), StorageError> {
+    if owner == current {
+        Ok(())
+    } else {
+        Err(StorageError::NotOwned {
+            path: path.to_path_buf(),
+            owner,
+        })
+    }
 }
 
 /// Removes group / other bits from an existing NineSQL file, if any (a warning is logged).
@@ -285,6 +342,42 @@ mod tests {
         let file = tmp.path().join("f");
         fs::write(&file, b"x").unwrap();
         assert!(ensure_private_dir(&file).is_err());
+    }
+
+    #[test]
+    fn directory_symlinks_are_refused_and_not_chmod_ed() {
+        let tmp = tempfile::tempdir().unwrap();
+        let real = tmp.path().join("real");
+        fs::create_dir(&real).unwrap();
+        fs::set_permissions(&real, fs::Permissions::from_mode(0o755)).unwrap();
+        let link = tmp.path().join("link");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        assert!(matches!(
+            ensure_private_dir(&link),
+            Err(StorageError::WrongFileType { .. })
+        ));
+        assert_eq!(mode(&real), 0o755);
+        // A dangling link is refused too, and nothing is created at its target.
+        let dangling = tmp.path().join("dangling");
+        std::os::unix::fs::symlink(tmp.path().join("nowhere"), &dangling).unwrap();
+        assert!(ensure_private_dir(&dangling).is_err());
+        assert!(!tmp.path().join("nowhere").exists());
+        // Symlinked parents are fine.
+        ensure_private_dir(&link.join("child")).unwrap();
+        assert_eq!(mode(&real.join("child")), DIR_MODE);
+    }
+
+    #[test]
+    fn foreign_owner_is_refused() {
+        assert!(check_owner(Path::new("/x"), 1000, 1000).is_ok());
+        let err = check_owner(Path::new("/x"), 0, 1000).unwrap_err();
+        assert!(
+            matches!(err, StorageError::NotOwned { owner: 0, .. }),
+            "{err}"
+        );
+        // Our own temp directory passes the real check.
+        let tmp = tempfile::tempdir().unwrap();
+        ensure_private_dir(tmp.path()).unwrap();
     }
 
     #[test]

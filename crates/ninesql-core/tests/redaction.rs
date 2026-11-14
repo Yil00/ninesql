@@ -91,6 +91,10 @@ fn rejected_type_and_project_values_are_never_echoed() {
         json!({ "schema_version": 1, "name": MARKER }),
         "project name",
     );
+    assert_hidden::<ProjectFile>(
+        json!({ "schema_version": 2, "id": MARKER, "name": "General" }),
+        "project id",
+    );
 }
 
 #[test]

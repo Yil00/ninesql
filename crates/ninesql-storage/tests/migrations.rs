@@ -2,7 +2,7 @@
 #![allow(clippy::unwrap_used, clippy::expect_used)] // Tests may panic (AGENTS.md).
 
 use std::fs;
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
 use ninesql_storage::document::{self, backup_path};
@@ -157,8 +157,12 @@ fn load_migrates_on_disk_and_keeps_a_backup() {
     assert_eq!(loaded.migrated_from, Some(1));
     assert_eq!(loaded.document, expected());
 
+    // JSON backups are re-encoded from the scrubbed value (same content, canonical layout).
     let bak = backup_path(&path);
-    assert_eq!(fs::read(&bak).unwrap(), original);
+    assert_eq!(
+        serde_json::from_slice::<Value>(&fs::read(&bak).unwrap()).unwrap(),
+        serde_json::from_slice::<Value>(&original).unwrap()
+    );
     for p in [&path, &bak] {
         assert_eq!(fs::metadata(p).unwrap().permissions().mode() & 0o777, 0o600);
     }
@@ -324,4 +328,196 @@ fn migration_backup_drops_secret_like_keys() {
             .unwrap()
             .contains("Hunter2-Secret")
     );
+}
+
+/// `Sample` with a `scrub` hook that removes tags starting with `pw:` (a stand-in for a model with
+/// free-form values, like driver properties).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+struct Scrubbed {
+    items: Vec<Item>,
+}
+
+impl Document for Scrubbed {
+    const NAME: &'static str = "scrubbed";
+    const FORMAT: Format = Format::Json;
+    const SCHEMA_VERSION: u32 = 3;
+    fn migrations() -> &'static [Migration] {
+        MIGRATIONS
+    }
+    fn scrub(value: &mut Value, schema_version: u32) {
+        assert_eq!(
+            schema_version, 1,
+            "the hook sees the version of the original file"
+        );
+        for item in value["items"].as_array_mut().into_iter().flatten() {
+            if let Some(tags) = item.get_mut("tags").and_then(Value::as_array_mut) {
+                tags.retain(|t| !t.as_str().is_some_and(|t| t.starts_with("pw:")));
+            }
+        }
+    }
+}
+
+#[test]
+fn migration_backup_goes_through_the_scrub_hook() {
+    let tmp = tempfile::tempdir().unwrap();
+    let path = tmp.path().join("scrubbed.json");
+    let content = br#"{ "schema_version": 1, "items": [
+        { "host": "h", "port": 1, "tags": ["blue", "pw:Hunter2-Secret"] } ] }"#;
+    fs::write(&path, content).unwrap();
+    let loaded = document::load::<Scrubbed>(&path).unwrap().unwrap();
+    assert_eq!(loaded.migrated_from, Some(1));
+    // No secret-looking key: only the hook could catch this value.
+    assert!(loaded.secret_like_keys.is_empty());
+    let bak = fs::read_to_string(backup_path(&path)).unwrap();
+    assert!(!bak.contains("Hunter2-Secret"), "{bak}");
+    assert!(bak.contains("\"blue\""), "{bak}");
+    assert!(bak.contains("\"schema_version\": 1"), "{bak}");
+    assert_eq!(
+        fs::metadata(backup_path(&path))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777,
+        0o600
+    );
+}
+
+/// Security review L2: duplicate JSON keys parse to their last value, so a clean-looking value
+/// does not prove clean bytes. JSON backups are always re-encoded from the scrubbed value.
+#[test]
+fn json_backup_never_copies_a_duplicate_key_secret() {
+    let tmp = tempfile::tempdir().unwrap();
+    let path = tmp.path().join("scrubbed.json");
+    let content = br#"{ "schema_version": 1, "items": [
+        { "host": "h", "port": 1, "token": "Hunter2-Secret", "token": "" } ] }"#;
+    fs::write(&path, content).unwrap();
+    document::load::<Scrubbed>(&path).unwrap().unwrap();
+    let bak = fs::read_to_string(backup_path(&path)).unwrap();
+    assert!(!bak.contains("Hunter2-Secret"), "{bak}");
+    assert!(bak.contains("\"schema_version\": 1"), "{bak}");
+}
+
+/// A TOML file (where duplicate keys are a parse error) with nothing to scrub is backed up
+/// verbatim, comments included.
+#[test]
+fn clean_toml_backup_keeps_the_original_bytes() {
+    #[derive(Debug, Serialize, Deserialize)]
+    struct OldToml {
+        items: Vec<Item>,
+    }
+    impl Document for OldToml {
+        const NAME: &'static str = "old-toml";
+        const FORMAT: Format = Format::Toml;
+        const SCHEMA_VERSION: u32 = 3;
+        fn migrations() -> &'static [Migration] {
+            MIGRATIONS
+        }
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let path = tmp.path().join("settings.toml");
+    let content =
+        b"# hand-written comment\nschema_version = 1\n\n[[items]]\nhost = \"h\"\nport = 1\n";
+    fs::write(&path, content).unwrap();
+    let loaded = document::load::<OldToml>(&path).unwrap().unwrap();
+    assert_eq!(loaded.migrated_from, Some(1));
+    assert_eq!(fs::read(backup_path(&path)).unwrap(), content);
+}
+
+/// Security review L7 support: `scrub_file` cleans a file in place without the model.
+#[test]
+fn scrub_file_removes_secrets_and_keeps_the_rest() {
+    let tmp = tempfile::tempdir().unwrap();
+    let path = tmp.path().join("scrubbed.json");
+    // `port` is invalid for the model; it must survive the scrub untouched.
+    let content = br#"{ "schema_version": 3, "items": [
+        { "hostname": "h", "endpoint": { "port": "not-a-port" }, "password": "Hunter2-Secret" } ] }"#;
+    fs::write(&path, content).unwrap();
+    assert!(document::scrub_file::<Sample>(&path).unwrap());
+    let text = fs::read_to_string(&path).unwrap();
+    assert!(!text.contains("Hunter2-Secret"), "{text}");
+    assert!(text.contains("not-a-port"), "{text}");
+    assert_eq!(
+        fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+        0o600
+    );
+    // Clean now: no second rewrite.
+    let ino = fs::metadata(&path).unwrap().ino();
+    assert!(!document::scrub_file::<Sample>(&path).unwrap());
+    assert_eq!(fs::metadata(&path).unwrap().ino(), ino);
+    // Duplicate keys force a rewrite even when the parsed value looks clean.
+    let dup = br#"{ "schema_version": 3, "token": "Hunter2-Secret", "token": "", "items": [] }"#;
+    fs::write(&path, dup).unwrap();
+    assert!(document::scrub_file::<Sample>(&path).unwrap());
+    assert!(
+        !fs::read_to_string(&path)
+            .unwrap()
+            .contains("Hunter2-Secret")
+    );
+    // Follow-up review N-3: a newer or unversioned file is never rewritten.
+    for content in [
+        &br#"{ "schema_version": 4, "password": "Hunter2-Secret", "items": [] }"#[..],
+        br#"{ "password": "Hunter2-Secret", "items": [] }"#,
+        br#"{ "schema_version": 0, "password": "Hunter2-Secret", "items": [] }"#,
+    ] {
+        fs::write(&path, content).unwrap();
+        assert!(!document::scrub_file::<Sample>(&path).unwrap());
+        assert_eq!(fs::read(&path).unwrap(), content);
+    }
+    // Missing or unparsable files are left alone.
+    assert!(!document::scrub_file::<Sample>(&tmp.path().join("absent.json")).unwrap());
+    fs::write(&path, b"{ broken").unwrap();
+    assert!(!document::scrub_file::<Sample>(&path).unwrap());
+    assert_eq!(fs::read(&path).unwrap(), b"{ broken");
+}
+
+/// N7.2: a plaintext secret found on load is removed from disk at once, not at the next save.
+#[test]
+fn secret_like_keys_are_removed_from_disk_on_load() {
+    let tmp = tempfile::tempdir().unwrap();
+    let path = tmp.path().join("sample.json");
+    let content = br#"{ "schema_version": 3,
+        "items": [ { "hostname": "h", "endpoint": { "port": 1 }, "password": "Hunter2-Secret" } ] }"#;
+    fs::write(&path, content).unwrap();
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
+    let loaded = document::load::<Sample>(&path).unwrap().unwrap();
+    assert_eq!(loaded.secret_like_keys, ["items[0].password"]);
+    assert_eq!(loaded.migrated_from, None);
+    let text = fs::read_to_string(&path).unwrap();
+    assert!(!text.contains("Hunter2-Secret"), "{text}");
+    assert!(text.contains("\"hostname\": \"h\""), "{text}");
+    assert_eq!(
+        fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+        0o600
+    );
+    // No backup of a same-version file, and nothing else left in the directory.
+    let names: Vec<_> = fs::read_dir(tmp.path())
+        .unwrap()
+        .map(|e| e.unwrap().file_name())
+        .collect();
+    assert_eq!(names, [std::ffi::OsString::from("sample.json")]);
+}
+
+/// A clean file is never rewritten on load.
+#[test]
+fn clean_file_is_not_rewritten_on_load() {
+    let (_tmp, path) = workspace_copy("v3.json");
+    let before = fs::metadata(&path).unwrap().ino();
+    document::load::<Sample>(&path).unwrap().unwrap();
+    assert_eq!(fs::metadata(&path).unwrap().ino(), before);
+}
+
+/// A duplicate JSON key hides its first value from the parser but not from the disk: the file is
+/// rewritten at once on load.
+#[test]
+fn duplicate_json_keys_are_rewritten_on_load() {
+    let tmp = tempfile::tempdir().unwrap();
+    let path = tmp.path().join("sample.json");
+    let content = br#"{ "schema_version": 3, "token": "Hunter2-Secret", "token": "",
+        "items": [ { "hostname": "h", "endpoint": { "port": 1 } } ] }"#;
+    fs::write(&path, content).unwrap();
+    let loaded = document::load::<Sample>(&path).unwrap().unwrap();
+    assert!(loaded.secret_like_keys.is_empty());
+    let text = fs::read_to_string(&path).unwrap();
+    assert!(!text.contains("Hunter2-Secret"), "{text}");
+    assert!(text.contains("\"hostname\": \"h\""), "{text}");
 }

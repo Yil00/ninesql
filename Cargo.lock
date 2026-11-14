@@ -3967,6 +3967,7 @@ dependencies = [
  "thiserror 2.0.21",
  "tracing",
  "uuid",
+ "zeroize",
 ]
 
 [[package]]
@@ -4032,12 +4033,14 @@ version = "0.0.0"
 dependencies = [
  "libc",
  "proptest",
+ "rustix",
  "serde",
  "serde_json",
  "tempfile",
  "thiserror 2.0.21",
  "toml 0.8.23",
  "tracing",
+ "zeroize",
 ]
 
 [[package]]

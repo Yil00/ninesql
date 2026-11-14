@@ -19,6 +19,8 @@ toml.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 libc.workspace = true
+rustix.workspace = true
+zeroize.workspace = true
 
 [dev-dependencies]
 proptest.workspace = true

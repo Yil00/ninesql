@@ -554,18 +554,20 @@ const STILL_REFUSED_KEYS: &[&str] = &[
     "gsslib",
 ];
 
-/// Keys the core accepted before and now refuses because the driver API reserves them (or, for
-/// `gssencmode`, because the core refuses it ahead of the driver API). Each one would have been
-/// stored and then refused by the driver at connect time.
+/// Keys the core accepted before and now refuses because the driver API reserves them. Each one
+/// would have been stored and then refused by the driver at connect time.
 const NEWLY_REFUSED_KEYS: &[&str] = &[
     // Was benign in core. MySQL: lets a MITM on a non-TLS connection obtain the password.
     "allowPublicKeyRetrieval",
     // Were benign in core. Matched by the driver API `password` fragment.
     "passwordCharacterEncoding",
     "password_encryption",
-    // Was benign in core. GSSAPI transport encryption bypasses the TLS settings
-    // (`PENDING_RESERVED_KEYS` until the driver API reserves it).
+    // Was benign in core. GSSAPI transport encryption bypasses the TLS settings; reserved by the
+    // driver API.
     "gssencmode",
+    // PostgreSQL walsender mode: replication commands bypass the read-only transaction (I3);
+    // reserved by the driver API.
+    "replication",
     // Session-level settings that can change lexical or access behavior.
     "options",
     "sessionVariables",
@@ -651,9 +653,17 @@ fn reserved_keys_win_over_benign_lists() {
     assert!(!ninesql_storage::hygiene::is_secret_like_key(
         "passwordCharacterEncoding"
     ));
+    let mut c = basic();
+    c.properties
+        .insert("passwordCharacterEncoding".into(), "UTF-8".into());
+    assert!(matches!(
+        c.validate(),
+        Err(ConnectionError::ReservedProperty { .. })
+    ));
+    // With a value that is not a charset it is treated as a misplaced secret.
     assert!(matches!(
         with_property("passwordCharacterEncoding").validate(),
-        Err(ConnectionError::ReservedProperty { .. })
+        Err(ConnectionError::SecretInProperties { .. })
     ));
 }
 
@@ -684,9 +694,10 @@ fn sanitize_reports_and_removes_now_reserved_keys() {
 }
 
 proptest! {
-    /// Whatever the key, a property the core keeps is one the drivers accept.
+    /// Whatever the key (ASCII letters, digits, separators and non-ASCII letters, which the
+    /// driver API's normalization drops), a property the core keeps is one the drivers accept.
     #[test]
-    fn kept_properties_pass_the_driver_check(key in "[A-Za-z_.-]{1,24}") {
+    fn kept_properties_pass_the_driver_check(key in "[A-Za-z0-9_.\\-éèüßçøåıİΣσжЖ中ﬁ]{1,24}") {
         let mut c = with_property(&key);
         let kept = c.validate().is_ok();
         let issues = c.sanitize();
@@ -699,5 +710,38 @@ proptest! {
             .collect();
             prop_assert!(ninesql_driver_api::check_properties(&props, &[]).is_ok(), "{}", key);
         }
+    }
+}
+
+/// L6: host / user / database names may hold characters that matter in DSNs; the model accepts
+/// them (drivers must pass structured config, never build a connection string from them), and
+/// still refuses the ones that could hide user info in the host.
+#[test]
+fn dsn_significant_characters_are_data_not_syntax() {
+    let mut c = basic();
+    c.endpoint = Endpoint::Tcp {
+        host: "db.example.test".into(),
+        port: Some(5432),
+        database: Some("app;sslmode=disable host='evil' ?x=&y%20".into()),
+    };
+    c.auth = Auth::Username {
+        username: "u;password=x' or '1'='1 @:{}".into(),
+    };
+    c.validate().unwrap();
+    for host in ["u:p@db", "db/x", "db x", "db\\x"] {
+        c.endpoint = Endpoint::Tcp {
+            host: host.into(),
+            port: None,
+            database: None,
+        };
+        assert!(c.validate().is_err(), "{host}");
+    }
+    for host in ["db;sslmode=disable", "fe80::1%eth0", "db?x=1"] {
+        c.endpoint = Endpoint::Tcp {
+            host: host.into(),
+            port: None,
+            database: None,
+        };
+        c.validate().unwrap();
     }
 }

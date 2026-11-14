@@ -12,6 +12,15 @@
 //!   field for it (ADR-0011 §6).
 //! - **I3**: every connection names its [`ConnectionTypeId`] explicitly (no default), and its
 //!   effective read-only mode comes from the type unless overridden.
+//!
+//! **Contract for drivers (review item L6)**: host names, user names and database names are
+//! checked for length and control characters only (host names also refuse whitespace, `@`, `/`
+//! and `\`). They may legitimately contain characters that are significant in connection strings
+//! and URLs: `;`, `=`, `'`, `"`, `?`, `&`, `%`, `:`, `{`, `}`, spaces (in user and database names).
+//! Drivers must pass them as **structured configuration** (typed config fields of the client
+//! library, or properly escaped / percent-encoded values when a library only takes a URL), and
+//! never interpolate them into a DSN, a URL or a `key=value` connection string as they are.
+//! Otherwise a database named `app;sslmode=disable` could inject options.
 
 use std::collections::BTreeMap;
 use std::fmt;
@@ -20,6 +29,7 @@ use std::path::PathBuf;
 use ninesql_secrets::{SecretKind, SecretRef};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
+use zeroize::Zeroize;
 
 use crate::connection_type::{ConnectionTypeId, ConnectionTypes, SafetyPolicy};
 use crate::error::ConnectionError;
@@ -113,12 +123,16 @@ impl From<EngineId> for String {
 pub enum Endpoint {
     /// A server reached over TCP (possibly through an SSH tunnel or a proxy).
     Tcp {
-        /// Host name or IP address (IPv6 without brackets).
+        /// Host name or IP address (IPv6 without brackets). Never contains whitespace, `@`, `/`
+        /// or `\`, but may contain other DSN-significant characters: drivers pass it as
+        /// structured configuration (see the module documentation).
         host: String,
         /// Port; `None` means the engine's default port.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         port: Option<u16>,
-        /// Database, schema or keyspace to open, if the engine has the notion.
+        /// Database, schema or keyspace to open, if the engine has the notion. May contain any
+        /// printable character, including DSN-significant ones (`;`, `=`, `'`, `?`, spaces):
+        /// drivers pass it as structured configuration (see the module documentation).
         #[serde(default, skip_serializing_if = "Option::is_none")]
         database: Option<String>,
     },
@@ -167,6 +181,10 @@ impl SecretSource {
 }
 
 /// Database authentication.
+///
+/// User names may contain any printable character, including DSN-significant ones (`;`, `=`,
+/// `'`, `@`, `:`, spaces): drivers pass them as structured configuration, never inside a URL or a
+/// connection string as they are (see the module documentation).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "method", rename_all = "kebab-case")]
 pub enum Auth {
@@ -533,23 +551,27 @@ impl Connection {
     /// Removes what must never be kept in a workspace file — properties that hold or look like a
     /// secret, properties reserved by the driver API rule ([`crate::properties::reserved`]: TLS,
     /// endpoint, credentials, read-only, init SQL, session modes…), init SQL with a password
-    /// literal — and returns one issue per removal. Used on load so that one bad
-    /// connection does not block the whole project and the next save drops the offending data.
+    /// literal — and returns one issue per removal. Removed values are zeroized. Used on load so
+    /// that one bad connection does not block the whole project; the loader then rewrites the
+    /// file at once without the offending data.
     pub fn sanitize(&mut self) -> Vec<ConnectionError> {
         let mut issues = Vec::new();
+        // Removed values may be secrets: zeroized before they are dropped (best effort, N7.4).
         self.properties
             .retain(|key, value| match property_problem(key, value) {
                 Some(problem) => {
                     issues.push(problem);
+                    value.zeroize();
                     false
                 }
                 None => true,
             });
         let mut index = 0;
-        self.init_sql.retain(|sql| {
+        self.init_sql.retain_mut(|sql| {
             let keep = !crate::properties::sql_carries_secret(sql);
             if !keep {
                 issues.push(ConnectionError::SecretInInitSql { index });
+                sql.zeroize();
             }
             index += 1;
             keep
@@ -703,10 +725,13 @@ impl Connection {
 
 /// Why a driver property cannot be kept, if it cannot. Never includes the value.
 ///
-/// Order: secret-like key (I1), then the reserved-key rule shared with the drivers
-/// ([`crate::properties::reserved`], which no benign list overrides), then the value detectors.
-fn property_problem(key: &str, value: &str) -> Option<ConnectionError> {
-    if ninesql_storage::hygiene::is_secret_like_key(key) {
+/// Order: secret-like key or key / value pair (I1), then the reserved-key rule shared with the
+/// drivers ([`crate::properties::reserved`], which no benign list overrides), then the value
+/// detectors.
+pub(crate) fn property_problem(key: &str, value: &str) -> Option<ConnectionError> {
+    if ninesql_storage::hygiene::is_secret_like_key(key)
+        || ninesql_storage::hygiene::is_secret_like_entry(key, value)
+    {
         return Some(ConnectionError::SecretInProperties {
             key: key.to_owned(),
         });
