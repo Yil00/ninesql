@@ -69,6 +69,10 @@ gpui-base = { version = "=0.9.1", default-features = false }
 gpui-component = { version = "=0.9.1", default-features = false }
 gpui-component-macros = { version = "=0.9.1", default-features = false }
 gpui-kit-assets = { version = "=0.9.1", default-features = false }
+# GPUI itself, already exact-pinned by gpui-kit; listed only so ninesql-ui tests can enable its
+# `test-support` feature (TestAppContext) without gpui-kit's `test-support`, which would drag the
+# optional `gpui-fast` family into Cargo.lock through weak features.
+gpui-pre = { version = "=0.3.12", default-features = false }
 
 [profile.release]
 lto = "thin"
