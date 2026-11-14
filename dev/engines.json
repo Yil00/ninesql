@@ -43,6 +43,14 @@
       "readiness": {
         "healthcheck": true,
         "seed_service": null
+      },
+      "tls": {
+        "$comment": "Test-only TLS (dev/tls/postgresql-tls.sh): certificate for these names, signed by a CA generated in the container at first start; read the CA (public) with ca_sql.",
+        "server_names": [
+          "localhost",
+          "127.0.0.1"
+        ],
+        "ca_sql": "SELECT pg_read_file(current_setting('data_directory') || '/ninesql-tls/ca.crt')"
       }
     },
     {
