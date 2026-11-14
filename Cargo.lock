@@ -3972,6 +3972,11 @@ dependencies = [
 [[package]]
 name = "ninesql-dbeaver"
 version = "0.0.0"
+dependencies = [
+ "aes 0.8.4",
+ "cbc 0.1.2",
+ "serde_json",
+]
 
 [[package]]
 name = "ninesql-driver-api"

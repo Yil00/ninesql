@@ -25,7 +25,10 @@ vault.bin
 # Real DBeaver workspaces must never be committed (fixtures live in crates/ninesql-dbeaver/tests/fixtures/)
 DBeaverData/
 credentials-config.json
-!crates/ninesql-dbeaver/tests/fixtures/**/credentials-config.json
+!crates/ninesql-dbeaver/tests/fixtures/dbeaver-*/workspace6/General/.dbeaver/credentials-config.json
+# DBeaver backups written next to the real files, never committed (fixtures included)
+*credentials-config.json*.bak
+.data-sources*.json.bak
 
 # Dev environment state
 dev/.state/
