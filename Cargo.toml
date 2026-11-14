@@ -33,6 +33,19 @@ ninesql-dbeaver = { path = "crates/ninesql-dbeaver" }
 ninesql-grid = { path = "crates/ninesql-grid" }
 ninesql-editor = { path = "crates/ninesql-editor" }
 
+# Driver API (ADR-0004): Arrow sub-crates only, async contract, secret handling.
+# arrow-* stays on 57.x while the workspace rust-version is 1.85 (arrow 58+ needs 1.88).
+arrow-array = { version = "57", default-features = false }
+arrow-schema = { version = "57", default-features = false }
+async-trait = "0.1"
+futures-core = { version = "0.3", default-features = false, features = ["std"] }
+futures-util = { version = "0.3", default-features = false, features = ["std"] }
+proptest = "1"
+thiserror = "2"
+tokio = { version = "1", default-features = false }
+tracing = { version = "0.1", default-features = false, features = ["std"] }
+zeroize = { version = "1", features = ["std"] }
+
 # GPUI and gpui-component are pinned to one git revision pair in P0-A (ADR-0001), e.g.:
 # gpui = { git = "https://github.com/zed-industries/zed", rev = "<sha>" }
 # gpui-component = { git = "https://github.com/longbridge/gpui-component", rev = "<sha>" }
