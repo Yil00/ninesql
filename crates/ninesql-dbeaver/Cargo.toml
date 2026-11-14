@@ -15,4 +15,7 @@ workspace = true
 [dependencies]
 
 [dev-dependencies]
+# Test-only: decrypt the fixture credentials-config.json files (fake values) in tests.
+aes = "0.8"
+cbc = { version = "0.1", features = ["alloc"] }
 serde_json = "1.0"
