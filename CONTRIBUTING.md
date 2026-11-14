@@ -16,6 +16,7 @@ Any PR that violates them will be rejected:
 - Apache 2.0-compatible dependencies only (`cargo deny check`).
 
 ## Development setup
+Rust 1.89 or newer through `rustup` (the `stable` channel of `rust-toolchain.toml` is selected automatically).
 ```bash
 cargo build --workspace
 cargo test --workspace

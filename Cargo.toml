@@ -6,7 +6,7 @@ members = ["crates/*"]
 [workspace.package]
 version = "0.0.0"
 edition = "2024"
-rust-version = "1.85"
+rust-version = "1.89"  # floor set by zbus 6 (ADR-0012); toolchain itself is stable
 license = "Apache-2.0"
 repository = "https://github.com/Yil00/ninesql"
 authors = ["NineSQL contributors"]

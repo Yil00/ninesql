@@ -86,7 +86,7 @@ There is deliberately no `curl … | bash` installer ([ADR-0010](docs/adr/0010-p
 
 ## Development
 ```bash
-# Rust stable (see rust-toolchain.toml)
+# Rust stable, 1.89 or newer (see rust-toolchain.toml)
 cargo build --workspace
 cargo test --workspace
 ```
