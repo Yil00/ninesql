@@ -13,9 +13,12 @@
 //! Items go to the default collection with attributes `xdg:schema = "org.ninesql.Secret"`,
 //! `service = "ninesql"`, `project`, `secret_id`, `connection_id` and `kind`. Lookups use
 //! `xdg:schema` + `service` + `project` + `secret_id`, so a project copied elsewhere (same
-//! connection ids) never reads or overwrites another project's secrets. Writing deletes any
-//! existing item for the id first, so a changed `connection_id` / `kind` cannot leave a stale
-//! duplicate behind.
+//! connection ids) never reads or overwrites another project's secrets.
+//!
+//! Writing stores the new item first (replacing one with the same attributes), then deletes the
+//! other items under the same id, such as a stale duplicate with an older `connection_id` /
+//! `kind`. A failed write therefore never loses the previous credential, and a stale duplicate
+//! that cannot be deleted (locked, prompt dismissed) is logged, not fatal.
 //!
 //! Calls block the current thread (zbus runs its own executor); run them on a blocking thread,
 //! never on the GPUI foreground.
@@ -124,23 +127,16 @@ impl SecretStore for SecretServiceStore {
         let ss = Self::connect()?;
         let collection = ss.get_default_collection().map_err(map_error)?;
         collection.ensure_unlocked().map_err(map_error)?;
-        // Delete-before-create: never leave an older item with other attributes behind.
-        for old in self.search(&ss, id)? {
-            old.delete().map_err(map_error)?;
-        }
-        let mut attributes = self.lookup(id);
-        attributes.insert(ATTR_CONNECTION_ID, meta.connection_id.as_str());
-        attributes.insert(ATTR_KIND, meta.kind.as_str());
-        collection
-            .create_item(
-                &meta.label,
-                attributes,
-                secret.expose_secret().as_bytes(),
-                true, // replace the item with the same attributes
-                "text/plain",
-            )
-            .map_err(map_error)?;
-        Ok(())
+        let mut ops = SsOps {
+            store: self,
+            ss: &ss,
+            collection: &collection,
+            id,
+            meta,
+            secret,
+            found: Vec::new(),
+        };
+        write_then_prune(&mut ops, id)
     }
 
     fn delete(&self, id: &SecretId) -> Result<bool, SecretError> {
@@ -151,6 +147,84 @@ impl SecretStore for SecretServiceStore {
                 Ok(true)
             }
             None => Ok(false),
+        }
+    }
+}
+
+/// The item operations [`write_then_prune`] needs, abstracted for testing.
+trait ItemOps {
+    /// Identity of an item (its D-Bus object path).
+    type Path: PartialEq + std::fmt::Debug;
+    /// Creates (or replaces, same attributes) the item holding the new secret.
+    fn create(&mut self) -> Result<Self::Path, SecretError>;
+    /// Every item matching the secret id, in any collection.
+    fn matching(&mut self) -> Result<Vec<Self::Path>, SecretError>;
+    /// Deletes one item.
+    fn delete(&mut self, path: &Self::Path) -> Result<(), SecretError>;
+}
+
+/// Writes the new secret **first**, then deletes the other items stored under the same id
+/// (stale duplicates with older attributes, other collections). If the write fails, the previous
+/// credential is untouched. Failing to delete a stale duplicate (locked collection, dismissed
+/// prompt) is logged, not fatal: the new secret is already stored.
+fn write_then_prune<O: ItemOps>(ops: &mut O, id: &SecretId) -> Result<(), SecretError> {
+    let created = ops.create()?;
+    match ops.matching() {
+        Ok(paths) => {
+            for stale in paths.iter().filter(|p| **p != created) {
+                if let Err(e) = ops.delete(stale) {
+                    tracing::warn!(id = %id, item = ?stale, error = %e, "could not delete a stale duplicate secret item");
+                }
+            }
+        }
+        Err(e) => {
+            tracing::warn!(id = %id, error = %e, "could not look for stale duplicate secret items");
+        }
+    }
+    Ok(())
+}
+
+struct SsOps<'s, 'a> {
+    store: &'s SecretServiceStore,
+    ss: &'a SecretService<'a>,
+    collection: &'a secret_service::blocking::Collection<'a>,
+    id: &'s SecretId,
+    meta: &'s SecretMeta,
+    secret: &'s SecretString,
+    /// Items returned by the last [`ItemOps::matching`] call.
+    found: Vec<Item<'a>>,
+}
+
+impl ItemOps for SsOps<'_, '_> {
+    /// D-Bus object path, as text.
+    type Path = String;
+
+    fn create(&mut self) -> Result<Self::Path, SecretError> {
+        let mut attributes = self.store.lookup(self.id);
+        attributes.insert(ATTR_CONNECTION_ID, self.meta.connection_id.as_str());
+        attributes.insert(ATTR_KIND, self.meta.kind.as_str());
+        let item = self
+            .collection
+            .create_item(
+                &self.meta.label,
+                attributes,
+                self.secret.expose_secret().as_bytes(),
+                true, // replace the item with the same attributes
+                "text/plain",
+            )
+            .map_err(map_error)?;
+        Ok(item.item_path.to_string())
+    }
+
+    fn matching(&mut self) -> Result<Vec<Self::Path>, SecretError> {
+        self.found = self.store.search(self.ss, self.id)?;
+        Ok(self.found.iter().map(|i| i.item_path.to_string()).collect())
+    }
+
+    fn delete(&mut self, path: &Self::Path) -> Result<(), SecretError> {
+        match self.found.iter().find(|i| i.item_path.to_string() == *path) {
+            Some(item) => item.delete().map_err(map_error),
+            None => Ok(()),
         }
     }
 }
@@ -218,6 +292,82 @@ mod tests {
             map_error(E::Crypto("x")),
             SecretError::Backend { .. }
         ));
+    }
+
+    /// Fake item store recording the order of operations.
+    struct Fake {
+        log: Vec<String>,
+        create_fails: bool,
+        matching: Result<Vec<u32>, ()>,
+        locked: Vec<u32>,
+    }
+
+    impl Fake {
+        fn new(matching: Vec<u32>) -> Self {
+            Self {
+                log: Vec::new(),
+                create_fails: false,
+                matching: Ok(matching),
+                locked: Vec::new(),
+            }
+        }
+    }
+
+    impl ItemOps for Fake {
+        type Path = u32;
+        fn create(&mut self) -> Result<u32, SecretError> {
+            self.log.push("create".into());
+            if self.create_fails {
+                Err(SecretError::Locked(StoreKind::Keyring))
+            } else {
+                Ok(7)
+            }
+        }
+        fn matching(&mut self) -> Result<Vec<u32>, SecretError> {
+            self.log.push("matching".into());
+            self.matching
+                .clone()
+                .map_err(|()| SecretError::Locked(StoreKind::Keyring))
+        }
+        fn delete(&mut self, path: &u32) -> Result<(), SecretError> {
+            self.log.push(format!("delete {path}"));
+            if self.locked.contains(path) {
+                Err(SecretError::Locked(StoreKind::Keyring))
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    #[test]
+    fn creates_first_then_deletes_only_other_items() {
+        let mut fake = Fake::new(vec![3, 7, 5]);
+        write_then_prune(&mut fake, &id()).unwrap();
+        assert_eq!(fake.log, ["create", "matching", "delete 3", "delete 5"]);
+    }
+
+    #[test]
+    fn failed_create_deletes_nothing() {
+        let mut fake = Fake::new(vec![3]);
+        fake.create_fails = true;
+        assert!(matches!(
+            write_then_prune(&mut fake, &id()),
+            Err(SecretError::Locked(_))
+        ));
+        assert_eq!(fake.log, ["create"]);
+    }
+
+    #[test]
+    fn stale_duplicate_failures_are_not_fatal() {
+        let mut fake = Fake::new(vec![3, 7, 5]);
+        fake.locked = vec![3];
+        write_then_prune(&mut fake, &id()).unwrap();
+        assert_eq!(fake.log, ["create", "matching", "delete 3", "delete 5"]);
+
+        let mut fake = Fake::new(vec![]);
+        fake.matching = Err(());
+        write_then_prune(&mut fake, &id()).unwrap();
+        assert_eq!(fake.log, ["create", "matching"]);
     }
 
     #[test]
