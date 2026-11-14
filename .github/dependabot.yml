@@ -12,7 +12,6 @@ updates:
       actions:
         patterns: ["*"]
 
-  # GPUI and gpui-component are git dependencies pinned on purpose (ADR-0001): bumped by hand.
   - package-ecosystem: cargo
     directory: /
     target-branch: dev
@@ -23,3 +22,27 @@ updates:
     groups:
       cargo:
         patterns: ["*"]
+    ignore:
+      # GPUI and gpui-component are exact-pinned from crates.io and bumped by hand in a
+      # dedicated `chore(ui): bump gpui` PR with scripts/verify-gpui-snapshot.sh (ADR-0013).
+      - dependency-name: "gpui-kit"
+      - dependency-name: "gpui-kit-*"
+      - dependency-name: "gpui-base"
+      - dependency-name: "gpui-component"
+      - dependency-name: "gpui-component-*"
+      - dependency-name: "gpui-pre"
+      - dependency-name: "gpui-pre-*"
+      # Release-candidate pin and advisory lock, moved by hand in their own PR (ADR-0012).
+      - dependency-name: "secret-service"
+      - dependency-name: "ctutils"
+
+  # Test database images of dev/compose.yaml (ADR-0009). Dependabot updates compose.yaml only:
+  # the same tag and digest must be copied to dev/engines.json in the PR; the dev-env workflow
+  # (`python3 dev/ready.py check`) fails until both files agree.
+  - package-ecosystem: docker-compose
+    directory: /dev
+    target-branch: dev
+    schedule:
+      interval: weekly
+    commit-message:
+      prefix: chore
