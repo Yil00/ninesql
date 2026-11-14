@@ -13,9 +13,22 @@ publish.workspace = true
 workspace = true
 
 [dependencies]
+# Lower layers only: `ninesql-core` depends on this crate (docs/02-architecture.md), so the
+# import model mirrors the core connection model instead of using it.
+ninesql-driver-api.workspace = true
+ninesql-secrets.workspace = true
+ninesql-storage.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+zeroize.workspace = true
+# credentials-config.json: AES-128-CBC with DBeaver Community's public fixed key.
+aes = "0.8"
+cbc = "0.1"
 
 [dev-dependencies]
-# Test-only: decrypt the fixture credentials-config.json files (fake values) in tests.
-aes = "0.8"
+# `alloc` for the test-only encryption helper (`encrypt_padded_vec_mut`).
 cbc = { version = "0.1", features = ["alloc"] }
-serde_json = "1.0"
+proptest.workspace = true
+tempfile.workspace = true
