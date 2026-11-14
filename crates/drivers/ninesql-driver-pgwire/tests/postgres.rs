@@ -431,6 +431,36 @@ async fn one_shot_read_write_transaction_cannot_write() {
         assert!(s.is_read_only());
     }
     s.set_auto_commit(true).await.unwrap();
+    let write_refused = |r: Result<Collected, DriverError>, case: &str| match r {
+        Err(DriverError::ReadOnly(_)) => {}
+        other => panic!("{case}: write not refused: {:?}", other.map(|_| ())),
+    };
+    // Savepoints: the one-shot READ WRITE, then SAVEPOINT, a write, ROLLBACK TO, a write.
+    s.begin().await.unwrap();
+    let _ = run(s.as_mut(), ONE_SHOT).await;
+    s.savepoint("sp").await.unwrap();
+    write_refused(
+        run(s.as_mut(), "SELECT ninesql_test.write_one()").await,
+        "after SAVEPOINT",
+    );
+    s.rollback_to_savepoint("sp").await.unwrap();
+    write_refused(
+        run(s.as_mut(), "SELECT ninesql_test.write_one()").await,
+        "after ROLLBACK TO",
+    );
+    s.rollback().await.unwrap();
+    // An aborted transaction, then ROLLBACK TO, then a write.
+    s.begin().await.unwrap();
+    let _ = run(s.as_mut(), ONE_SHOT).await;
+    s.savepoint("sp").await.unwrap();
+    assert!(run(s.as_mut(), "SELECT 1 / 0").await.is_err());
+    s.rollback_to_savepoint("sp").await.unwrap();
+    write_refused(
+        run(s.as_mut(), "SELECT ninesql_test.write_one()").await,
+        "after an aborted transaction and ROLLBACK TO",
+    );
+    s.rollback().await.unwrap();
+    assert!(s.is_read_only());
     let after = count(
         &run(s.as_mut(), "SELECT count(*) FROM ninesql_test.written")
             .await
