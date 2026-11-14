@@ -31,6 +31,7 @@ An agent does **not** modify files belonging to another owner, unless the task e
   - The only accepted exception is a crate that must call a C library (for example SQLite or DuckDB bundled builds): the `unsafe` stays inside the upstream crate, never in ours.
 - `cargo fmt --all`, `cargo clippy --workspace --all-targets --all-features -- -D warnings`, `cargo test --workspace` must pass.
 - `cargo deny check` must pass (licenses, bans, sources). Lifting a ban needs a `security-reviewer` review, and an ADR when it touches an invariant.
+- The GPUI version moves only in a dedicated `chore(ui): bump gpui` PR with the output of `scripts/verify-gpui-snapshot.sh` attached ([ADR-0013](docs/adr/0013-gpui-source-and-supply-chain.md)).
 - TLS: **rustls only** (no OpenSSL, no `native-tls`).
 - No `println!` / `eprintln!` in library crates: `tracing`. **Never** log a password, a query parameter value or a result value. Query text is logged only at `trace` level and never for connections typed "production".
 - Errors: `thiserror` in libraries, typed and user-presentable; no `unwrap()` / `expect()` outside tests and `main` setup.
@@ -38,7 +39,8 @@ An agent does **not** modify files belonging to another owner, unless the task e
 - Every query has a timeout and a cancel path. Every result is fetched in batches under a memory budget (I6).
 
 ## Conventions – UI (`ninesql-ui`, `ninesql-grid`, `ninesql-editor`)
-- GPUI pinned to the revision in the workspace `Cargo.toml` ([ADR-0001](docs/adr/0001-native-stack-rust-gpui.md)). Bumping it is its own PR.
+- GPUI pinned to the exact version in the workspace `Cargo.toml` ([ADR-0001](docs/adr/0001-native-stack-rust-gpui.md), [ADR-0013](docs/adr/0013-gpui-source-and-supply-chain.md)). Bumping it is its own PR.
+- Never use GPUI's credentials API (`read_credentials` / `write_credentials`) or HTTP client API (`set_http_client` / `with_http_client`); secrets go only through `ninesql-secrets` ([ADR-0013](docs/adr/0013-gpui-source-and-supply-chain.md)).
 - Never depend on Zed's GPL crates (`editor`, `language`, `project`, `workspace`…). `cargo deny` enforces it.
 - Every user-facing action is a GPUI `Action` with a key binding and an entry in the command palette.
 - UI code never formats a connection's password, even masked; it shows "saved in keyring" / "not saved".

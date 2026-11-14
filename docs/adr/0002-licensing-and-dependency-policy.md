@@ -1,6 +1,6 @@
 # ADR-0002: Licensing and dependency policy
 
-- **Status**: Accepted
+- **Status**: Accepted. Partially superseded by [ADR-0013](0013-gpui-source-and-supply-chain.md) for Decision §6 (git source allow-list: only sources actually used; GPUI is no longer a git dependency).
 - **Date**: 2026-11-14
 
 ## Context
