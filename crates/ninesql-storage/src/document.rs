@@ -148,9 +148,12 @@ pub fn load<D: Document>(path: &Path) -> Result<Option<Loaded<D>>, StorageError>
 }
 
 /// Content of the migration backup: the original file with secret-looking keys stripped and
-/// [`Document::scrub`] applied for `version`. The original bytes when that changes nothing
-/// (keeps comments and layout of hand-edited files), else the scrubbed value re-encoded in the
-/// file's own format.
+/// [`Document::scrub`] applied for `version`, re-encoded in the file's own format.
+///
+/// JSON is always re-encoded from the scrubbed value: a JSON parser keeps only the last of
+/// duplicate keys, so comparing parsed values cannot prove that the original bytes are clean
+/// (`"token": "abc", "token": ""`). TOML refuses duplicate keys, so a TOML file whose scrubbed
+/// value equals the parsed one is kept verbatim (with its comments and layout).
 fn backup_bytes<D: Document>(
     path: &Path,
     bytes: &[u8],
@@ -161,34 +164,149 @@ fn backup_bytes<D: Document>(
         from: version,
         detail: format!("cannot write a backup without its secret-looking values: {detail}"),
     };
-    let mut original: Value = match D::FORMAT {
-        Format::Json => serde_json::from_slice(bytes).map_err(|_| err("unreadable".into()))?,
-        Format::Toml => std::str::from_utf8(bytes)
-            .ok()
-            .and_then(|t| toml::from_str(t).ok())
-            .ok_or_else(|| err("unreadable".into()))?,
-    };
-    let mut scrubbed = original.clone();
-    hygiene::strip_secret_like_keys(&mut scrubbed);
-    D::scrub(&mut scrubbed, version);
-    let out = if scrubbed == original {
+    let (mut original, mut scrubbed) =
+        scrubbed_value::<D>(bytes, Some(version)).ok_or_else(|| err("unreadable".into()))?;
+    let out = if D::FORMAT == Format::Toml && scrubbed == original {
         Ok(Zeroizing::new(bytes.to_vec()))
     } else {
-        match D::FORMAT {
-            Format::Json => serde_json::to_vec_pretty(&scrubbed)
-                .map(|mut out| {
-                    out.push(b'\n');
-                    Zeroizing::new(out)
-                })
-                .map_err(|e| err(e.to_string())),
-            Format::Toml => toml::to_string_pretty(&scrubbed)
-                .map(|t| Zeroizing::new(t.into_bytes()))
-                .map_err(|e| err(e.to_string())),
-        }
+        encode_value(D::FORMAT, &scrubbed).map_err(err)
     };
     hygiene::zeroize_value(&mut original);
     hygiene::zeroize_value(&mut scrubbed);
     out
+}
+
+/// The parsed file and a copy with secret-looking keys stripped and [`Document::scrub`] applied
+/// (for `version`, or the file's own `schema_version`). `None` if the bytes do not parse.
+fn scrubbed_value<D: Document>(bytes: &[u8], version: Option<u32>) -> Option<(Value, Value)> {
+    let original: Value = match D::FORMAT {
+        Format::Json => serde_json::from_slice(bytes).ok()?,
+        Format::Toml => toml::from_str(std::str::from_utf8(bytes).ok()?).ok()?,
+    };
+    let version = version
+        .or_else(|| {
+            original
+                .get(SCHEMA_VERSION_KEY)
+                .and_then(Value::as_u64)
+                .and_then(|v| u32::try_from(v).ok())
+        })
+        .unwrap_or(D::SCHEMA_VERSION);
+    let mut scrubbed = original.clone();
+    hygiene::strip_secret_like_keys(&mut scrubbed);
+    D::scrub(&mut scrubbed, version);
+    Some((original, scrubbed))
+}
+
+fn encode_value(format: Format, value: &Value) -> Result<Zeroizing<Vec<u8>>, String> {
+    match format {
+        Format::Json => serde_json::to_vec_pretty(value)
+            .map(|mut out| {
+                out.push(b'\n');
+                Zeroizing::new(out)
+            })
+            .map_err(|e| e.to_string()),
+        Format::Toml => toml::to_string_pretty(value)
+            .map(|t| Zeroizing::new(t.into_bytes()))
+            .map_err(|e| e.to_string()),
+    }
+}
+
+/// Removes secret-looking keys and what [`Document::scrub`] removes from a file **as it is on
+/// disk**, without deserializing it into the model, and writes it back atomically (`0600`) if
+/// anything was removed. Everything else is kept, including data the model would reject.
+///
+/// Used when a load fails validation after parsing, so a misplaced secret elsewhere in the file
+/// does not stay on disk until the user fixes the invalid data (I1). A JSON file is re-encoded
+/// whenever it holds a duplicate key, for the reason given on the migration backup. Returns
+/// whether the file was rewritten; a missing or unparsable file is left alone (`Ok(false)`).
+///
+/// # Errors
+/// I/O errors.
+pub fn scrub_file<D: Document>(path: &Path) -> Result<bool, StorageError> {
+    let Some(bytes) = fs::read_private(path, DEFAULT_READ_LIMIT)? else {
+        return Ok(false);
+    };
+    let bytes = Zeroizing::new(bytes);
+    let Some((mut original, mut scrubbed)) = scrubbed_value::<D>(&bytes, None) else {
+        return Ok(false);
+    };
+    // Equal values do not prove clean JSON bytes: a duplicate key may hide a secret that the
+    // parser dropped in favour of a later value.
+    let changed =
+        scrubbed != original || (D::FORMAT == Format::Json && has_duplicate_json_keys(&bytes));
+    let result = if changed {
+        let out = encode_value(D::FORMAT, &scrubbed).map_err(|detail| StorageError::Serialize {
+            document: D::NAME,
+            detail,
+        })?;
+        fs::write_atomic(path, &out)?;
+        tracing::warn!(path = %path.display(), "removed secret-looking data from a workspace file that failed to load");
+        Ok(true)
+    } else {
+        Ok(false)
+    };
+    hygiene::zeroize_value(&mut original);
+    hygiene::zeroize_value(&mut scrubbed);
+    result
+}
+
+/// Whether a JSON document repeats a key inside one object (checked with a streaming visitor).
+fn has_duplicate_json_keys(bytes: &[u8]) -> bool {
+    use serde::de::{Deserializer, MapAccess, SeqAccess, Visitor};
+    use std::collections::HashSet;
+
+    struct Dup;
+    impl<'de> Visitor<'de> for Dup {
+        type Value = bool;
+        fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str("any JSON value")
+        }
+        fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<bool, A::Error> {
+            let mut seen = HashSet::new();
+            let mut dup = false;
+            while let Some(key) = map.next_key::<String>()? {
+                dup |= !seen.insert(key);
+                dup |= map.next_value::<DupValue>()?.0;
+            }
+            Ok(dup)
+        }
+        fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<bool, A::Error> {
+            let mut dup = false;
+            while let Some(v) = seq.next_element::<DupValue>()? {
+                dup |= v.0;
+            }
+            Ok(dup)
+        }
+        fn visit_bool<E>(self, _: bool) -> Result<bool, E> {
+            Ok(false)
+        }
+        fn visit_i64<E>(self, _: i64) -> Result<bool, E> {
+            Ok(false)
+        }
+        fn visit_u64<E>(self, _: u64) -> Result<bool, E> {
+            Ok(false)
+        }
+        fn visit_f64<E>(self, _: f64) -> Result<bool, E> {
+            Ok(false)
+        }
+        fn visit_str<E>(self, _: &str) -> Result<bool, E> {
+            Ok(false)
+        }
+        fn visit_unit<E>(self) -> Result<bool, E> {
+            Ok(false)
+        }
+        fn visit_string<E>(self, _: String) -> Result<bool, E> {
+            Ok(false)
+        }
+    }
+    struct DupValue(bool);
+    impl<'de> serde::Deserialize<'de> for DupValue {
+        fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+            d.deserialize_any(Dup).map(DupValue)
+        }
+    }
+    let mut de = serde_json::Deserializer::from_slice(bytes);
+    de.deserialize_any(Dup).unwrap_or(true)
 }
 
 /// Saves a document atomically with its `schema_version`. The parent directory must exist.
@@ -333,57 +451,171 @@ impl<D: Serialize> Serialize for Envelope<'_, D> {
 /// Redacts quoted text in a parser message so a misplaced secret in the file never reaches an
 /// error message or a log (I1):
 /// - double-quoted literals (`invalid type: string "…"`) are always replaced by `"…"`;
-/// - backtick-quoted text is replaced by `` `…` `` unless it is a key name (right after
-///   `field`) or an item of the schema's expectation list: the contiguous list that starts right
-///   after `expected` or `expected one of` and continues only through `, `, ` or ` and `, or `
-///   separators. Both only hold names from NineSQL's own models; any other text breaks the list.
+/// - backtick-quoted text is replaced by `` `…` `` unless it is
+///   - a key name right after `field` that is identifier-like (`[A-Za-z0-9_-]+`), or
+///   - an item of the schema's expectation list: the contiguous list that starts right after
+///     `expected` or `expected one of`, continues only through `, `, ` or ` and `, or `
+///     separators, and **runs to the end of the message** (optionally followed by serde_json's
+///     ` at line N column M`). Every item must be identifier-like, otherwise the whole list is
+///     redacted.
+///
+/// The end-of-message rule matters because the rejected value comes first in serde messages
+/// (`unknown variant `…`, expected …`): a value that embeds backticks and "expected" can forge a
+/// list, but that forged list is always followed by serde's own text, never by the end.
 pub fn redact(message: &str) -> String {
+    let segments = segments(message);
+    let mut keep = vec![false; segments.len()];
+    let prefix_text = |i: usize| -> &str {
+        match i.checked_sub(1).map(|j| &segments[j]) {
+            Some(Segment::Text(t)) => t.trim_end(),
+            _ => "",
+        }
+    };
+    let mut i = 0;
+    while i < segments.len() {
+        let Segment::Tick { inner, closed } = &segments[i] else {
+            i += 1;
+            continue;
+        };
+        let before = prefix_text(i);
+        if before.ends_with("expected") || before.ends_with("expected one of") {
+            // Collect the list: ticks separated by separator-only text.
+            let mut items = vec![i];
+            let mut j = i + 1;
+            while j + 1 < segments.len()
+                && matches!(&segments[j], Segment::Text(t) if matches!(*t, ", " | " or " | ", or "))
+                && matches!(segments[j + 1], Segment::Tick { .. })
+            {
+                items.push(j + 1);
+                j += 2;
+            }
+            let last = items[items.len() - 1];
+            let at_end = match segments.get(last + 1) {
+                None => true,
+                Some(Segment::Text(t)) => last + 2 == segments.len() && is_position_suffix(t),
+                Some(_) => false,
+            };
+            let all_ok = items.iter().all(|&k| {
+                matches!(&segments[k], Segment::Tick { inner, closed: true } if is_identifier(inner))
+            });
+            if at_end && all_ok {
+                for k in &items {
+                    keep[*k] = true;
+                }
+            }
+            i = last + 1;
+            continue;
+        }
+        if before.ends_with("field") && *closed && is_identifier(inner) {
+            keep[i] = true;
+        }
+        i += 1;
+    }
     let mut out = String::with_capacity(message.len());
-    let mut chars = message.char_indices().peekable();
-    // End (byte index) of the last backtick item kept as part of an expectation list.
-    let mut list_end: Option<usize> = None;
+    for (segment, keep) in segments.iter().zip(keep) {
+        match segment {
+            Segment::Text(t) => out.push_str(t),
+            Segment::Quoted => out.push_str("\"…\""),
+            Segment::Tick { inner, .. } => {
+                out.push('`');
+                out.push_str(if keep { inner } else { "…" });
+                out.push('`');
+            }
+        }
+    }
+    out
+}
+
+/// A piece of a parser message.
+enum Segment<'a> {
+    /// Text outside quotes.
+    Text(&'a str),
+    /// A double-quoted literal (always redacted).
+    Quoted,
+    /// Backtick-quoted text; `closed` is false when the message ends inside it.
+    Tick { inner: &'a str, closed: bool },
+}
+
+fn segments(message: &str) -> Vec<Segment<'_>> {
+    let mut out = Vec::new();
+    let mut chars = message.char_indices();
+    let mut text_start = 0;
     while let Some((i, c)) = chars.next() {
         match c {
             '"' => {
+                if text_start < i {
+                    out.push(Segment::Text(&message[text_start..i]));
+                }
                 let mut escaped = false;
-                for (_, d) in chars.by_ref() {
+                let mut end = message.len();
+                for (j, d) in chars.by_ref() {
                     if escaped {
                         escaped = false;
                     } else if d == '\\' {
                         escaped = true;
                     } else if d == '"' {
-                        break;
-                    }
-                }
-                out.push_str("\"…\"");
-                list_end = None;
-            }
-            '`' => {
-                let before = message[..i].trim_end();
-                let starts_list =
-                    before.ends_with("expected") || before.ends_with("expected one of");
-                let continues_list =
-                    list_end.is_some_and(|end| matches!(&message[end..i], ", " | " or " | ", or "));
-                let in_list = starts_list || continues_list;
-                let keep = in_list || before.ends_with("field");
-                let mut inner = String::new();
-                let mut end = message.len();
-                for (j, d) in chars.by_ref() {
-                    if d == '`' {
                         end = j + 1;
                         break;
                     }
-                    inner.push(d);
                 }
-                out.push('`');
-                out.push_str(if keep { &inner } else { "…" });
-                out.push('`');
-                list_end = in_list.then_some(end);
+                out.push(Segment::Quoted);
+                text_start = end;
             }
-            _ => out.push(c),
+            '`' => {
+                if text_start < i {
+                    out.push(Segment::Text(&message[text_start..i]));
+                }
+                let mut end = None;
+                for (j, d) in chars.by_ref() {
+                    if d == '`' {
+                        end = Some(j);
+                        break;
+                    }
+                }
+                match end {
+                    Some(j) => {
+                        out.push(Segment::Tick {
+                            inner: &message[i + 1..j],
+                            closed: true,
+                        });
+                        text_start = j + 1;
+                    }
+                    None => {
+                        out.push(Segment::Tick {
+                            inner: &message[i + 1..],
+                            closed: false,
+                        });
+                        text_start = message.len();
+                    }
+                }
+            }
+            _ => {}
         }
     }
+    if text_start < message.len() {
+        out.push(Segment::Text(&message[text_start..]));
+    }
     out
+}
+
+/// `[A-Za-z0-9_-]+`: the shape of every name in NineSQL's models.
+fn is_identifier(s: &str) -> bool {
+    !s.is_empty()
+        && s.bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+}
+
+/// ` at line N column M`, as appended by serde_json.
+fn is_position_suffix(t: &str) -> bool {
+    let Some(rest) = t.strip_prefix(" at line ") else {
+        return false;
+    };
+    let Some((line, column)) = rest.split_once(" column ") else {
+        return false;
+    };
+    [line, column]
+        .iter()
+        .all(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))
 }
 
 #[cfg(test)]
@@ -434,7 +666,7 @@ mod tests {
         // redacted.
         assert_eq!(
             redact("expected `a` at line 1 near `Hunter2-Secret`"),
-            "expected `a` at line 1 near `…`"
+            "expected `…` at line 1 near `…`"
         );
         assert_eq!(
             redact("expected a string, found `Hunter2-Secret`"),
@@ -446,7 +678,50 @@ mod tests {
         );
         assert_eq!(
             redact("expected `a`, \"x\" `Hunter2`"),
-            "expected `a`, \"…\" `…`"
+            "expected `…`, \"…\" `…`"
+        );
+        // serde_json's position suffix may follow the list.
+        assert_eq!(
+            redact("unknown variant `x`, expected `tcp` or `file` at line 3 column 17"),
+            "unknown variant `…`, expected `tcp` or `file` at line 3 column 17"
+        );
+    }
+
+    /// Security review L1: a value embedding backticks and "expected" cannot forge a kept list.
+    #[test]
+    fn forged_expectation_lists_are_redacted() {
+        // The enum value is: x`, expected `Hunter2
+        assert_eq!(
+            redact("unknown variant `x`, expected `Hunter2`, expected one of `tcp`, `file`"),
+            "unknown variant `…`, expected `…`, expected one of `tcp`, `file`"
+        );
+        assert_eq!(
+            redact("unknown field `x`, expected `Hunter2`, expected one of `a`, `b`"),
+            "unknown field `x`, expected `…`, expected one of `a`, `b`"
+        );
+        // A forged list before serde's "there are no …" tail.
+        assert_eq!(
+            redact("unknown variant `x`, expected `Hunter2`, there are no variants"),
+            "unknown variant `…`, expected `…`, there are no variants"
+        );
+        // Trying to glue the forged item onto the real list.
+        assert_eq!(
+            redact("unknown variant `x`, expected `Hunter2`, ``, expected one of `tcp`"),
+            "unknown variant `…`, expected `…`, `…`, expected one of `tcp`"
+        );
+        // Odd backticks shift the quoting: the real list then fails the identifier check.
+        assert_eq!(
+            redact("unknown variant ```, expected one of `tcp`, `file`"),
+            "unknown variant `…``…`tcp`…`file`…`"
+        );
+        // Non-identifier items or field names are redacted.
+        assert_eq!(
+            redact("expected one of `a`, `Hunter 2!`"),
+            "expected one of `…`, `…`"
+        );
+        assert_eq!(
+            redact("unknown field `p@ss word`, expected `a`"),
+            "unknown field `…`, expected `a`"
         );
     }
 

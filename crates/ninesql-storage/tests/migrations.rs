@@ -157,8 +157,12 @@ fn load_migrates_on_disk_and_keeps_a_backup() {
     assert_eq!(loaded.migrated_from, Some(1));
     assert_eq!(loaded.document, expected());
 
+    // JSON backups are re-encoded from the scrubbed value (same content, canonical layout).
     let bak = backup_path(&path);
-    assert_eq!(fs::read(&bak).unwrap(), original);
+    assert_eq!(
+        serde_json::from_slice::<Value>(&fs::read(&bak).unwrap()).unwrap(),
+        serde_json::from_slice::<Value>(&original).unwrap()
+    );
     for p in [&path, &bak] {
         assert_eq!(fs::metadata(p).unwrap().permissions().mode() & 0o777, 0o600);
     }
@@ -378,14 +382,82 @@ fn migration_backup_goes_through_the_scrub_hook() {
     );
 }
 
+/// Security review L2: duplicate JSON keys parse to their last value, so a clean-looking value
+/// does not prove clean bytes. JSON backups are always re-encoded from the scrubbed value.
 #[test]
-fn clean_migration_backup_keeps_the_original_bytes() {
+fn json_backup_never_copies_a_duplicate_key_secret() {
     let tmp = tempfile::tempdir().unwrap();
     let path = tmp.path().join("scrubbed.json");
-    let content = b"{ \"schema_version\": 1,\n  \"items\": [ { \"host\": \"h\", \"port\": 1, \"tags\": [\"blue\"] } ] }";
+    let content = br#"{ "schema_version": 1, "items": [
+        { "host": "h", "port": 1, "token": "Hunter2-Secret", "token": "" } ] }"#;
     fs::write(&path, content).unwrap();
     document::load::<Scrubbed>(&path).unwrap().unwrap();
+    let bak = fs::read_to_string(backup_path(&path)).unwrap();
+    assert!(!bak.contains("Hunter2-Secret"), "{bak}");
+    assert!(bak.contains("\"schema_version\": 1"), "{bak}");
+}
+
+/// A TOML file (where duplicate keys are a parse error) with nothing to scrub is backed up
+/// verbatim, comments included.
+#[test]
+fn clean_toml_backup_keeps_the_original_bytes() {
+    #[derive(Debug, Serialize, Deserialize)]
+    struct OldToml {
+        items: Vec<Item>,
+    }
+    impl Document for OldToml {
+        const NAME: &'static str = "old-toml";
+        const FORMAT: Format = Format::Toml;
+        const SCHEMA_VERSION: u32 = 3;
+        fn migrations() -> &'static [Migration] {
+            MIGRATIONS
+        }
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let path = tmp.path().join("settings.toml");
+    let content =
+        b"# hand-written comment\nschema_version = 1\n\n[[items]]\nhost = \"h\"\nport = 1\n";
+    fs::write(&path, content).unwrap();
+    let loaded = document::load::<OldToml>(&path).unwrap().unwrap();
+    assert_eq!(loaded.migrated_from, Some(1));
     assert_eq!(fs::read(backup_path(&path)).unwrap(), content);
+}
+
+/// Security review L7 support: `scrub_file` cleans a file in place without the model.
+#[test]
+fn scrub_file_removes_secrets_and_keeps_the_rest() {
+    let tmp = tempfile::tempdir().unwrap();
+    let path = tmp.path().join("scrubbed.json");
+    // `port` is invalid for the model; it must survive the scrub untouched.
+    let content = br#"{ "schema_version": 3, "items": [
+        { "hostname": "h", "endpoint": { "port": "not-a-port" }, "password": "Hunter2-Secret" } ] }"#;
+    fs::write(&path, content).unwrap();
+    assert!(document::scrub_file::<Sample>(&path).unwrap());
+    let text = fs::read_to_string(&path).unwrap();
+    assert!(!text.contains("Hunter2-Secret"), "{text}");
+    assert!(text.contains("not-a-port"), "{text}");
+    assert_eq!(
+        fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+        0o600
+    );
+    // Clean now: no second rewrite.
+    let ino = fs::metadata(&path).unwrap().ino();
+    assert!(!document::scrub_file::<Sample>(&path).unwrap());
+    assert_eq!(fs::metadata(&path).unwrap().ino(), ino);
+    // Duplicate keys force a rewrite even when the parsed value looks clean.
+    let dup = br#"{ "schema_version": 3, "token": "Hunter2-Secret", "token": "", "items": [] }"#;
+    fs::write(&path, dup).unwrap();
+    assert!(document::scrub_file::<Sample>(&path).unwrap());
+    assert!(
+        !fs::read_to_string(&path)
+            .unwrap()
+            .contains("Hunter2-Secret")
+    );
+    // Missing or unparsable files are left alone.
+    assert!(!document::scrub_file::<Sample>(&tmp.path().join("absent.json")).unwrap());
+    fs::write(&path, b"{ broken").unwrap();
+    assert!(!document::scrub_file::<Sample>(&path).unwrap());
+    assert_eq!(fs::read(&path).unwrap(), b"{ broken");
 }
 
 /// N7.2: a plaintext secret found on load is removed from disk at once, not at the next save.

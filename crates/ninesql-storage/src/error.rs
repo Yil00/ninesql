@@ -53,6 +53,15 @@ pub enum StorageError {
         /// Lock file.
         path: PathBuf,
     },
+    /// The file system of the workspace does not support file locks (some network or FUSE file
+    /// systems), so NineSQL cannot make sure it is the only process writing the workspace.
+    #[error(
+        "file locking is not available on the file system holding {path}; NineSQL cannot protect the workspace against a second process. Move the XDG data directory to a local file system"
+    )]
+    LockUnsupported {
+        /// Lock file.
+        path: PathBuf,
+    },
     /// A file is larger than NineSQL accepts for its kind.
     #[error("{path} is too large ({size} bytes, the limit is {limit} bytes)")]
     TooLarge {

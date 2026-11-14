@@ -39,26 +39,91 @@ const PASSWORD_ENCRYPTION_VALUES: &[&str] = &["scram-sha-256", "md5", "on", "off
 /// Whether `value` has the shape expected for the benign key `normalized_key` (one of
 /// [`BENIGN_SECRET_LIKE_KEYS`]). A misplaced password in such a key fails the check.
 ///
-/// - `passwordcharacterencoding`: a charset name, 1 to 40 ASCII letters, digits, `.`, `_`, `:`,
-///   `+` or `-` (`UTF-8`, `ISO-8859-1`, `utf8mb4`, `Cp1252`) and at least one letter.
+/// - `passwordcharacterencoding`: a known charset name ([`is_known_charset`]): `UTF-8`, `utf8mb4`,
+///   `ISO-8859-1`, `Cp1252`, `windows-1252`, `latin1`, `Shift_JIS`…
 /// - `passwordencryption`: one of `scram-sha-256`, `md5`, `on`, `off`, `true`, `false`.
 ///
 /// Any other key returns `false`.
 #[must_use]
 pub fn benign_value_shape_ok(normalized_key: &str, value: &str) -> bool {
     match normalized_key {
-        "passwordcharacterencoding" => {
-            (1..=40).contains(&value.len())
-                && value.bytes().any(|b| b.is_ascii_alphabetic())
-                && value.bytes().all(|b| {
-                    b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b':' | b'+' | b'-')
-                })
-        }
+        "passwordcharacterencoding" => is_known_charset(value),
         "passwordencryption" => PASSWORD_ENCRYPTION_VALUES
             .iter()
             .any(|v| v.eq_ignore_ascii_case(value)),
         _ => false,
     }
+}
+
+/// Charset names accepted as they are (case-insensitive).
+const CHARSET_NAMES: &[&str] = &[
+    "utf-8",
+    "utf8",
+    "utf8mb3",
+    "utf8mb4",
+    "utf-16",
+    "utf16",
+    "utf-16le",
+    "utf-16be",
+    "utf16le",
+    "utf16be",
+    "utf-32",
+    "utf32",
+    "utf-32le",
+    "utf-32be",
+    "us-ascii",
+    "ascii",
+    "big5",
+    "big5-hkscs",
+    "gbk",
+    "gb2312",
+    "gb18030",
+    "shift_jis",
+    "shift-jis",
+    "sjis",
+    "ms932",
+    "windows-31j",
+    "euc-jp",
+    "euc_jp",
+    "eucjpms",
+    "euc-kr",
+    "euc_kr",
+    "euckr",
+    "euc-cn",
+    "euc-tw",
+    "koi8-r",
+    "koi8-u",
+    "koi8r",
+    "koi8u",
+    "tis-620",
+    "tis620",
+    "iso-2022-jp",
+];
+
+/// Charset families: a prefix followed by 1 to 5 digits (`cp1252`, `windows-1251`, `latin1`,
+/// `iso-8859-15`, `ISO8859_1`).
+const CHARSET_NUMBERED_PREFIXES: &[&str] = &[
+    "iso-8859-",
+    "iso8859-",
+    "iso8859_",
+    "iso_8859-",
+    "cp",
+    "windows-",
+    "latin",
+    "ibm",
+];
+
+/// Whether `value` is a known character set name (Java, MySQL / MariaDB and IANA spellings,
+/// case-insensitive). A pasted password such as `Hunter2` is not.
+#[must_use]
+pub fn is_known_charset(value: &str) -> bool {
+    let v = value.to_ascii_lowercase();
+    CHARSET_NAMES.contains(&v.as_str())
+        || CHARSET_NUMBERED_PREFIXES.iter().any(|p| {
+            v.strip_prefix(p).is_some_and(|n| {
+                (1..=5).contains(&n.len()) && n.bytes().all(|b| b.is_ascii_digit())
+            })
+        })
 }
 
 /// Normalizes a key: lower case, without `-`, `_`, `.` and spaces.
@@ -225,6 +290,12 @@ mod tests {
             ("passwordCharacterEncoding", "UTF-8"),
             ("passwordCharacterEncoding", "utf8mb4"),
             ("passwordCharacterEncoding", "ISO-8859-1"),
+            ("passwordCharacterEncoding", "Cp1252"),
+            ("passwordCharacterEncoding", "windows-1251"),
+            ("passwordCharacterEncoding", "latin1"),
+            ("passwordCharacterEncoding", "ISO8859_15"),
+            ("passwordCharacterEncoding", "Shift_JIS"),
+            ("passwordCharacterEncoding", "UTF-16LE"),
             ("password_encryption", "scram-sha-256"),
             ("password_encryption", "MD5"),
         ] {
@@ -233,6 +304,11 @@ mod tests {
         for (key, value) in [
             ("passwordCharacterEncoding", "Hunter2 secret!"),
             ("passwordCharacterEncoding", "12345678"),
+            // Security review L4: identifier-like passwords are not charsets.
+            ("passwordCharacterEncoding", "Hunter2"),
+            ("passwordCharacterEncoding", "cpHunter2"),
+            ("passwordCharacterEncoding", "latin123456"),
+            ("passwordCharacterEncoding", "utf-8x"),
             ("passwordCharacterEncoding", &"a".repeat(41)),
             ("password_encryption", "Hunter2"),
             ("password", "x"),

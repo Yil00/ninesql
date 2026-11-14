@@ -75,7 +75,7 @@ impl DirLock {
                     path: path.to_path_buf(),
                 });
             }
-            Err(TryLockError::Error(e)) => return Err(StorageError::io(path, e)),
+            Err(TryLockError::Error(e)) => return Err(lock_error(path, e)),
         }
         let lock = Arc::new(Self {
             path: path.to_path_buf(),
@@ -90,6 +90,20 @@ impl DirLock {
     #[must_use]
     pub fn path(&self) -> &Path {
         &self.path
+    }
+}
+
+/// [`StorageError::LockUnsupported`] when the file system has no locks (`ENOLCK`,
+/// `EOPNOTSUPP`, or std's `Unsupported`), else an I/O error.
+fn lock_error(path: &Path, e: io::Error) -> StorageError {
+    let unsupported = e.kind() == io::ErrorKind::Unsupported
+        || matches!(e.raw_os_error(), Some(code) if code == libc::ENOLCK || code == libc::EOPNOTSUPP);
+    if unsupported {
+        StorageError::LockUnsupported {
+            path: path.to_path_buf(),
+        }
+    } else {
+        StorageError::io(path, e)
     }
 }
 
@@ -117,7 +131,7 @@ pub fn is_locked_elsewhere(path: &Path) -> Result<bool, StorageError> {
     match file.try_lock() {
         Ok(()) => Ok(false),
         Err(TryLockError::WouldBlock) => Ok(true),
-        Err(TryLockError::Error(e)) => Err(StorageError::io(path, e)),
+        Err(TryLockError::Error(e)) => Err(lock_error(path, e)),
     }
 }
 
@@ -162,6 +176,24 @@ mod tests {
         ));
         drop(other);
         DirLock::acquire(&path).unwrap();
+    }
+
+    #[test]
+    fn missing_lock_support_has_its_own_error() {
+        let p = Path::new("/x/ninesql.lock");
+        for e in [
+            io::Error::from_raw_os_error(libc::ENOLCK),
+            io::Error::from_raw_os_error(libc::EOPNOTSUPP),
+            io::Error::from(io::ErrorKind::Unsupported),
+        ] {
+            let err = lock_error(p, e);
+            assert!(matches!(err, StorageError::LockUnsupported { .. }), "{err}");
+            assert!(err.to_string().contains("file locking is not available"));
+        }
+        assert!(matches!(
+            lock_error(p, io::Error::from_raw_os_error(libc::EIO)),
+            StorageError::Io { .. }
+        ));
     }
 
     #[test]
