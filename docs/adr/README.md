@@ -7,7 +7,7 @@ New ADR: copy [template.md](template.md), take the next number, status `Proposed
 | # | Title | Status |
 |---|-------|--------|
 | [0001](0001-native-stack-rust-gpui.md) | Native stack – Rust and GPUI | Accepted, partially superseded by [0013](0013-gpui-source-and-supply-chain.md) |
-| [0002](0002-licensing-and-dependency-policy.md) | Licensing and dependency policy | Accepted, partially superseded by [0013](0013-gpui-source-and-supply-chain.md), partially amended by [0015](0015-allow-0bsd-license.md), partially amended by [0018](0018-patched-third-party-crates.md) (proposed) |
+| [0002](0002-licensing-and-dependency-policy.md) | Licensing and dependency policy | Accepted, partially superseded by [0013](0013-gpui-source-and-supply-chain.md), partially amended by [0015](0015-allow-0bsd-license.md), partially amended by [0018](0018-patched-third-party-crates.md) |
 | [0003](0003-supported-engines-v1.md) | Supported engines for v1 and driver families | Accepted, partially superseded by [0014](0014-dev-environment-profiles.md) |
 | [0004](0004-driver-api-runtime-and-results.md) | Driver API, async runtime and result model | Accepted |
 | [0005](0005-secrets-storage.md) | Secrets storage | Accepted, partially superseded by [0012](0012-secret-service-client-and-msrv.md) |
@@ -18,9 +18,9 @@ New ADR: copy [template.md](template.md), take the next number, status `Proposed
 | [0010](0010-packaging-and-distribution.md) | Packaging and distribution | Accepted |
 | [0011](0011-tls-and-ssh-defaults.md) | TLS and SSH defaults | Accepted, partially amended by [0016](0016-ssh-rsa-and-host-key-policies.md) |
 | [0012](0012-secret-service-client-and-msrv.md) | Secret Service client crate and minimum Rust version | Accepted, partially amended by [0017](0017-workspace-lock-rewrite-on-load-and-project-identity.md) |
-| [0013](0013-gpui-source-and-supply-chain.md) | GPUI source (gpui-kit / gpui-pre from crates.io) and supply-chain controls | Accepted, partially amended by [0018](0018-patched-third-party-crates.md) (proposed) |
+| [0013](0013-gpui-source-and-supply-chain.md) | GPUI source (gpui-kit / gpui-pre from crates.io) and supply-chain controls | Accepted, partially amended by [0018](0018-patched-third-party-crates.md) |
 | [0014](0014-dev-environment-profiles.md) | Dev environment profiles follow ADR-0009 | Accepted |
 | [0015](0015-allow-0bsd-license.md) | Allow the 0BSD license | Accepted |
 | [0016](0016-ssh-rsa-and-host-key-policies.md) | SSH – RSA keys disabled until russh moves to rsa ≥ 0.10, and non-strict host-key policies | Accepted |
 | [0017](0017-workspace-lock-rewrite-on-load-and-project-identity.md) | Workspace lock, rewrite-on-load and project identity | Accepted |
-| [0018](0018-patched-third-party-crates.md) | Patched third-party crates | Proposed |
+| [0018](0018-patched-third-party-crates.md) | Patched third-party crates | Accepted |

@@ -1,6 +1,6 @@
 # ADR-0013: GPUI source (gpui-kit / gpui-pre from crates.io) and supply-chain controls
 
-- **Status**: Accepted (maintainer, 2026-11-14). Supersedes [ADR-0001](0001-native-stack-rust-gpui.md) Decision §2 (git pin of `zed-industries/zed` and `gpui-component`). Amends [ADR-0002](0002-licensing-and-dependency-policy.md) Decision §6 (git source allow-list). Every other point of both ADRs stands. Partially amended by [ADR-0018](0018-patched-third-party-crates.md) (proposed): a control for patched third-party crates.
+- **Status**: Accepted (maintainer, 2026-11-14). Supersedes [ADR-0001](0001-native-stack-rust-gpui.md) Decision §2 (git pin of `zed-industries/zed` and `gpui-component`). Amends [ADR-0002](0002-licensing-and-dependency-policy.md) Decision §6 (git source allow-list). Every other point of both ADRs stands. Partially amended by [ADR-0018](0018-patched-third-party-crates.md): a control for patched third-party crates.
 - **Date**: 2026-11-14
 
 ## Context

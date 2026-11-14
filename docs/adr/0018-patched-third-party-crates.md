@@ -1,6 +1,6 @@
 # ADR-0018: Patched third-party crates
 
-- **Status**: Proposed. Amends [ADR-0013](0013-gpui-source-and-supply-chain.md) (adds a supply-chain control for patched crates) and [ADR-0002](0002-licensing-and-dependency-policy.md) (dependency policy: path patches of third-party crates). Every other point of both ADRs stands.
+- **Status**: Accepted (maintainer, 2026-11-14). Amends [ADR-0013](0013-gpui-source-and-supply-chain.md) (adds a supply-chain control for patched crates) and [ADR-0002](0002-licensing-and-dependency-policy.md) (dependency policy: path patches of third-party crates). Every other point of both ADRs stands.
 - **Date**: 2026-11-14
 
 ## Context
@@ -64,12 +64,13 @@ f. **cargo-deny.** cargo-deny does not cover path sources. Rules a to e are the 
 ## Consequences
 - Upstream fixes that NineSQL cannot wait for can be shipped. Each one is reviewed, recorded and checked against its archive, and has a planned removal.
 - Patches cost more than a plain dependency: an audit entry, a review, a CI check, and re-applying the patch on each bump that moves the crate. Patches should be rare and small, and should be reported upstream.
-- The P1-A patch satisfies rules a, b, c and e. For rule d, it has the `xim-ctext` pin only.
+- The P1-A patch satisfies rules a, b, c and e. For rule d, it had the `xim-ctext` pin only when this ADR was proposed.
 - `.github/CODEOWNERS` gets rules for `/crates/patches/` and for the root `Cargo.toml` in the PR that adds this ADR. CODEOWNERS works per file, so the rule covers the whole `Cargo.toml`, not only its `[patch]` section.
 - Follow-up tasks:
   - write `scripts/verify-patches.sh` and run it as a step in the required CI (rule d: allowlist, path sources in Cargo.lock, archive diff limited to marked files);
   - anchor `zed-xim`, either with an exact-pin dev-dependency (`zed-xim = "=0.4.0-zed"`) or with the CI check above;
   - if a `log` to `tracing` bridge is ever added, cap the `zed_xim` log target at `warn`: upstream `log::trace!` calls on XIM requests include the text the user types through the IME.
+- State at acceptance (2026-11-14, `dev` at `1e46a98`): the P1-A patch landed with phase 1 wave 2. The first two follow-up tasks are done: `scripts/verify-patches.sh` runs as the "Patched crates" step of the `deny` job in `.github/workflows/ci.yml`, and `ninesql-ui` anchors `zed-xim` with an exact-pin dev-dependency (`=0.4.0-zed`) next to the `xim-ctext` pin. The checks the script performs are listed in the [audit log](../audits/gpui-snapshot.md). The third task (log cap) stays conditional.
 
 ## Rejected alternatives
 - **Fork the crates under a new name and depend on the fork from crates.io**: GPUI depends on the upstream names, so the fork would still need a `[patch]` entry. A new published crate would also add a publisher to trust and maintain.
