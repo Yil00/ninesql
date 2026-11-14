@@ -33,11 +33,18 @@ ninesql-dbeaver = { path = "crates/ninesql-dbeaver" }
 ninesql-grid = { path = "crates/ninesql-grid" }
 ninesql-editor = { path = "crates/ninesql-editor" }
 
-# GPUI and gpui-component, pinned as one pair (ADR-0001 §3, P0-A, docs/spikes/p0-a-gpui.md).
+# GPUI and gpui-component, pinned as one set from crates.io (ADR-0013, P0-A, docs/spikes/p0-a-gpui.md).
 # gpui-kit 0.9.1 = longbridge/gpui-component tag v0.9.1 (39ab849a93b5f15507b969164d49891db8d5b470);
-# it pins GPUI exactly to gpui-pre =0.3.12, a crates.io snapshot of zed-industries/zed@d2a4fb6.
-# Bump the pair only in a dedicated `chore(ui): bump gpui` PR that re-runs the spike.
+# it pins GPUI exactly to gpui-pre =0.3.12, a snapshot of zed-industries/zed@d2a4fb6.
+# The gpui-kit family requires its siblings with caret ranges ("0.9.1"), so each one is
+# exact-pinned here and used as a direct dependency of ninesql-ui: that is what holds
+# resolution on 0.9.1. Bump the set only in a dedicated `chore(ui): bump gpui` PR that runs
+# scripts/verify-gpui-snapshot.sh and re-runs the spike.
 gpui-kit = { version = "=0.9.1", default-features = false }
+gpui-base = { version = "=0.9.1", default-features = false }
+gpui-component = { version = "=0.9.1", default-features = false }
+gpui-component-macros = { version = "=0.9.1", default-features = false }
+gpui-kit-assets = { version = "=0.9.1", default-features = false }
 
 [profile.release]
 lto = "thin"

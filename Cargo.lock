@@ -3836,7 +3836,11 @@ version = "0.0.0"
 name = "ninesql-ui"
 version = "0.0.0"
 dependencies = [
+ "gpui-base",
+ "gpui-component",
+ "gpui-component-macros",
  "gpui-kit",
+ "gpui-kit-assets",
  "ninesql-core",
  "ninesql-editor",
  "ninesql-grid",
