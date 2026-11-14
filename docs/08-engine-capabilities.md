@@ -23,12 +23,17 @@ Defined in `crates/ninesql-driver-api/src/capabilities.rs` (`Capabilities`, P0-B
 | `tls` | set of `TlsMode` | TLS modes offered (`disable`, `require`, `verify-ca`, `verify-full`); empty for file engines | TLS section disabled |
 | `parameters` | bool | Bind parameters in statements | Parameter prompt not offered |
 
-`ReadOnlyMechanism` values (ADR-0007): `SessionSetting` (session-level `SET … READ ONLY`), `TransactionMode` (every transaction started read-only), `OpenMode` (file opened read-only), `ServerSetting` (per-session server setting such as ClickHouse `readonly = 1`), `ReadEndpointsOnly` (only read endpoints are called), and `ClientSideOnly` (no engine-side mechanism: the driver refuses writes it can classify). Every value except `ClientSideOnly` counts as engine-side.
+`ReadOnlyMechanism` values (ADR-0007): `SessionSetting { liftable }` (session-level `SET … READ ONLY`), `TransactionMode` (every transaction started read-only by the driver), `OpenMode` (file opened read-only), `ServerSetting { liftable }` (per-session server setting such as ClickHouse `readonly = 1`, not liftable, or `readonly = 2`, liftable), `ReadEndpointsOnly` (only read endpoints are called, InfluxDB 3), and `ClientSideOnly` (no engine-side mechanism: the driver refuses writes it can classify). Every value except `ClientSideOnly` counts as engine-side. `liftable` means a client statement can switch the mechanism off again (PostgreSQL, MySQL / MariaDB / TiDB session settings).
 
 Rules every driver follows whatever its mechanism (rustdoc of `Driver::connect` and `Session::execute`):
 - read-only is applied **before** `connect` returns and before init statements run; if it cannot be applied, connect fails;
-- in a read-only session, statements the dialect classifies as writes are refused client-side as well, and statements that may lift the access mode (`SET … READ WRITE`, `default_transaction_read_only = off`, `PRAGMA query_only = OFF`…, class `ChangesAccessMode`) are always refused;
-- every result goes through `ResultStream`, which enforces the caller's `FetchBudget` (`batch_rows` default 200, `max_bytes` default 256 MiB, optional `max_rows`), the timeout and the cancel token, and ends with `Truncated` at the budget (I6).
+- driver properties go through `check_properties`: they can never set TLS / certificate verification, host / port, credentials, read-only / access mode, multi-statements, init SQL or lexical modes (`sslmode`, `useSSL`, `trustServerCertificate`, `readonly`, `options`, `allowMultiQueries`, `initSql`, `sql_mode`…); property values are `PropertyValue::Plain` or `PropertyValue::Secret` and are never logged;
+- exactly one statement per protocol call: text the dialect splits into several statements is refused (`MultipleStatements`), and the dialect's lexical rules follow the session's modes (MySQL `NO_BACKSLASH_ESCAPES`, executable comments `/*! … */`, `--` needing a space; PostgreSQL `E'…'` strings, dollar quotes, nested comments);
+- in a read-only session, statements the dialect classifies as writes are refused client-side as well, and statements that may lift the access mode (class `ChangesAccessMode`: any `SET` / `RESET` / `PRAGMA` outside an allowlist of harmless settings such as `search_path` or `time_zone`, quoted names included, `set_config(…)`, `BEGIN READ WRITE`…) are always refused;
+- with a liftable mechanism, the driver also verifies the access mode after every statement (PostgreSQL `ParameterStatus`, MySQL session-state tracking, or a read-back) and closes the session if it changed;
+- every result goes through `ResultStream`, which enforces the caller's `FetchBudget` (`batch_rows` default 200, clamped to 10 000; `max_bytes` default 256 MiB; optional `max_rows`; `max_batch_bytes` default 8 MiB; `max_value_bytes` default 1 MiB), the timeout and the cancel token, counts notices and update counts against the budget, and ends with `Truncated` at the budget (I6). Drivers end each batch at the row or byte limit and cut oversized values, flagging the column with the `ninesql.truncated` field metadata.
+
+The conformance helpers of the `mock` feature (`conformance::assert_reserved_properties_rejected`, `assert_read_only_refuses_writes`, `assert_multiple_statements_refused`) are reused by every driver's integration tests.
 
 The mock driver (feature `mock` of `ninesql-driver-api`, engine id `mock`) declares every capability by default and accepts overrides so UI tests can check that undeclared features are hidden.
 
@@ -73,7 +78,7 @@ Ports in `dev/` are remapped to avoid clashes; `dev/engines.json` (P0-C) is auth
 | InfluxDB 3 | Query API is read-only; writes go through a separate API the driver will not expose in read-only mode | 🗓 |
 | MongoDB | No session read-only; driver refuses write commands, recommend a read-only role → `ClientSideOnly` | 🗓 |
 | Redis, Valkey | `READONLY` only applies to cluster replicas → `ClientSideOnly` via command classification, recommend an ACL user with read commands | 🗓 |
-| Elasticsearch, OpenSearch | No session read-only → `ClientSideOnly` (only search / SQL endpoints called), recommend a read-only role | 🗓 |
+| Elasticsearch, OpenSearch | No session read-only → `ClientSideOnly` (the driver calls only search / SQL endpoints in read-only mode, but query DSL scripts and plugins cannot be proven read-only), recommend a read-only role | 🗓 |
 | Cassandra | No session read-only → `ClientSideOnly`, recommend a role with `SELECT` only | 🗓 |
 | Neo4j | Read access mode on sessions / transactions (`READ`) — routes to readers; to verify that writes are rejected on a single instance | 🗓 verify |
 
