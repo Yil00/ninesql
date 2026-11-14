@@ -1,0 +1,7 @@
+{
+  "schema_version": 1,
+  "items": [
+    { "host": "db.example.test", "port": 5432 },
+    { "host": "localhost", "port": 3306 }
+  ]
+}

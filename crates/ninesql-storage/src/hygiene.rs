@@ -1,0 +1,152 @@
+//! Defence in depth for I1: find keys in a loaded file that look like they hold a secret value.
+//!
+//! NineSQL's own models have no such field, so a hit means a hand edit or a foreign tool put a
+//! value there. The caller warns (naming the key path, never the value); such unknown keys are
+//! dropped on the next save because models ignore unknown fields.
+
+use serde_json::Value;
+
+/// Key fragments (lower case, `-` / `_` removed) that suggest a secret value.
+const SUSPICIOUS: &[&str] = &[
+    "password",
+    "passwd",
+    "passphrase",
+    "secret",
+    "token",
+    "apikey",
+    "accesskey",
+    "privatekey",
+    "credential",
+];
+/// Keys that suggest a secret only when they match exactly.
+const SUSPICIOUS_EXACT: &[&str] = &["pwd", "pass", "pin"];
+
+/// Known driver option keys that match the fragments above but never hold a secret (normalized).
+/// Checked before the heuristics so they are not reported, stripped or refused.
+pub const BENIGN_SECRET_LIKE_KEYS: &[&str] = &[
+    // MySQL Connector/J: charset used to encode the password.
+    "passwordcharacterencoding",
+    // PostgreSQL: password hashing method (server setting, also passed as an option).
+    "passwordencryption",
+];
+
+/// Normalizes a key: lower case, without `-`, `_`, `.` and spaces.
+#[must_use]
+pub fn normalize_key(key: &str) -> String {
+    key.chars()
+        .filter(|c| !matches!(c, '-' | '_' | '.' | ' '))
+        .flat_map(char::to_lowercase)
+        .collect()
+}
+
+/// Whether a key name looks like it would hold a secret.
+#[must_use]
+pub fn is_secret_like_key(key: &str) -> bool {
+    let norm = normalize_key(key);
+    if BENIGN_SECRET_LIKE_KEYS.contains(&norm.as_str()) {
+        return false;
+    }
+    SUSPICIOUS_EXACT.contains(&norm.as_str()) || SUSPICIOUS.iter().any(|s| norm.contains(s))
+}
+
+/// Paths (`connections[2].auth.password`) of keys that look secret and hold a non-empty string.
+/// Values are never returned.
+#[must_use]
+pub fn find_secret_like_keys(value: &Value) -> Vec<String> {
+    let mut found = Vec::new();
+    walk(value, &mut String::new(), &mut found);
+    found
+}
+
+/// Removes every key that [`find_secret_like_keys`] would report, in place.
+pub fn strip_secret_like_keys(value: &mut Value) {
+    match value {
+        Value::Object(map) => {
+            map.retain(|key, child| {
+                !(matches!(child, Value::String(s) if !s.is_empty()) && is_secret_like_key(key))
+            });
+            map.values_mut().for_each(strip_secret_like_keys);
+        }
+        Value::Array(items) => items.iter_mut().for_each(strip_secret_like_keys),
+        _ => {}
+    }
+}
+
+fn walk(value: &Value, path: &mut String, found: &mut Vec<String>) {
+    match value {
+        Value::Object(map) => {
+            for (key, child) in map {
+                let len = path.len();
+                if !path.is_empty() {
+                    path.push('.');
+                }
+                path.push_str(key);
+                if matches!(child, Value::String(s) if !s.is_empty()) && is_secret_like_key(key) {
+                    found.push(path.clone());
+                }
+                walk(child, path, found);
+                path.truncate(len);
+            }
+        }
+        Value::Array(items) => {
+            for (i, child) in items.iter().enumerate() {
+                let len = path.len();
+                path.push_str(&format!("[{i}]"));
+                walk(child, path, found);
+                path.truncate(len);
+            }
+        }
+        _ => {}
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)] // Tests may panic (AGENTS.md).
+mod tests {
+    use serde_json::json;
+
+    use super::*;
+
+    #[test]
+    fn benign_keys_are_not_secret_like() {
+        for key in ["passwordCharacterEncoding", "password_encryption"] {
+            assert!(!is_secret_like_key(key), "{key}");
+        }
+        for key in [
+            "password",
+            "PASSWORD",
+            "sslpassword",
+            "clientSecret",
+            "api-token",
+        ] {
+            assert!(is_secret_like_key(key), "{key}");
+        }
+    }
+
+    #[test]
+    fn detects_secret_like_string_values_only() {
+        let v = json!({
+            "connections": [
+                { "auth": { "method": "password", "secret": { "store": "keyring", "id": "x" } } },
+                { "auth": { "Password": "hunter2" }, "properties": { "ssl-key-passphrase": "x" } }
+            ],
+            "token": "",
+            "pwd": "p",
+            "compass": "north"
+        });
+        let found = find_secret_like_keys(&v);
+        assert_eq!(
+            found,
+            vec![
+                "connections[1].auth.Password",
+                "connections[1].properties.ssl-key-passphrase",
+                "pwd",
+            ]
+        );
+        let mut stripped = v.clone();
+        strip_secret_like_keys(&mut stripped);
+        assert!(find_secret_like_keys(&stripped).is_empty());
+        assert_eq!(stripped["compass"], "north");
+        assert_eq!(stripped["connections"][0]["auth"]["method"], "password");
+    }
+}

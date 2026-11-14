@@ -1,0 +1,7 @@
+{
+  "schema_version": 3,
+  "items": [
+    { "hostname": "db.example.test", "endpoint": { "port": 5432 }, "tags": [] },
+    { "hostname": "localhost", "endpoint": { "port": 3306 }, "tags": [] }
+  ]
+}

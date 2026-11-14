@@ -1,0 +1,15 @@
+schema_version = 3
+
+[[items]]
+hostname = "db.example.test"
+tags = []
+
+[items.endpoint]
+port = 5432
+
+[[items]]
+hostname = "localhost"
+tags = []
+
+[items.endpoint]
+port = 3306

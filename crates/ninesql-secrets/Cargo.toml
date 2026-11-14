@@ -13,3 +13,19 @@ publish.workspace = true
 workspace = true
 
 [dependencies]
+serde.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+secrecy.workspace = true
+zeroize.workspace = true
+secret-service = { workspace = true, optional = true }
+
+[features]
+default = []
+# In-memory store for tests of dependent crates (ADR-0005). Never enabled in release builds.
+memory-store = []
+# Spike: freedesktop Secret Service backend (pure-Rust zbus 6 client, Rust crypto). Needs Rust >= 1.89.
+secret-service = ["dep:secret-service"]
+
+[dev-dependencies]
+serde_json.workspace = true
