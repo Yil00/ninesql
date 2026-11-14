@@ -1,0 +1,36 @@
+# cargo-fuzz targets for the DBeaver decoders (ADR-0006: total parsing, fuzzed).
+# Not a member of the main workspace: needs a nightly toolchain and `cargo install cargo-fuzz`.
+#   cd crates/ninesql-dbeaver/fuzz && cargo +nightly fuzz run data_sources
+#   cd crates/ninesql-dbeaver/fuzz && cargo +nightly fuzz run credentials
+# The same entry points are fuzzed on stable by tests/fuzz_decoders.rs (proptest).
+[package]
+name = "ninesql-dbeaver-fuzz"
+version = "0.0.0"
+edition = "2024"
+license = "Apache-2.0"
+publish = false
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+ninesql-dbeaver = { path = ".." }
+
+# Own workspace: keeps libFuzzer out of the main workspace, its lockfile and its cargo-deny scope.
+[workspace]
+members = ["."]
+
+[[bin]]
+name = "data_sources"
+path = "fuzz_targets/data_sources.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "credentials"
+path = "fuzz_targets/credentials.rs"
+test = false
+doc = false
+bench = false
