@@ -69,10 +69,10 @@ fn fixture_workspaces() -> Result<Vec<(String, PathBuf)>, Box<dyn Error>> {
     for entry in fs::read_dir(fixtures_root())? {
         let entry = entry?;
         let name = entry.file_name().to_string_lossy().into_owned();
-        if let Some(version) = name.strip_prefix("dbeaver-") {
-            if entry.file_type()?.is_dir() {
-                out.push((version.to_owned(), entry.path().join("workspace6")));
-            }
+        if let Some(version) = name.strip_prefix("dbeaver-")
+            && entry.file_type()?.is_dir()
+        {
+            out.push((version.to_owned(), entry.path().join("workspace6")));
         }
     }
     out.sort();
@@ -101,10 +101,10 @@ fn collect_strings(value: &Value, key: &str, out: &mut Vec<String>) {
     match value {
         Value::Object(map) => {
             for (k, v) in map {
-                if k == key {
-                    if let Value::String(s) = v {
-                        out.push(s.clone());
-                    }
+                if k == key
+                    && let Value::String(s) = v
+                {
+                    out.push(s.clone());
                 }
                 collect_strings(v, key, out);
             }
@@ -150,7 +150,7 @@ fn assert_fake_host(version: &str, what: &str, host: &str) {
 
 /// Decrypts a DBeaver `credentials-config.json` (16-byte IV, AES-128-CBC, PKCS#7).
 fn decrypt_credentials(bytes: &[u8]) -> Result<Value, Box<dyn Error>> {
-    if bytes.len() <= 16 || bytes.len() % 16 != 0 {
+    if bytes.len() <= 16 || !bytes.len().is_multiple_of(16) {
         return Err(format!("unexpected size {}", bytes.len()).into());
     }
     let (iv, ciphertext) = bytes.split_at(16);
