@@ -19,13 +19,22 @@ tracing.workspace = true
 secrecy.workspace = true
 zeroize.workspace = true
 secret-service = { workspace = true, optional = true }
+ninesql-storage.workspace = true
+argon2.workspace = true
+chacha20poly1305.workspace = true
+getrandom.workspace = true
 
 [features]
 default = []
-# In-memory store for tests of dependent crates (ADR-0005). Never enabled in release builds.
+# In-memory store and fast (insecure) vault KDF parameters for tests of dependent crates
+# (ADR-0005). Never enabled in release builds.
 memory-store = []
-# Spike: freedesktop Secret Service backend (pure-Rust zbus 6 client, Rust crypto). Needs Rust >= 1.89.
+# Freedesktop Secret Service backend (pure-Rust zbus 6 client, Rust crypto). Needs Rust >= 1.89.
+# Off by default until the review of secret-service 6.0.0-rc.1 (ROADMAP, P0-D review L5) and the
+# desktop round trip (ADR-0012) are closed.
 secret-service = ["dep:secret-service"]
 
 [dev-dependencies]
 serde_json.workspace = true
+proptest.workspace = true
+tempfile.workspace = true

@@ -46,6 +46,11 @@ toml = "0.8"
 uuid = { version = "1", features = ["v4", "serde"] }
 secrecy = "0.10"
 secret-service = { version = "=6.0.0-rc.1", default-features = false, features = ["rt-default", "crypto-rust"] }
+# Encrypted vault (P1-D, ADR-0005 §2): RustCrypto crates only, versions aligned with the ones
+# russh already pulls in (argon2 0.6, chacha20 0.10, aead 0.6, getrandom 0.4).
+argon2 = { version = "0.6", default-features = false, features = ["alloc", "zeroize"] }
+chacha20poly1305 = { version = "0.11", default-features = false, features = ["alloc", "zeroize"] }
+getrandom = { version = "0.4", default-features = false }
 tempfile = "3"
 libc = "0.2"
 # Safe `geteuid` for the workspace ownership check (already in the graph through tempfile).
@@ -89,6 +94,14 @@ gpui-kit-assets = { version = "=0.9.1", default-features = false }
 # `test-support` feature (TestAppContext) without gpui-kit's `test-support`, which would drag the
 # optional `gpui-fast` family into Cargo.lock through weak features.
 gpui-pre = { version = "=0.3.12", default-features = false }
+
+# Argon2 is very slow unoptimized; the vault derives its key with the real parameters (64 MiB)
+# in debug builds and tests too.
+[profile.dev.package.argon2]
+opt-level = 3
+
+[profile.dev.package.blake2]
+opt-level = 3
 
 [profile.release]
 lto = "thin"

@@ -52,6 +52,16 @@ impl SecretStores {
         self.stores.contains_key(&kind)
     }
 
+    /// Where a newly saved secret goes: the keyring when a keyring store is registered, else the
+    /// vault when one is registered, else `None` (the password cannot be saved; the core offers
+    /// "ask every time" only). There is no plaintext option (I1); see [`crate::backend`].
+    #[must_use]
+    pub fn store_for_new_secrets(&self) -> Option<StoreKind> {
+        [StoreKind::Keyring, StoreKind::Vault]
+            .into_iter()
+            .find(|kind| self.has(*kind))
+    }
+
     /// Reads the secret behind a reference.
     ///
     /// # Errors
@@ -119,6 +129,16 @@ mod tests {
         ));
         assert!(stores.delete(&r).unwrap());
         assert!(!stores.delete(&r).unwrap());
+    }
+
+    #[test]
+    fn new_secrets_prefer_keyring_then_vault_never_plaintext() {
+        let mut stores = SecretStores::new();
+        assert_eq!(stores.store_for_new_secrets(), None);
+        stores.register(Arc::new(MemoryStore::new(StoreKind::Vault)));
+        assert_eq!(stores.store_for_new_secrets(), Some(StoreKind::Vault));
+        stores.register(Arc::new(MemoryStore::new(StoreKind::Keyring)));
+        assert_eq!(stores.store_for_new_secrets(), Some(StoreKind::Keyring));
     }
 
     #[test]

@@ -276,6 +276,7 @@ dependencies = [
  "blake2",
  "cpufeatures 0.3.1",
  "password-hash",
+ "zeroize",
 ]
 
 [[package]]
@@ -1011,6 +1012,19 @@ dependencies = [
  "cipher 0.5.2",
  "cpufeatures 0.3.1",
  "rand_core 0.10.1",
+ "zeroize",
+]
+
+[[package]]
+name = "chacha20poly1305"
+version = "0.11.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9b89e1c441e926b9c82a8d023f6e1b7ae0adcfaa7d621814e4d60789bac751cb"
+dependencies = [
+ "aead",
+ "chacha20",
+ "cipher 0.5.2",
+ "poly1305",
  "zeroize",
 ]
 
@@ -4561,10 +4575,16 @@ dependencies = [
 name = "ninesql-secrets"
 version = "0.0.0"
 dependencies = [
+ "argon2",
+ "chacha20poly1305",
+ "getrandom 0.4.3",
+ "ninesql-storage",
+ "proptest",
  "secrecy",
  "secret-service",
  "serde",
  "serde_json",
+ "tempfile",
  "thiserror 2.0.21",
  "tracing",
  "zeroize",
