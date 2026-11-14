@@ -453,6 +453,16 @@ fn scrub_file_removes_secrets_and_keeps_the_rest() {
             .unwrap()
             .contains("Hunter2-Secret")
     );
+    // Follow-up review N-3: a newer or unversioned file is never rewritten.
+    for content in [
+        &br#"{ "schema_version": 4, "password": "Hunter2-Secret", "items": [] }"#[..],
+        br#"{ "password": "Hunter2-Secret", "items": [] }"#,
+        br#"{ "schema_version": 0, "password": "Hunter2-Secret", "items": [] }"#,
+    ] {
+        fs::write(&path, content).unwrap();
+        assert!(!document::scrub_file::<Sample>(&path).unwrap());
+        assert_eq!(fs::read(&path).unwrap(), content);
+    }
     // Missing or unparsable files are left alone.
     assert!(!document::scrub_file::<Sample>(&tmp.path().join("absent.json")).unwrap());
     fs::write(&path, b"{ broken").unwrap();
@@ -494,4 +504,20 @@ fn clean_file_is_not_rewritten_on_load() {
     let before = fs::metadata(&path).unwrap().ino();
     document::load::<Sample>(&path).unwrap().unwrap();
     assert_eq!(fs::metadata(&path).unwrap().ino(), before);
+}
+
+/// A duplicate JSON key hides its first value from the parser but not from the disk: the file is
+/// rewritten at once on load.
+#[test]
+fn duplicate_json_keys_are_rewritten_on_load() {
+    let tmp = tempfile::tempdir().unwrap();
+    let path = tmp.path().join("sample.json");
+    let content = br#"{ "schema_version": 3, "token": "Hunter2-Secret", "token": "",
+        "items": [ { "hostname": "h", "endpoint": { "port": 1 } } ] }"#;
+    fs::write(&path, content).unwrap();
+    let loaded = document::load::<Sample>(&path).unwrap().unwrap();
+    assert!(loaded.secret_like_keys.is_empty());
+    let text = fs::read_to_string(&path).unwrap();
+    assert!(!text.contains("Hunter2-Secret"), "{text}");
+    assert!(text.contains("\"hostname\": \"h\""), "{text}");
 }

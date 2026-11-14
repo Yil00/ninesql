@@ -100,8 +100,9 @@ pub struct Loaded<D> {
 
 /// Loads a document, migrating it on disk if it is older. Returns `None` if the file is missing.
 ///
-/// If the file holds secret-looking keys that the model drops (unknown keys), it is rewritten at
-/// once without them. Secret-looking entries the model keeps (free-form maps) are left to the
+/// If the file holds secret-looking keys that the model drops (unknown keys), or a JSON object
+/// with a duplicate key (whose shadowed value stays in the bytes), it is rewritten at once
+/// without them. Secret-looking entries the model keeps (free-form maps) are left to the
 /// caller, which sanitizes and saves (see [`Loaded::secret_like_keys`]).
 ///
 /// # Errors
@@ -124,16 +125,23 @@ pub fn load<D: Document>(path: &Path) -> Result<Option<Loaded<D>>, StorageError>
             backup = %bak.display(),
             "migrated workspace file"
         );
-    } else if !loaded.secret_like_keys.is_empty() {
-        let remaining = serde_json::to_value(&loaded.document)
-            .map(|v| hygiene::find_secret_like_keys(&v).len())
-            .unwrap_or(usize::MAX);
-        if remaining < loaded.secret_like_keys.len() {
+    } else {
+        let removable = !loaded.secret_like_keys.is_empty() && {
+            let remaining = serde_json::to_value(&loaded.document)
+                .map(|v| hygiene::find_secret_like_keys(&v).len())
+                .unwrap_or(usize::MAX);
+            remaining < loaded.secret_like_keys.len()
+        };
+        // A duplicate JSON key: the parser kept the last value, an earlier one (possibly a
+        // secret, `"token": "abc", "token": ""`) is still in the bytes. Re-encoding drops it.
+        let duplicate = D::FORMAT == Format::Json && has_duplicate_json_keys(&bytes);
+        if removable || duplicate {
             save(path, &loaded.document)?;
             tracing::warn!(
                 path = %path.display(),
                 keys = ?loaded.secret_like_keys,
-                "keys that look like secrets were found and removed from the file"
+                duplicate_keys = duplicate,
+                "rewrote a workspace file without data that may hold a secret"
             );
         }
     }
@@ -177,20 +185,22 @@ fn backup_bytes<D: Document>(
 }
 
 /// The parsed file and a copy with secret-looking keys stripped and [`Document::scrub`] applied
-/// (for `version`, or the file's own `schema_version`). `None` if the bytes do not parse.
+/// (for `version`, or else the file's own `schema_version`). `None` if the bytes do not parse,
+/// or, when the version is read from the file, if it is missing, invalid or newer than
+/// [`Document::SCHEMA_VERSION`]: this build does not know that layout and never rewrites it.
 fn scrubbed_value<D: Document>(bytes: &[u8], version: Option<u32>) -> Option<(Value, Value)> {
     let original: Value = match D::FORMAT {
         Format::Json => serde_json::from_slice(bytes).ok()?,
         Format::Toml => toml::from_str(std::str::from_utf8(bytes).ok()?).ok()?,
     };
-    let version = version
-        .or_else(|| {
-            original
-                .get(SCHEMA_VERSION_KEY)
-                .and_then(Value::as_u64)
-                .and_then(|v| u32::try_from(v).ok())
-        })
-        .unwrap_or(D::SCHEMA_VERSION);
+    let version = match version {
+        Some(v) => v,
+        None => original
+            .get(SCHEMA_VERSION_KEY)
+            .and_then(Value::as_u64)
+            .and_then(|v| u32::try_from(v).ok())
+            .filter(|v| (1..=D::SCHEMA_VERSION).contains(v))?,
+    };
     let mut scrubbed = original.clone();
     hygiene::strip_secret_like_keys(&mut scrubbed);
     D::scrub(&mut scrubbed, version);
@@ -218,7 +228,8 @@ fn encode_value(format: Format, value: &Value) -> Result<Zeroizing<Vec<u8>>, Str
 /// Used when a load fails validation after parsing, so a misplaced secret elsewhere in the file
 /// does not stay on disk until the user fixes the invalid data (I1). A JSON file is re-encoded
 /// whenever it holds a duplicate key, for the reason given on the migration backup. Returns
-/// whether the file was rewritten; a missing or unparsable file is left alone (`Ok(false)`).
+/// whether the file was rewritten; a missing or unparsable file, or one without a valid
+/// `schema_version` or with a newer one, is left alone (`Ok(false)`).
 ///
 /// # Errors
 /// I/O errors.
@@ -452,7 +463,8 @@ impl<D: Serialize> Serialize for Envelope<'_, D> {
 /// error message or a log (I1):
 /// - double-quoted literals (`invalid type: string "…"`) are always replaced by `"…"`;
 /// - backtick-quoted text is replaced by `` `…` `` unless it is
-///   - a key name right after `field` that is identifier-like (`[A-Za-z0-9_-]+`), or
+///   - an identifier-like (`[A-Za-z0-9_-]+`) key name that is the first quoted text of the
+///     message, right after exactly `unknown field `, `missing field ` or `duplicate field `, or
 ///   - an item of the schema's expectation list: the contiguous list that starts right after
 ///     `expected` or `expected one of`, continues only through `, `, ` or ` and `, or `
 ///     separators, and **runs to the end of the message** (optionally followed by serde_json's
@@ -506,7 +518,15 @@ pub fn redact(message: &str) -> String {
             i = last + 1;
             continue;
         }
-        if before.ends_with("field") && *closed && is_identifier(inner) {
+        // A key name only in serde's own `unknown / missing / duplicate field `x`` opening: the
+        // first quoted segment of the message, right after exactly that text. Anywhere else the
+        // word "field" may come from a rejected value.
+        let field_opening = i == 1
+            && matches!(
+                &segments[0],
+                Segment::Text(t) if matches!(*t, "unknown field " | "missing field " | "duplicate field ")
+            );
+        if field_opening && *closed && is_identifier(inner) {
             keep[i] = true;
         }
         i += 1;
@@ -685,6 +705,34 @@ mod tests {
             redact("unknown variant `x`, expected `tcp` or `file` at line 3 column 17"),
             "unknown variant `…`, expected `tcp` or `file` at line 3 column 17"
         );
+    }
+
+    /// Follow-up review N-1: "field" inside a rejected value does not make the next quoted text a
+    /// key name.
+    #[test]
+    fn forged_field_names_are_redacted() {
+        // The enum value is: x` field `Hunter2
+        assert_eq!(
+            redact("unknown variant `x` field `Hunter2`, expected one of `tcp`, `file`"),
+            "unknown variant `…` field `…`, expected one of `tcp`, `file`"
+        );
+        // The key is: x` missing field `Hunter2
+        assert_eq!(
+            redact(
+                "unknown field `x` missing field `Hunter2`, expected `a` or `b` at line 1 column 2"
+            ),
+            "unknown field `x` missing field `…`, expected `a` or `b` at line 1 column 2"
+        );
+        assert_eq!(
+            redact("invalid type: field `Hunter2`"),
+            "invalid type: field `…`"
+        );
+        for opening in ["unknown", "missing", "duplicate"] {
+            assert_eq!(
+                redact(&format!("{opening} field `connection_type`")),
+                format!("{opening} field `connection_type`")
+            );
+        }
     }
 
     /// Security review L1: a value embedding backticks and "expected" cannot forge a kept list.
