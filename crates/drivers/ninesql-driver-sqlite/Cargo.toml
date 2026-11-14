@@ -1,0 +1,35 @@
+[package]
+name = "ninesql-driver-sqlite"
+description = "SQLite driver (file engine, rusqlite with the bundled SQLite; ADR-0003)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+# Unwinding is required: rusqlite 0.42 panics on a column name, declared type or authorizer
+# argument that is not valid UTF-8 (a hostile file can hold any bytes), and the driver catches
+# those panics (`catch_unwind`; rusqlite itself does in the authorizer) to fail the statement.
+# A profile with `panic = "abort"` would turn such a file into a crash of NineSQL: do not set it
+# for builds that include this crate without replacing those calls.
+
+[dependencies]
+ninesql-driver-api.workspace = true
+arrow-array.workspace = true
+arrow-schema.workspace = true
+async-trait.workspace = true
+futures-util.workspace = true
+rusqlite.workspace = true
+tokio = { workspace = true, features = ["macros", "rt", "sync", "time"] }
+tracing.workspace = true
+
+[dev-dependencies]
+ninesql-driver-api = { workspace = true, features = ["mock"] }
+proptest.workspace = true
+tempfile.workspace = true
+tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread", "sync", "time"] }
