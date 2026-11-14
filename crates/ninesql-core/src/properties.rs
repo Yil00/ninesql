@@ -118,10 +118,10 @@ pub fn value_carries_secret(value: &str) -> bool {
     while let Some(pos) = rest.find("://") {
         let after = &rest[pos + 3..];
         let authority = after.split(['/', '?', '#']).next().unwrap_or_default();
-        if let Some(at) = authority.rfind('@') {
-            if authority[..at].contains(':') {
-                return true;
-            }
+        if let Some(at) = authority.rfind('@')
+            && authority[..at].contains(':')
+        {
+            return true;
         }
         rest = after;
     }

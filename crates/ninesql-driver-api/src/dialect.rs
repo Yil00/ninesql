@@ -375,10 +375,10 @@ fn skip_quoted(bytes: &[u8], start: usize, quote: u8, backslash: bool) -> usize 
 /// If a dollar-quote tag starts at `start`, returns the tag length (including both `$`).
 fn dollar_tag(bytes: &[u8], start: usize) -> Option<usize> {
     let mut i = start + 1;
-    if let Some(&b) = bytes.get(i) {
-        if b.is_ascii_digit() {
-            return None;
-        }
+    if let Some(&b) = bytes.get(i)
+        && b.is_ascii_digit()
+    {
+        return None;
     }
     while let Some(&b) = bytes.get(i) {
         if b == b'$' {
@@ -886,12 +886,12 @@ fn classify_set_target(first: &str, seg: &[Located]) -> StatementClass {
             return StatementClass::Session;
         }
         i = 2;
-        if let (Some(scope), Some(dot)) = (seg.get(i), seg.get(i + 1)) {
-            if dot.item == Item::Punct(b'.') {
-                match word(scope) {
-                    Some("SESSION" | "LOCAL") => i += 2,
-                    _ => return StatementClass::ChangesAccessMode,
-                }
+        if let (Some(scope), Some(dot)) = (seg.get(i), seg.get(i + 1))
+            && dot.item == Item::Punct(b'.')
+        {
+            match word(scope) {
+                Some("SESSION" | "LOCAL") => i += 2,
+                _ => return StatementClass::ChangesAccessMode,
             }
         }
     } else {

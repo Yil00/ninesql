@@ -637,10 +637,9 @@ impl Connection {
             passphrase: Some(secret),
             ..
         }) = &self.tls.client_certificate
+            && let Some(r) = secret.stored()
         {
-            if let Some(r) = secret.stored() {
-                refs.push((SecretSlot::TlsClientKey, SecretKind::ClientKeyPassphrase, r));
-            }
+            refs.push((SecretSlot::TlsClientKey, SecretKind::ClientKeyPassphrase, r));
         }
         refs
     }
