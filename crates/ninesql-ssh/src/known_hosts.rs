@@ -42,8 +42,14 @@ pub const DEFAULT_SSH_PORT: u16 = 22;
 /// (`Paths::lock_file()` next to `Paths::known_hosts_file()`, both in `$XDG_DATA_HOME/ninesql`).
 const LOCK_FILE_NAME: &str = "ninesql.lock";
 
-/// How long a write waits for another NineSQL process to release the workspace lock (another
-/// process writing its own `known_hosts` entry holds it for milliseconds) before failing.
+/// How long a write waits for another process to release the workspace lock before failing.
+///
+/// Under ADR-0017 a NineSQL process with an open workspace holds this lock for its whole
+/// lifetime, so the wait never helps against such a process: its write fails after the wait, as
+/// it must. It only covers holders that take the lock briefly, i.e. a `KnownHosts` writer in a
+/// process without an open workspace (tools, tests, a start-up path before the workspace opens),
+/// which would otherwise fail on a lock held for a few milliseconds. The wait runs on a blocking
+/// thread and is short, so it is kept.
 const LOCK_WAIT: Duration = Duration::from_secs(2);
 
 /// Pause between two attempts to take the workspace lock.
@@ -537,8 +543,9 @@ impl KnownHosts {
     /// A process that already holds the workspace lock (the core keeps it for the whole
     /// session) shares it: [`ninesql_storage::DirLock::acquire`] returns the held lock, so this
     /// never deadlocks against its own process. Within one process, writers are serialized by
-    /// a process-wide mutex taken first. Another NineSQL process holding the lock is waited for
-    /// at most [`LOCK_WAIT`] (blocking: callers are on a blocking thread), then is an error.
+    /// a process-wide mutex taken first. Another process holding the lock is waited for at most
+    /// [`LOCK_WAIT`] (blocking: callers are on a blocking thread), then is an error; another
+    /// NineSQL with an open workspace holds it for its lifetime, so that write fails.
     fn lock_own(&self) -> Result<WriteGuard, SshError> {
         let process = WRITERS.lock().unwrap_or_else(PoisonError::into_inner);
         let dir = match self.own_path.parent() {
@@ -567,9 +574,10 @@ impl KnownHosts {
     /// Adds a key for `host:port` to NineSQL's file after the user confirmed it (or under the
     /// explicit accept-new policy). The read-modify-write runs under the workspace lock
     /// (`ninesql_storage::DirLock` on `Paths::lock_file()`, shared with the core if this process
-    /// already holds it, waited for at most 2 s when another process holds it), so two NineSQL
-    /// processes cannot drop each other's additions; the file is re-read first so earlier
-    /// additions are kept, then rewritten atomically with mode `0600`. Adding a key that is already present for the
+    /// already holds it, waited for at most 2 s when another process holds it), so two writers
+    /// cannot drop each other's additions; both files are re-read first, so earlier additions
+    /// are kept and a key `@revoked` meanwhile in either file is honoured, then NineSQL's file is
+    /// rewritten atomically with mode `0600`. Adding a key that is already present for the
     /// host is a no-op. Refuses to add a key if the host has another supported key on file:
     /// a changed key must be removed explicitly first ([`KnownHosts::remove_host`], ADR-0011 §6).
     ///
@@ -590,6 +598,9 @@ impl KnownHosts {
         }
         let _lock = self.lock_own()?;
         self.own = read_own(&self.own_path)?;
+        if let Some(user_path) = &self.user_path {
+            self.user = read_user(user_path)?;
+        }
         match self.check(host, port, key_blob) {
             HostKeyStatus::Known { .. } => return Ok(()),
             HostKeyStatus::Changed {
@@ -1078,9 +1089,14 @@ mod tests {
         let before = std::fs::read_to_string(&own).unwrap();
         let other: File = OpenOptions::new().read(true).open(&lock_path).unwrap();
         other.try_lock().unwrap();
+        let started = std::time::Instant::now();
         let err = kh
             .add("c.example.test", 22, "ssh-ed25519", &blob(K2))
             .unwrap_err();
+        assert!(
+            started.elapsed() >= LOCK_WAIT,
+            "waited for the other holder first"
+        );
         assert!(
             matches!(&err, SshError::KnownHosts(m) if m.contains("locked")),
             "{err:?}"
@@ -1094,6 +1110,22 @@ mod tests {
         kh.add("c.example.test", 22, "ssh-ed25519", &blob(K2))
             .unwrap();
         assert_eq!(std::fs::read_to_string(&own).unwrap().lines().count(), 2);
+    }
+
+    #[test]
+    fn add_honours_a_key_revoked_in_the_user_file_after_load() {
+        let dir = tempfile::tempdir().unwrap();
+        let own = dir.path().join("ninesql").join("known_hosts");
+        let user = dir.path().join("user_known_hosts");
+        std::fs::write(&user, "# empty\n").unwrap();
+        let mut kh = KnownHosts::load(&own, Some(&user)).unwrap();
+        // The user revokes the key after NineSQL loaded the files.
+        std::fs::write(&user, format!("@revoked * ssh-ed25519 {K1}\n")).unwrap();
+        assert!(matches!(
+            kh.add("db.example.test", 22, "ssh-ed25519", &blob(K1)),
+            Err(SshError::HostKeyRevoked { .. })
+        ));
+        assert!(!own.exists() || std::fs::read_to_string(&own).unwrap().is_empty());
     }
 
     #[test]
