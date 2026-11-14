@@ -32,7 +32,7 @@ ninesql-ui ──► ninesql-grid, ninesql-editor ──► ninesql-core ──�
 ```
 - UI crates never depend on a driver crate directly: `ninesql-core` registers drivers and exposes services.
 - Drivers depend only on `ninesql-driver-api` (and their client crates). They never read workspace files or secrets; they receive resolved parameters.
-- `ninesql-dbeaver` produces model values; `ninesql-core` persists them and moves secrets.
+- `ninesql-dbeaver` does not depend on `ninesql-core` (the core depends on it). It outputs a **mirror** of the core connection model, with the decrypted secrets in zeroized buffers; `ninesql-core` converts that model, runs its own validation, persists the connections and moves the secrets to `ninesql-secrets` (P2-C).
 
 ## Threads and data flow
 ```
@@ -54,7 +54,10 @@ grid entity  ◄── channel ◄─────────────┘   s
 4. The UI enables actions from the capabilities (I8).
 
 ## Storage
-See [ADR-0008](adr/0008-workspace-and-config-storage.md): settings in `$XDG_CONFIG_HOME/ninesql`, projects in `$XDG_DATA_HOME/ninesql/workspace`, history and logs in `$XDG_STATE_HOME/ninesql`. No secrets in any of them.
+See [ADR-0008](adr/0008-workspace-and-config-storage.md): settings in `$XDG_CONFIG_HOME/ninesql`, projects in `$XDG_DATA_HOME/ninesql/workspace`, history and logs in `$XDG_STATE_HOME/ninesql`. No secrets in any of them. Proposed amendments in [ADR-0017](adr/0017-workspace-lock-rewrite-on-load-and-project-identity.md):
+- **Single writer**: an open workspace holds an exclusive lock on `$XDG_DATA_HOME/ninesql/ninesql.lock`, released by the kernel when the process ends. A second NineSQL process is refused; a file system without locks is refused with an explanation.
+- **Rewrite on load**: a secret-looking value found in a workspace file is removed and the file is rewritten at once, atomically; migration backups (`.bak`) are built from the scrubbed content.
+- **Project id**: `project.json` (schema version 2) carries a stable UUID, which scopes the project's Secret Service items, so renaming a project keeps its secrets.
 
 ## Error handling and logging
 - Typed errors per crate (`thiserror`), mapped by `ninesql-core` to user-facing messages with an optional technical detail panel.

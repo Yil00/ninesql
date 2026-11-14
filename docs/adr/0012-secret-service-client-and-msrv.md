@@ -1,6 +1,6 @@
 # ADR-0012: Secret Service client crate and minimum Rust version
 
-- **Status**: Accepted (maintainer, 2026-11-14). Partially supersedes [ADR-0005](0005-secrets-storage.md): only the choice of the Rust crate that talks to the Secret Service; every other point of ADR-0005 stands.
+- **Status**: Accepted (maintainer, 2026-11-14). Partially supersedes [ADR-0005](0005-secrets-storage.md): only the choice of the Rust crate that talks to the Secret Service; every other point of ADR-0005 stands. Item attributes (§4) partially amended by [ADR-0017](0017-workspace-lock-rewrite-on-load-and-project-identity.md) (proposed): items also carry `xdg:schema = org.ninesql.Secret` and `project` = the project UUID from `project.json`.
 - **Date**: 2026-11-14
 
 ## Context

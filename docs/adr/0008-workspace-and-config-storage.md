@@ -1,6 +1,6 @@
 # ADR-0008: Workspace and configuration storage
 
-- **Status**: Accepted
+- **Status**: Accepted. Partially amended by [ADR-0017](0017-workspace-lock-rewrite-on-load-and-project-identity.md) (proposed): workspace lock, rewrite on load, scrubbed migration backups, project id in `project.json`.
 - **Date**: 2026-11-14
 
 ## Context
