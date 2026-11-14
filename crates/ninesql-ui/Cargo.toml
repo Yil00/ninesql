@@ -40,3 +40,8 @@ gpui-pre = { workspace = true, features = ["test-support"] }
 tempfile.workspace = true
 # Regression test of the patched X11 IME decoder ([patch.crates-io] in the root Cargo.toml).
 xim-ctext = { version = "=0.3.0", default-features = false }
+
+# Anchors GPUI's XIM client to the patched release: GPUI asks for `^0.4.0-zed`, so without this exact
+# requirement a newer 0.4.x from crates.io could replace the patched copy on `cargo update`.
+[target.'cfg(any(target_os = "linux", target_os = "freebsd"))'.dev-dependencies]
+zed-xim = { version = "=0.4.0-zed", default-features = false }

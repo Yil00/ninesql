@@ -650,3 +650,38 @@ fn x11_ime_compound_text_decodes_without_error() {
     assert_eq!(decode(b"\x1b$)C\xb0\xa1").as_deref(), Some("가"));
     assert_eq!(decode(b"\x1b%G").as_deref(), Some(""));
 }
+
+/// GPUI's XIM client and its decoder resolve to NineSQL's patched copies under `crates/patches/`
+/// (path sources in Cargo.lock, no registry `source`), at the exact versions the patch was made
+/// from. Fails if a `cargo update` or a GPUI bump lets a crates.io release bypass the patch.
+#[cfg(any(target_os = "linux", target_os = "freebsd"))]
+#[test]
+fn x11_ime_crates_resolve_to_the_patched_copies() {
+    use zed_xim as _;
+
+    let lock_path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../Cargo.lock");
+    let lock = std::fs::read_to_string(lock_path)
+        .unwrap_or_else(|e| panic!("cannot read the workspace Cargo.lock: {e}"));
+    for (name, version) in [("xim-ctext", "0.3.0"), ("zed-xim", "0.4.0-zed")] {
+        let entries: Vec<&str> = lock
+            .split("[[package]]")
+            .filter(|entry| entry.lines().any(|l| l == format!("name = \"{name}\"")))
+            .collect();
+        assert_eq!(
+            entries.len(),
+            1,
+            "{name}: exactly one version in Cargo.lock"
+        );
+        let entry = entries[0];
+        assert!(
+            entry
+                .lines()
+                .any(|l| l == format!("version = \"{version}\"")),
+            "{name}: Cargo.lock must keep {version}, the version patched under crates/patches/"
+        );
+        assert!(
+            !entry.lines().any(|l| l.starts_with("source = ")),
+            "{name}: Cargo.lock resolves it from a registry, so the patch is not applied"
+        );
+    }
+}
