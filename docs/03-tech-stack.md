@@ -4,14 +4,14 @@ Starting choices. Driver client crates are confirmed (or replaced) by their driv
 
 | Area | Choice | Notes |
 |---|---|---|
-| Language | Rust stable, edition 2024 | `rust-toolchain.toml` |
-| UI | `gpui` (git revision of `zed-industries/zed`), `gpui-component` (matching revision) | ADR-0001; never Zed's GPL crates |
+| Language | Rust stable, edition 2024, minimum 1.89 | `rust-toolchain.toml`; `rust-version` in the root `Cargo.toml` ([ADR-0012](adr/0012-secret-service-client-and-msrv.md)) |
+| UI | GPUI and `gpui-component` from crates.io through `gpui-kit` (exact pin; GPUI is the `gpui-pre` snapshot of `zed-industries/zed`) | ADR-0001, [ADR-0013](adr/0013-gpui-source-and-supply-chain.md) (supply-chain controls); never Zed's GPL crates |
 | Syntax | `tree-sitter` + SQL grammars per dialect | Completion from our own metadata cache |
 | Async runtime | `tokio` (multi-thread, bounded workers) for driver and network I/O | ADR-0004 |
 | Results | `arrow-array`, `arrow-schema` (not the full `arrow` crate) | Tabular batches; documents as an ordered value tree |
 | TLS | `rustls`, `rustls-platform-verifier` / `rustls-native-certs` | No OpenSSL (ADR-0011) |
 | SSH | `russh`, `russh-keys` | Jump hosts, agent, known_hosts |
-| Secrets | `keyring` (Secret Service, pure-Rust D-Bus backend), `argon2`, `chacha20poly1305`, `secrecy`, `zeroize` | ADR-0005 |
+| Secrets | `secret-service` 6 (pure Rust, `zbus` 6, no `libsecret` / `libdbus` / OpenSSL; pinned `=6.0.0-rc.1` until 6.x is stable) instead of `keyring`, `argon2`, `chacha20poly1305`, `secrecy`, `zeroize` | ADR-0005, [ADR-0012](adr/0012-secret-service-client-and-msrv.md) |
 | Storage | `serde`, `serde_json`, `toml`, `directories` (XDG), `rusqlite` for history | ADR-0008 |
 | HTTP (for HTTP-based engines) | `reqwest` with `rustls-tls`, no default features | ClickHouse, Trino, InfluxDB, Elasticsearch / OpenSearch |
 | Export formats | `csv`, `serde_json`, `parquet` (phase 10), `rust_xlsxwriter` (phase 10) | Streamed |

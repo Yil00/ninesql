@@ -1,6 +1,6 @@
 # ADR-0001: Native stack – Rust and GPUI
 
-- **Status**: Accepted
+- **Status**: Accepted. Partially superseded by [ADR-0013](0013-gpui-source-and-supply-chain.md) for Decision §2 (GPUI and `gpui-component` now come from crates.io through `gpui-kit` / `gpui-pre`, under supply-chain controls).
 - **Date**: 2026-11-14
 
 ## Context

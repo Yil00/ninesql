@@ -15,7 +15,9 @@ Ubuntu 22.04 support depends on the GPUI spike (P0-A): GPUI's Vulkan and Wayland
 - A Secret Service provider (GNOME Keyring, KWallet ≥ 5.97 with Secret Service, KeePassXC) for saved passwords; otherwise NineSQL uses its encrypted vault.
 
 ## Build requirements (Debian / Ubuntu)
-The exact list is finalized in P0-A. Starting point for GPUI on Linux:
+Rust **1.89 or newer**, installed with `rustup` (the repository pins the `stable` channel in `rust-toolchain.toml`; 1.89 is the floor, [ADR-0012](adr/0012-secret-service-client-and-msrv.md)). The default `rustc` package of Debian 12 and Ubuntu 24.04 is older than that and cannot build NineSQL. This does not affect them as release targets: the `.deb` is built in CI with stable Rust and the Flatpak with the Flatpak Rust SDK extension, so users need no Rust toolchain.
+
+System packages: the exact list is finalized in P0-A. Starting point for GPUI on Linux:
 ```bash
 sudo apt install build-essential pkg-config clang cmake libvulkan-dev libwayland-dev libxkbcommon-dev libxkbcommon-x11-dev libx11-xcb-dev libxcb1-dev libfontconfig-dev libfreetype-dev libzstd-dev libasound2-dev
 ```
