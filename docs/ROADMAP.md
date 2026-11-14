@@ -33,7 +33,7 @@ P0-A and P0-B gate phase 1. P2 (interop) only depends on P0-D and runs in parall
 **Exit status** (2026-11-14): the driver API is frozen. Not met yet: real-GPU measurements of the spike (only software-rendered numbers exist) and a green run of the dev-environment CI job. Phase 1 starts in parallel; both items stay open above.
 
 ### Phase 0 follow-ups
-Items deferred by the phase 0 security reviews and spikes. The detail of each review item is in the review comments of its task; the deadline is when the item must have landed.
+Items deferred by the phase 0 security reviews and spikes. The deadline is when the item must have landed.
 
 | Origin | Item | Must land |
 |---|---|---|
@@ -41,16 +41,19 @@ Items deferred by the phase 0 security reviews and spikes. The detail of each re
 | P0-A | Patch the X11 IME crash (`xim-ctext` / `zed-xim`, `[patch.crates-io]` under ADR-0013's rules) and report it upstream | P1 (P1-A) |
 | P0-A | Test accessibility with Orca | Before P6 |
 | P0-A | Trim the build packages of `docs/10-supported-platforms.md`; check Ubuntu 22.04 and Debian 12 builds and Vulkan adapters | P1 |
-| P0-B review | M6: cancel races | Before the first P1 driver (P1-B) |
-| P0-B review | L1, L2, L3, L4, L5 | Before the first P1 driver (P1-B) |
-| P0-B review | F1, F2, F4, F5, F7 | Before the first P1 driver (P1-B) |
+| P0-B review | M6: cancel races. Keep the session busy until the server confirms the cancelled statement ended, and scope cancel handles to one execution so a late or stale cancel cannot hit the next statement | Before the first P1 driver (P1-B) |
+| P0-B review | L1: one SSH host-key policy covers every hop; document it as the weakest across hops or store one per hop. L2: the timeout is only checked while the consumer polls; add a watchdog or document it. L3: a sliced batch keeps the whole buffer alive while only the slice is counted | Before the first P1 driver (P1-B) |
+| P0-B review | L4: calls with side effects (`dblink_exec`, user functions) classify as `Read`; document the limit. L5: declare per driver whether the secret is retained for reconnects; the metadata connection applies the same TLS and read-only settings; bind `PageRequest.filter` | Before the first P1 driver (P1-B) |
+| P0-B review | F1: decode or classify `U&"…"` Unicode-escaped identifiers. F2: extend the side-effect function list (replication slots, `pg_stat_reset*`, `pg_backup_*`…). F4: a truncation flag for document values. F5: a per-row size bound and counting `ResultSet` headers in the budget. F7: redact SQL-form secrets (`PASSWORD '…'`, `IDENTIFIED BY`), `user:pass@host` without a scheme, `-p secret` | Before the first P1 driver (P1-B) |
+| P0-B review | Conformance helpers still missing: verify-full rejects an untrusted certificate, batches stay within `max_batch_bytes` / `max_value_bytes`, per-driver identifier quoting; make `WRITES` engine-neutral. `Document` is still exhaustive with public fields | Before the first P1 driver (P1-B) |
 | P0-B | Per-engine SQL that lifts read-only (liftable mechanisms), with tests | P1-B, per engine |
 | P0-C | Commit a fix for the YugabyteDB / Elasticsearch disk requirement, re-run the heavy profile whole, first green `dev-env.yml` run | Before the first P1 driver integration test in CI |
 | P0-C | Build the wide table of the "nine" dataset (ADR-0009) | Before P3-B grid work relies on it |
 | P0-D | Secret Service round trip on GNOME Keyring and KWallet, Debian 12 and Ubuntu 24.04 ([ADR-0012](adr/0012-secret-service-client-and-msrv.md)) | Before P1-D ships the Secret Service backend |
-| P0-D review | N1, N3, N4, N6, N7.2, N7.4 | Before P1-D |
-| P0-D review | L2, L5, L6, L8 | Before P1-D |
-| P0-D review | L-A (`gsslib`), L-B (ambiguous duplicate), L-C | Before P1-D |
+| P0-D review | N1: the redaction rule keeps any backtick text after "expected"; restrict it to the list right after `expected` / `expected one of`. N3: secret detection misses Go DSNs without a scheme, `token=` / `apikey=` / `secret=` pairs and more SQL forms (`SET PASSWORD = PASSWORD(…)`, `ALTER LOGIN … WITH PASSWORD = N'…'`, `IDENTIFIED WITH … BY`) | Before P1-D |
+| P0-D review | N6: keyring items are keyed by the mutable project name; use a stable project UUID from `project.json`. N7.2: when a plaintext secret is found on load, rewrite the file at once instead of waiting for the next save. N7.4: zeroize dropped property values | Before P1-D |
+| P0-D review | L2: check workspace directory ownership (`ensure_private_dir` still follows directory symlinks). L5: review the `secret-service` 6.0.0-rc.1 internals (key material not zeroized) before the feature is on by default. L6: characters that matter in DSNs are allowed in host / user / database; drivers must pass structured config (contract). L8: lock against two NineSQL processes writing the workspace | Before P1-D |
+| P0-D review | L-B: a stale duplicate that cannot be deleted makes `get` return `Ambiguous`; prefer the default-collection item and skip the prune if the created path is not among the matches. L-C: value-shape checks for allowlisted keys. Remove `PENDING_RESERVED_KEYS` in `ninesql-core` now that the driver API reserves `gssencmode` | Before P1-D |
 | P0-D review | Scrub secret-looking values (not only keys) from the `.bak` written by a migration | Before the first workspace schema bump |
 | ADR-0012 | Move `secret-service` from `=6.0.0-rc.1` to a stable 6.x; revisit the `ctutils` lock (RUSTSEC-2026-0385) | Stable release available; checked at each phase-end review |
 | ADR-0013 | `cargo vet` or a checked-in audit log | Before `gpui-kit` becomes a normal dependency in P1 |
