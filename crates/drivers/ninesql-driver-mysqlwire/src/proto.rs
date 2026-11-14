@@ -102,11 +102,33 @@ impl Packets {
         }
     }
 
-    /// Writes a secret-bearing payload and zeroes the caller's buffer afterwards.
+    /// Writes a secret-bearing payload and zeroes the caller's buffer afterwards. The frame is
+    /// built in a zeroized buffer and written straight to the transport, after a flush, so no
+    /// copy stays in the (not zeroized) write buffer of the `BufStream`.
     pub(crate) async fn write_secret(&mut self, payload: &mut [u8]) -> DriverResult<()> {
-        let r = self.write_payload(payload).await;
+        let r = self.write_secret_frame(payload).await;
         zeroize::Zeroize::zeroize(payload);
         r
+    }
+
+    async fn write_secret_frame(&mut self, payload: &[u8]) -> DriverResult<()> {
+        if payload.len() >= MAX_PACKET {
+            return Err(proto("authentication packet too large"));
+        }
+        self.io.flush().await.map_err(io_err)?;
+        let n = payload.len();
+        let mut frame = zeroize::Zeroizing::new(Vec::with_capacity(n + 4));
+        frame.extend_from_slice(&[
+            (n & 0xff) as u8,
+            ((n >> 8) & 0xff) as u8,
+            ((n >> 16) & 0xff) as u8,
+            self.seq,
+        ]);
+        frame.extend_from_slice(payload);
+        self.seq = self.seq.wrapping_add(1);
+        let inner = self.io.get_mut();
+        inner.write_all(&frame).await.map_err(io_err)?;
+        inner.flush().await.map_err(io_err)
     }
 
     /// Shuts the transport down (best effort).

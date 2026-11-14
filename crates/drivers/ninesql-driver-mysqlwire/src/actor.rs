@@ -44,6 +44,9 @@ pub const PAUSED_RESULT_TIMEOUT: Duration = Duration::from_secs(300);
 /// drain, before the session is closed.
 const DROP_GRACE: Duration = SERVER_CANCEL_GRACE;
 
+/// Bound on one driver statement (transaction control, settings, metadata, read-back).
+pub(crate) const INTERNAL_TIMEOUT: Duration = Duration::from_secs(60);
+
 /// Most server warnings turned into notices per statement.
 const MAX_WARNINGS: usize = 1000;
 
@@ -301,11 +304,13 @@ impl Actor {
                     let _ = reply.send(result);
                 }
                 Command::Ping { guard, reply } => {
-                    let result = match self.conn.ping().await {
-                        Ok(Ok(())) => Ok(()),
-                        Ok(Err(e)) => Err(statement_error(&e, false)),
-                        Err(e) => Err(e),
-                    };
+                    let result =
+                        match tokio::time::timeout(INTERNAL_TIMEOUT, self.conn.ping()).await {
+                            Ok(Ok(Ok(()))) => Ok(()),
+                            Ok(Ok(Err(e))) => Err(statement_error(&e, false)),
+                            Ok(Err(e)) => Err(e),
+                            Err(_) => Err(DriverError::Closed("ping timed out".into())),
+                        };
                     self.sync_status();
                     if let Err(e) = &result {
                         self.note_fatal(e);
@@ -347,9 +352,19 @@ impl Actor {
             .store(status & STATUS_NO_BACKSLASH_ESCAPES != 0, Ordering::SeqCst);
     }
 
-    /// Runs a driver statement and returns its rows as text.
+    /// Runs a driver statement and returns its rows as text, bounded by
+    /// [`INTERNAL_TIMEOUT`]: past it the connection is out of sync and the session is closed.
     pub(crate) async fn internal(&mut self, sql: &str) -> DriverResult<Rows> {
-        let r = self.conn.query(sql).await;
+        let r = match tokio::time::timeout(INTERNAL_TIMEOUT, self.conn.query(sql)).await {
+            Ok(r) => r,
+            Err(_) => {
+                self.close_session("driver statement timed out");
+                return Err(DriverError::Closed(format!(
+                    "a driver statement did not finish within {INTERNAL_TIMEOUT:?}; the session \
+                     was closed"
+                )));
+            }
+        };
         self.sync_status();
         match r? {
             Ok(rows) => Ok(rows.rows),
@@ -413,6 +428,26 @@ impl Actor {
                 "a statement turned the session's read-only mode off; the session was closed"
                     .into(),
             ));
+        }
+        if read_only {
+            // `SET TRANSACTION … READ WRITE` (no SESSION) only changes the *next* transaction
+            // and leaves `transaction_read_only` at 1, so the read-back cannot see it.
+            // Re-asserting the session characteristic resets that pending one-shot mode, on
+            // MySQL and MariaDB, inside an open transaction too.
+            let sql = "SET SESSION TRANSACTION READ ONLY";
+            let mut r = self.internal(sql).await;
+            if matches!(&r, Err(DriverError::Query { code: Some(c), .. }) if c == "1317") {
+                r = self.internal(sql).await;
+            }
+            if let Err(e) = r {
+                tracing::warn!(error = ?std::mem::discriminant(&e), "read-only re-assert failed");
+                self.close_session("read-only mode could not be re-asserted");
+                return Err(DriverError::Closed(
+                    "the read-only mode could not be re-asserted after the statement; the \
+                     session was closed"
+                        .into(),
+                ));
+            }
         }
         Ok(())
     }
@@ -531,7 +566,7 @@ impl Actor {
             };
             let status = match head {
                 Head::Ok(ok) => {
-                    ex.warnings += u32::from(ok.warnings);
+                    ex.warnings = ex.warnings.saturating_add(u32::from(ok.warnings));
                     if ex.error.is_none() {
                         ex.items
                             .push(Ok(ResultItem::UpdateCount(Some(ok.affected_rows))));
@@ -617,6 +652,12 @@ impl Actor {
                 // The handle sent `KILL QUERY`: read the rest without keeping it.
                 ex.deadline = Some(Instant::now() + DROP_GRACE);
             }
+            // A drain that keeps receiving rows never lets `watched` time out: check here too.
+            if ex.deadline.is_some_and(|d| Instant::now() >= d) {
+                return Err(DriverError::Closed(
+                    "the server did not confirm the end of a dropped statement in time".into(),
+                ));
+            }
             let may_cancel = ex.may_cancel();
             let draining = ex.deadline.is_some();
             let read = {
@@ -639,7 +680,7 @@ impl Actor {
             match read {
                 RowOrEnd::Row => ex.rows_seen += 1,
                 RowOrEnd::End(eof) => {
-                    ex.warnings += u32::from(eof.warnings);
+                    ex.warnings = ex.warnings.saturating_add(u32::from(eof.warnings));
                     return Ok(Some(eof.status));
                 }
                 RowOrEnd::Err(e) => {

@@ -199,6 +199,16 @@ async fn fixtures(dev: &Dev) {
             panic!("{}: fixture `{sql}` failed: {e}", dev.engine);
         }
     }
+    if dev.engine == EngineId::MARIADB {
+        // MariaDB lets a stored function set the next transaction's access mode.
+        for sql in [
+            "DROP FUNCTION IF EXISTS ninesql_next_rw_fn",
+            "CREATE FUNCTION ninesql_next_rw_fn() RETURNS INT DETERMINISTIC \
+             BEGIN SET TRANSACTION READ WRITE; RETURN 1; END",
+        ] {
+            run(s.as_mut(), sql).await.unwrap();
+        }
+    }
     s.close().await.unwrap();
 }
 
@@ -400,6 +410,60 @@ async fn read_only_refuses_writes_engine_side() {
         ));
         s.set_read_only(false).await.unwrap();
         run(s.as_mut(), "SELECT ninesql_write_one()").await.unwrap();
+        s.close().await.unwrap();
+    }
+}
+
+/// Security review H1: `SET TRANSACTION … READ WRITE` (no SESSION) only changes the next
+/// transaction and leaves `transaction_read_only` at 1, so the read-back cannot see it; the
+/// comma form is classified `Session` by the shared classifier. The driver re-asserts the
+/// session's read-only characteristic after every statement, so the next write still fails
+/// engine-side.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn one_shot_read_write_transaction_is_reset() {
+    const ONE_SHOT: &str = "SET TRANSACTION ISOLATION LEVEL READ COMMITTED, READ WRITE";
+    for dev in devs() {
+        fixtures(&dev).await;
+        let mut p = params(&dev);
+        p.read_only = true;
+        let mut s = MySqlWireDriver::new().connect(p).await.unwrap();
+        let count = |c: &Collected| scalar(c).unwrap();
+        let before = count(
+            &run(s.as_mut(), "SELECT COUNT(*) FROM ninesql_written")
+                .await
+                .unwrap(),
+        );
+        let mut lifts = vec![ONE_SHOT];
+        if dev.engine == EngineId::MARIADB {
+            lifts.push("SELECT ninesql_next_rw_fn()");
+        }
+        for manual in [false, true] {
+            s.set_auto_commit(!manual).await.unwrap();
+            for lift in &lifts {
+                // Accepted (not classified as a lift), but it must not open a writable
+                // transaction.
+                run(s.as_mut(), lift).await.unwrap();
+                match run(s.as_mut(), "SELECT ninesql_write_one()").await {
+                    Err(DriverError::ReadOnly(_)) => {}
+                    other => panic!(
+                        "{} manual={manual} `{lift}`: write after a one-shot READ WRITE: {:?}",
+                        dev.engine,
+                        other.map(|_| ())
+                    ),
+                }
+                if manual {
+                    s.rollback().await.unwrap();
+                }
+                assert!(s.is_read_only());
+            }
+        }
+        s.set_auto_commit(true).await.unwrap();
+        let after = count(
+            &run(s.as_mut(), "SELECT COUNT(*) FROM ninesql_written")
+                .await
+                .unwrap(),
+        );
+        assert_eq!(before, after, "{}: rows were written", dev.engine);
         s.close().await.unwrap();
     }
 }

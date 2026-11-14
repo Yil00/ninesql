@@ -43,7 +43,15 @@ impl Link {
             })
             .await
             .map_err(|_| self.shared.closed_error())?;
-        rx.await.map_err(|_| self.shared.closed_error())?
+        // The connection task bounds the statement itself; this also bounds a queue that
+        // never drains (a stuck task). Past it the session is closed.
+        match tokio::time::timeout(crate::actor::INTERNAL_TIMEOUT * 2, rx).await {
+            Ok(r) => r.map_err(|_| self.shared.closed_error())?,
+            Err(_) => {
+                self.shared.mark_closed("driver statement timed out");
+                Err(self.shared.closed_error())
+            }
+        }
     }
 }
 

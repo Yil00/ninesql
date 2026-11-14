@@ -507,7 +507,7 @@ impl Driver for MySqlWireDriver {
                 .internal(
                     "SELECT CONNECTION_ID(), @@SESSION.sql_mode, \
                      @@SESSION.net_write_timeout, @@SESSION.character_set_client, \
-                     @@SESSION.character_set_results",
+                     @@SESSION.character_set_results, VERSION()",
                     false,
                 )
                 .await?;
@@ -519,12 +519,27 @@ impl Driver for MySqlWireDriver {
                 .and_then(|v| v.parse::<u64>().ok())
                 .ok_or_else(|| DriverError::Connect("the server sent no connection id".into()))?;
             control.target.store(id, Ordering::SeqCst);
+            // The greeting checked above travels in clear before TLS: check the engine and
+            // version again from inside the (possibly verified TLS) session.
+            let server_version = row
+                .get(5)
+                .cloned()
+                .flatten()
+                .ok_or_else(|| DriverError::Connect("the server sent no version".into()))?;
+            if check_server(&engine, &server_version)? != ro_var {
+                return Err(DriverError::Connect(
+                    "the server version changed between the handshake and the session".into(),
+                ));
+            }
+            session.capabilities =
+                capabilities_for(&engine, Some(display_version(&server_version)));
             if let Some(Some(mode)) = row.get(1) {
                 modes.set_sql_mode(mode);
             }
             if !row
                 .iter()
                 .skip(3)
+                .take(2)
                 .all(|c| c.as_deref().is_some_and(|c| c.starts_with("utf8")))
             {
                 return Err(DriverError::Connect(

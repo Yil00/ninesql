@@ -9,7 +9,9 @@
 //!   key (`allowPublicKeyRetrieval` is reserved: a man in the middle could send his own).
 //!
 //! Remnants outside the driver's control: the `Secret` itself (zeroized on drop by
-//! `ninesql-driver-api`), and copies inside the TLS stack's buffers for the full exchange.
+//! `ninesql-driver-api`), the `Digest` values `ring` returns on the stack (copied into zeroized
+//! arrays at once), and copies inside the TLS stack's buffers for the full exchange.
+//! Authentication frames bypass the transport's write buffer (`Packets::write_secret`).
 
 use ring::digest::{Context, SHA1_FOR_LEGACY_USE_ONLY, SHA256, digest};
 use zeroize::Zeroizing;
@@ -27,21 +29,23 @@ pub(crate) fn nonce(data: &[u8]) -> &[u8] {
     }
 }
 
+fn copy<const N: usize>(d: &ring::digest::Digest) -> Zeroizing<[u8; N]> {
+    let mut out = Zeroizing::new([0u8; N]);
+    out.copy_from_slice(d.as_ref());
+    out
+}
+
 /// `mysql_native_password` response (empty for an empty password).
 pub(crate) fn native(password: &[u8], nonce: &[u8]) -> Zeroizing<Vec<u8>> {
     if password.is_empty() {
         return Zeroizing::new(Vec::new());
     }
-    let stage1 = Zeroizing::new(
-        digest(&SHA1_FOR_LEGACY_USE_ONLY, password)
-            .as_ref()
-            .to_vec(),
-    );
-    let stage2 = Zeroizing::new(digest(&SHA1_FOR_LEGACY_USE_ONLY, &stage1).as_ref().to_vec());
+    let stage1: Zeroizing<[u8; 20]> = copy(&digest(&SHA1_FOR_LEGACY_USE_ONLY, password));
+    let stage2: Zeroizing<[u8; 20]> = copy(&digest(&SHA1_FOR_LEGACY_USE_ONLY, &stage1[..]));
     let mut ctx = Context::new(&SHA1_FOR_LEGACY_USE_ONLY);
     ctx.update(nonce);
-    ctx.update(&stage2);
-    let mix = Zeroizing::new(ctx.finish().as_ref().to_vec());
+    ctx.update(&stage2[..]);
+    let mix: Zeroizing<[u8; 20]> = copy(&ctx.finish());
     Zeroizing::new(stage1.iter().zip(mix.iter()).map(|(a, b)| a ^ b).collect())
 }
 
@@ -50,12 +54,12 @@ pub(crate) fn caching_sha2(password: &[u8], nonce: &[u8]) -> Zeroizing<Vec<u8>> 
     if password.is_empty() {
         return Zeroizing::new(Vec::new());
     }
-    let stage1 = Zeroizing::new(digest(&SHA256, password).as_ref().to_vec());
-    let stage2 = Zeroizing::new(digest(&SHA256, &stage1).as_ref().to_vec());
+    let stage1: Zeroizing<[u8; 32]> = copy(&digest(&SHA256, password));
+    let stage2: Zeroizing<[u8; 32]> = copy(&digest(&SHA256, &stage1[..]));
     let mut ctx = Context::new(&SHA256);
-    ctx.update(&stage2);
+    ctx.update(&stage2[..]);
     ctx.update(nonce);
-    let mix = Zeroizing::new(ctx.finish().as_ref().to_vec());
+    let mix: Zeroizing<[u8; 32]> = copy(&ctx.finish());
     Zeroizing::new(stage1.iter().zip(mix.iter()).map(|(a, b)| a ^ b).collect())
 }
 

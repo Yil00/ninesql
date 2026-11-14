@@ -37,6 +37,8 @@ const FLAG_UNSIGNED: u16 = 32;
 const FLAG_ENUM: u16 = 256;
 const FLAG_SET: u16 = 2048;
 const BINARY_CHARSET: u16 = 63;
+/// Longest column name kept (longer names are cut on a character boundary).
+pub(crate) const MAX_COLUMN_NAME: usize = 1024;
 
 /// A column definition (protocol 4.1).
 #[derive(Clone, Debug)]
@@ -53,7 +55,9 @@ impl Column {
         for _ in 0..4 {
             b.lenenc_bytes()?; // catalog, schema, table, org_table
         }
-        let name = String::from_utf8_lossy(b.lenenc_bytes()?).into_owned();
+        let raw = b.lenenc_bytes()?;
+        let raw = &raw[..raw.len().min(MAX_COLUMN_NAME)];
+        let name = crate::conn::utf8_prefix(raw.to_vec());
         b.lenenc_bytes()?; // org_name
         b.lenenc()?; // length of the fixed fields
         let charset = b.u16()?;
@@ -499,6 +503,20 @@ mod tests {
         assert_eq!(plan(&col(254, FLAG_ENUM, 45)), (Kind::Text, Some("enum")));
         assert_eq!(plan(&col(246, 0, 63)), (Kind::Text, Some("decimal")));
         assert_eq!(plan(&col(11, 0, 63)), (Kind::Text, Some("time")));
+    }
+
+    #[test]
+    fn long_column_names_are_cut() {
+        let name = "é".repeat(3000);
+        let mut def = vec![0, 0, 0, 0];
+        def.push(0xfc);
+        def.extend_from_slice(&u16::try_from(name.len()).unwrap().to_le_bytes());
+        def.extend_from_slice(name.as_bytes());
+        def.extend_from_slice(&[0, 0x0c, 45, 0, 0, 0, 0, 0, 253, 0, 0, 0, 0, 0]);
+        let c = Column::parse(&def).unwrap();
+        assert!(c.name.len() <= MAX_COLUMN_NAME && c.name.len() >= MAX_COLUMN_NAME - 1);
+        assert!(c.name.chars().all(|ch| ch == 'é'));
+        assert_eq!(c.type_code, 253);
     }
 
     #[test]

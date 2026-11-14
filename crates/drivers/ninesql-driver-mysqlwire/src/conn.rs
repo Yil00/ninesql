@@ -44,6 +44,9 @@ pub(crate) const MAX_INTERNAL_ROWS: usize = 10_001;
 const MAX_INTERNAL_BYTES: usize = 32 * 1024 * 1024;
 /// Most columns accepted in one result set.
 const MAX_COLUMNS: u64 = 4096;
+/// Most bytes of column definitions accepted for one result set (a hostile server could
+/// otherwise send 4096 definitions of 1 MiB each).
+pub(crate) const MAX_COLUMN_DEFS_BYTES: usize = 4 * 1024 * 1024;
 /// Widest text form accepted for a number or a date (protects the parsers).
 const MAX_FIXED_TEXT: u64 = 64;
 
@@ -512,8 +515,15 @@ impl Conn {
     /// Reads `n` column definitions and the EOF packet that follows them.
     pub(crate) async fn read_columns(&mut self, n: u64) -> DriverResult<Vec<Column>> {
         let mut cols = Vec::with_capacity(usize::try_from(n).unwrap_or(0));
+        let mut total = 0usize;
         for _ in 0..n {
             let data = self.p.read_packet().await?;
+            total = total.saturating_add(data.len());
+            if total > MAX_COLUMN_DEFS_BYTES {
+                return Err(DriverError::Protocol(
+                    "the server sent oversized column definitions".into(),
+                ));
+            }
             cols.push(Column::parse(&data)?);
         }
         let eof = self.p.read_packet().await?;
@@ -608,11 +618,18 @@ impl Conn {
     ) -> DriverResult<Vec<Option<String>>> {
         let mut out = Vec::with_capacity(ncols);
         let mut first = Some(first);
+        let mut bytes = 0u64;
         for _ in 0..ncols {
             match self.value_len(first.take()).await? {
                 None => out.push(None),
                 Some(len) => {
                     let keep = len.min(MAX_INTERNAL_VALUE);
+                    bytes = bytes.saturating_add(keep + 24);
+                    if bytes > MAX_INTERNAL_BYTES as u64 {
+                        return Err(DriverError::Protocol(
+                            "the server returned more data than the driver asked for".into(),
+                        ));
+                    }
                     let mut v = vec![0u8; usize::try_from(keep).unwrap_or(0)];
                     self.p.read_exact(&mut v).await?;
                     self.p.skip(len - keep).await?;
@@ -875,6 +892,82 @@ mod tests {
         };
         let r = Conn::connect(tcp, tls.as_ref(), &startup, None).await;
         assert!(matches!(r, Err(DriverError::Tls(_))));
+    }
+
+    /// Handshake with a fake server that accepts at once, then `script` on the same socket.
+    async fn after_ok<F, Fut>(script: F) -> Conn
+    where
+        F: FnOnce(TcpStream) -> Fut + Send + 'static,
+        Fut: std::future::Future<Output = ()> + Send,
+    {
+        let port = serve(|mut s| async move {
+            s.write_all(&frame(0, &greeting(auth::NATIVE, false)))
+                .await
+                .unwrap();
+            let _ = read_frame(&mut s).await;
+            s.write_all(&frame(2, &[0, 0, 0, 2, 0, 0, 0]))
+                .await
+                .unwrap();
+            script(s).await;
+        })
+        .await;
+        client(port, true).await.unwrap()
+    }
+
+    #[tokio::test]
+    async fn local_infile_request_gets_an_empty_file_and_fails() {
+        let (tx, rx) = oneshot::channel();
+        let mut conn = after_ok(|mut s| async move {
+            let _query = read_frame(&mut s).await.unwrap();
+            let mut req = vec![0xfb];
+            req.extend_from_slice(b"/etc/passwd");
+            s.write_all(&frame(1, &req)).await.unwrap();
+            let mut h = [0u8; 4];
+            s.read_exact(&mut h).await.unwrap();
+            let mut e = vec![0xff];
+            e.extend_from_slice(&1148u16.to_le_bytes());
+            e.extend_from_slice(b"#42000refused");
+            s.write_all(&frame(3, &e)).await.unwrap();
+            let _ = tx.send(h);
+        })
+        .await;
+        let r = conn
+            .query("LOAD DATA LOCAL INFILE 'x' INTO TABLE t")
+            .await
+            .unwrap();
+        assert!(r.is_err(), "the statement must fail");
+        let h = rx.await.unwrap();
+        assert_eq!(
+            &h[..3],
+            &[0, 0, 0],
+            "a zero-length packet (empty file) is sent"
+        );
+        assert_eq!(h[3], 2, "with the next sequence id");
+    }
+
+    #[tokio::test]
+    async fn oversized_column_definitions_are_refused() {
+        let mut conn = after_ok(|mut s| async move {
+            let _query = read_frame(&mut s).await.unwrap();
+            s.write_all(&frame(1, &[5])).await.unwrap();
+            let name = vec![b'n'; 1_000_000];
+            let mut def = vec![0, 0, 0, 0];
+            def.push(0xfd);
+            def.extend_from_slice(&u32::try_from(name.len()).unwrap().to_le_bytes()[..3]);
+            def.extend_from_slice(&name);
+            for seq in 2..7u8 {
+                if s.write_all(&frame(seq, &def)).await.is_err() {
+                    return;
+                }
+            }
+            let mut rest = Vec::new();
+            let _ = s.read_to_end(&mut rest).await;
+        })
+        .await;
+        assert!(matches!(
+            conn.query("SELECT 1").await,
+            Err(DriverError::Protocol(_))
+        ));
     }
 
     #[test]
