@@ -16,7 +16,7 @@ pub use connection_type::{Color, ConnectionType, ConnectionTypeId, ConnectionTyp
 pub use error::{ConnectionError, WorkspaceError};
 pub use workspace::{
     ConnectionTypesFile, Connections, ConnectionsFile, LoadIssue, LoadedConnections, ProjectFile,
-    Workspace,
+    ProjectId, Workspace,
 };
 
 // Dependency graph of docs/02-architecture.md, made explicit until real code uses these crates.

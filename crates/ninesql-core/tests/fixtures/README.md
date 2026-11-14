@@ -8,6 +8,7 @@ loading it through the migration chain.
 |------|----------|--------|
 | `connections/v1.json` | `connections.json` | 1 |
 | `connection-types/v1.json` | `connection-types.json` | 1 |
+| `project/v1.json` | `project.json` | 1 (current: 2, adds `id`) |
 
 Hosts use `example.test`; no fixture contains a real host or any secret value, only secret
 references.

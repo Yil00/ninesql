@@ -7,18 +7,20 @@
 //!
 //! **Reserved keys have a single source of truth**:
 //! [`ninesql_driver_api::is_reserved_property`], the rule every driver applies through
-//! `check_properties` at connect time. The core reuses it for validation (connection dialog,
-//! DBeaver import) and for sanitize-on-load, so it never stores a connection a driver would later
-//! refuse. No benign list overrides it: a key the driver API reserves is always refused here.
-//! This module only adds:
+//! `check_properties` at connect time (it reserves `gssencmode` and `replication` too). The core
+//! reuses it, unchanged, for validation (connection dialog, DBeaver import) and for
+//! sanitize-on-load, so it never stores a connection a driver would later refuse, and never
+//! refuses one a driver accepts. No benign list overrides it: a key the driver API reserves is
+//! always refused here. This module only adds:
 //! - a classification of reserved keys ([`Reserved`]) to tell the user which typed field to use;
-//! - [`PENDING_RESERVED_KEYS`], keys the core already refuses while the driver API catches up
-//!   (the core may only be *stricter* than the driver API, never looser);
 //! - the secret-**value** detectors ([`value_carries_secret`], [`sql_carries_secret`]), layered on
 //!   top of the key rules.
 //!
-//! The secret-like **key** heuristic is [`ninesql_storage::hygiene::is_secret_like_key`] (with
-//! its own benign list, which only affects that heuristic).
+//! Extra keys a single driver reserves on top of the shared rule are not visible here yet; they
+//! are refused by that driver at connect time (ROADMAP integration-review follow-up).
+//!
+//! The secret-like **key** heuristic is [`ninesql_storage::hygiene::is_secret_like_entry`] (with
+//! its own benign list and value-shape checks, which only affect that heuristic).
 
 /// What a reserved property key collides with, to tell the user which typed field to use.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -63,13 +65,6 @@ impl Reserved {
     }
 }
 
-/// Normalized keys the core refuses on top of [`ninesql_driver_api::is_reserved_property`],
-/// until the driver API reserves them too (then the entry is redundant and should be removed).
-///
-/// - `gssencmode` (PostgreSQL): GSSAPI transport encryption, which would bypass the TLS settings
-///   and their warnings; being added to the driver API's reserved keys.
-pub const PENDING_RESERVED_KEYS: &[&str] = &["gssencmode"];
-
 /// Normalization of the driver API (lower case, ASCII alphanumerics only).
 fn normalize(key: &str) -> String {
     key.chars()
@@ -78,12 +73,10 @@ fn normalize(key: &str) -> String {
         .collect()
 }
 
-/// Whether a property key is reserved: [`ninesql_driver_api::is_reserved_property`] or one of
-/// [`PENDING_RESERVED_KEYS`].
+/// Whether a property key is reserved: exactly [`ninesql_driver_api::is_reserved_property`].
 #[must_use]
 pub fn is_reserved(key: &str) -> bool {
     ninesql_driver_api::is_reserved_property(key)
-        || PENDING_RESERVED_KEYS.contains(&normalize(key).as_str())
 }
 
 /// Whether a property key is reserved, and what it collides with (see [`is_reserved`]).
@@ -156,12 +149,38 @@ pub fn reserved(key: &str) -> Option<Reserved> {
     Some(class)
 }
 
-/// Whether a property value embeds a credential: a URL with `user:password@` user info, or a
-/// `password=` / `pwd=` / `passwd=` pair (connection-string style).
+/// Key fragments that make a `key=value` pair a credential, matched right before `=` in the
+/// value with whitespace removed (`Password = x`, `client_secret=x`, `access_token=x`).
+const SECRET_PAIR_KEYS: &[&str] = &[
+    "password=",
+    "pwd=",
+    "passwd=",
+    "token=",
+    "apikey=",
+    "api_key=",
+    "api-key=",
+    "secret=",
+];
+
+/// Whether a property value embeds a credential:
+/// - a URL with `user:password@` user info (`postgres://u:p@h/db`, also after `jdbc:`);
+/// - user info without a scheme, as in Go DSNs (`user:pass@tcp(h:3306)/db`,
+///   `user:pass@unix(/s)/db`, `user:pass@/db`): a word with a `:`, then at least one character,
+///   then `@` and something after it. Words are separated by whitespace, quotes and `;`. This
+///   fails closed on look-alikes such as `mailto:a@b`;
+/// - a `password=` / `pwd=` / `passwd=` / `token=` (`access_token=`…) / `apikey=` / `api_key=` /
+///   `secret=` (`client_secret=`…) pair, connection-string style.
 #[must_use]
 pub fn value_carries_secret(value: &str) -> bool {
     let lower = value.to_lowercase();
-    let mut rest = lower.as_str();
+    url_userinfo(&lower) || schemeless_userinfo(&lower) || {
+        let compact: String = lower.chars().filter(|c| !c.is_whitespace()).collect();
+        SECRET_PAIR_KEYS.iter().any(|p| compact.contains(p))
+    }
+}
+
+fn url_userinfo(lower: &str) -> bool {
+    let mut rest = lower;
     while let Some(pos) = rest.find("://") {
         let after = &rest[pos + 3..];
         let authority = after.split(['/', '?', '#']).next().unwrap_or_default();
@@ -172,32 +191,145 @@ pub fn value_carries_secret(value: &str) -> bool {
         }
         rest = after;
     }
-    let compact: String = lower.chars().filter(|c| !c.is_whitespace()).collect();
-    ["password=", "pwd=", "passwd="]
-        .iter()
-        .any(|p| compact.contains(p))
+    false
 }
 
-/// Whether an init SQL statement contains an obvious password literal (`IDENTIFIED BY …`,
-/// `PASSWORD '…'`, `PASSWORD = "…"`, `PASSWORD $$…$$`).
+fn schemeless_userinfo(lower: &str) -> bool {
+    lower
+        .split(|c: char| c.is_whitespace() || matches!(c, '\'' | '"' | '`' | ';'))
+        .filter(|word| !word.contains("://"))
+        .any(|word| {
+            word.find(':').is_some_and(|colon| {
+                let rest = &word[colon + 1..];
+                rest.find('@')
+                    .is_some_and(|at| at > 0 && at + 1 < rest.len())
+            })
+        })
+}
+
+/// Whether an init SQL statement contains an obvious credential:
+/// - `IDENTIFIED BY …` and `IDENTIFIED WITH <plugin> BY …` (MySQL / MariaDB / Oracle);
+/// - `PASSWORD` followed (after an optional `=`, `TO` and opening parentheses) by a string
+///   literal, including prefixed literals: `'…'`, `"…"`, `$$…$$`, `E'…'`, `N'…'`, `U&'…'`,
+///   `B'…'`, `X'…'` and charset introducers (`_utf8mb4'…'`). This covers
+///   `PASSWORD '…'`, `SET PASSWORD = PASSWORD('…')`, `ALTER LOGIN … WITH PASSWORD = N'…'` and
+///   `IDENTIFIED VIA … USING PASSWORD('…')`;
+/// - anything [`value_carries_secret`] reports (`dblink_connect('… password=…')`, DSNs with user
+///   info).
+///
+/// The statement is checked as written and again with its comments (`--`, `#`, `/* */`)
+/// replaced by spaces, so a comment cannot split a keyword from its literal and commented-out or
+/// executable (`/*! … */`) text is still seen.
 #[must_use]
 pub fn sql_carries_secret(sql: &str) -> bool {
+    sql_text_carries_secret(sql) || sql_text_carries_secret(&strip_sql_comments(sql))
+}
+
+fn sql_text_carries_secret(sql: &str) -> bool {
+    if value_carries_secret(sql) {
+        return true;
+    }
     let words: Vec<String> = sql.split_whitespace().map(str::to_lowercase).collect();
     let flat = words.join(" ");
     if flat.contains("identified by") {
         return true;
     }
     let mut rest = flat.as_str();
+    while let Some(pos) = rest.find("identified with") {
+        let after = &rest[pos + "identified with".len()..];
+        let statement = after.split(';').next().unwrap_or_default();
+        if statement.contains(" by ") || statement.contains(" by'") {
+            return true;
+        }
+        rest = after;
+    }
+    let mut rest = flat.as_str();
     while let Some(pos) = rest.find("password") {
-        let after = rest[pos + "password".len()..].trim_start();
-        let after = after.strip_prefix('=').map_or(after, str::trim_start);
-        let after = after.strip_prefix("to ").map_or(after, str::trim_start);
-        if after.starts_with(['\'', '"', '$']) || after.starts_with("e'") {
+        let mut after = rest[pos + "password".len()..].trim_start();
+        after = after.strip_prefix('=').map_or(after, str::trim_start);
+        after = after.strip_prefix("to ").map_or(after, str::trim_start);
+        while let Some(inner) = after.strip_prefix('(') {
+            after = inner.trim_start();
+        }
+        if starts_with_literal(after) {
             return true;
         }
         rest = &rest[pos + "password".len()..];
     }
     false
+}
+
+/// Whether lower-cased SQL text starts with a string literal, possibly prefixed.
+fn starts_with_literal(s: &str) -> bool {
+    let quoted = |t: &str| t.starts_with(['\'', '"', '$']);
+    if quoted(s) {
+        return true;
+    }
+    if ["u&", "e", "n", "b", "x"]
+        .iter()
+        .any(|p| s.strip_prefix(p).is_some_and(quoted))
+    {
+        return true;
+    }
+    // Charset introducer: `_utf8mb4'…'`.
+    s.strip_prefix('_').is_some_and(|t| {
+        let name_len = t
+            .find(|c: char| !c.is_ascii_alphanumeric())
+            .unwrap_or(t.len());
+        name_len > 0 && quoted(&t[name_len..])
+    })
+}
+
+/// Replaces SQL comments (`-- …`, `# …` to the end of the line, `/* … */`) by a space, outside
+/// single- and double-quoted text.
+fn strip_sql_comments(sql: &str) -> String {
+    let mut out = String::with_capacity(sql.len());
+    let mut chars = sql.chars().peekable();
+    let mut quote: Option<char> = None;
+    while let Some(c) = chars.next() {
+        if let Some(q) = quote {
+            out.push(c);
+            if c == q {
+                quote = None;
+            }
+            continue;
+        }
+        match c {
+            '\'' | '"' => {
+                quote = Some(c);
+                out.push(c);
+            }
+            '-' if chars.peek() == Some(&'-') => {
+                for d in chars.by_ref() {
+                    if d == '\n' {
+                        break;
+                    }
+                }
+                out.push(' ');
+            }
+            '#' => {
+                for d in chars.by_ref() {
+                    if d == '\n' {
+                        break;
+                    }
+                }
+                out.push(' ');
+            }
+            '/' if chars.peek() == Some(&'*') => {
+                chars.next();
+                let mut prev = '\0';
+                for d in chars.by_ref() {
+                    if prev == '*' && d == '/' {
+                        break;
+                    }
+                    prev = d;
+                }
+                out.push(' ');
+            }
+            _ => out.push(c),
+        }
+    }
+    out
 }
 
 #[cfg(test)]
@@ -225,6 +357,7 @@ mod tests {
             ("socksProxyHost", Reserved::Proxy),
             ("gssencmode", Reserved::Gssapi),
             ("gsslib", Reserved::Gssapi),
+            ("replication", Reserved::Other),
             ("options", Reserved::Other),
             ("sql_mode", Reserved::Other),
             ("allowMultiQueries", Reserved::Other),
@@ -241,8 +374,7 @@ mod tests {
         }
     }
 
-    /// The core is never looser than the driver API, and only stricter by
-    /// [`PENDING_RESERVED_KEYS`].
+    /// The core is exactly as strict as the driver API.
     #[test]
     fn driver_api_rule_is_the_source_of_truth() {
         for key in [
@@ -255,11 +387,13 @@ mod tests {
             "application_name",
             "fetchSize",
             "gssencmode",
+            "replication",
         ] {
             let api = ninesql_driver_api::is_reserved_property(key);
-            let pending = PENDING_RESERVED_KEYS.contains(&normalize(key).as_str());
-            assert_eq!(reserved(key).is_some(), api || pending, "{key}");
+            assert_eq!(reserved(key).is_some(), api, "{key}");
         }
+        assert!(ninesql_driver_api::is_reserved_property("gssencmode"));
+        assert!(ninesql_driver_api::is_reserved_property("replication"));
         // `gsslib` is reserved by the driver API through the `ssl` fragment (fails closed).
         assert!(ninesql_driver_api::is_reserved_property("gsslib"));
     }
@@ -272,6 +406,23 @@ mod tests {
             "Server=h;User Id=u;Password=Hunter2;",
             "pwd = x",
             "x://h/?a=1 then mongodb://u:p@h",
+            // N3: Go DSNs without a scheme.
+            "user:Hunter2@tcp(db:3306)/app",
+            "user:Hunter2@unix(/run/mysqld.sock)/app",
+            "user:Hunter2@/app?charset=utf8mb4",
+            "dsn=user:Hunter2@tcp(db)/app",
+            ":Hunter2@tcp(db)/app",
+            "user:p@ss@tcp(db)/app",
+            // N3: token / API key / secret pairs.
+            "token=abc123",
+            "access_token=abc123",
+            "Refresh_Token = abc123",
+            "apikey=abc123",
+            "api_key=abc123",
+            "api-key=abc123",
+            "secret=abc123",
+            "client_secret=abc123",
+            "a=1;Password=Hunter2",
         ] {
             assert!(value_carries_secret(bad), "{bad}");
         }
@@ -281,6 +432,13 @@ mod tests {
             "10",
             "https://example.test/a:b@c",
             "password_encryption",
+            "user@db.example.test",
+            "db.example.test:5432",
+            "12:30",
+            "user:@tcp(db)/app",
+            "UTF-8",
+            "token_type=bearer",
+            "Europe/Paris",
         ] {
             assert!(!value_carries_secret(ok), "{ok}");
         }
@@ -294,6 +452,26 @@ mod tests {
             "CREATE USER x PASSWORD = \"Hunter2\"",
             "ALTER ROLE a PASSWORD $$x$$",
             "SET PASSWORD TO 'x'",
+            // N3: MySQL / MariaDB / SQL Server forms.
+            "SET PASSWORD = PASSWORD('Hunter2')",
+            "SET PASSWORD FOR app = PASSWORD ( 'Hunter2' )",
+            "ALTER LOGIN app WITH PASSWORD = N'Hunter2'",
+            "CREATE USER app IDENTIFIED WITH mysql_native_password BY 'Hunter2'",
+            "ALTER USER app IDENTIFIED WITH caching_sha2_password BY'Hunter2'",
+            "CREATE USER app IDENTIFIED VIA ed25519 USING PASSWORD('Hunter2')",
+            // N3: prefixed literals.
+            "ALTER ROLE app PASSWORD U&'Hunter\\0032'",
+            "ALTER ROLE app PASSWORD E'Hunter2'",
+            "ALTER USER app PASSWORD _utf8mb4'Hunter2'",
+            // N3: comments cannot split the keyword from its literal, nor hide the statement.
+            "ALTER ROLE app PASSWORD/**/'Hunter2'",
+            "ALTER ROLE app PASSWORD -- note\n 'Hunter2'",
+            "ALTER ROLE app PASSWORD # note\n 'Hunter2'",
+            "ALTER USER app IDENTIFIED/* x */BY 'Hunter2'",
+            "/*!80000 ALTER USER app IDENTIFIED BY 'Hunter2' */",
+            "SELECT 1 -- ALTER USER app IDENTIFIED BY 'Hunter2'",
+            // Connection strings inside SQL.
+            "SELECT dblink_connect('host=h user=u password=Hunter2')",
         ] {
             assert!(sql_carries_secret(bad), "{bad}");
         }
@@ -301,6 +479,10 @@ mod tests {
             "SET search_path TO app",
             "SET password_encryption = 'scram-sha-256'",
             "SELECT 1",
+            "SET NAMES utf8mb4",
+            "SELECT '--' AS dashes, 'a#b' AS hash",
+            "CREATE USER app IDENTIFIED WITH auth_socket",
+            "SET application_name = 'NineSQL /* x */'",
         ] {
             assert!(!sql_carries_secret(ok), "{ok}");
         }

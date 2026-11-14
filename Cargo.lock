@@ -3967,6 +3967,7 @@ dependencies = [
  "thiserror 2.0.21",
  "tracing",
  "uuid",
+ "zeroize",
 ]
 
 [[package]]
