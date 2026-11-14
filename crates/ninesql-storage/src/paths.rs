@@ -113,6 +113,10 @@ impl Paths {
     }
 
     /// `$XDG_CONFIG_HOME/ninesql/settings.toml`.
+    ///
+    /// Not covered by the workspace lock ([`Self::lock_file`]): the settings writer serializes
+    /// its writes within one process only. With two NineSQL processes, the last write wins; each
+    /// write is atomic (no torn file) and the file never holds a secret.
     #[must_use]
     pub fn settings_file(&self) -> PathBuf {
         self.config_dir.join("settings.toml")

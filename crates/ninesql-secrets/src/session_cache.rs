@@ -15,8 +15,9 @@
 //! Expiry is measured on `CLOCK_BOOTTIME`, so time spent suspended counts: a value cached "for
 //! 15 minutes" before an overnight suspend is gone at the first access or purge after resume. A
 //! duration too large to represent is capped at [`MAX_TIMED_LIFETIME`] (fail closed: the value
-//! still expires). The core should also call [`SessionSecretCache::clear`] on logind's
-//! `PrepareForSleep(true)` and on the session `Lock` signal.
+//! still expires). The cache is also a [`crate::LockHook`]: registered in a [`crate::LockHooks`],
+//! it is cleared on logind's `PrepareForSleep(true)` and on the session `Lock` signal
+//! ([`crate::lock_events`]).
 //!
 //! Intended use in the core (one cache per open workspace):
 //! 1. On connect, for each slot without a saved reference, look up

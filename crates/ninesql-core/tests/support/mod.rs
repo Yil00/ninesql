@@ -201,6 +201,26 @@ pub fn manager_with(
     )
 }
 
+/// A manager with `driver` registered, the given secret `stores` and `known_hosts` under `dir`.
+pub fn manager_with_stores(
+    driver: Arc<dyn Driver>,
+    dir: &Path,
+    stores: SecretStores,
+    tune: impl FnOnce(&mut ManagerConfig),
+) -> SessionManager {
+    let mut registry = DriverRegistry::new();
+    registry.register(driver);
+    let mut config = ManagerConfig::with_known_hosts(KnownHostsFiles {
+        own: dir.join("known_hosts"),
+        user: None,
+    });
+    config.workers = 2;
+    config.connect_timeout = Duration::from_secs(5);
+    config.busy_wait = Duration::from_millis(400);
+    tune(&mut config);
+    SessionManager::new(config, registry, stores).unwrap()
+}
+
 pub fn mock_engine() -> EngineId {
     EngineId::new(MOCK_ENGINE.as_str()).unwrap()
 }
