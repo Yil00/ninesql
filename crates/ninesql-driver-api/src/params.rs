@@ -12,6 +12,7 @@ use std::fmt;
 use std::path::PathBuf;
 use std::time::Duration;
 
+use crate::error::{DriverError, DriverResult};
 use crate::secret::Secret;
 
 /// Identifier of one engine (not one family): `postgresql`, `timescaledb`, `mysql`…
@@ -134,6 +135,7 @@ pub enum Auth {
 
 /// TLS mode, in the engine-neutral terms of ADR-0011. Defaults to [`TlsMode::VerifyFull`].
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[non_exhaustive]
 pub enum TlsMode {
     /// Plain text. Flagged as a downgrade.
     Disable,
@@ -166,7 +168,10 @@ pub struct ClientCertificate {
 }
 
 /// TLS settings for one connection. Drivers implement them with rustls only (ADR-0002).
+///
+/// Non-exhaustive: start from `TlsConfig::default()` (`verify-full`) and set fields.
 #[derive(Debug, Default)]
+#[non_exhaustive]
 pub struct TlsConfig {
     /// Verification mode; default [`TlsMode::VerifyFull`].
     pub mode: TlsMode,
@@ -195,6 +200,7 @@ pub enum HostKeyVerification {
 /// session report the full route and lets [`ConnectParams::security_warnings`] flag a disabled
 /// host key check.
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct TunnelInfo {
     /// SSH server (last hop) host name.
     pub ssh_host: String,
@@ -204,10 +210,66 @@ pub struct TunnelInfo {
     pub jump_hosts: u8,
     /// Host key policy that was applied when the tunnel was opened.
     pub host_key: HostKeyVerification,
+    /// Proxy used to reach the first SSH hop, if any (ADR-0011 §8).
+    pub proxy: Option<ProxyInfo>,
+}
+
+impl TunnelInfo {
+    /// A direct tunnel (no jump host, no proxy) with strict host key checking.
+    #[must_use]
+    pub fn new(ssh_host: impl Into<String>, ssh_port: u16) -> Self {
+        Self {
+            ssh_host: ssh_host.into(),
+            ssh_port,
+            jump_hosts: 0,
+            host_key: HostKeyVerification::Strict,
+            proxy: None,
+        }
+    }
+}
+
+/// Kind of proxy (ADR-0011 §8).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum ProxyKind {
+    /// HTTP `CONNECT`.
+    HttpConnect,
+    /// SOCKS5.
+    Socks5,
+}
+
+/// Description of a proxy hop opened by the core (ADR-0011 §8). Informational for drivers,
+/// like [`TunnelInfo`]: the driver receives an already proxied endpoint. Proxy credentials are
+/// resolved and used by the component that opens the proxy, never passed here.
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct ProxyInfo {
+    /// Proxy kind.
+    pub kind: ProxyKind,
+    /// Proxy host.
+    pub host: String,
+    /// Proxy port.
+    pub port: u16,
+    /// User name sent to the proxy, if it authenticates.
+    pub user: Option<String>,
+}
+
+impl ProxyInfo {
+    /// A proxy without authentication.
+    #[must_use]
+    pub fn new(kind: ProxyKind, host: impl Into<String>, port: u16) -> Self {
+        Self {
+            kind,
+            host: host.into(),
+            port,
+            user: None,
+        }
+    }
 }
 
 /// A security downgrade the UI must show on the connection and its tabs (I5).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[non_exhaustive]
 pub enum SecurityWarning {
     /// TLS is below `verify-full`.
     TlsDowngraded(TlsMode),
@@ -217,11 +279,148 @@ pub enum SecurityWarning {
     SshHostKeyNotVerified,
 }
 
+/// Value of a driver property. `Debug` never shows the value.
+#[non_exhaustive]
+pub enum PropertyValue {
+    /// A non-secret value (still never logged: properties are free-form).
+    Plain(String),
+    /// A secret value resolved from the secret store (I1).
+    Secret(Secret),
+}
+
+impl PropertyValue {
+    /// Reads the value (plain or secret). Never format, log or store the result.
+    #[must_use]
+    pub fn expose(&self) -> &str {
+        match self {
+            Self::Plain(s) => s,
+            Self::Secret(s) => s.expose(),
+        }
+    }
+
+    /// `true` for [`PropertyValue::Secret`].
+    #[must_use]
+    pub fn is_secret(&self) -> bool {
+        matches!(self, Self::Secret(_))
+    }
+}
+
+impl fmt::Debug for PropertyValue {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Plain(_) => f.write_str("PropertyValue::Plain(<redacted>)"),
+            Self::Secret(_) => f.write_str("PropertyValue::Secret(<redacted>)"),
+        }
+    }
+}
+
+/// Normalized property keys (lower-case, ASCII alphanumerics only) that are always reserved.
+pub const RESERVED_PROPERTY_KEYS: &[&str] = &[
+    "host",
+    "hostaddr",
+    "hostname",
+    "port",
+    "server",
+    "servername",
+    "user",
+    "username",
+    "uid",
+    "pwd",
+    "passfile",
+    "service",
+    "options",
+    "socket",
+    "unixsocket",
+    "socketfactory",
+    "encrypt",
+    "sessionvariables",
+    "sqlmode",
+    "standardconformingstrings",
+    "allowpublickeyretrieval",
+    "allowloadlocalinfile",
+    "allowlocalinfile",
+    "localinfile",
+];
+
+/// Fragments that make a normalized property key reserved wherever they appear: TLS and
+/// certificate verification, credentials, access mode, multi-statements, init SQL.
+pub const RESERVED_PROPERTY_FRAGMENTS: &[&str] = &[
+    "ssl",
+    "tls",
+    "cert",
+    "trust",
+    "verif",
+    "insecure",
+    "password",
+    "passwd",
+    "secret",
+    "token",
+    "apikey",
+    "auth",
+    "credential",
+    "readonly",
+    "readwrite",
+    "accessmode",
+    "multistatement",
+    "multiquer",
+    "initsql",
+    "initcommand",
+    "initscript",
+    "initstatement",
+];
+
+fn normalize_property_key(key: &str) -> String {
+    key.chars()
+        .filter(char::is_ascii_alphanumeric)
+        .map(|c| c.to_ascii_lowercase())
+        .collect()
+}
+
+/// `true` when `key` controls a security-relevant setting that only the typed
+/// [`ConnectParams`] fields may set (H3 of the P0-B security review).
+#[must_use]
+pub fn is_reserved_property(key: &str) -> bool {
+    let k = normalize_property_key(key);
+    RESERVED_PROPERTY_KEYS.contains(&k.as_str())
+        || RESERVED_PROPERTY_FRAGMENTS.iter().any(|f| k.contains(f))
+}
+
+/// Rejects properties that would override TLS / verification, host / port, credentials,
+/// read-only / access mode, multi-statements, init SQL or lexical modes. `extra_reserved` adds
+/// engine-specific keys (compared after the same normalization).
+///
+/// Every driver calls it at the start of [`Driver::connect`](crate::Driver::connect) and reuses
+/// the conformance test of the `mock` feature (`conformance::assert_reserved_properties_rejected`).
+///
+/// # Errors
+/// [`DriverError::InvalidParams`] naming the first reserved key (never its value).
+pub fn check_properties(
+    properties: &BTreeMap<String, PropertyValue>,
+    extra_reserved: &[&str],
+) -> DriverResult<()> {
+    let extra: Vec<String> = extra_reserved
+        .iter()
+        .map(|k| normalize_property_key(k))
+        .collect();
+    for key in properties.keys() {
+        if is_reserved_property(key) || extra.contains(&normalize_property_key(key)) {
+            return Err(DriverError::InvalidParams(format!(
+                "property `{key}` cannot be set as a driver property; use the connection's \
+                 TLS, authentication, read-only or endpoint settings"
+            )));
+        }
+    }
+    Ok(())
+}
+
 /// Fully resolved parameters for one session.
 ///
 /// Built by `ninesql-core`, moved into [`Driver::connect`](crate::Driver::connect). The `Debug`
 /// output never contains secrets, and only property keys (not values), since DBeaver-style
 /// driver properties sometimes carry credentials.
+///
+/// Non-exhaustive: build with [`ConnectParams::new`] and set fields.
+#[non_exhaustive]
 pub struct ConnectParams {
     /// Engine served by the driver (one family serves several engines).
     pub engine: EngineId,
@@ -235,6 +434,9 @@ pub struct ConnectParams {
     pub tls: TlsConfig,
     /// SSH tunnel description, if the endpoint is a tunnel.
     pub tunnel: Option<TunnelInfo>,
+    /// Proxy description, if the endpoint (or the first SSH hop, see [`TunnelInfo::proxy`]) is
+    /// reached through a proxy (ADR-0011 §8). Informational.
+    pub proxy: Option<ProxyInfo>,
     /// Open the session read-only. The driver **must** apply the engine-side mechanism declared
     /// in [`Capabilities::read_only`](crate::Capabilities::read_only) before returning the
     /// session (I3, ADR-0007), or fail the connect.
@@ -246,7 +448,12 @@ pub struct ConnectParams {
     /// Statements run after connect (connection "bootstrap queries").
     pub init_statements: Vec<String>,
     /// Engine-specific options (driver properties). Values may be sensitive: never logged.
-    pub properties: BTreeMap<String, String>,
+    ///
+    /// Drivers **must** pass them through [`check_properties`] before use: properties can never
+    /// override TLS / certificate verification, host / port, credentials, read-only / access
+    /// mode, multi-statement support, init SQL or lexical modes, which only come from the typed
+    /// fields of [`ConnectParams`].
+    pub properties: BTreeMap<String, PropertyValue>,
     /// `true` for connections typed "production": the driver must never log query text, even at
     /// `trace` level (ADR-0007 §6).
     pub production: bool,
@@ -269,6 +476,7 @@ impl ConnectParams {
             database: None,
             tls: TlsConfig::default(),
             tunnel: None,
+            proxy: None,
             read_only: false,
             auto_commit: true,
             connect_timeout: Self::DEFAULT_CONNECT_TIMEOUT,
@@ -312,6 +520,7 @@ impl fmt::Debug for ConnectParams {
             .field("database", &self.database)
             .field("tls", &self.tls)
             .field("tunnel", &self.tunnel)
+            .field("proxy", &self.proxy)
             .field("read_only", &self.read_only)
             .field("auto_commit", &self.auto_commit)
             .field("connect_timeout", &self.connect_timeout)
@@ -356,12 +565,9 @@ mod tests {
         assert!(w.contains(&SecurityWarning::TlsDowngraded(TlsMode::Disable)));
         assert!(w.contains(&SecurityWarning::CredentialsInClear));
 
-        p.tunnel = Some(TunnelInfo {
-            ssh_host: "bastion.example.test".to_owned(),
-            ssh_port: 22,
-            jump_hosts: 0,
-            host_key: HostKeyVerification::Disabled,
-        });
+        let mut tunnel = TunnelInfo::new("bastion.example.test", 22);
+        tunnel.host_key = HostKeyVerification::Disabled;
+        p.tunnel = Some(tunnel);
         let w = p.security_warnings();
         assert!(w.contains(&SecurityWarning::SshHostKeyNotVerified));
         assert!(!w.contains(&SecurityWarning::CredentialsInClear));
@@ -386,13 +592,69 @@ mod tests {
             key_file: "/k.pem".into(),
             key_passphrase: Some(Secret::new("key-pass-123".to_owned())),
         });
-        p.properties
-            .insert("sslpassword".to_owned(), "prop-value-xyz".to_owned());
+        p.properties.insert(
+            "applicationLabel".to_owned(),
+            PropertyValue::Plain("prop-value-xyz".to_owned()),
+        );
+        p.properties.insert(
+            "kerberosKey".to_owned(),
+            PropertyValue::Secret(Secret::new("prop-secret-xyz".to_owned())),
+        );
         let dbg = format!("{p:?}");
         assert!(!dbg.contains("s3cr3t-pw"));
         assert!(!dbg.contains("key-pass-123"));
         assert!(!dbg.contains("prop-value-xyz"));
-        assert!(dbg.contains("sslpassword"));
+        assert!(!dbg.contains("prop-secret-xyz"));
+        assert!(dbg.contains("applicationLabel"));
+        let v = PropertyValue::Plain("abc".into());
+        assert!(!format!("{v:?}").contains("abc"));
+    }
+
+    #[test]
+    fn reserved_properties_are_rejected() {
+        for key in [
+            "sslmode",
+            "useSSL",
+            "verifyServerCertificate",
+            "trustServerCertificate",
+            "readonly",
+            "options",
+            "allowMultiQueries",
+            "multiStatements",
+            "initSql",
+            "init_command",
+            "sessionVariables",
+            "password",
+            "trustStorePassword",
+            "PGPASSWORD",
+            "host",
+            "Port",
+            "user",
+            "sql_mode",
+            "standard_conforming_strings",
+            "default_transaction_read_only",
+            "tls.insecure",
+            "sslrootcert",
+            "authenticationPlugins",
+        ] {
+            assert!(is_reserved_property(key), "{key}");
+            let mut props = BTreeMap::new();
+            props.insert(key.to_owned(), PropertyValue::Plain("x-value".into()));
+            let err = check_properties(&props, &[]).unwrap_err();
+            assert!(matches!(err, DriverError::InvalidParams(_)));
+            assert!(!err.to_string().contains("x-value"));
+        }
+        let mut props = BTreeMap::new();
+        props.insert(
+            "connectTimeout".to_owned(),
+            PropertyValue::Plain("5".into()),
+        );
+        props.insert(
+            "application_name".to_owned(),
+            PropertyValue::Plain("x".into()),
+        );
+        assert!(check_properties(&props, &[]).is_ok());
+        assert!(check_properties(&props, &["connect_timeout"]).is_err());
     }
 
     #[test]

@@ -8,7 +8,11 @@
 //! |---|---|
 //! | `SELECT * FROM numbers(N)` | `N` rows (`id: Int64`, `label: Utf8`), generated lazily batch by batch |
 //! | `SELECT * FROM slow_numbers(N, MS)` | Same, waiting `MS` ms before each batch (timeout / cancel tests) |
+//! | `SELECT * FROM wide(N, BYTES)` | `N` rows with `BYTES`-byte labels, cut at the value budget and flagged |
 //! | `SELECT * FROM documents(N)` | `N` documents |
+//! | `SELECT * FROM notices(N)` | `N` notices |
+//! | `SELECT mock_write()` | A write the classifier cannot see (rejected by the simulated server in read-only mode) |
+//! | `SELECT mock_lift_read_only()` | Lifts the simulated engine-side read-only setting (detected; the session is closed) |
 //! | `SELECT * FROM multi()` | Two result sets with a notice in between |
 //! | `SELECT error()` | A query error with SQLSTATE `XX000` |
 //! | `INSERT …`, `UPDATE … WHERE …`, `DELETE … WHERE …`, `CREATE …`, `DROP …` | Update count 1 |
@@ -16,7 +20,7 @@
 //! | `SET …` | Accepted (refused in read-only mode when it may change the access mode) |
 //!
 //! Read-only sessions behave like an engine with
-//! [`ReadOnlyMechanism::SessionSetting`]: writes are refused client-side by classification and
+//! [`ReadOnlyMechanism::SessionSetting`] (liftable): writes are refused client-side by classification and
 //! rejected again by the simulated server. [`MockStats`] exposes counters (rows generated,
 //! server-side cancels, connects) so tests can prove that streaming stops at the budget and that
 //! cancel reaches the "server".
@@ -34,19 +38,19 @@ use crate::capabilities::{
     MetadataCapabilities, ObjectKind, QueryLanguage, ReadOnlyMechanism, ResultKind,
     TransactionCapabilities,
 };
-use crate::dialect::{AnsiDialect, Dialect, StatementClass};
+use crate::dialect::{AnsiDialect, Dialect, StatementClass, ensure_single_statement};
 use crate::driver::{Driver, Session};
 use crate::error::{DriverError, DriverResult};
 use crate::metadata::{
     ColumnInfo, Metadata, ObjectDetails, ObjectInfo, ObjectPath, Page, PageRequest, TableInfo,
 };
-use crate::params::{Auth, ConnectParams, EngineId};
+use crate::params::{Auth, ConnectParams, EngineId, check_properties};
 use crate::result::{
     CancelHandle, DocValue, Document, Notice, NoticeSeverity, RawResultStream, ResultItem,
-    ResultSetHeader, ResultSetKind, ResultStream,
+    ResultSetHeader, ResultSetKind, ResultStream, TRUNCATED_VALUES_METADATA_KEY,
 };
 use crate::secret::Secret;
-use crate::statement::{ExecOptions, Statement};
+use crate::statement::{BatchLimiter, ExecOptions, FetchBudget, Statement, truncate_str};
 
 /// Engine id served by the mock driver.
 pub const MOCK_ENGINE: EngineId = EngineId::from_static("mock");
@@ -125,7 +129,7 @@ pub fn full_capabilities() -> Capabilities {
                 IsolationLevel::Serializable,
             ]),
         },
-        read_only: ReadOnlyMechanism::SessionSetting,
+        read_only: ReadOnlyMechanism::SessionSetting { liftable: true },
         cancel: CancelSupport::ServerSide,
         explain: BTreeSet::from([ExplainFormat::Text]),
         multiple_result_sets: true,
@@ -229,6 +233,7 @@ impl Driver for MockDriver {
 
     async fn connect(&self, params: ConnectParams) -> DriverResult<Box<dyn Session>> {
         Self::check_engine(&params.engine)?;
+        check_properties(&params.properties, &[])?;
         if let Some(expected) = &self.password {
             match &params.auth {
                 Auth::Password {
@@ -255,6 +260,7 @@ impl Driver for MockDriver {
             auto_commit: true,
             in_transaction: false,
             read_only: false,
+            closed: false,
         };
         if params.read_only {
             session.set_read_only(true).await?;
@@ -314,6 +320,8 @@ pub struct MockSession {
     auto_commit: bool,
     in_transaction: bool,
     read_only: bool,
+    /// Closed after a detected access-mode change (or by the user).
+    closed: bool,
 }
 
 fn numbers_schema() -> SchemaRef {
@@ -323,16 +331,61 @@ fn numbers_schema() -> SchemaRef {
     ]))
 }
 
-fn numbers_batch(schema: &SchemaRef, from: u64, count: u64) -> DriverResult<RecordBatch> {
-    let ids: Vec<i64> = (from..from + count)
-        .map(|i| i64::try_from(i).unwrap_or(i64::MAX))
-        .collect();
-    let labels: Vec<String> = ids.iter().map(|i| format!("row-{i:08}")).collect();
+/// Builds rows `from..` until `total` or the batch limits are reached. `label_len` = `None`
+/// gives `row-00000042` labels; `Some(n)` gives `n`-byte labels, cut at the value budget (the
+/// simulated server never materializes more than the budget).
+fn numbers_batch(
+    schema: &SchemaRef,
+    from: u64,
+    total: u64,
+    label_len: Option<u64>,
+    budget: &FetchBudget,
+) -> DriverResult<RecordBatch> {
+    let max_value = budget.effective_max_value_bytes();
+    let mut limiter = BatchLimiter::new(budget);
+    let mut ids = Vec::new();
+    let mut labels = Vec::new();
+    let mut truncated = false;
+    let mut i = from;
+    while i < total && !limiter.is_full() {
+        let label = match label_len {
+            None => format!("row-{i:08}"),
+            Some(n) => {
+                let produced = "x".repeat(usize::try_from(n.min(max_value)).unwrap_or(0));
+                truncated |= n > max_value;
+                produced
+            }
+        };
+        let (label, cut) = truncate_str(&label, max_value);
+        truncated |= cut;
+        limiter.add_row(8 + 4 + label.len() as u64);
+        ids.push(i64::try_from(i).unwrap_or(i64::MAX));
+        labels.push(label.to_owned());
+        i += 1;
+    }
+    let schema = if truncated {
+        let fields: Vec<Field> = schema
+            .fields()
+            .iter()
+            .map(|f| {
+                if f.name() == "label" {
+                    f.as_ref().clone().with_metadata(
+                        [(TRUNCATED_VALUES_METADATA_KEY.to_owned(), "true".to_owned())].into(),
+                    )
+                } else {
+                    f.as_ref().clone()
+                }
+            })
+            .collect();
+        Arc::new(Schema::new(fields))
+    } else {
+        Arc::clone(schema)
+    };
     let cols: Vec<ArrayRef> = vec![
         Arc::new(Int64Array::from(ids)),
         Arc::new(StringArray::from(labels)),
     ];
-    RecordBatch::try_new(Arc::clone(schema), cols).map_err(|e| DriverError::Protocol(e.to_string()))
+    RecordBatch::try_new(schema, cols).map_err(|e| DriverError::Protocol(e.to_string()))
 }
 
 /// Parses the integer arguments of `name(a, b…)` in `text` (lower-cased).
@@ -351,7 +404,8 @@ impl MockSession {
         &self,
         total: u64,
         delay: Option<Duration>,
-        batch_rows: u32,
+        label_len: Option<u64>,
+        budget: FetchBudget,
         guard: BusyGuard,
     ) -> RawResultStream {
         let schema = numbers_schema();
@@ -360,7 +414,6 @@ impl MockSession {
             index: 0,
             kind: ResultSetKind::Tabular(Arc::clone(&schema)),
         });
-        let batch = u64::from(batch_rows.max(1));
         let rows = futures_util::stream::unfold((0u64, guard), move |(next, guard)| {
             let schema = Arc::clone(&schema);
             let stats = Arc::clone(&stats);
@@ -371,11 +424,16 @@ impl MockSession {
                 if let Some(d) = delay {
                     tokio::time::sleep(d).await;
                 }
-                let count = batch.min(total - next);
-                // Rows are produced only when the consumer polls: nothing runs ahead.
-                stats.rows_generated.fetch_add(count, Ordering::SeqCst);
-                let item = numbers_batch(&schema, next, count).map(ResultItem::Rows);
-                Some((item, (next + count, guard)))
+                // Rows are produced only when the consumer polls: nothing runs ahead, and a
+                // batch ends at the budget's row or byte limit.
+                match numbers_batch(&schema, next, total, label_len, &budget) {
+                    Ok(batch) => {
+                        let count = batch.num_rows() as u64;
+                        stats.rows_generated.fetch_add(count, Ordering::SeqCst);
+                        Some((Ok(ResultItem::Rows(batch)), (next + count.max(1), guard)))
+                    }
+                    Err(e) => Some((Err(e), (total, guard))),
+                }
             }
         });
         Box::pin(futures_util::StreamExt::chain(
@@ -390,7 +448,7 @@ impl MockSession {
             index: 0,
             kind: ResultSetKind::Documents,
         });
-        let batch = u64::from(batch_rows.max(1));
+        let batch = u64::from(batch_rows);
         let docs = futures_util::stream::unfold((0u64, guard), move |(next, guard)| {
             let stats = Arc::clone(&stats);
             async move {
@@ -430,7 +488,13 @@ impl MockSession {
                 index: 0,
                 kind: ResultSetKind::Tabular(Arc::clone(&schema)),
             })),
-            Ok(ResultItem::Rows(numbers_batch(&schema, 0, 1)?)),
+            Ok(ResultItem::Rows(numbers_batch(
+                &schema,
+                0,
+                1,
+                None,
+                &FetchBudget::default(),
+            )?)),
             Ok(ResultItem::Notice(Notice {
                 severity: NoticeSeverity::Info,
                 code: None,
@@ -440,7 +504,13 @@ impl MockSession {
                 index: 1,
                 kind: ResultSetKind::Tabular(Arc::clone(&schema)),
             })),
-            Ok(ResultItem::Rows(numbers_batch(&schema, 1, 2)?)),
+            Ok(ResultItem::Rows(numbers_batch(
+                &schema,
+                1,
+                3,
+                None,
+                &FetchBudget::default(),
+            )?)),
         ];
         Ok(Box::pin(futures_util::StreamExt::chain(
             futures_util::stream::iter(items),
@@ -491,9 +561,14 @@ impl Session for MockSession {
         if !statement.params.is_empty() && !self.capabilities.parameters {
             return Err(DriverError::Unsupported(Feature::Parameters));
         }
+        if self.closed {
+            return Err(DriverError::Closed("session closed".into()));
+        }
         if self.server.streaming.load(Ordering::SeqCst) {
             return Err(DriverError::Busy);
         }
+        // One statement per call: what runs is what was classified (H1).
+        ensure_single_statement(&AnsiDialect, &statement.text)?;
         let class = AnsiDialect.classify(&statement.text);
         // Client-side refusal (always on in read-only sessions, I3).
         if self.read_only && class.is_write() {
@@ -504,16 +579,14 @@ impl Session for MockSession {
         let lower = statement.text.trim().to_ascii_lowercase();
         let first = lower.split_whitespace().next().unwrap_or("").to_owned();
 
-        // Simulated server-side read-only (SessionSetting mechanism): rejects any write keyword
-        // even if the client-side classification missed it.
+        // Simulated server-side read-only (SessionSetting mechanism): rejects any write,
+        // including `mock_write()`, a write the client-side classifier cannot see.
         let engine_side = self.capabilities.read_only.is_engine_side();
-        if engine_side
-            && self.server.read_only.load(Ordering::SeqCst)
-            && matches!(
-                first.as_str(),
-                "insert" | "update" | "delete" | "merge" | "create" | "drop" | "alter" | "truncate"
-            )
-        {
+        let server_sees_write = matches!(
+            first.as_str(),
+            "insert" | "update" | "delete" | "merge" | "create" | "drop" | "alter" | "truncate"
+        ) || lower.contains("mock_write(");
+        if engine_side && self.server.read_only.load(Ordering::SeqCst) && server_sees_write {
             self.stats
                 .server_rejected_writes
                 .fetch_add(1, Ordering::SeqCst);
@@ -522,9 +595,27 @@ impl Session for MockSession {
             ));
         }
 
+        // `mock_lift_read_only()` simulates a statement that lifts the engine-side setting
+        // without being classified as such. For liftable mechanisms the driver verifies the
+        // access mode after every statement and closes the session if it changed (H2).
+        if engine_side && lower.contains("mock_lift_read_only(") {
+            self.server.read_only.store(false, Ordering::SeqCst);
+        }
+        if self.read_only
+            && self.capabilities.read_only.is_liftable()
+            && !self.server.read_only.load(Ordering::SeqCst)
+        {
+            self.closed = true;
+            tracing::warn!("mock: read-only mode was lifted by a statement; session closed");
+            return Err(DriverError::ReadOnly(
+                "the session left read-only mode; it was closed".into(),
+            ));
+        }
+
         match class {
             StatementClass::Read => {
-                let batch_rows = options.budget.batch_rows;
+                let batch_rows = options.budget.effective_batch_rows();
+                let budget = options.budget;
                 if let Some(args) = call_args(&lower, "slow_numbers") {
                     let [n, ms] = args[..] else {
                         return Err(DriverError::Query {
@@ -535,16 +626,49 @@ impl Session for MockSession {
                     };
                     self.server.streaming.store(true, Ordering::SeqCst);
                     let guard = BusyGuard(Arc::clone(&self.server.streaming));
-                    let raw =
-                        self.tabular_stream(n, Some(Duration::from_millis(ms)), batch_rows, guard);
+                    let delay = Some(Duration::from_millis(ms));
+                    let raw = self.tabular_stream(n, delay, None, budget, guard);
                     return Ok(ResultStream::new(raw, &options, self.cancel_handle()));
                 }
                 if let Some(args) = call_args(&lower, "numbers") {
                     let n = args.first().copied().unwrap_or(0);
                     self.server.streaming.store(true, Ordering::SeqCst);
                     let guard = BusyGuard(Arc::clone(&self.server.streaming));
-                    let raw = self.tabular_stream(n, None, batch_rows, guard);
+                    let raw = self.tabular_stream(n, None, None, budget, guard);
                     return Ok(ResultStream::new(raw, &options, self.cancel_handle()));
+                }
+                if let Some(args) = call_args(&lower, "wide") {
+                    let [n, len] = args[..] else {
+                        return Err(DriverError::Query {
+                            code: Some("42883".into()),
+                            message: "wide(rows, value_bytes) expects two arguments".into(),
+                            position: None,
+                        });
+                    };
+                    self.server.streaming.store(true, Ordering::SeqCst);
+                    let guard = BusyGuard(Arc::clone(&self.server.streaming));
+                    let raw = self.tabular_stream(n, None, Some(len), budget, guard);
+                    return Ok(ResultStream::new(raw, &options, self.cancel_handle()));
+                }
+                if lower.contains("mock_write(") {
+                    return Ok(self.single(Ok(ResultItem::UpdateCount(Some(1))), &options));
+                }
+                if let Some(args) = call_args(&lower, "notices") {
+                    let n = args.first().copied().unwrap_or(0);
+                    let items: Vec<_> = (0..n)
+                        .map(|i| {
+                            Ok(ResultItem::Notice(Notice {
+                                severity: NoticeSeverity::Info,
+                                code: None,
+                                message: format!("notice {i}"),
+                            }))
+                        })
+                        .collect();
+                    return Ok(ResultStream::new(
+                        Box::pin(futures_util::stream::iter(items)),
+                        &options,
+                        self.cancel_handle(),
+                    ));
                 }
                 if let Some(args) = call_args(&lower, "documents") {
                     let n = args.first().copied().unwrap_or(0);
@@ -678,6 +802,9 @@ impl Session for MockSession {
     }
 
     async fn ping(&mut self) -> DriverResult<()> {
+        if self.closed {
+            return Err(DriverError::Closed("session closed".into()));
+        }
         Ok(())
     }
 

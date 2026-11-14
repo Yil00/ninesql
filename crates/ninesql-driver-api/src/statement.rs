@@ -111,25 +111,100 @@ impl fmt::Debug for Statement {
 
 /// Memory budget for one result (I6, ADR-0004).
 ///
-/// The stream never delivers more than `max_bytes` (estimated from Arrow buffer sizes and
-/// document sizes) nor more than `max_rows` rows; it ends with
-/// [`ResultItem::Truncated`](crate::ResultItem::Truncated) instead. Drivers size their batches
-/// with `batch_rows`, which also bounds how far the server cursor runs ahead of the consumer.
+/// The stream never delivers more than `max_bytes` (estimated from Arrow buffer sizes, document
+/// sizes, notice and update-count items) nor more than `max_rows` rows; it ends with
+/// [`ResultItem::Truncated`](crate::ResultItem::Truncated) instead.
+///
+/// Drivers bound what they build **before** handing it to the stream:
+/// - a batch ends at [`effective_batch_rows`](Self::effective_batch_rows) rows or as soon as it
+///   reaches [`effective_max_batch_bytes`](Self::effective_max_batch_bytes) (use
+///   [`BatchLimiter`]), which also bounds how far the server cursor runs ahead of the consumer;
+/// - a single value longer than `max_value_bytes` (text, binary, JSON, LOB) is cut (use
+///   [`truncate_str`] / [`truncate_bytes`]) and its field carries
+///   [`TRUNCATED_VALUES_METADATA_KEY`](crate::TRUNCATED_VALUES_METADATA_KEY) `= "true"` in the
+///   batch schema; drivers stream LOBs instead of reading them whole when the client allows.
+///
+/// Non-exhaustive: build from `FetchBudget::default()` and the `with_*` methods.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct FetchBudget {
-    /// Rows per batch fetched from the server (DBeaver's "fetch size").
+    /// Rows per batch fetched from the server (DBeaver's "fetch size"); clamped to
+    /// `1..=MAX_BATCH_ROWS` by [`effective_batch_rows`](Self::effective_batch_rows).
     pub batch_rows: u32,
     /// Maximum bytes held by this result.
     pub max_bytes: u64,
     /// Maximum rows / documents delivered, if any.
     pub max_rows: Option<u64>,
+    /// Maximum estimated bytes of one batch.
+    pub max_batch_bytes: u64,
+    /// Maximum bytes of one value; longer values are cut and flagged.
+    pub max_value_bytes: u64,
 }
 
 impl FetchBudget {
     /// DBeaver's default fetch size.
     pub const DEFAULT_BATCH_ROWS: u32 = 200;
+    /// Upper bound of `batch_rows`.
+    pub const MAX_BATCH_ROWS: u32 = 10_000;
     /// Default per-result memory budget: 256 MiB.
     pub const DEFAULT_MAX_BYTES: u64 = 256 * 1024 * 1024;
+    /// Default per-batch budget: 8 MiB.
+    pub const DEFAULT_MAX_BATCH_BYTES: u64 = 8 * 1024 * 1024;
+    /// Default per-value budget: 1 MiB.
+    pub const DEFAULT_MAX_VALUE_BYTES: u64 = 1024 * 1024;
+
+    /// Rows per batch, clamped to `1..=MAX_BATCH_ROWS`.
+    #[must_use]
+    pub fn effective_batch_rows(&self) -> u32 {
+        self.batch_rows.clamp(1, Self::MAX_BATCH_ROWS)
+    }
+
+    /// Bytes per batch, never above `max_bytes`, at least 1.
+    #[must_use]
+    pub fn effective_max_batch_bytes(&self) -> u64 {
+        self.max_batch_bytes.min(self.max_bytes).max(1)
+    }
+
+    /// Bytes per value, never above the batch budget.
+    #[must_use]
+    pub fn effective_max_value_bytes(&self) -> u64 {
+        self.max_value_bytes.min(self.effective_max_batch_bytes())
+    }
+
+    /// Sets `batch_rows`.
+    #[must_use]
+    pub fn with_batch_rows(mut self, rows: u32) -> Self {
+        self.batch_rows = rows;
+        self
+    }
+
+    /// Sets `max_bytes`.
+    #[must_use]
+    pub fn with_max_bytes(mut self, bytes: u64) -> Self {
+        self.max_bytes = bytes;
+        self
+    }
+
+    /// Sets `max_rows`.
+    #[must_use]
+    pub fn with_max_rows(mut self, rows: Option<u64>) -> Self {
+        self.max_rows = rows;
+        self
+    }
+
+    /// Sets `max_batch_bytes`.
+    #[must_use]
+    pub fn with_max_batch_bytes(mut self, bytes: u64) -> Self {
+        self.max_batch_bytes = bytes;
+        self
+    }
+
+    /// Sets `max_value_bytes`.
+    #[must_use]
+    pub fn with_max_value_bytes(mut self, bytes: u64) -> Self {
+        self.max_value_bytes = bytes;
+        self
+    }
 }
 
 impl Default for FetchBudget {
@@ -138,12 +213,95 @@ impl Default for FetchBudget {
             batch_rows: Self::DEFAULT_BATCH_ROWS,
             max_bytes: Self::DEFAULT_MAX_BYTES,
             max_rows: None,
+            max_batch_bytes: Self::DEFAULT_MAX_BATCH_BYTES,
+            max_value_bytes: Self::DEFAULT_MAX_VALUE_BYTES,
         }
     }
 }
 
+/// Helps a driver end a batch at the budget's row and byte limits while it decodes rows.
+#[derive(Clone, Copy, Debug)]
+pub struct BatchLimiter {
+    max_rows: u32,
+    max_bytes: u64,
+    rows: u32,
+    bytes: u64,
+}
+
+impl BatchLimiter {
+    /// A limiter for one batch under `budget`.
+    #[must_use]
+    pub fn new(budget: &FetchBudget) -> Self {
+        Self {
+            max_rows: budget.effective_batch_rows(),
+            max_bytes: budget.effective_max_batch_bytes(),
+            rows: 0,
+            bytes: 0,
+        }
+    }
+
+    /// Records one decoded row of estimated size `row_bytes`.
+    pub fn add_row(&mut self, row_bytes: u64) {
+        self.rows = self.rows.saturating_add(1);
+        self.bytes = self.bytes.saturating_add(row_bytes);
+    }
+
+    /// `true` when the batch must be emitted now (row or byte limit reached).
+    #[must_use]
+    pub fn is_full(&self) -> bool {
+        self.rows >= self.max_rows || self.bytes >= self.max_bytes
+    }
+
+    /// Rows in the current batch.
+    #[must_use]
+    pub fn rows(&self) -> u32 {
+        self.rows
+    }
+
+    /// Estimated bytes of the current batch.
+    #[must_use]
+    pub fn bytes(&self) -> u64 {
+        self.bytes
+    }
+
+    /// Starts the next batch.
+    pub fn reset(&mut self) {
+        self.rows = 0;
+        self.bytes = 0;
+    }
+}
+
+/// Cuts `value` to at most `max_bytes` bytes on a `char` boundary. The flag is `true` when it
+/// was cut.
+#[must_use]
+pub fn truncate_str(value: &str, max_bytes: u64) -> (&str, bool) {
+    let max = usize::try_from(max_bytes).unwrap_or(usize::MAX);
+    if value.len() <= max {
+        return (value, false);
+    }
+    let mut end = max;
+    while !value.is_char_boundary(end) {
+        end -= 1;
+    }
+    (&value[..end], true)
+}
+
+/// Cuts `value` to at most `max_bytes` bytes. The flag is `true` when it was cut.
+#[must_use]
+pub fn truncate_bytes(value: &[u8], max_bytes: u64) -> (&[u8], bool) {
+    let max = usize::try_from(max_bytes).unwrap_or(usize::MAX);
+    if value.len() <= max {
+        (value, false)
+    } else {
+        (&value[..max], true)
+    }
+}
+
 /// Options for one [`Session::execute`](crate::Session::execute) call.
+///
+/// Non-exhaustive: build from `ExecOptions::default()` and the `with_*` methods.
 #[derive(Clone, Debug, Default)]
+#[non_exhaustive]
 pub struct ExecOptions {
     /// Wall-clock limit for the whole execution, including fetching. `None` = no limit
     /// (interactive default, ADR-0004). On expiry the statement is cancelled (server-side when
@@ -154,6 +312,29 @@ pub struct ExecOptions {
     /// Cancelled by the user ("Stop" button). The stream yields
     /// [`DriverError::Cancelled`](crate::DriverError::Cancelled).
     pub cancel: CancelToken,
+}
+
+impl ExecOptions {
+    /// Sets the timeout.
+    #[must_use]
+    pub fn with_timeout(mut self, timeout: Option<Duration>) -> Self {
+        self.timeout = timeout;
+        self
+    }
+
+    /// Sets the budget.
+    #[must_use]
+    pub fn with_budget(mut self, budget: FetchBudget) -> Self {
+        self.budget = budget;
+        self
+    }
+
+    /// Sets the cancel token.
+    #[must_use]
+    pub fn with_cancel(mut self, cancel: CancelToken) -> Self {
+        self.cancel = cancel;
+        self
+    }
 }
 
 /// A cloneable cancellation flag shared between the UI side and the running stream.
@@ -228,6 +409,31 @@ mod tests {
         assert_eq!(b.batch_rows, 200);
         assert_eq!(b.max_bytes, 256 * 1024 * 1024);
         assert_eq!(ExecOptions::default().timeout, None);
+        assert_eq!(b.with_batch_rows(0).effective_batch_rows(), 1);
+        assert_eq!(
+            b.with_batch_rows(u32::MAX).effective_batch_rows(),
+            FetchBudget::MAX_BATCH_ROWS
+        );
+        assert_eq!(b.with_max_bytes(1000).effective_max_batch_bytes(), 1000);
+    }
+
+    #[test]
+    fn batch_limiter_and_value_truncation() {
+        let b = FetchBudget::default()
+            .with_batch_rows(3)
+            .with_max_batch_bytes(100);
+        let mut l = BatchLimiter::new(&b);
+        l.add_row(10);
+        l.add_row(10);
+        assert!(!l.is_full());
+        l.add_row(10);
+        assert!(l.is_full());
+        l.reset();
+        l.add_row(150);
+        assert!(l.is_full());
+        assert_eq!(truncate_str("héllo", 2), ("h", true));
+        assert_eq!(truncate_str("hello", 10), ("hello", false));
+        assert_eq!(truncate_bytes(b"abcdef", 3), (&b"abc"[..], true));
     }
 
     #[tokio::test]

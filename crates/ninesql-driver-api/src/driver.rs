@@ -50,6 +50,11 @@ pub trait Driver: Send + Sync {
     /// Opens a session.
     ///
     /// Contract:
+    /// - call [`check_properties`](crate::check_properties) first: driver properties never
+    ///   override TLS / verification, host / port, credentials, read-only / access mode,
+    ///   multi-statements, init SQL or lexical modes (reuse
+    ///   `conformance::assert_reserved_properties_rejected` in the integration tests);
+    /// - disable multi-statement support in the client (MySQL `CLIENT_MULTI_STATEMENTS` off);
     /// - honour [`ConnectParams::connect_timeout`] for the whole connect;
     /// - verify TLS according to [`TlsConfig`](crate::TlsConfig) with rustls; never fall back to
     ///   a weaker mode than requested;
@@ -88,14 +93,32 @@ pub trait Session: Send + Sync {
     /// Contract:
     /// - returns quickly with a [`ResultStream`] built by [`ResultStream::new`] around a lazy raw
     ///   stream, so the timeout, the cancel token and the budget in `options` cover the work;
-    /// - fetches in batches of [`FetchBudget::batch_rows`](crate::FetchBudget::batch_rows) rows,
-    ///   never reading the whole result into memory (I6);
+    /// - sends exactly **one statement per protocol call** (PostgreSQL extended protocol, MySQL
+    ///   without `CLIENT_MULTI_STATEMENTS`) and refuses text that
+    ///   [`Dialect::split_statements`] splits into more than one span with
+    ///   [`DriverError::MultipleStatements`] ([`ensure_single_statement`](crate::ensure_single_statement)),
+    ///   so the statement the engine runs is the one that was classified;
+    /// - builds the [`Dialect`]'s [`LexicalRules`](crate::LexicalRules) from the session's
+    ///   current lexical modes (MySQL `NO_BACKSLASH_ESCAPES`, PostgreSQL
+    ///   `standard_conforming_strings`) before classifying;
+    /// - ends each batch at
+    ///   [`FetchBudget::effective_batch_rows`](crate::FetchBudget::effective_batch_rows) rows or
+    ///   [`FetchBudget::effective_max_batch_bytes`](crate::FetchBudget::effective_max_batch_bytes)
+    ///   bytes, whichever comes first ([`BatchLimiter`](crate::BatchLimiter)), and cuts values
+    ///   above [`FetchBudget::max_value_bytes`](crate::FetchBudget::max_value_bytes), flagging
+    ///   the field with [`TRUNCATED_VALUES_METADATA_KEY`](crate::TRUNCATED_VALUES_METADATA_KEY);
+    ///   never reads the whole result, or a whole oversized value, into memory (I6);
     /// - in a read-only session, refuses statements whose
     ///   [`Dialect::classify`] is a write with
     ///   [`DriverError::ReadOnly`] before sending them, in addition to the engine-side mechanism
     ///   that rejects anything the classifier misses (I3). Statements classified
     ///   [`ChangesAccessMode`](crate::StatementClass::ChangesAccessMode) are always refused in a
     ///   read-only session, since many engines let a client lift the session setting;
+    /// - when the mechanism is [liftable](crate::ReadOnlyMechanism::is_liftable), verifies the
+    ///   engine's access mode after every statement (PostgreSQL `ParameterStatus` for
+    ///   `default_transaction_read_only`, MySQL session-state tracking of
+    ///   `transaction_read_only`, or a read-back) and, if it changed, closes the session and
+    ///   fails with [`DriverError::ReadOnly`]; later calls fail with [`DriverError::Closed`];
     /// - fails with [`DriverError::Busy`] while a previous [`ResultStream`] of this session is
     ///   still alive, unless the engine multiplexes;
     /// - fails with [`DriverError::Unsupported`] for a language or parameters not declared.

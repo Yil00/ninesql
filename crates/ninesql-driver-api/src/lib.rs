@@ -22,6 +22,8 @@
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
 
 pub mod capabilities;
+#[cfg(feature = "mock")]
+pub mod conformance;
 pub mod dialect;
 pub mod driver;
 pub mod error;
@@ -40,6 +42,7 @@ pub use capabilities::{
 };
 pub use dialect::{
     AnsiDialect, Dialect, LexicalRules, RowChange, RowEdit, StatementClass, StatementSpan,
+    ensure_single_statement,
 };
 pub use driver::{Driver, Session};
 pub use error::{DriverError, DriverResult, redact_connection_string, redact_secret};
@@ -48,16 +51,20 @@ pub use metadata::{
     TableInfo,
 };
 pub use params::{
-    Auth, ClientCertificate, ConnectParams, Endpoint, EngineId, HostKeyVerification,
-    SecurityWarning, TlsConfig, TlsMode, TunnelInfo,
+    Auth, ClientCertificate, ConnectParams, Endpoint, EngineId, HostKeyVerification, PropertyValue,
+    ProxyInfo, ProxyKind, SecurityWarning, TlsConfig, TlsMode, TunnelInfo, check_properties,
+    is_reserved_property,
 };
 pub use result::{
     CancelHandle, DocValue, Document, ENGINE_TYPE_METADATA_KEY, NoServerCancel, Notice,
     NoticeSeverity, RawResultStream, ResultItem, ResultSetHeader, ResultSetKind, ResultStream,
-    Truncation, TruncationReason,
+    TRUNCATED_VALUES_METADATA_KEY, Truncation, TruncationReason,
 };
 pub use secret::Secret;
-pub use statement::{CancelToken, ExecOptions, FetchBudget, Param, Statement};
+pub use statement::{
+    BatchLimiter, CancelToken, ExecOptions, FetchBudget, Param, Statement, truncate_bytes,
+    truncate_str,
+};
 
 /// Re-exported Arrow array crate, so drivers and the grid use the exact same version.
 pub use arrow_array;

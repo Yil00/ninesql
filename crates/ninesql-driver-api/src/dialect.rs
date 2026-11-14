@@ -4,25 +4,133 @@
 //! Every method has an ANSI default so a driver only overrides what its engine does differently.
 //! The defaults are conservative: anything the classifier does not recognise is
 //! [`StatementClass::Unknown`], which counts as destructive.
+//!
+//! # Security
+//! The classifier is a guard rail, not the read-only mechanism (I3): engines enforce read-only
+//! themselves. It must still never under-classify, so its lexer follows the engine's lexical
+//! rules exactly ([`LexicalRules`]): a driver whose engine has a session mode that changes them
+//! (MySQL `NO_BACKSLASH_ESCAPES`, PostgreSQL `standard_conforming_strings`) builds its rules from
+//! the session's current mode. Drivers also send exactly one statement per protocol call (see
+//! [`ensure_single_statement`]).
 
 use crate::capabilities::ExplainFormat;
 use crate::error::{DriverError, DriverResult};
 use crate::statement::{Param, Statement};
 
 /// Lexical rules used by the default splitter, classifier and literal formatter.
+///
+/// Build them from a preset ([`LexicalRules::ANSI`], [`POSTGRES`](Self::POSTGRES),
+/// [`MYSQL`](Self::MYSQL), [`SQLITE`](Self::SQLITE)) and the `with_*` methods.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+#[non_exhaustive]
 #[allow(clippy::struct_excessive_bools)]
 pub struct LexicalRules {
-    /// Backslash escapes inside string literals (MySQL / MariaDB default mode).
+    /// Backslash escapes inside every string literal (MySQL / MariaDB unless the session's
+    /// `sql_mode` has `NO_BACKSLASH_ESCAPES`; PostgreSQL with `standard_conforming_strings = off`).
     pub backslash_escapes: bool,
+    /// Backslash escapes inside `E'…'` strings (PostgreSQL family).
+    pub e_string_backslash: bool,
     /// Block comments nest (PostgreSQL).
     pub nested_block_comments: bool,
     /// `$tag$ … $tag$` dollar-quoted strings (PostgreSQL family).
     pub dollar_quotes: bool,
     /// `#` starts a line comment (MySQL family).
     pub hash_comments: bool,
+    /// `--` starts a comment only when followed by whitespace, a control character or the end
+    /// of input (MySQL family): `1--1` is an expression.
+    pub dash_comment_needs_space: bool,
+    /// `/*! … */` and `/*M! … */` (optionally with a version number) are executed as code
+    /// (MySQL / MariaDB executable comments).
+    pub executable_comments: bool,
     /// `` ` `` quotes identifiers (MySQL family, SQLite, ClickHouse).
     pub backtick_identifiers: bool,
+}
+
+impl LexicalRules {
+    /// ANSI SQL: `'…'` strings with `''`, `"…"` identifiers, `--` and `/* */` comments.
+    pub const ANSI: Self = Self {
+        backslash_escapes: false,
+        e_string_backslash: false,
+        nested_block_comments: false,
+        dollar_quotes: false,
+        hash_comments: false,
+        dash_comment_needs_space: false,
+        executable_comments: false,
+        backtick_identifiers: false,
+    };
+
+    /// PostgreSQL family with `standard_conforming_strings = on` (the default since 9.1).
+    pub const POSTGRES: Self = Self::ANSI
+        .with_e_string_backslash(true)
+        .with_nested_block_comments(true)
+        .with_dollar_quotes(true);
+
+    /// MySQL / MariaDB in the default `sql_mode` (backslash escapes on).
+    pub const MYSQL: Self = Self::ANSI
+        .with_backslash_escapes(true)
+        .with_hash_comments(true)
+        .with_dash_comment_needs_space(true)
+        .with_executable_comments(true)
+        .with_backtick_identifiers(true);
+
+    /// SQLite.
+    pub const SQLITE: Self = Self::ANSI.with_backtick_identifiers(true);
+
+    /// Sets [`backslash_escapes`](Self::backslash_escapes).
+    #[must_use]
+    pub const fn with_backslash_escapes(mut self, on: bool) -> Self {
+        self.backslash_escapes = on;
+        self
+    }
+
+    /// Sets [`e_string_backslash`](Self::e_string_backslash).
+    #[must_use]
+    pub const fn with_e_string_backslash(mut self, on: bool) -> Self {
+        self.e_string_backslash = on;
+        self
+    }
+
+    /// Sets [`nested_block_comments`](Self::nested_block_comments).
+    #[must_use]
+    pub const fn with_nested_block_comments(mut self, on: bool) -> Self {
+        self.nested_block_comments = on;
+        self
+    }
+
+    /// Sets [`dollar_quotes`](Self::dollar_quotes).
+    #[must_use]
+    pub const fn with_dollar_quotes(mut self, on: bool) -> Self {
+        self.dollar_quotes = on;
+        self
+    }
+
+    /// Sets [`hash_comments`](Self::hash_comments).
+    #[must_use]
+    pub const fn with_hash_comments(mut self, on: bool) -> Self {
+        self.hash_comments = on;
+        self
+    }
+
+    /// Sets [`dash_comment_needs_space`](Self::dash_comment_needs_space).
+    #[must_use]
+    pub const fn with_dash_comment_needs_space(mut self, on: bool) -> Self {
+        self.dash_comment_needs_space = on;
+        self
+    }
+
+    /// Sets [`executable_comments`](Self::executable_comments).
+    #[must_use]
+    pub const fn with_executable_comments(mut self, on: bool) -> Self {
+        self.executable_comments = on;
+        self
+    }
+
+    /// Sets [`backtick_identifiers`](Self::backtick_identifiers).
+    #[must_use]
+    pub const fn with_backtick_identifiers(mut self, on: bool) -> Self {
+        self.backtick_identifiers = on;
+        self
+    }
 }
 
 /// Byte range of one statement inside a script, excluding surrounding whitespace, leading
@@ -211,7 +319,10 @@ impl Dialect for AnsiDialect {}
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum TokKind {
     Word,
-    Quoted,
+    /// String literal (`'…'`, `E'…'`, `$tag$…$tag$`).
+    Str,
+    /// Quoted identifier (`"…"`, `` `…` ``).
+    Ident,
     Semicolon,
     Other,
 }
@@ -221,6 +332,12 @@ struct Tok {
     kind: TokKind,
     start: usize,
     end: usize,
+}
+
+struct Lexed {
+    toks: Vec<Tok>,
+    /// A `/*!` or `/*M!` comment was seen while executable comments were not enabled.
+    executable_comment_as_comment: bool,
 }
 
 fn is_word_byte(b: u8) -> bool {
@@ -278,20 +395,56 @@ fn find_sub(hay: &[u8], needle: &[u8], from: usize) -> Option<usize> {
         .map(|p| p + from)
 }
 
-fn lex(text: &str, rules: LexicalRules) -> Vec<Tok> {
+/// Length of an executable-comment opener (`/*!`, `/*M!`, plus version digits) at `i`.
+fn executable_opener(bytes: &[u8], i: usize) -> Option<usize> {
+    let rest = &bytes[i..];
+    let base = if rest.starts_with(b"/*!") {
+        3
+    } else if rest.starts_with(b"/*M!") {
+        4
+    } else {
+        return None;
+    };
+    let digits = rest[base..]
+        .iter()
+        .take_while(|b| b.is_ascii_digit())
+        .count();
+    Some(base + digits)
+}
+
+fn lex(text: &str, rules: LexicalRules) -> Lexed {
     let bytes = text.as_bytes();
     let mut toks = Vec::new();
+    let mut executable_comment_as_comment = false;
+    let mut in_executable = false;
     let mut i = 0;
+    let push = |toks: &mut Vec<Tok>, kind, start, end| toks.push(Tok { kind, start, end });
     while i < bytes.len() {
         let b = bytes[i];
         let next = bytes.get(i + 1).copied();
+        let dash_comment = b == b'-'
+            && next == Some(b'-')
+            && (!rules.dash_comment_needs_space
+                || bytes.get(i + 2).is_none_or(|c| *c <= b' ' || *c == 0x7f));
         if b.is_ascii_whitespace() {
             i += 1;
-        } else if b == b'-' && next == Some(b'-') || rules.hash_comments && b == b'#' {
+        } else if in_executable && b == b'*' && next == Some(b'/') {
+            // End of a `/*! … */` executable comment: its content was lexed as code.
+            in_executable = false;
+            i += 2;
+        } else if dash_comment || rules.hash_comments && b == b'#' {
             while i < bytes.len() && bytes[i] != b'\n' {
                 i += 1;
             }
         } else if b == b'/' && next == Some(b'*') {
+            if let Some(len) = executable_opener(bytes, i) {
+                if rules.executable_comments && !in_executable {
+                    in_executable = true;
+                    i += len;
+                    continue;
+                }
+                executable_comment_as_comment = true;
+            }
             let mut depth = 1usize;
             i += 2;
             while i < bytes.len() && depth > 0 {
@@ -309,60 +462,48 @@ fn lex(text: &str, rules: LexicalRules) -> Vec<Tok> {
                 }
             }
             i = i.min(bytes.len());
+        } else if rules.e_string_backslash && matches!(b, b'e' | b'E') && next == Some(b'\'') {
+            let end = skip_quoted(bytes, i + 1, b'\'', true).min(bytes.len());
+            push(&mut toks, TokKind::Str, i, end);
+            i = end;
         } else if b == b'\'' || b == b'"' || rules.backtick_identifiers && b == b'`' {
             let backslash = rules.backslash_escapes && b != b'`';
             let end = skip_quoted(bytes, i, b, backslash).min(bytes.len());
-            toks.push(Tok {
-                kind: TokKind::Quoted,
-                start: i,
-                end,
-            });
+            let kind = if b == b'\'' {
+                TokKind::Str
+            } else {
+                TokKind::Ident
+            };
+            push(&mut toks, kind, i, end);
             i = end;
         } else if rules.dollar_quotes && b == b'$' {
             if let Some(len) = dollar_tag(bytes, i) {
                 let tag = &bytes[i..i + len];
                 let end = find_sub(bytes, tag, i + len).map_or(bytes.len(), |p| p + len);
-                toks.push(Tok {
-                    kind: TokKind::Quoted,
-                    start: i,
-                    end,
-                });
+                push(&mut toks, TokKind::Str, i, end);
                 i = end;
             } else {
-                toks.push(Tok {
-                    kind: TokKind::Other,
-                    start: i,
-                    end: i + 1,
-                });
+                push(&mut toks, TokKind::Other, i, i + 1);
                 i += 1;
             }
         } else if b == b';' {
-            toks.push(Tok {
-                kind: TokKind::Semicolon,
-                start: i,
-                end: i + 1,
-            });
+            push(&mut toks, TokKind::Semicolon, i, i + 1);
             i += 1;
         } else if is_word_byte(b) {
             let start = i;
             while i < bytes.len() && is_word_byte(bytes[i]) {
                 i += 1;
             }
-            toks.push(Tok {
-                kind: TokKind::Word,
-                start,
-                end: i,
-            });
+            push(&mut toks, TokKind::Word, start, i);
         } else {
-            toks.push(Tok {
-                kind: TokKind::Other,
-                start: i,
-                end: i + 1,
-            });
+            push(&mut toks, TokKind::Other, i, i + 1);
             i += 1;
         }
     }
-    toks
+    Lexed {
+        toks,
+        executable_comment_as_comment,
+    }
 }
 
 /// Splits `script` with the given lexical rules (the default of [`Dialect::split_statements`]).
@@ -370,7 +511,7 @@ fn lex(text: &str, rules: LexicalRules) -> Vec<Tok> {
 pub fn split_with_rules(script: &str, rules: LexicalRules) -> Vec<StatementSpan> {
     let mut spans = Vec::new();
     let mut current: Option<StatementSpan> = None;
-    for t in lex(script, rules) {
+    for t in lex(script, rules).toks {
         if t.kind == TokKind::Semicolon {
             if let Some(s) = current.take() {
                 spans.push(s);
@@ -393,58 +534,247 @@ pub fn split_with_rules(script: &str, rules: LexicalRules) -> Vec<StatementSpan>
     spans
 }
 
+/// Fails with [`DriverError::MultipleStatements`] when `text` contains more than one statement
+/// for `dialect`.
+///
+/// Drivers call it in [`Session::execute`](crate::Session::execute) and send exactly one
+/// statement per protocol call (PostgreSQL extended protocol, MySQL without
+/// `CLIENT_MULTI_STATEMENTS`), so the statement the engine runs is the one that was classified.
+///
+/// # Errors
+/// [`DriverError::MultipleStatements`] with the number of statements found.
+pub fn ensure_single_statement<D: Dialect + ?Sized>(dialect: &D, text: &str) -> DriverResult<()> {
+    let n = dialect.split_statements(text).len();
+    if n > 1 {
+        Err(DriverError::MultipleStatements(n))
+    } else {
+        Ok(())
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
+// Classifier
+
+/// One significant token of a statement, as seen by the classifier.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum Item {
+    /// Unquoted word, upper-cased.
+    Word(String),
+    /// Quoted identifier, unquoted and lower-cased.
+    Ident(String),
+    /// String literal.
+    Str,
+    /// Punctuation.
+    Punct(u8),
+}
+
+#[derive(Clone, Debug)]
+struct Located {
+    item: Item,
+    /// Parenthesis depth (0 = top level).
+    depth: u32,
+}
+
 /// Classifies `text` with the given lexical rules (the default of [`Dialect::classify`]).
 #[must_use]
 pub fn classify_with_rules(text: &str, rules: LexicalRules) -> StatementClass {
-    let toks = lex(text, rules);
-    let mut worst: Option<StatementClass> = None;
-    for stmt in toks.split(|t| t.kind == TokKind::Semicolon) {
+    let lexed = lex(text, rules);
+    let mut worst = if lexed.executable_comment_as_comment {
+        // The engine might execute what we skipped as a comment.
+        Some(StatementClass::Unknown)
+    } else {
+        None
+    };
+    for stmt in lexed.toks.split(|t| t.kind == TokKind::Semicolon) {
         if stmt.is_empty() {
             continue;
         }
-        let words: Vec<String> = stmt
-            .iter()
-            .filter(|t| t.kind == TokKind::Word)
-            .map(|t| text[t.start..t.end].to_ascii_uppercase())
-            .collect();
-        // Statements must start with a keyword, optionally after opening parentheses.
-        let starts_with_word = stmt
-            .iter()
-            .find(|t| !(t.kind == TokKind::Other && &text[t.start..t.end] == "("))
-            .is_some_and(|t| t.kind == TokKind::Word);
-        let c = if starts_with_word {
-            classify_words(&words)
-        } else {
-            StatementClass::Unknown
-        };
+        let items = locate(text, stmt);
+        let c = classify_items(&items);
         worst = Some(worst.map_or(c, |w| w.max(c)));
     }
     worst.unwrap_or(StatementClass::Read)
 }
 
-const ACCESS_MODE_WORDS: &[&str] = &[
-    "READ",
-    "WRITE",
-    "READONLY",
-    "READ_ONLY",
-    "QUERY_ONLY",
-    "ACCESS_MODE",
-    "TRANSACTION",
-    "DEFAULT_TRANSACTION_READ_ONLY",
-    "TRANSACTION_READ_ONLY",
-    "TX_READ_ONLY",
-    "SESSION_AUTHORIZATION",
-    "ROLE",
+fn unquote_ident(raw: &str) -> String {
+    let inner = raw.get(1..raw.len().saturating_sub(1)).unwrap_or("");
+    inner
+        .replace("\"\"", "\"")
+        .replace("``", "`")
+        .to_lowercase()
+}
+
+fn locate(text: &str, toks: &[Tok]) -> Vec<Located> {
+    let mut depth = 0u32;
+    let mut out = Vec::with_capacity(toks.len());
+    for t in toks {
+        let raw = &text[t.start..t.end];
+        let item = match t.kind {
+            TokKind::Word => Item::Word(raw.to_ascii_uppercase()),
+            TokKind::Ident => Item::Ident(unquote_ident(raw)),
+            TokKind::Str => Item::Str,
+            TokKind::Other | TokKind::Semicolon => Item::Punct(raw.as_bytes()[0]),
+        };
+        if item == Item::Punct(b')') {
+            depth = depth.saturating_sub(1);
+        }
+        out.push(Located {
+            item: item.clone(),
+            depth,
+        });
+        if item == Item::Punct(b'(') {
+            depth += 1;
+        }
+    }
+    out
+}
+
+/// Functions that change the session's access mode.
+const ACCESS_MODE_FUNCTIONS: &[&str] = &["SET_CONFIG"];
+
+/// Functions with side effects a `SELECT` can call. Unknown = needs confirmation, refused in
+/// read-only sessions.
+const SIDE_EFFECT_FUNCTIONS: &[&str] = &[
+    "NEXTVAL",
+    "SETVAL",
+    "DBLINK",
+    "DBLINK_EXEC",
+    "DBLINK_CONNECT",
+    "DBLINK_SEND_QUERY",
+    "PG_TERMINATE_BACKEND",
+    "PG_CANCEL_BACKEND",
+    "PG_RELOAD_CONF",
+    "PG_ROTATE_LOGFILE",
+    "PG_PROMOTE",
+    "PG_SWITCH_WAL",
+    "PG_CREATE_RESTORE_POINT",
+    "PG_FILE_WRITE",
+    "LO_IMPORT",
+    "LO_EXPORT",
+    "LO_UNLINK",
+    "LO_CREAT",
+    "LO_CREATE",
+    "LO_PUT",
+    "LO_FROM_BYTEA",
+    "LOAD_EXTENSION",
 ];
 
-fn classify_words(words: &[String]) -> StatementClass {
-    let Some(first) = words.first() else {
+/// Settings `SET` / `RESET` may change without affecting access mode, privileges or the lexical
+/// rules. Everything else is [`StatementClass::ChangesAccessMode`].
+const HARMLESS_SETTINGS: &[&str] = &[
+    "search_path",
+    "schema",
+    "timezone",
+    "time_zone",
+    "time",
+    "datestyle",
+    "intervalstyle",
+    "client_encoding",
+    "names",
+    "character",
+    "character_set_client",
+    "character_set_results",
+    "character_set_connection",
+    "collation_connection",
+    "application_name",
+    "statement_timeout",
+    "lock_timeout",
+    "idle_in_transaction_session_timeout",
+    "extra_float_digits",
+    "bytea_output",
+    "work_mem",
+    "client_min_messages",
+    "lc_messages",
+    "lc_monetary",
+    "lc_numeric",
+    "lc_time",
+    "max_execution_time",
+    "sql_select_limit",
+    "net_read_timeout",
+    "net_write_timeout",
+    "wait_timeout",
+    "lock_wait_timeout",
+    "innodb_lock_wait_timeout",
+    "div_precision_increment",
+    "group_concat_max_len",
+];
+
+/// SQLite pragmas that only read schema information.
+const READ_PRAGMAS: &[&str] = &[
+    "table_info",
+    "table_xinfo",
+    "table_list",
+    "index_list",
+    "index_info",
+    "index_xinfo",
+    "foreign_key_list",
+    "database_list",
+    "collation_list",
+    "compile_options",
+    "function_list",
+    "module_list",
+    "pragma_list",
+];
+
+fn word(l: &Located) -> Option<&str> {
+    match &l.item {
+        Item::Word(w) => Some(w),
+        _ => None,
+    }
+}
+
+/// Lower-cased name of a word or quoted identifier.
+fn name(l: &Located) -> Option<String> {
+    match &l.item {
+        Item::Word(w) => Some(w.to_ascii_lowercase()),
+        Item::Ident(i) => Some(i.clone()),
+        _ => None,
+    }
+}
+
+fn classify_items(items: &[Located]) -> StatementClass {
+    // Statements must start with a keyword, optionally after opening parentheses.
+    let Some(first_idx) = items.iter().position(|l| l.item != Item::Punct(b'(')) else {
         return StatementClass::Unknown;
     };
-    let has = |w: &str| words.iter().any(|x| x == w);
-    match first.as_str() {
+    let Some(first) = word(&items[first_idx]) else {
+        return StatementClass::Unknown;
+    };
+    let base = classify_by_keyword(first, &items[first_idx..]);
+
+    // Function calls anywhere in the statement.
+    let mut worst = base;
+    for pair in items.windows(2) {
+        if pair[1].item != Item::Punct(b'(') {
+            continue;
+        }
+        let Some(f) = word(&pair[0])
+            .map(str::to_owned)
+            .or_else(|| name(&pair[0]).map(|n| n.to_ascii_uppercase()))
+        else {
+            continue;
+        };
+        if ACCESS_MODE_FUNCTIONS.contains(&f.as_str()) {
+            worst = worst.max(StatementClass::ChangesAccessMode);
+        } else if SIDE_EFFECT_FUNCTIONS.contains(&f.as_str()) {
+            worst = worst.max(StatementClass::Unknown);
+        }
+    }
+    worst
+}
+
+fn has_word(items: &[Located], w: &str) -> bool {
+    items.iter().any(|l| word(l) == Some(w))
+}
+
+fn has_top_level_word(items: &[Located], w: &str) -> bool {
+    items.iter().any(|l| l.depth == 0 && word(l) == Some(w))
+}
+
+fn classify_by_keyword(first: &str, items: &[Located]) -> StatementClass {
+    match first {
         "SELECT" | "VALUES" | "TABLE" => {
-            if has("INTO") {
+            if has_word(items, "INTO") {
                 StatementClass::Write
             } else {
                 StatementClass::Read
@@ -452,30 +782,25 @@ fn classify_words(words: &[String]) -> StatementClass {
         }
         "SHOW" | "DESCRIBE" | "DESC" => StatementClass::Read,
         "EXPLAIN" => {
-            if has("ANALYZE") || has("ANALYSE") {
+            let analyze = items
+                .iter()
+                .position(|l| matches!(word(l), Some("ANALYZE" | "ANALYSE")));
+            match analyze {
                 // EXPLAIN ANALYZE runs the statement: classify what it runs.
-                let rest: Vec<String> = words
-                    .iter()
-                    .skip_while(|w| !matches!(w.as_str(), "ANALYZE" | "ANALYSE"))
-                    .skip(1)
-                    .cloned()
-                    .collect();
-                if rest.is_empty() {
-                    StatementClass::Unknown
-                } else {
-                    classify_words(&rest).max(StatementClass::Read)
+                Some(p) if p + 1 < items.len() => {
+                    classify_items(&items[p + 1..]).max(StatementClass::Read)
                 }
-            } else {
-                StatementClass::Read
+                Some(_) => StatementClass::Unknown,
+                None => StatementClass::Read,
             }
         }
         "WITH" => {
             if ["INSERT", "UPDATE", "DELETE", "MERGE"]
                 .iter()
-                .any(|w| has(w))
+                .any(|w| has_word(items, w))
             {
                 StatementClass::Unknown
-            } else if has("INTO") {
+            } else if has_word(items, "INTO") {
                 StatementClass::Write
             } else {
                 StatementClass::Read
@@ -483,7 +808,8 @@ fn classify_words(words: &[String]) -> StatementClass {
         }
         "INSERT" | "MERGE" | "UPSERT" | "REPLACE" => StatementClass::Write,
         "UPDATE" | "DELETE" => {
-            if has("WHERE") {
+            // Only a top-level WHERE filters the statement; a WHERE inside a subquery does not.
+            if has_top_level_word(items, "WHERE") {
                 StatementClass::Write
             } else {
                 StatementClass::Destructive
@@ -494,28 +820,99 @@ fn classify_words(words: &[String]) -> StatementClass {
             StatementClass::Destructive
         }
         "BEGIN" | "START" | "COMMIT" | "ROLLBACK" | "SAVEPOINT" | "RELEASE" | "END" => {
-            if first == "START" && !has("TRANSACTION") {
+            if first == "START" && !has_word(items, "TRANSACTION") {
                 return StatementClass::Unknown;
             }
-            if words.iter().any(|w| w == "WRITE") {
+            if has_word(items, "WRITE") {
                 // `BEGIN READ WRITE` / `START TRANSACTION READ WRITE`.
                 StatementClass::ChangesAccessMode
             } else {
                 StatementClass::Transaction
             }
         }
-        "SET" | "RESET" | "USE" => {
-            let touches_access_mode = words
-                .iter()
-                .skip(1)
-                .any(|w| ACCESS_MODE_WORDS.contains(&w.as_str()));
-            if touches_access_mode || first == "RESET" && has("ALL") {
-                StatementClass::ChangesAccessMode
-            } else {
-                StatementClass::Session
+        "SET" | "RESET" => classify_set(first, &items[1..]),
+        "PRAGMA" => classify_pragma(&items[1..]),
+        "USE" => StatementClass::Session,
+        _ => StatementClass::Unknown,
+    }
+}
+
+/// `SET` / `RESET`: every assignment must target an allowlisted setting.
+fn classify_set(first: &str, rest: &[Located]) -> StatementClass {
+    if rest.is_empty() {
+        return StatementClass::Unknown;
+    }
+    let segments = rest.split(|l| l.depth == 0 && l.item == Item::Punct(b','));
+    let mut class = StatementClass::Session;
+    for (n, seg) in segments.enumerate() {
+        // After the first, a segment without `=` / `TO` continues the previous value list
+        // (`SET search_path TO a, b`); it names no setting.
+        let assigns = seg.iter().any(|l| l.item == Item::Punct(b'=')) || has_word(seg, "TO");
+        if n > 0 && !assigns {
+            continue;
+        }
+        let c = classify_set_target(first, seg);
+        class = class.max(c);
+    }
+    class
+}
+
+fn classify_set_target(first: &str, seg: &[Located]) -> StatementClass {
+    let mut i = 0;
+    // `@user_var` (MySQL) is harmless; `@@[session.|local.]name` is a system variable.
+    if seg.first().map(|l| &l.item) == Some(&Item::Punct(b'@')) {
+        if seg.get(1).map(|l| &l.item) != Some(&Item::Punct(b'@')) {
+            return StatementClass::Session;
+        }
+        i = 2;
+        if let (Some(scope), Some(dot)) = (seg.get(i), seg.get(i + 1)) {
+            if dot.item == Item::Punct(b'.') {
+                match word(scope) {
+                    Some("SESSION" | "LOCAL") => i += 2,
+                    _ => return StatementClass::ChangesAccessMode,
+                }
             }
         }
-        _ => StatementClass::Unknown,
+    } else {
+        // Scope modifiers.
+        while let Some(w) = seg.get(i).and_then(word) {
+            match w {
+                "SESSION" | "LOCAL" => i += 1,
+                _ => break,
+            }
+        }
+    }
+    let Some(target) = seg.get(i).and_then(name) else {
+        return StatementClass::Unknown;
+    };
+    if first == "RESET" && target == "all" {
+        return StatementClass::ChangesAccessMode;
+    }
+    if target == "transaction" {
+        // `SET TRANSACTION ISOLATION LEVEL …` is harmless; `… READ WRITE` is not.
+        return if has_word(seg, "WRITE") {
+            StatementClass::ChangesAccessMode
+        } else {
+            StatementClass::Session
+        };
+    }
+    if HARMLESS_SETTINGS.contains(&target.as_str()) {
+        StatementClass::Session
+    } else {
+        StatementClass::ChangesAccessMode
+    }
+}
+
+/// `PRAGMA [schema.]name[(arg)| = value]`: only schema-reading pragmas are reads.
+fn classify_pragma(rest: &[Located]) -> StatementClass {
+    let target = rest
+        .iter()
+        .take_while(|l| !matches!(l.item, Item::Punct(b'(' | b'=')))
+        .filter_map(name)
+        .last();
+    match target {
+        Some(t) if READ_PRAGMAS.contains(&t.as_str()) => StatementClass::Read,
+        _ => StatementClass::ChangesAccessMode,
     }
 }
 
@@ -542,6 +939,39 @@ fn civil_from_days(days: i64) -> (i64, u32, u32) {
     )
 }
 
+/// `^[+-]?\d+(\.\d+)?([eE][+-]?\d+)?$`
+fn is_strict_decimal(s: &str) -> bool {
+    fn digits(b: &[u8]) -> usize {
+        b.iter().take_while(|c| c.is_ascii_digit()).count()
+    }
+    let b = s.as_bytes();
+    let mut i = usize::from(matches!(b.first(), Some(b'+' | b'-')));
+    let n = digits(&b[i..]);
+    if n == 0 {
+        return false;
+    }
+    i += n;
+    if b.get(i) == Some(&b'.') {
+        let n = digits(&b[i + 1..]);
+        if n == 0 {
+            return false;
+        }
+        i += 1 + n;
+    }
+    if matches!(b.get(i), Some(b'e' | b'E')) {
+        i += 1;
+        if matches!(b.get(i), Some(b'+' | b'-')) {
+            i += 1;
+        }
+        let n = digits(&b[i..]);
+        if n == 0 {
+            return false;
+        }
+        i += n;
+    }
+    i == b.len()
+}
+
 fn quote_text(s: &str, backslash: bool) -> String {
     let mut out = String::with_capacity(s.len() + 2);
     out.push('\'');
@@ -564,11 +994,7 @@ fn ansi_literal(value: &Param, backslash: bool) -> String {
         Param::Float(f) if f.is_finite() => format!("{f:?}"),
         Param::Float(f) => quote_text(&f.to_string(), backslash),
         Param::Decimal(d) => {
-            let numeric = !d.is_empty()
-                && d.chars()
-                    .all(|c| c.is_ascii_digit() || matches!(c, '+' | '-' | '.' | 'e' | 'E'))
-                && d.chars().any(|c| c.is_ascii_digit());
-            if numeric {
+            if is_strict_decimal(d) {
                 d.clone()
             } else {
                 quote_text(d, backslash)
@@ -705,22 +1131,13 @@ mod tests {
 
     #[test]
     fn dialect_rules() {
-        let pg = LexicalRules {
-            dollar_quotes: true,
-            nested_block_comments: true,
-            ..LexicalRules::default()
-        };
+        let pg = LexicalRules::POSTGRES;
         let s = "create function f() as $body$ select 1; $body$; /* a /* b; */ c; */ select $1;";
         let spans = split_with_rules(s, pg);
         assert_eq!(spans.len(), 2, "{spans:?}");
         assert_eq!(spans[1].text(s), "select $1");
 
-        let my = LexicalRules {
-            backslash_escapes: true,
-            hash_comments: true,
-            backtick_identifiers: true,
-            ..LexicalRules::default()
-        };
+        let my = LexicalRules::MYSQL;
         let s = "select 'it\\'s; ok', `a;b` # x; y\n; select 2";
         let spans = split_with_rules(s, my);
         assert_eq!(spans.len(), 2, "{spans:?}");
@@ -777,6 +1194,198 @@ mod tests {
         assert!(C::Unknown.needs_confirmation());
         assert!(C::Unknown.is_write());
         assert!(!C::Read.is_write());
+    }
+
+    /// Bypasses found in the P0-B security review (H1, H2, M5). Each must stay caught.
+    #[test]
+    fn security_review_corpus() {
+        use StatementClass as C;
+        let my = LexicalRules::MYSQL;
+        let pg = LexicalRules::POSTGRES;
+        let ansi = LexicalRules::ANSI;
+        for (rules, sql, at_least, spans) in [
+            // H1: MySQL / MariaDB executable comments are code.
+            (my, "SELECT 1 /*! ; DROP TABLE users */", C::Destructive, 2),
+            (my, "/*!50000 DROP TABLE users */", C::Destructive, 1),
+            (my, "/*M! DROP TABLE users */", C::Destructive, 1),
+            (my, "/*M!100100 DROP TABLE users */", C::Destructive, 1),
+            // ...and count as Unknown when the rules do not execute them.
+            (ansi, "/*!50000 DROP TABLE users */", C::Unknown, 0),
+            (pg, "SELECT 1 /*! DROP TABLE users */", C::Unknown, 1),
+            // H1: `--` needs a following space in MySQL.
+            (my, "SELECT 1--1; DROP TABLE users", C::Destructive, 2),
+            (my, "SELECT 1-- comment; DROP TABLE users", C::Read, 1),
+            // H1: PostgreSQL E-strings take backslash escapes.
+            (
+                pg,
+                "SELECT E'\\''; DROP TABLE users; --'",
+                C::Destructive,
+                2,
+            ),
+            (
+                pg,
+                "SELECT e'\\''; DROP TABLE users; --'",
+                C::Destructive,
+                2,
+            ),
+            // H1: MySQL default mode vs NO_BACKSLASH_ESCAPES.
+            (my, "SELECT 'a\\'; DROP TABLE users; -- '", C::Read, 1),
+            (
+                my.with_backslash_escapes(false),
+                "SELECT 'a\\'; DROP TABLE users; -- '",
+                C::Destructive,
+                2,
+            ),
+            // H2: quoted setting names and functions that lift read-only.
+            (
+                pg,
+                "SET \"default_transaction_read_only\" = off",
+                C::ChangesAccessMode,
+                1,
+            ),
+            (
+                pg,
+                "SET default_transaction_read_only = off",
+                C::ChangesAccessMode,
+                1,
+            ),
+            (
+                pg,
+                "SET SESSION default_transaction_read_only TO off",
+                C::ChangesAccessMode,
+                1,
+            ),
+            (
+                pg,
+                "SET search_path = app, transaction_read_only = off",
+                C::ChangesAccessMode,
+                1,
+            ),
+            (
+                pg,
+                "SELECT set_config('default_transaction_read_only','off',false)",
+                C::ChangesAccessMode,
+                1,
+            ),
+            (
+                pg,
+                "select * from (select SET_CONFIG('a','b',false)) x",
+                C::ChangesAccessMode,
+                1,
+            ),
+            (my, "SET `transaction_read_only`=0", C::ChangesAccessMode, 1),
+            (
+                my,
+                "SET @@session.transaction_read_only = 0",
+                C::ChangesAccessMode,
+                1,
+            ),
+            (
+                my,
+                "SET @@global.time_zone = '+00:00'",
+                C::ChangesAccessMode,
+                1,
+            ),
+            (
+                my,
+                "SET GLOBAL time_zone = '+00:00'",
+                C::ChangesAccessMode,
+                1,
+            ),
+            (
+                my,
+                "SET sql_mode = 'NO_BACKSLASH_ESCAPES'",
+                C::ChangesAccessMode,
+                1,
+            ),
+            (ansi, "SET `transaction_read_only`=0", C::Unknown, 1),
+            (pg, "SET ROLE admin", C::ChangesAccessMode, 1),
+            (
+                pg,
+                "RESET default_transaction_read_only",
+                C::ChangesAccessMode,
+                1,
+            ),
+            (ansi, "PRAGMA query_only = OFF", C::ChangesAccessMode, 1),
+            (ansi, "PRAGMA query_only(0)", C::ChangesAccessMode, 1),
+            (ansi, "PRAGMA main.table_info(users)", C::Read, 1),
+            (pg, "select nextval('s')", C::Unknown, 1),
+            (pg, "select pg_terminate_backend(42)", C::Unknown, 1),
+            // Harmless settings stay Session.
+            (pg, "SET search_path TO app, public", C::Session, 1),
+            (pg, "SET TIME ZONE 'UTC'", C::Session, 1),
+            (my, "SET NAMES utf8mb4", C::Session, 1),
+            (my, "SET @x = 1", C::Session, 1),
+            (my, "SET @@session.time_zone = '+00:00'", C::Session, 1),
+            (
+                pg,
+                "SET TRANSACTION ISOLATION LEVEL SERIALIZABLE",
+                C::Session,
+                1,
+            ),
+            (pg, "SET TRANSACTION READ WRITE", C::ChangesAccessMode, 1),
+            // M5: WHERE must be at the top level.
+            (
+                pg,
+                "UPDATE users SET active = (SELECT false FROM flags WHERE id = 1)",
+                C::Destructive,
+                1,
+            ),
+            (
+                pg,
+                "DELETE FROM t WHERE id IN (SELECT id FROM u)",
+                C::Write,
+                1,
+            ),
+            (
+                pg,
+                "DELETE FROM t USING (SELECT 1 WHERE true) x",
+                C::Destructive,
+                1,
+            ),
+        ] {
+            let got = classify_with_rules(sql, rules);
+            assert!(
+                got >= at_least,
+                "{sql}: got {got:?}, want at least {at_least:?}"
+            );
+            if at_least <= C::Session {
+                assert_eq!(got, at_least, "{sql}");
+            }
+            assert_eq!(split_with_rules(sql, rules).len(), spans, "{sql}");
+        }
+    }
+
+    #[test]
+    fn single_statement_guard() {
+        struct My;
+        impl Dialect for My {
+            fn lexical_rules(&self) -> LexicalRules {
+                LexicalRules::MYSQL
+            }
+        }
+        assert!(ensure_single_statement(&AnsiDialect, "select 1;").is_ok());
+        assert!(ensure_single_statement(&AnsiDialect, "-- only a comment").is_ok());
+        assert_eq!(
+            ensure_single_statement(&AnsiDialect, "select 1; select 2"),
+            Err(DriverError::MultipleStatements(2))
+        );
+        assert_eq!(
+            ensure_single_statement(&My, "SELECT 1 /*! ; DROP TABLE users */"),
+            Err(DriverError::MultipleStatements(2))
+        );
+    }
+
+    #[test]
+    fn strict_decimals() {
+        for ok in ["0", "-12.50", "+1", "1e10", "1.5E-3"] {
+            assert!(is_strict_decimal(ok), "{ok}");
+        }
+        for bad in [
+            "", "-", "1.", ".5", "1e", "1-2", "--1", "1e+", "1.2.3", "1 ", "0x10",
+        ] {
+            assert!(!is_strict_decimal(bad), "{bad}");
+        }
     }
 
     #[test]
@@ -859,20 +1468,17 @@ mod tests {
     }
 
     fn any_rules() -> impl Strategy<Value = LexicalRules> {
-        (
-            any::<bool>(),
-            any::<bool>(),
-            any::<bool>(),
-            any::<bool>(),
-            any::<bool>(),
-        )
-            .prop_map(|(a, b, c, d, e)| LexicalRules {
-                backslash_escapes: a,
-                nested_block_comments: b,
-                dollar_quotes: c,
-                hash_comments: d,
-                backtick_identifiers: e,
-            })
+        prop::collection::vec(any::<bool>(), 8).prop_map(|b| {
+            LexicalRules::ANSI
+                .with_backslash_escapes(b[0])
+                .with_e_string_backslash(b[1])
+                .with_nested_block_comments(b[2])
+                .with_dollar_quotes(b[3])
+                .with_hash_comments(b[4])
+                .with_dash_comment_needs_space(b[5])
+                .with_executable_comments(b[6])
+                .with_backtick_identifiers(b[7])
+        })
     }
 
     proptest! {
@@ -907,17 +1513,17 @@ mod tests {
         #[test]
         fn quoted_identifiers_roundtrip_as_one_token(name in "\\PC{0,30}") {
             let q = AnsiDialect.quote_identifier(&name);
-            let toks = lex(&q, LexicalRules::default());
+            let toks = lex(&q, LexicalRules::default()).toks;
             prop_assert_eq!(toks.len(), 1);
-            prop_assert_eq!(toks[0].kind, TokKind::Quoted);
+            prop_assert_eq!(toks[0].kind, TokKind::Ident);
             prop_assert_eq!(toks[0].end, q.len());
         }
 
         #[test]
         fn text_literals_are_one_token(value in "\\PC{0,30}", backslash in any::<bool>()) {
             let lit = ansi_literal(&Param::Text(value), backslash);
-            let rules = LexicalRules { backslash_escapes: backslash, ..LexicalRules::default() };
-            let toks = lex(&lit, rules);
+            let rules = LexicalRules::ANSI.with_backslash_escapes(backslash);
+            let toks = lex(&lit, rules).toks;
             prop_assert_eq!(toks.len(), 1);
             prop_assert_eq!(toks[0].end, lit.len());
         }

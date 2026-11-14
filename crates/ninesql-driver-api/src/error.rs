@@ -34,6 +34,9 @@ pub enum DriverError {
     #[error("read-only session: {0}")]
     ReadOnly(String),
     /// The engine reported an error for a statement.
+    ///
+    /// `message` is **display-only**: engines may quote values or statement text in it, so logs
+    /// record only `code` and the variant, and nothing for production connections.
     #[error("{message}")]
     Query {
         /// Engine error code (SQLSTATE, MySQL error number, …) when available.
@@ -53,6 +56,10 @@ pub enum DriverError {
     /// The driver does not offer this feature for this engine (should have been hidden, I8).
     #[error("not supported by this engine: {0:?}")]
     Unsupported(Feature),
+    /// The text holds several statements; drivers execute exactly one per call
+    /// ([`ensure_single_statement`](crate::dialect::ensure_single_statement)).
+    #[error("{0} statements found: run them one at a time")]
+    MultipleStatements(usize),
     /// The session is still streaming a previous result.
     #[error("session busy: a result is still streaming")]
     Busy,
@@ -87,10 +94,13 @@ pub fn redact_secret(message: &str, secret: &Secret) -> String {
     message.replace(value, "***")
 }
 
-/// Masks credentials in text that may contain a connection string or URL:
-/// `scheme://user:password@host` user-info passwords and `key=value` pairs whose key looks like a
-/// secret (`password`, `pwd`, `passwd`, `sslpassword`, `token`, `secret`, `apikey`…), in both
-/// space-separated (libpq) and `;`/`&`-separated (ODBC, URL query) forms.
+/// Masks credentials in text that may contain a connection string, a URL, JSON or HTTP headers:
+/// - `scheme://user:password@host` user-info passwords (up to the last `@` before the next
+///   whitespace, so passwords containing `/`, `#` or `@` are covered);
+/// - `key=value`, `key: value`, `"key":"value"` pairs whose key contains `password`, `passwd`,
+///   `secret`, `token`, `apikey`, `credential` or `authorization`, or is `pwd` / `pass` / `auth`
+///   (case-insensitive, separators ignored: `trustStorePassword`, `PGPASSWORD`, `api-key`);
+/// - the credential after an `Authorization: Bearer|Basic|Token …` scheme.
 #[must_use]
 pub fn redact_connection_string(text: &str) -> String {
     redact_kv_pairs(&redact_userinfo(text))
@@ -102,22 +112,18 @@ fn redact_userinfo(text: &str) -> String {
     while let Some(idx) = rest.find("://") {
         let (head, tail) = rest.split_at(idx + 3);
         out.push_str(head);
-        // The authority ends at the first '/', '?', '#' or whitespace.
         let end = tail
-            .find(|c: char| c == '/' || c == '?' || c == '#' || c.is_whitespace())
+            .find(|c: char| c.is_whitespace() || matches!(c, '"' | '\'' | '<' | '>'))
             .unwrap_or(tail.len());
-        let authority = &tail[..end];
-        if let Some(at) = authority.rfind('@') {
-            let userinfo = &authority[..at];
-            if let Some(colon) = userinfo.find(':') {
-                out.push_str(&userinfo[..colon]);
+        let segment = &tail[..end];
+        match segment.rfind('@') {
+            Some(at) if segment[..at].contains(':') => {
+                let colon = segment.find(':').unwrap_or(0);
+                out.push_str(&segment[..colon]);
                 out.push_str(":***");
-                out.push_str(&authority[at..]);
-            } else {
-                out.push_str(authority);
+                out.push_str(&segment[at..]);
             }
-        } else {
-            out.push_str(authority);
+            _ => out.push_str(segment),
         }
         rest = &tail[end..];
     }
@@ -125,77 +131,131 @@ fn redact_userinfo(text: &str) -> String {
     out
 }
 
-const SECRET_KEYS: &[&str] = &[
+const SECRET_KEY_FRAGMENTS: &[&str] = &[
     "password",
     "passwd",
-    "pwd",
-    "pass",
-    "sslpassword",
-    "token",
     "secret",
+    "token",
     "apikey",
-    "api_key",
-    "access_token",
-    "auth_token",
+    "credential",
+    "authorization",
 ];
 
+const SECRET_KEYS_EXACT: &[&str] = &["pwd", "pass", "auth", "pw"];
+
+const AUTH_SCHEMES: &[&str] = &["bearer", "basic", "token", "digest", "negotiate", "apikey"];
+
 fn is_secret_key(key: &str) -> bool {
-    let k = key
-        .trim()
-        .trim_start_matches(['?', '&', ';'])
-        .to_ascii_lowercase();
-    SECRET_KEYS
-        .iter()
-        .any(|s| k == *s || k.ends_with(&format!("_{s}")))
+    let k: String = key
+        .chars()
+        .filter(char::is_ascii_alphanumeric)
+        .map(|c| c.to_ascii_lowercase())
+        .collect();
+    SECRET_KEYS_EXACT.contains(&k.as_str()) || SECRET_KEY_FRAGMENTS.iter().any(|f| k.contains(f))
+}
+
+fn is_key_byte(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-' | b'.')
+}
+
+fn is_value_end(b: u8) -> bool {
+    b.is_ascii_whitespace() || matches!(b, b';' | b'&' | b',' | b'}' | b')' | b']' | b'"' | b'\'')
+}
+
+/// End of a value starting at `k` (quoted or bare).
+fn value_end(bytes: &[u8], k: usize) -> usize {
+    match bytes.get(k) {
+        Some(&q) if q == b'"' || q == b'\'' => {
+            let mut j = k + 1;
+            while j < bytes.len() && bytes[j] != q {
+                if bytes[j] == b'\\' {
+                    j += 1;
+                }
+                j += 1;
+            }
+            (j + 1).min(bytes.len())
+        }
+        _ => {
+            let mut j = k;
+            while j < bytes.len() && !is_value_end(bytes[j]) {
+                j += 1;
+            }
+            j
+        }
+    }
+}
+
+fn skip_blanks(bytes: &[u8], mut k: usize) -> usize {
+    while k < bytes.len() && matches!(bytes[k], b' ' | b'\t') {
+        k += 1;
+    }
+    k
 }
 
 fn redact_kv_pairs(text: &str) -> String {
-    let mut out = String::with_capacity(text.len());
     let bytes = text.as_bytes();
+    let mut out = String::with_capacity(text.len());
+    let mut last = 0;
     let mut i = 0;
-    let mut token_start = 0;
     while i < bytes.len() {
-        let c = bytes[i];
-        if c == b'=' {
-            let key = &text[token_start..i];
-            out.push_str(&text[token_start..=i]);
+        let starts_key = is_key_byte(bytes[i]) && (i == 0 || !is_key_byte(bytes[i - 1]));
+        if !starts_key {
             i += 1;
-            // Value: quoted ('…' or "…") or up to the next separator.
-            let value_end = if i < bytes.len() && (bytes[i] == b'\'' || bytes[i] == b'"') {
-                let q = bytes[i];
-                let mut j = i + 1;
-                while j < bytes.len() && bytes[j] != q {
-                    if bytes[j] == b'\\' {
-                        j += 1;
-                    }
-                    j += 1;
-                }
-                (j + 1).min(bytes.len())
-            } else {
-                let mut j = i;
-                while j < bytes.len() && !matches!(bytes[j], b' ' | b'\t' | b'\n' | b';' | b'&') {
-                    j += 1;
-                }
-                j
-            };
-            if is_secret_key(key) {
-                out.push_str("***");
-            } else {
-                out.push_str(&text[i..value_end]);
-            }
-            i = value_end;
-            token_start = i;
-        } else if matches!(c, b' ' | b'\t' | b'\n' | b';' | b'&' | b'?' | b',') {
-            out.push_str(&text[token_start..=i]);
-            i += 1;
-            token_start = i;
-        } else {
-            i += 1;
+            continue;
         }
+        let mut j = i;
+        while j < bytes.len() && is_key_byte(bytes[j]) {
+            j += 1;
+        }
+        if !is_secret_key(&text[i..j]) {
+            i = j;
+            continue;
+        }
+        // Optional closing quote of a JSON key, blanks, then `=` / `:` / `:=`.
+        let mut k = j;
+        if matches!(bytes.get(k), Some(b'"' | b'\'')) {
+            k += 1;
+        }
+        k = skip_blanks(bytes, k);
+        match bytes.get(k) {
+            Some(b'=') => k += 1,
+            Some(b':') => {
+                k += 1;
+                if bytes.get(k) == Some(&b'=') {
+                    k += 1;
+                }
+            }
+            _ => {
+                i = j;
+                continue;
+            }
+        }
+        k = skip_blanks(bytes, k);
+        let mut end = value_end(bytes, k);
+        // `Authorization: Bearer <credential>`: keep the scheme, mask the credential.
+        let first = text[k..end].to_ascii_lowercase();
+        if AUTH_SCHEMES.contains(&first.as_str()) {
+            let cred = skip_blanks(bytes, end);
+            if cred > end {
+                k = cred;
+                end = value_end(bytes, k);
+            }
+        }
+        if end > k {
+            let quoted = matches!(bytes[k], b'"' | b'\'') && end - k >= 2;
+            if quoted {
+                out.push_str(&text[last..=k]);
+                out.push_str("***");
+                out.push_str(&text[end - 1..end]);
+            } else {
+                out.push_str(&text[last..k]);
+                out.push_str("***");
+            }
+            last = end;
+        }
+        i = end.max(j);
     }
-    if token_start < text.len() {
-        out.push_str(&text[token_start..]);
-    }
+    out.push_str(&text[last..]);
     out
 }
 
@@ -225,6 +285,35 @@ mod tests {
             assert!(!r.contains("Pa55"), "{s} -> {r}");
             assert!(r.contains("***"), "{s} -> {r}");
         }
+    }
+
+    #[test]
+    fn redacts_review_m3_forms() {
+        for s in [
+            "trustStorePassword=Pa55word;x=1",
+            "PGPASSWORD=Pa55word psql",
+            "{\"password\":\"Pa55word\",\"user\":\"nine\"}",
+            "{\"password\": \"Pa55word\"}",
+            "password: Pa55word",
+            "Authorization: Bearer Pa55word",
+            "authorization=Basic Pa55word",
+            "api-key=Pa55word",
+            "client_secret = 'Pa55word'",
+            "postgres://nine:Pa/55#wo@rd@db.example.test:5432/app",
+            "jdbc:mysql://nine:Pa55word@db/app",
+        ] {
+            let r = redact_connection_string(s);
+            assert!(!r.contains("Pa55") && !r.contains("55#wo"), "{s} -> {r}");
+            assert!(r.contains("***"), "{s} -> {r}");
+        }
+        assert_eq!(
+            redact_connection_string("Authorization: Bearer abc.def"),
+            "Authorization: Bearer ***"
+        );
+        assert_eq!(
+            redact_connection_string("password authentication failed for user \"nine\""),
+            "password authentication failed for user \"nine\""
+        );
     }
 
     #[test]
@@ -274,6 +363,35 @@ mod tests {
             sep in prop::sample::select(vec![" ", ";", "&"]),
         ) {
             let s = format!("host=db{sep}user=nine{sep}{key}={pw}{sep}dbname=app");
+            let r = redact_connection_string(&s);
+            prop_assert!(!r.contains(&pw), "{} -> {}", s, r);
+        }
+
+        #[test]
+        fn url_password_with_reserved_chars_never_survives(
+            pw in "[A-Za-z0-9/#@:!$*+.~-]{6,24}",
+            host in "[a-z]{1,10}\\.test",
+        ) {
+            let s = format!("error: postgres://nine:{pw}@{host}:5432/db failed");
+            let r = redact_connection_string(&s);
+            prop_assert!(!r.contains(&pw), "{} -> {}", s, r);
+        }
+
+        #[test]
+        fn structured_secrets_never_survive(
+            pw in "[A-Za-z0-9!$%*+.~-]{6,24}",
+            key in prop::sample::select(vec![
+                "password", "trustStorePassword", "PGPASSWORD", "client_secret", "api_key",
+                "x-api-key", "accessToken", "Authorization",
+            ]),
+            form in 0usize..4,
+        ) {
+            let s = match form {
+                0 => format!("{{\"{key}\":\"{pw}\"}}"),
+                1 => format!("{key}: {pw}"),
+                2 => format!("{key} = '{pw}'"),
+                _ => format!("{key}=Bearer {pw}"),
+            };
             let r = redact_connection_string(&s);
             prop_assert!(!r.contains(&pw), "{} -> {}", s, r);
         }

@@ -4,11 +4,13 @@
 
 use std::time::Duration;
 
+use ninesql_driver_api::conformance;
 use ninesql_driver_api::mock::{MOCK_ENGINE, MOCK_TABLE_COUNT, MockDriver};
 use ninesql_driver_api::{
     Auth, CancelToken, Capabilities, ConnectParams, Driver, DriverError, Endpoint, ExecOptions,
-    Feature, FetchBudget, ObjectKind, ObjectPath, PageRequest, ReadOnlyMechanism, ResultItem,
-    ResultSetKind, ResultStream, Secret, Session, Statement, TruncationReason,
+    Feature, FetchBudget, ObjectKind, ObjectPath, PageRequest, PropertyValue, ReadOnlyMechanism,
+    ResultItem, ResultSetKind, ResultStream, Secret, Session, Statement,
+    TRUNCATED_VALUES_METADATA_KEY, TruncationReason,
 };
 
 fn params() -> ConnectParams {
@@ -46,10 +48,7 @@ async fn drain(stream: &mut ResultStream) -> (u64, Vec<ResultItem>, Option<Drive
 }
 
 fn opts(budget: FetchBudget) -> ExecOptions {
-    ExecOptions {
-        budget,
-        ..ExecOptions::default()
-    }
+    ExecOptions::default().with_budget(budget)
 }
 
 #[tokio::test]
@@ -86,11 +85,9 @@ async fn truncates_at_max_rows_and_stops_producing() {
     let driver = MockDriver::new();
     let stats = driver.stats();
     let mut s = connect(&driver).await;
-    let budget = FetchBudget {
-        batch_rows: 100,
-        max_rows: Some(250),
-        ..FetchBudget::default()
-    };
+    let budget = FetchBudget::default()
+        .with_batch_rows(100)
+        .with_max_rows(Some(250));
     let mut stream = s
         .execute(
             Statement::sql("SELECT * FROM numbers(1000000)"),
@@ -116,11 +113,9 @@ async fn truncates_at_max_bytes() {
     let stats = driver.stats();
     let mut s = connect(&driver).await;
     let max_bytes = 64 * 1024;
-    let budget = FetchBudget {
-        batch_rows: 200,
-        max_bytes,
-        max_rows: None,
-    };
+    let budget = FetchBudget::default()
+        .with_batch_rows(200)
+        .with_max_bytes(max_bytes);
     let mut stream = s
         .execute(
             Statement::sql("SELECT * FROM numbers(1000000)"),
@@ -148,11 +143,9 @@ async fn truncates_at_max_bytes() {
 async fn documents_respect_the_budget() {
     let driver = MockDriver::new();
     let mut s = connect(&driver).await;
-    let budget = FetchBudget {
-        batch_rows: 50,
-        max_rows: Some(120),
-        ..FetchBudget::default()
-    };
+    let budget = FetchBudget::default()
+        .with_batch_rows(50)
+        .with_max_rows(Some(120));
     let mut stream = s
         .execute(
             Statement::sql("SELECT * FROM documents(1000)"),
@@ -201,14 +194,9 @@ async fn cancel_stops_the_stream_and_reaches_the_server() {
     let stats = driver.stats();
     let mut s = connect(&driver).await;
     let cancel = CancelToken::new();
-    let options = ExecOptions {
-        cancel: cancel.clone(),
-        budget: FetchBudget {
-            batch_rows: 10,
-            ..FetchBudget::default()
-        },
-        ..ExecOptions::default()
-    };
+    let options = ExecOptions::default()
+        .with_cancel(cancel.clone())
+        .with_budget(FetchBudget::default().with_batch_rows(10));
     let mut stream = s
         .execute(
             Statement::sql("SELECT * FROM slow_numbers(100000, 1000)"),
@@ -261,10 +249,7 @@ async fn timeout_cancels_server_side() {
     let driver = MockDriver::new();
     let stats = driver.stats();
     let mut s = connect(&driver).await;
-    let options = ExecOptions {
-        timeout: Some(Duration::from_secs(5)),
-        ..ExecOptions::default()
-    };
+    let options = ExecOptions::default().with_timeout(Some(Duration::from_secs(5)));
     let mut stream = s
         .execute(
             Statement::sql("SELECT * FROM slow_numbers(10000, 2000)"),
@@ -546,4 +531,191 @@ async fn sessions_are_object_safe_and_send() {
         .unwrap()
         .unwrap();
     s.close().await.unwrap();
+}
+
+// ---------------------------------------------------------------------------------------------
+// P0-B security review fixes (H1–H4, L7)
+
+#[tokio::test]
+async fn conformance_suite_passes_on_the_mock() {
+    let driver = MockDriver::new();
+    conformance::assert_reserved_properties_rejected(&driver, &params()).await;
+    conformance::assert_read_only_refuses_writes(&driver, params(), conformance::WRITES).await;
+    conformance::assert_multiple_statements_refused(&driver, params()).await;
+}
+
+#[tokio::test]
+async fn harmless_properties_are_accepted() {
+    let driver = MockDriver::new();
+    let mut p = params();
+    p.properties
+        .insert("connectTimeout".into(), PropertyValue::Plain("5".into()));
+    assert!(driver.connect(p).await.is_ok());
+}
+
+#[tokio::test]
+async fn multi_statement_text_is_refused_before_classification() {
+    let driver = MockDriver::new();
+    let mut s = connect_read_only(&driver).await;
+    let r = s
+        .execute(
+            Statement::sql("SELECT * FROM numbers(1); SELECT * FROM numbers(2)"),
+            ExecOptions::default(),
+        )
+        .await;
+    assert_eq!(r.err(), Some(DriverError::MultipleStatements(2)));
+}
+
+#[tokio::test]
+async fn engine_rejects_a_write_the_classifier_missed() {
+    let driver = MockDriver::new();
+    let stats = driver.stats();
+    let mut s = connect_read_only(&driver).await;
+    let r = s
+        .execute(
+            Statement::sql("SELECT mock_write()"),
+            ExecOptions::default(),
+        )
+        .await;
+    assert!(matches!(r, Err(DriverError::ReadOnly(_))), "{r:?}");
+    assert_eq!(stats.server_rejected_writes(), 1);
+    // Outside read-only mode the same statement writes.
+    let mut rw = connect(&driver).await;
+    let mut stream = rw
+        .execute(
+            Statement::sql("SELECT mock_write()"),
+            ExecOptions::default(),
+        )
+        .await
+        .unwrap();
+    let (_, items, _) = drain(&mut stream).await;
+    assert!(matches!(items[..], [ResultItem::UpdateCount(Some(1))]));
+}
+
+#[tokio::test]
+async fn lifted_access_mode_closes_the_session() {
+    let driver = MockDriver::new();
+    let mut s = connect_read_only(&driver).await;
+    assert!(s.capabilities().read_only.is_liftable());
+    let r = s
+        .execute(
+            Statement::sql("SELECT mock_lift_read_only()"),
+            ExecOptions::default(),
+        )
+        .await;
+    assert!(matches!(r, Err(DriverError::ReadOnly(_))), "{r:?}");
+    let r = s
+        .execute(
+            Statement::sql("SELECT * FROM numbers(1)"),
+            ExecOptions::default(),
+        )
+        .await;
+    assert!(matches!(r, Err(DriverError::Closed(_))), "{r:?}");
+    assert!(s.ping().await.is_err());
+}
+
+#[tokio::test]
+async fn batches_end_at_the_batch_byte_budget() {
+    let driver = MockDriver::new();
+    let mut s = connect(&driver).await;
+    // 1000-byte values, 10 kB per batch: about 10 rows per batch whatever batch_rows says.
+    let budget = FetchBudget::default()
+        .with_batch_rows(u32::MAX)
+        .with_max_batch_bytes(10_000);
+    let mut stream = s
+        .execute(
+            Statement::sql("SELECT * FROM wide(100, 1000)"),
+            opts(budget),
+        )
+        .await
+        .unwrap();
+    let (rows, items, err) = drain(&mut stream).await;
+    assert!(err.is_none());
+    assert_eq!(rows, 100);
+    for item in &items {
+        if let ResultItem::Rows(b) = item {
+            assert!(b.num_rows() <= 10, "{} rows", b.num_rows());
+        }
+    }
+}
+
+#[tokio::test]
+async fn huge_rows_are_bounded_by_batch_rows_clamp() {
+    let driver = MockDriver::new();
+    let stats = driver.stats();
+    let mut s = connect(&driver).await;
+    let budget = FetchBudget::default().with_batch_rows(u32::MAX);
+    let mut stream = s
+        .execute(
+            Statement::sql("SELECT * FROM numbers(1000000)"),
+            opts(budget),
+        )
+        .await
+        .unwrap();
+    let _header = stream.next().await;
+    let first = stream.next().await.unwrap().unwrap();
+    let ResultItem::Rows(b) = first else {
+        panic!("expected rows");
+    };
+    assert!(b.num_rows() <= FetchBudget::MAX_BATCH_ROWS as usize);
+    assert!(stats.rows_generated() <= u64::from(FetchBudget::MAX_BATCH_ROWS));
+}
+
+#[tokio::test]
+async fn oversized_values_are_cut_and_flagged() {
+    let driver = MockDriver::new();
+    let mut s = connect(&driver).await;
+    let budget = FetchBudget::default().with_max_value_bytes(100);
+    let mut stream = s
+        .execute(Statement::sql("SELECT * FROM wide(3, 5000)"), opts(budget))
+        .await
+        .unwrap();
+    let (_, items, _) = drain(&mut stream).await;
+    let batch = items
+        .iter()
+        .find_map(|i| match i {
+            ResultItem::Rows(b) => Some(b.clone()),
+            _ => None,
+        })
+        .unwrap();
+    let field = batch.schema().field_with_name("label").unwrap().clone();
+    assert_eq!(
+        field
+            .metadata()
+            .get(TRUNCATED_VALUES_METADATA_KEY)
+            .map(String::as_str),
+        Some("true")
+    );
+    let labels = batch
+        .column(1)
+        .as_any()
+        .downcast_ref::<ninesql_driver_api::arrow_array::StringArray>()
+        .unwrap();
+    assert!(labels.iter().all(|v| v.unwrap().len() <= 100));
+}
+
+#[tokio::test]
+async fn notices_count_against_the_budget() {
+    let driver = MockDriver::new();
+    let mut s = connect(&driver).await;
+    let budget = FetchBudget::default().with_max_bytes(1000);
+    let mut stream = s
+        .execute(
+            Statement::sql("SELECT * FROM notices(1000000)"),
+            opts(budget),
+        )
+        .await
+        .unwrap();
+    let (_, items, err) = drain(&mut stream).await;
+    assert!(err.is_none());
+    let notices = items
+        .iter()
+        .filter(|i| matches!(i, ResultItem::Notice(_)))
+        .count();
+    assert!(notices < 20, "{notices} notices delivered");
+    assert!(matches!(
+        items.last(),
+        Some(ResultItem::Truncated(t)) if t.reason == TruncationReason::MaxBytes
+    ));
+    assert!(stream.bytes_delivered() <= 1000);
 }

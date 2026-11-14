@@ -28,7 +28,10 @@ use std::collections::BTreeSet;
 use crate::params::{EngineId, TlsMode};
 
 /// Everything one engine supports through its driver. See the module documentation.
+///
+/// Non-exhaustive: drivers start from [`Capabilities::minimal`] and set fields.
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct Capabilities {
     /// Engine these capabilities describe.
     pub engine: EngineId,
@@ -210,6 +213,7 @@ pub enum ObjectKind {
 
 /// Navigator support.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct MetadataCapabilities {
     /// Object kinds [`Metadata::list`](crate::Metadata::list) can return.
     pub kinds: BTreeSet<ObjectKind>,
@@ -219,6 +223,7 @@ pub struct MetadataCapabilities {
 
 /// In-grid editing support. Editing generates DML through the [`Dialect`](crate::Dialect).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct EditingCapabilities {
     /// Rows can be inserted.
     pub insert: bool,
@@ -241,6 +246,7 @@ impl EditingCapabilities {
 
 /// Transaction control support.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct TransactionCapabilities {
     /// `begin` / `commit` / `rollback` and auto-commit off are supported.
     pub manual_commit: bool,
@@ -266,24 +272,43 @@ pub enum IsolationLevel {
 }
 
 /// How a read-only session is enforced (I3, ADR-0007 §2).
+///
+/// `liftable` is `true` when a client statement can switch the mechanism off again (PostgreSQL
+/// `SET SESSION CHARACTERISTICS AS TRANSACTION READ WRITE`, MySQL
+/// `SET SESSION transaction_read_only = 0`, ClickHouse `readonly = 2`). For liftable mechanisms
+/// the driver, besides refusing
+/// [`StatementClass::ChangesAccessMode`](crate::StatementClass::ChangesAccessMode) statements,
+/// **verifies the access mode after every statement** (PostgreSQL `ParameterStatus` for
+/// `default_transaction_read_only`, MySQL session-state tracking of `transaction_read_only`, or
+/// a read-back) and closes the session with
+/// [`DriverError::ReadOnly`](crate::DriverError::ReadOnly) if it changed.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[non_exhaustive]
 pub enum ReadOnlyMechanism {
     /// A session setting makes every transaction read-only
     /// (`SET SESSION CHARACTERISTICS AS TRANSACTION READ ONLY`, `SET SESSION TRANSACTION READ ONLY`).
-    SessionSetting,
-    /// Every transaction is started read-only (Firebird `isc_tpb_read`, Neo4j `READ` mode).
+    SessionSetting {
+        /// A client statement can lift the setting.
+        liftable: bool,
+    },
+    /// Every transaction is started read-only by the driver (Firebird `isc_tpb_read`, Neo4j
+    /// `READ` mode); not liftable by statements.
     TransactionMode,
     /// The database file is opened read-only (SQLite `SQLITE_OPEN_READ_ONLY` + `query_only`,
-    /// DuckDB `access_mode = READ_ONLY`).
+    /// DuckDB `access_mode = READ_ONLY`); not liftable.
     OpenMode,
-    /// A per-session / per-query server setting (ClickHouse `readonly = 1`).
-    ServerSetting,
-    /// The driver only calls read endpoints in read-only mode (InfluxDB 3 query API, search
-    /// engines' `_search` / `_sql`).
+    /// A per-session / per-query server setting (ClickHouse `readonly = 1`, which forbids
+    /// changing settings, or `readonly = 2`, which does not).
+    ServerSetting {
+        /// A client statement can lift the setting.
+        liftable: bool,
+    },
+    /// The driver only calls read endpoints in read-only mode (InfluxDB 3 query API).
     ReadEndpointsOnly,
     /// No engine-side mechanism: the driver refuses writes it can classify, which a statement it
     /// fails to classify can bypass. The UI says so in plain words and recommends a read-only
-    /// account.
+    /// account. Elasticsearch / OpenSearch, MongoDB, Redis / Valkey and Cassandra are declared
+    /// this way (docs/08-engine-capabilities.md).
     ClientSideOnly,
 }
 
@@ -292,6 +317,16 @@ impl ReadOnlyMechanism {
     #[must_use]
     pub fn is_engine_side(self) -> bool {
         self != Self::ClientSideOnly
+    }
+
+    /// `true` when a client statement can switch the mechanism off (the driver must then verify
+    /// the access mode after every statement).
+    #[must_use]
+    pub fn is_liftable(self) -> bool {
+        matches!(
+            self,
+            Self::SessionSetting { liftable: true } | Self::ServerSetting { liftable: true }
+        )
     }
 }
 
@@ -336,7 +371,10 @@ mod tests {
 
     #[test]
     fn engine_side_read_only() {
-        assert!(ReadOnlyMechanism::SessionSetting.is_engine_side());
+        assert!(ReadOnlyMechanism::SessionSetting { liftable: true }.is_engine_side());
+        assert!(ReadOnlyMechanism::SessionSetting { liftable: true }.is_liftable());
+        assert!(!ReadOnlyMechanism::ServerSetting { liftable: false }.is_liftable());
+        assert!(!ReadOnlyMechanism::OpenMode.is_liftable());
         assert!(ReadOnlyMechanism::OpenMode.is_engine_side());
         assert!(!ReadOnlyMechanism::ClientSideOnly.is_engine_side());
     }

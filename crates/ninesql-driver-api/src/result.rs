@@ -36,6 +36,17 @@ use crate::statement::{CancelToken, ExecOptions, FetchBudget};
 /// a faithful mapping (the column is then `Utf8`, ADR-0004).
 pub const ENGINE_TYPE_METADATA_KEY: &str = "ninesql.type";
 
+/// Arrow field metadata key set to `"true"` (in a batch's schema) when at least one value of
+/// the column in that batch was cut at
+/// [`FetchBudget::max_value_bytes`](crate::FetchBudget::max_value_bytes).
+pub const TRUNCATED_VALUES_METADATA_KEY: &str = "ninesql.truncated";
+
+/// Estimated fixed cost of a notice item, added to its text lengths for the budget.
+pub const NOTICE_OVERHEAD_BYTES: u64 = 64;
+
+/// Estimated cost of an update-count item for the budget.
+pub const UPDATE_COUNT_BYTES: u64 = 16;
+
 /// One item of a result stream.
 #[derive(Clone)]
 #[non_exhaustive]
@@ -99,6 +110,10 @@ pub enum NoticeSeverity {
 }
 
 /// A server notice. Its message comes from the engine and is shown in the output panel.
+///
+/// The message is **display-only**: it may quote data or statement text, so it is never written
+/// to logs (logs record the severity and code only) and never for production connections.
+/// Notices count against [`FetchBudget::max_bytes`](crate::FetchBudget::max_bytes).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Notice {
     /// Severity.
@@ -386,7 +401,13 @@ impl ResultStream {
                 self.inner = None;
                 Some(Err(e))
             }
-            Polled::Item(Some(Ok(item))) => Some(Ok(self.account(item))),
+            Polled::Item(Some(Ok(item))) => {
+                let item = self.account(item);
+                if matches!(item, ResultItem::Truncated(_)) {
+                    self.inner = None;
+                }
+                Some(Ok(item))
+            }
         }
     }
 
@@ -485,8 +506,26 @@ impl ResultStream {
                     }
                 }
             }
+            ResultItem::Notice(n) => {
+                let size = NOTICE_OVERHEAD_BYTES
+                    + n.message.len() as u64
+                    + n.code.as_ref().map_or(0, |c| c.len() as u64);
+                self.account_small(size, ResultItem::Notice(n))
+            }
+            ResultItem::UpdateCount(c) => {
+                self.account_small(UPDATE_COUNT_BYTES, ResultItem::UpdateCount(c))
+            }
             other => other,
         }
+    }
+
+    /// Accounts an indivisible item; truncates instead of delivering it when it does not fit.
+    fn account_small(&mut self, size: u64, item: ResultItem) -> ResultItem {
+        if size > self.remaining_bytes() {
+            return self.truncate(TruncationReason::MaxBytes);
+        }
+        self.bytes += size;
+        item
     }
 
     /// How many of `n` rows of estimated total `size` fit, and which limit cuts them.
