@@ -530,7 +530,11 @@ async fn sessions_are_object_safe_and_send() {
 async fn conformance_suite_passes_on_the_mock() {
     let driver = MockDriver::new();
     conformance::assert_reserved_properties_rejected(&driver, &params()).await;
-    conformance::assert_read_only_refuses_writes(&driver, params(), conformance::WRITES).await;
+    let mut writes = conformance::WRITES.to_vec();
+    writes.extend(conformance::POSTGRES_ACCESS_MODE_WRITES);
+    writes.extend(conformance::MYSQL_ACCESS_MODE_WRITES);
+    writes.extend(conformance::SQLITE_ACCESS_MODE_WRITES);
+    conformance::assert_read_only_refuses_writes(&driver, params(), &writes).await;
     conformance::assert_multiple_statements_refused(&driver, params()).await;
     conformance::assert_access_mode_change_detected(
         &driver,
@@ -714,4 +718,458 @@ async fn notices_count_against_the_budget() {
         Some(ResultItem::Truncated(t)) if t.reason == TruncationReason::MaxBytes
     ));
     assert!(stream.bytes_delivered() <= 1000);
+}
+
+// ---------------------------------------------------------------------------------------------
+// Phase 0 follow-ups landed before the first P1 driver (M6, L1–L5, F1–F7, conformance helpers)
+
+#[tokio::test]
+async fn new_conformance_helpers_pass_on_the_mock() {
+    let driver = MockDriver::new();
+    let rows = conformance::assert_stale_cancel_ignored(
+        &driver,
+        params(),
+        "SELECT * FROM numbers(5)",
+        "SELECT * FROM slow_numbers(50, 5)",
+    )
+    .await;
+    assert_eq!(rows, 50);
+    assert_eq!(
+        driver.stats().server_cancels(),
+        0,
+        "a stale cancel reached the server"
+    );
+
+    conformance::assert_identifier_quoting(
+        &driver,
+        params(),
+        conformance::ALIAS_TEMPLATE,
+        conformance::IDENTIFIER_SAMPLES,
+    )
+    .await;
+
+    let budget = FetchBudget::default()
+        .with_max_value_bytes(300)
+        .with_max_row_bytes(500)
+        .with_max_batch_bytes(4_000);
+    let report = conformance::assert_batches_within_budget(
+        &driver,
+        params(),
+        "SELECT * FROM wide(200, 5000)",
+        budget,
+    )
+    .await;
+    assert_eq!(report.rows, 200);
+    assert!(report.batches > 1 && report.truncated_values, "{report:?}");
+    let report = conformance::assert_batches_within_budget(
+        &driver,
+        params(),
+        "SELECT * FROM wide_documents(100, 5000)",
+        budget,
+    )
+    .await;
+    assert_eq!(report.rows, 100);
+    assert!(report.batches > 1 && report.truncated_values, "{report:?}");
+
+    let mut p = ConnectParams::new(
+        MOCK_ENGINE,
+        Endpoint::tcp(ninesql_driver_api::mock::MOCK_SELF_SIGNED_HOST, 5432),
+    );
+    p.auth = Auth::password("nine", Some(Secret::new("self-signed-pw".into())));
+    conformance::assert_verify_full_rejects_untrusted_certificate(&driver, p).await;
+}
+
+#[test]
+fn writes_lists_are_per_dialect() {
+    use ninesql_driver_api::EngineId;
+    let pg = conformance::writes_for(&EngineId::POSTGRESQL);
+    let my = conformance::writes_for(&EngineId::MARIADB);
+    let lite = conformance::writes_for(&EngineId::SQLITE);
+    assert!(pg.iter().any(|w| w.contains("set_config")));
+    assert!(!my.iter().any(|w| w.contains("set_config")));
+    assert!(my.iter().any(|w| w.contains("@@session")));
+    assert!(lite.iter().any(|w| w.contains("query_only")));
+    assert_eq!(
+        conformance::writes_for(&EngineId::CASSANDRA),
+        conformance::WRITES.to_vec()
+    );
+    // Every list is refused by the classifier of its own dialect family.
+    use ninesql_driver_api::dialect::classify_with_rules;
+    use ninesql_driver_api::{LexicalRules, StatementClass};
+    for (list, rules) in [
+        (pg, LexicalRules::POSTGRES),
+        (my, LexicalRules::MYSQL),
+        (lite, LexicalRules::SQLITE),
+    ] {
+        for w in list {
+            assert!(classify_with_rules(w, rules).is_write(), "{w}");
+            assert!(
+                classify_with_rules(w, rules) >= StatementClass::Write,
+                "{w}"
+            );
+        }
+    }
+}
+
+/// M6: a cancelled statement keeps the session busy until the server confirmed its end.
+#[tokio::test(start_paused = true)]
+async fn session_stays_busy_until_the_cancelled_statement_ends() {
+    let driver = MockDriver::new();
+    let stats = driver.stats();
+    let mut s = connect(&driver).await;
+    let cancel = CancelToken::new();
+    let options = ExecOptions::default()
+        .with_cancel(cancel.clone())
+        .with_budget(FetchBudget::default().with_batch_rows(10));
+    let mut stream = s
+        .execute(
+            Statement::sql("SELECT * FROM slow_numbers(100000, 1000)"),
+            options,
+        )
+        .await
+        .unwrap();
+    assert!(stream.execution_id().is_some());
+    let consumer = tokio::spawn(async move {
+        let r = drain(&mut stream).await;
+        (r, stream)
+    });
+    tokio::time::sleep(Duration::from_millis(3500)).await;
+    cancel.cancel();
+    for _ in 0..20 {
+        tokio::task::yield_now().await;
+    }
+    // The cancel reached the server, but the server is still finishing the batch it started:
+    // no new statement may start (it could be hit by the cancel).
+    assert_eq!(stats.server_cancels(), 1);
+    let busy = s
+        .execute(
+            Statement::sql("SELECT * FROM numbers(1)"),
+            ExecOptions::default(),
+        )
+        .await;
+    assert_eq!(busy.err(), Some(DriverError::Busy));
+    let ((rows, _, err), stream) = consumer.await.unwrap();
+    assert_eq!(err, Some(DriverError::Cancelled));
+    assert_eq!(rows, 30, "nothing from the drain is delivered");
+    assert!(stream.is_finished());
+    // Confirmed: the session is free even before the stream object is dropped.
+    let mut again = s
+        .execute(
+            Statement::sql("SELECT * FROM numbers(3)"),
+            ExecOptions::default(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(drain(&mut again).await.0, 3);
+    drop(stream);
+    assert_eq!(stats.server_cancels(), 1);
+}
+
+/// M6: the stream's own handle and the session's handle are scoped to their execution.
+#[tokio::test]
+async fn cancel_handles_are_execution_scoped() {
+    let driver = MockDriver::new();
+    let stats = driver.stats();
+    let mut s = connect(&driver).await;
+    // Idle: the session handle does nothing.
+    s.cancel().await.unwrap();
+    assert_eq!(stats.server_cancels(), 0);
+    let mut a = s
+        .execute(
+            Statement::sql("SELECT * FROM numbers(10)"),
+            ExecOptions::default(),
+        )
+        .await
+        .unwrap();
+    let a_id = a.execution_id().unwrap();
+    let handle = a.cancel_handle();
+    drain(&mut a).await;
+    drop(a);
+    let mut b = s
+        .execute(
+            Statement::sql("SELECT * FROM numbers(1000)"),
+            ExecOptions::default(),
+        )
+        .await
+        .unwrap();
+    assert!(b.execution_id().unwrap() > a_id);
+    handle.cancel().await.unwrap();
+    let (rows, _, err) = drain(&mut b).await;
+    assert!(err.is_none(), "{err:?}");
+    assert_eq!(rows, 1000);
+    assert_eq!(stats.server_cancels(), 0);
+}
+
+/// L2: the timeout cancels the server cursor at the deadline even if nobody polls.
+#[tokio::test(start_paused = true)]
+async fn timeout_cancels_the_server_cursor_while_not_polled() {
+    let driver = MockDriver::new();
+    let stats = driver.stats();
+    let mut s = connect(&driver).await;
+    let options = ExecOptions::default()
+        .with_timeout(Some(Duration::from_secs(5)))
+        .with_budget(FetchBudget::default().with_batch_rows(10));
+    let mut stream = s
+        .execute(
+            Statement::sql("SELECT * FROM slow_numbers(100000, 1000)"),
+            options,
+        )
+        .await
+        .unwrap();
+    let _header = stream.next().await.unwrap().unwrap();
+    // The grid shows its first page and stops polling.
+    tokio::time::sleep(Duration::from_secs(4)).await;
+    assert_eq!(stats.server_cancels(), 0);
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    assert_eq!(
+        stats.server_cancels(),
+        1,
+        "watchdog did not cancel at the deadline"
+    );
+    // The next poll reports the timeout without a second cancel.
+    assert_eq!(
+        stream.next().await.unwrap().err(),
+        Some(DriverError::Timeout(Duration::from_secs(5)))
+    );
+    assert!(stream.next().await.is_none());
+    assert_eq!(stats.server_cancels(), 1);
+    // Rows generated: only what the consumer pulled before the pause plus the drained batch.
+    assert!(stats.rows_generated() <= 10, "{}", stats.rows_generated());
+}
+
+#[tokio::test(start_paused = true)]
+async fn watchdog_stops_with_the_stream() {
+    let driver = MockDriver::new();
+    let stats = driver.stats();
+    let mut s = connect(&driver).await;
+    let options = ExecOptions::default().with_timeout(Some(Duration::from_secs(5)));
+    let mut stream = s
+        .execute(Statement::sql("SELECT * FROM numbers(10)"), options)
+        .await
+        .unwrap();
+    drain(&mut stream).await;
+    drop(stream);
+    tokio::time::sleep(Duration::from_secs(10)).await;
+    assert_eq!(stats.server_cancels(), 0, "watchdog fired after the end");
+}
+
+fn label_batch(rows: usize, value_len: usize) -> ninesql_driver_api::arrow_array::RecordBatch {
+    use ninesql_driver_api::arrow_array::{RecordBatch, StringArray};
+    use ninesql_driver_api::arrow_schema::{DataType, Field, Schema};
+    let schema = std::sync::Arc::new(Schema::new(vec![Field::new(
+        "label",
+        DataType::Utf8,
+        false,
+    )]));
+    let values: Vec<String> = (0..rows).map(|_| "z".repeat(value_len)).collect();
+    RecordBatch::try_new(schema, vec![std::sync::Arc::new(StringArray::from(values))]).unwrap()
+}
+
+fn header_of(batch: &ninesql_driver_api::arrow_array::RecordBatch) -> ResultItem {
+    ResultItem::ResultSet(ninesql_driver_api::ResultSetHeader::tabular(
+        0,
+        batch.schema(),
+    ))
+}
+
+/// L3: a cut batch is copied, so the retained memory is what is counted.
+#[tokio::test]
+async fn cut_batches_are_compacted_and_counted_honestly() {
+    let batch = label_batch(1000, 1000);
+    let full = batch.get_array_memory_size() as u64;
+    let max_bytes = 100_000;
+    let opts = ExecOptions::default().with_budget(FetchBudget::default().with_max_bytes(max_bytes));
+    let mut stream = ResultStream::from_items(
+        vec![Ok(header_of(&batch)), Ok(ResultItem::Rows(batch))],
+        &opts,
+    );
+    let (rows, items, err) = drain(&mut stream).await;
+    assert!(err.is_none());
+    assert!(rows > 0 && rows < 1000, "{rows}");
+    let retained: u64 = items
+        .iter()
+        .filter_map(|i| match i {
+            ResultItem::Rows(b) => Some(b.get_array_memory_size() as u64),
+            _ => None,
+        })
+        .sum();
+    assert!(
+        retained < full / 5,
+        "the slice keeps the whole buffer: {retained} of {full}"
+    );
+    assert!(stream.bytes_delivered() <= max_bytes);
+    assert!(
+        matches!(items.last(), Some(ResultItem::Truncated(t)) if t.reason == TruncationReason::MaxBytes)
+    );
+}
+
+/// L3: a `Truncated` sent by the driver ends the stream.
+#[tokio::test]
+async fn driver_sent_truncation_is_terminal() {
+    use ninesql_driver_api::Truncation;
+    let batch = label_batch(3, 4);
+    let items = vec![
+        Ok(header_of(&batch)),
+        Ok(ResultItem::Rows(batch.clone())),
+        Ok(ResultItem::Truncated(Truncation::new(
+            TruncationReason::MaxRows,
+            3,
+            100,
+        ))),
+        Ok(ResultItem::Rows(batch)),
+        Ok(ResultItem::UpdateCount(Some(1))),
+    ];
+    let mut stream = ResultStream::from_items(items, &ExecOptions::default());
+    let (rows, items, err) = drain(&mut stream).await;
+    assert!(err.is_none());
+    assert_eq!(rows, 3);
+    assert!(matches!(items.last(), Some(ResultItem::Truncated(_))));
+    assert!(stream.is_finished());
+}
+
+/// L3: batches are checked against their header, up to field metadata.
+#[tokio::test]
+async fn batches_must_match_their_header() {
+    use ninesql_driver_api::arrow_array::{Int64Array, RecordBatch};
+    use ninesql_driver_api::arrow_schema::{DataType, Field, Schema};
+    let batch = label_batch(2, 4);
+    let other = RecordBatch::try_new(
+        std::sync::Arc::new(Schema::new(vec![Field::new(
+            "label",
+            DataType::Int64,
+            false,
+        )])),
+        vec![std::sync::Arc::new(Int64Array::from(vec![1, 2]))],
+    )
+    .unwrap();
+    let flagged = RecordBatch::try_new(
+        std::sync::Arc::new(Schema::new(vec![
+            Field::new("label", DataType::Utf8, false)
+                .with_metadata([(TRUNCATED_VALUES_METADATA_KEY.to_owned(), "true".to_owned())]),
+        ])),
+        batch.columns().to_vec(),
+    )
+    .unwrap();
+    let docs_header = ResultItem::ResultSet(ninesql_driver_api::ResultSetHeader::documents(0));
+    let doc =
+        ninesql_driver_api::Document::new(vec![("a".into(), ninesql_driver_api::DocValue::Int(1))]);
+    for (case, items, ok) in [
+        (
+            "metadata only",
+            vec![header_of(&batch), ResultItem::Rows(flagged)],
+            true,
+        ),
+        (
+            "other type",
+            vec![header_of(&batch), ResultItem::Rows(other)],
+            false,
+        ),
+        ("no header", vec![ResultItem::Rows(batch.clone())], false),
+        (
+            "rows in documents",
+            vec![docs_header.clone(), ResultItem::Rows(batch.clone())],
+            false,
+        ),
+        (
+            "documents in tabular",
+            vec![header_of(&batch), ResultItem::Documents(vec![doc.clone()])],
+            false,
+        ),
+        (
+            "documents",
+            vec![docs_header, ResultItem::Documents(vec![doc])],
+            true,
+        ),
+    ] {
+        let mut stream =
+            ResultStream::from_items(items.into_iter().map(Ok).collect(), &ExecOptions::default());
+        let (_, _, err) = drain(&mut stream).await;
+        if ok {
+            assert!(err.is_none(), "{case}: {err:?}");
+        } else {
+            assert!(
+                matches!(err, Some(DriverError::Protocol(_))),
+                "{case}: {err:?}"
+            );
+            assert!(stream.is_finished());
+        }
+    }
+}
+
+/// F5: result-set headers count against the budget.
+#[tokio::test]
+async fn headers_count_against_the_budget() {
+    let items: Vec<_> = (0..100_000u32)
+        .map(|i| {
+            Ok(ResultItem::ResultSet(
+                ninesql_driver_api::ResultSetHeader::documents(i),
+            ))
+        })
+        .collect();
+    let opts = ExecOptions::default().with_budget(FetchBudget::default().with_max_bytes(10_000));
+    let mut stream = ResultStream::from_items(items, &opts);
+    let (_, items, err) = drain(&mut stream).await;
+    assert!(err.is_none());
+    assert!(items.len() < 200, "{} headers delivered", items.len());
+    assert!(
+        matches!(items.last(), Some(ResultItem::Truncated(t)) if t.reason == TruncationReason::MaxBytes)
+    );
+    assert!(stream.bytes_delivered() <= 10_000);
+}
+
+/// F4: cut document values are flagged and make the document non-editable.
+#[tokio::test]
+async fn truncated_document_values_are_flagged() {
+    let driver = MockDriver::new();
+    let mut s = connect(&driver).await;
+    let budget = FetchBudget::default().with_max_value_bytes(100);
+    let mut stream = s
+        .execute(
+            Statement::sql("SELECT * FROM wide_documents(2, 5000)"),
+            opts(budget),
+        )
+        .await
+        .unwrap();
+    let (_, items, _) = drain(&mut stream).await;
+    let docs: Vec<_> = items
+        .iter()
+        .filter_map(|i| match i {
+            ResultItem::Documents(d) => Some(d.clone()),
+            _ => None,
+        })
+        .flatten()
+        .collect();
+    assert_eq!(docs.len(), 2);
+    for d in &docs {
+        assert!(d.has_truncated_values());
+        let payload = &d.fields.iter().find(|(k, _)| k == "payload").unwrap().1;
+        let ninesql_driver_api::DocValue::Truncated { kept, original_len } = payload else {
+            panic!("payload not flagged: {payload:?}");
+        };
+        assert_eq!(*original_len, Some(5000));
+        assert!(matches!(kept.as_ref(), ninesql_driver_api::DocValue::String(v) if v.len() == 100));
+    }
+}
+
+/// Integration review: a driver's extra reserved keys are exposed and enforced.
+#[tokio::test]
+async fn extra_reserved_properties_are_exposed_and_enforced() {
+    use ninesql_driver_api::mock::MOCK_RESERVED_PROPERTY;
+    let driver = MockDriver::new();
+    let caps = driver.capabilities(&MOCK_ENGINE, None).unwrap();
+    assert!(
+        caps.extra_reserved_properties
+            .contains(MOCK_RESERVED_PROPERTY)
+    );
+    assert!(caps.is_reserved_property("Mock-Backdoor"));
+    assert!(!ninesql_driver_api::is_reserved_property("mock_backdoor"));
+    assert!(!caps.retains_secret_for_reconnect);
+    let mut p = params();
+    p.properties.insert(
+        "mockBackdoor".into(),
+        PropertyValue::Plain("open-sesame".into()),
+    );
+    let err = driver.connect(p).await.err().unwrap();
+    assert!(matches!(err, DriverError::InvalidParams(_)));
+    assert!(!err.to_string().contains("open-sesame"));
 }

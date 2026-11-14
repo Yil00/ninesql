@@ -135,7 +135,15 @@ impl fmt::Debug for Statement {
 /// - a single value longer than `max_value_bytes` (text, binary, JSON, LOB) is cut (use
 ///   [`truncate_str`] / [`truncate_bytes`]) and its field carries
 ///   [`TRUNCATED_VALUES_METADATA_KEY`](crate::TRUNCATED_VALUES_METADATA_KEY) `= "true"` in the
-///   batch schema; drivers stream LOBs instead of reading them whole when the client allows.
+///   batch schema; drivers stream LOBs instead of reading them whole when the client allows;
+/// - a single row (or document) never exceeds
+///   [`effective_max_row_bytes`](Self::effective_max_row_bytes): a wide row whose values each
+///   fit `max_value_bytes` can still be huge, so values are cut further once the row's
+///   allowance is spent (use [`RowBudget`]), and flagged in the same way (for documents:
+///   [`DocValue::Truncated`](crate::DocValue::Truncated)).
+///
+/// The bounds nest: `max_value_bytes` ≤ `max_row_bytes` ≤ `max_batch_bytes` ≤ `max_bytes`
+/// (the `effective_*` accessors apply it).
 ///
 /// Non-exhaustive: build from `FetchBudget::default()` and the `with_*` methods.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -152,6 +160,8 @@ pub struct FetchBudget {
     pub max_batch_bytes: u64,
     /// Maximum bytes of one value; longer values are cut and flagged.
     pub max_value_bytes: u64,
+    /// Maximum estimated bytes of one row or document; values beyond it are cut and flagged.
+    pub max_row_bytes: u64,
 }
 
 impl FetchBudget {
@@ -165,6 +175,8 @@ impl FetchBudget {
     pub const DEFAULT_MAX_BATCH_BYTES: u64 = 8 * 1024 * 1024;
     /// Default per-value budget: 1 MiB.
     pub const DEFAULT_MAX_VALUE_BYTES: u64 = 1024 * 1024;
+    /// Default per-row budget: 4 MiB.
+    pub const DEFAULT_MAX_ROW_BYTES: u64 = 4 * 1024 * 1024;
 
     /// Rows per batch, clamped to `1..=MAX_BATCH_ROWS`.
     #[must_use]
@@ -178,10 +190,18 @@ impl FetchBudget {
         self.max_batch_bytes.min(self.max_bytes).max(1)
     }
 
-    /// Bytes per value, never above the batch budget.
+    /// Bytes per row or document, never above the batch budget, at least 1.
+    #[must_use]
+    pub fn effective_max_row_bytes(&self) -> u64 {
+        self.max_row_bytes
+            .min(self.effective_max_batch_bytes())
+            .max(1)
+    }
+
+    /// Bytes per value, never above the row budget (and so the batch budget).
     #[must_use]
     pub fn effective_max_value_bytes(&self) -> u64 {
-        self.max_value_bytes.min(self.effective_max_batch_bytes())
+        self.max_value_bytes.min(self.effective_max_row_bytes())
     }
 
     /// Sets `batch_rows`.
@@ -218,6 +238,13 @@ impl FetchBudget {
         self.max_value_bytes = bytes;
         self
     }
+
+    /// Sets `max_row_bytes`.
+    #[must_use]
+    pub fn with_max_row_bytes(mut self, bytes: u64) -> Self {
+        self.max_row_bytes = bytes;
+        self
+    }
 }
 
 impl Default for FetchBudget {
@@ -228,6 +255,7 @@ impl Default for FetchBudget {
             max_rows: None,
             max_batch_bytes: Self::DEFAULT_MAX_BATCH_BYTES,
             max_value_bytes: Self::DEFAULT_MAX_VALUE_BYTES,
+            max_row_bytes: Self::DEFAULT_MAX_ROW_BYTES,
         }
     }
 }
@@ -281,6 +309,71 @@ impl BatchLimiter {
     pub fn reset(&mut self) {
         self.rows = 0;
         self.bytes = 0;
+    }
+}
+
+/// Bounds the values of one row (or document) while a driver decodes it: each value keeps at
+/// most [`FetchBudget::effective_max_value_bytes`] bytes and the row as a whole at most
+/// [`FetchBudget::effective_max_row_bytes`] (F5 of the P0-B security review).
+///
+/// ```
+/// # use ninesql_driver_api::{FetchBudget, RowBudget, truncate_str};
+/// let budget = FetchBudget::default().with_max_value_bytes(8).with_max_row_bytes(12);
+/// let mut row = RowBudget::new(&budget);
+/// let (a, cut_a) = truncate_str("0123456789", row.allow(10)); // value bound: 8 bytes
+/// let (b, cut_b) = truncate_str("abcdefgh", row.allow(8)); // row bound: 4 bytes left
+/// assert_eq!((a, cut_a, b, cut_b), ("01234567", true, "abcd", true));
+/// assert!(row.was_truncated());
+/// ```
+#[derive(Clone, Copy, Debug)]
+pub struct RowBudget {
+    max_value: u64,
+    remaining: u64,
+    used: u64,
+    truncated: bool,
+}
+
+impl RowBudget {
+    /// A budget for one row under `budget`.
+    #[must_use]
+    pub fn new(budget: &FetchBudget) -> Self {
+        let max_row = budget.effective_max_row_bytes();
+        Self {
+            max_value: budget.effective_max_value_bytes(),
+            remaining: max_row,
+            used: 0,
+            truncated: false,
+        }
+    }
+
+    /// Bytes the next value, `len` bytes long, may keep; records them against the row. When the
+    /// result is below `len`, the driver cuts the value to it and flags the field.
+    pub fn allow(&mut self, len: u64) -> u64 {
+        let keep = len.min(self.max_value).min(self.remaining);
+        if keep < len {
+            self.truncated = true;
+        }
+        self.remaining -= keep;
+        self.used += keep;
+        keep
+    }
+
+    /// Records fixed-size bytes (numbers, dates, per-value overhead) that cannot be cut.
+    pub fn add_fixed(&mut self, bytes: u64) {
+        self.remaining = self.remaining.saturating_sub(bytes);
+        self.used = self.used.saturating_add(bytes);
+    }
+
+    /// `true` when at least one value of this row was cut.
+    #[must_use]
+    pub fn was_truncated(&self) -> bool {
+        self.truncated
+    }
+
+    /// Bytes recorded for this row (feed it to [`BatchLimiter::add_row`]).
+    #[must_use]
+    pub fn used(&self) -> u64 {
+        self.used
     }
 }
 
@@ -428,6 +521,27 @@ mod tests {
             FetchBudget::MAX_BATCH_ROWS
         );
         assert_eq!(b.with_max_bytes(1000).effective_max_batch_bytes(), 1000);
+        assert_eq!(b.max_row_bytes, FetchBudget::DEFAULT_MAX_ROW_BYTES);
+        let tiny = b.with_max_batch_bytes(100);
+        assert_eq!(tiny.effective_max_row_bytes(), 100);
+        assert_eq!(tiny.effective_max_value_bytes(), 100);
+        assert_eq!(b.with_max_row_bytes(0).effective_max_row_bytes(), 1);
+    }
+
+    #[test]
+    fn row_budget_bounds_wide_rows() {
+        let b = FetchBudget::default()
+            .with_max_value_bytes(10)
+            .with_max_row_bytes(25);
+        let mut row = RowBudget::new(&b);
+        row.add_fixed(5);
+        assert_eq!(row.allow(4), 4);
+        assert!(!row.was_truncated());
+        assert_eq!(row.allow(100), 10);
+        assert_eq!(row.allow(100), 6);
+        assert_eq!(row.allow(100), 0);
+        assert!(row.was_truncated());
+        assert_eq!(row.used(), 25);
     }
 
     #[test]

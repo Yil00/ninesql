@@ -10,6 +10,8 @@
 //!   strict SSH host keys, I5) and secrets as zeroized [`Secret`]s (I1).
 //! - [`Session`]: executes [`Statement`]s into a [`ResultStream`], cancels, controls
 //!   transactions and the engine-side read-only mode (I3), exposes [`Metadata`].
+//! - [`ExecutionTracker`]: execution ids, the busy state and execution-scoped cancel handles,
+//!   so a late cancel never reaches the next statement.
 //! - [`ResultStream`]: Arrow [`RecordBatch`](arrow_array::RecordBatch)es, [`Document`]s, update
 //!   counts and notices, with the memory budget, timeout and cancel enforced uniformly (I6);
 //!   ends with [`ResultItem::Truncated`] when the budget is reached.
@@ -27,6 +29,7 @@ pub mod conformance;
 pub mod dialect;
 pub mod driver;
 pub mod error;
+pub mod execution;
 pub mod metadata;
 #[cfg(feature = "mock")]
 pub mod mock;
@@ -46,24 +49,25 @@ pub use dialect::{
 };
 pub use driver::{Driver, Session};
 pub use error::{DriverError, DriverResult, redact_connection_string, redact_secret};
+pub use execution::{ExecutionGuard, ExecutionId, ExecutionTracker};
 pub use metadata::{
     ColumnInfo, Metadata, ObjectDetails, ObjectInfo, ObjectPath, Page, PageRequest, PathSegment,
-    TableInfo,
+    TableInfo, escape_like,
 };
 pub use params::{
     Auth, ClientCertificate, ConnectParams, Endpoint, EngineId, HostKeyVerification, PropertyValue,
-    ProxyInfo, ProxyKind, SecurityWarning, TlsConfig, TlsMode, TunnelInfo, check_properties,
-    is_reserved_property,
+    ProxyInfo, ProxyKind, SecurityWarning, SshHop, TlsConfig, TlsMode, TunnelInfo,
+    check_properties, is_reserved_property,
 };
 pub use result::{
     CancelHandle, DocValue, Document, ENGINE_TYPE_METADATA_KEY, NoServerCancel, Notice,
     NoticeSeverity, RawResultStream, ResultItem, ResultSetHeader, ResultSetKind, ResultStream,
-    TRUNCATED_VALUES_METADATA_KEY, Truncation, TruncationReason,
+    SERVER_CANCEL_GRACE, TRUNCATED_VALUES_METADATA_KEY, Truncation, TruncationReason,
 };
 pub use secret::Secret;
 pub use statement::{
-    BatchLimiter, CancelToken, ExecOptions, FetchBudget, Param, Statement, truncate_bytes,
-    truncate_str,
+    BatchLimiter, CancelToken, ExecOptions, FetchBudget, Param, RowBudget, Statement,
+    truncate_bytes, truncate_str,
 };
 
 /// Re-exported Arrow array crate (Arrow 60), so drivers and the grid use the exact same version.

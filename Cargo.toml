@@ -52,6 +52,8 @@ libc = "0.2"
 # Driver API (ADR-0004): Arrow sub-crates only, async contract.
 arrow-array = { version = "60.1", default-features = false }
 arrow-schema = { version = "60.1", default-features = false }
+# Copy-on-slice of truncated batches (MutableArrayData); already a dependency of arrow-array.
+arrow-data = { version = "60.1", default-features = false }
 async-trait = "0.1"
 futures-core = { version = "0.3", default-features = false, features = ["std"] }
 futures-util = { version = "0.3", default-features = false, features = ["std"] }

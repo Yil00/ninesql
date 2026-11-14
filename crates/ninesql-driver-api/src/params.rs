@@ -249,11 +249,59 @@ pub enum HostKeyVerification {
     Disabled,
 }
 
+impl HostKeyVerification {
+    /// Ordering by strength: lower is weaker.
+    fn strength(self) -> u8 {
+        match self {
+            Self::Disabled => 0,
+            Self::Strict => 1,
+        }
+    }
+
+    /// The weaker of two policies.
+    #[must_use]
+    pub fn weakest(self, other: Self) -> Self {
+        if other.strength() < self.strength() {
+            other
+        } else {
+            self
+        }
+    }
+}
+
+/// One SSH hop of a tunnel (a jump host or the last hop) with the host key policy applied to
+/// it (ADR-0011 §5–6). Build with [`SshHop::new`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct SshHop {
+    /// Host name of the SSH server.
+    pub host: String,
+    /// Port of the SSH server.
+    pub port: u16,
+    /// Host key policy applied when connecting to this hop.
+    pub host_key: HostKeyVerification,
+}
+
+impl SshHop {
+    /// A hop with the given host key policy.
+    #[must_use]
+    pub fn new(host: impl Into<String>, port: u16, host_key: HostKeyVerification) -> Self {
+        Self {
+            host: host.into(),
+            port,
+            host_key,
+        }
+    }
+}
+
 /// Description of the SSH tunnel the core opened before calling the driver.
 ///
 /// The driver does not open tunnels (`ninesql-ssh` does). This is informational: it lets the
 /// session report the full route and lets [`ConnectParams::security_warnings`] flag a disabled
-/// host key check.
+/// host key check on **any** hop (L1 of the P0-B security review).
+///
+/// Build with [`TunnelInfo::new`] for a direct tunnel or [`TunnelInfo::with_hops`] for a
+/// ProxyJump chain; `with_hops` keeps the summary fields consistent with the hop list.
 #[derive(Clone, Debug, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct TunnelInfo {
@@ -263,8 +311,12 @@ pub struct TunnelInfo {
     pub ssh_port: u16,
     /// Number of jump hosts before the last hop.
     pub jump_hosts: u8,
-    /// Host key policy that was applied when the tunnel was opened.
+    /// The **weakest** host key policy applied to any hop of the tunnel (jump hosts included):
+    /// `Strict` only when every hop verified its host key.
     pub host_key: HostKeyVerification,
+    /// Every hop in connection order, jump hosts first and the last hop (`ssh_host`) last, each
+    /// with its own policy. Empty when the core reports only the summary fields.
+    pub hops: Vec<SshHop>,
     /// Proxy used to reach the first SSH hop, if any (ADR-0011 §8).
     pub proxy: Option<ProxyInfo>,
 }
@@ -278,8 +330,37 @@ impl TunnelInfo {
             ssh_port,
             jump_hosts: 0,
             host_key: HostKeyVerification::Strict,
+            hops: Vec::new(),
             proxy: None,
         }
+    }
+
+    /// Sets the hop list (jump hosts first, last hop last) and derives the summary fields from
+    /// it: `ssh_host` / `ssh_port` from the last hop, `jump_hosts` from the count, `host_key`
+    /// as the weakest policy across hops. An empty list leaves the tunnel unchanged.
+    #[must_use]
+    pub fn with_hops(mut self, hops: Vec<SshHop>) -> Self {
+        let Some(last) = hops.last() else {
+            return self;
+        };
+        self.ssh_host.clone_from(&last.host);
+        self.ssh_port = last.port;
+        self.jump_hosts = u8::try_from(hops.len() - 1).unwrap_or(u8::MAX);
+        self.host_key = hops
+            .iter()
+            .fold(HostKeyVerification::Strict, |w, h| w.weakest(h.host_key));
+        self.hops = hops;
+        self
+    }
+
+    /// The weakest host key policy across `host_key` and every entry of `hops`. Used by
+    /// [`ConnectParams::security_warnings`], so a hop list that disagrees with the summary
+    /// still fails safe.
+    #[must_use]
+    pub fn weakest_host_key(&self) -> HostKeyVerification {
+        self.hops
+            .iter()
+            .fold(self.host_key, |w, h| w.weakest(h.host_key))
     }
 }
 
@@ -330,8 +411,15 @@ pub enum SecurityWarning {
     TlsDowngraded(TlsMode),
     /// TLS is disabled although credentials are sent over the network.
     CredentialsInClear,
-    /// An SSH hop does not verify its host key.
+    /// An SSH hop does not verify its host key (any hop of the tunnel).
     SshHostKeyNotVerified,
+    /// The hop at this index of [`TunnelInfo::hops`] (0 = first hop) does not verify its host
+    /// key. Reported in addition to [`SecurityWarning::SshHostKeyNotVerified`] so the UI can
+    /// name the hop.
+    SshHopHostKeyNotVerified {
+        /// Index in [`TunnelInfo::hops`].
+        hop: u8,
+    },
 }
 
 /// Value of a driver property. `Debug` never shows the value.
@@ -452,7 +540,9 @@ pub const RESERVED_PROPERTY_FRAGMENTS: &[&str] = &[
     "initstatement",
 ];
 
-fn normalize_property_key(key: &str) -> String {
+/// Normalization used by the reserved-key rules: ASCII letters lower-cased, digits kept, every
+/// other character dropped.
+pub(crate) fn normalize_property_key(key: &str) -> String {
     key.chars()
         .filter(char::is_ascii_alphanumeric)
         .map(|c| c.to_ascii_lowercase())
@@ -464,11 +554,24 @@ fn normalize_property_key(key: &str) -> String {
 ///
 /// This is the **canonical** reserved-property rule: drivers apply it through
 /// [`check_properties`], and `ninesql-core` (connection dialog, DBeaver import) must reuse this
-/// function rather than keep its own list, so the UI and the drivers always agree.
+/// function rather than keep its own list, so the UI and the drivers always agree. A driver's
+/// extra keys are in [`Capabilities::extra_reserved_properties`](crate::Capabilities::extra_reserved_properties);
+/// [`Capabilities::is_reserved_property`](crate::Capabilities::is_reserved_property) applies
+/// both.
+///
+/// Matching is on the normalized key (ASCII letters lower-cased, digits kept, everything else
+/// dropped), so separators and case never hide a reserved key. Keys the normalization cannot
+/// judge are reserved too (fails closed): keys holding a non-ASCII or control character
+/// (homoglyphs, zero-width or full-width characters that a client might fold into a reserved
+/// key) and keys with no ASCII letter or digit at all.
 #[must_use]
 pub fn is_reserved_property(key: &str) -> bool {
+    if !key.chars().all(|c| c == ' ' || c.is_ascii_graphic()) {
+        return true;
+    }
     let k = normalize_property_key(key);
-    RESERVED_PROPERTY_KEYS.contains(&k.as_str())
+    k.is_empty()
+        || RESERVED_PROPERTY_KEYS.contains(&k.as_str())
         || RESERVED_PROPERTY_FRAGMENTS.iter().any(|f| k.contains(f))
 }
 
@@ -591,12 +694,17 @@ impl ConnectParams {
                 out.push(SecurityWarning::CredentialsInClear);
             }
         }
-        if self
-            .tunnel
-            .as_ref()
-            .is_some_and(|t| t.host_key == HostKeyVerification::Disabled)
-        {
-            out.push(SecurityWarning::SshHostKeyNotVerified);
+        if let Some(t) = &self.tunnel {
+            if t.weakest_host_key() == HostKeyVerification::Disabled {
+                out.push(SecurityWarning::SshHostKeyNotVerified);
+            }
+            for (i, hop) in t.hops.iter().enumerate() {
+                if hop.host_key == HostKeyVerification::Disabled {
+                    out.push(SecurityWarning::SshHopHostKeyNotVerified {
+                        hop: u8::try_from(i).unwrap_or(u8::MAX),
+                    });
+                }
+            }
         }
         out
     }
@@ -626,6 +734,49 @@ impl fmt::Debug for ConnectParams {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use proptest::prelude::*;
+
+    proptest! {
+        /// A reserved fragment survives any separators, digits-free decoration and case.
+        #[test]
+        fn reserved_fragments_survive_decoration(
+            fragment in prop::sample::select(RESERVED_PROPERTY_FRAGMENTS.to_vec()),
+            prefix in "[a-z0-9]{0,6}",
+            sep in "[-_. :/]{0,3}",
+            upper in any::<bool>(),
+        ) {
+            let mut decorated = String::new();
+            for (i, c) in fragment.chars().enumerate() {
+                if i > 0 {
+                    decorated.push_str(&sep);
+                }
+                decorated.push(if upper { c.to_ascii_uppercase() } else { c });
+            }
+            let key = format!("{prefix}{sep}{decorated}");
+            prop_assert!(is_reserved_property(&key), "{:?}", key);
+        }
+
+        /// Any key with a non-ASCII or control character is reserved.
+        #[test]
+        fn non_ascii_keys_are_reserved(
+            head in "[a-z0-9]{0,8}",
+            odd in "[^\x20-\x7e]",
+            tail in "[a-z0-9]{0,8}",
+        ) {
+            let key = format!("{head}{odd}{tail}");
+            prop_assert!(is_reserved_property(&key), "{:?}", key);
+        }
+
+        /// Printable ASCII keys: reserved exactly when the normalized key matches a rule.
+        #[test]
+        fn ascii_keys_follow_the_normalized_rule(key in "[ -~]{0,24}") {
+            let k = normalize_property_key(&key);
+            let expected = k.is_empty()
+                || RESERVED_PROPERTY_KEYS.contains(&k.as_str())
+                || RESERVED_PROPERTY_FRAGMENTS.iter().any(|f| k.contains(f));
+            prop_assert_eq!(is_reserved_property(&key), expected);
+        }
+    }
 
     fn tcp() -> Endpoint {
         Endpoint::Tcp {
@@ -662,6 +813,51 @@ mod tests {
         let w = p.security_warnings();
         assert!(w.contains(&SecurityWarning::SshHostKeyNotVerified));
         assert!(!w.contains(&SecurityWarning::CredentialsInClear));
+    }
+
+    #[test]
+    fn every_ssh_hop_is_checked() {
+        use HostKeyVerification::{Disabled, Strict};
+        let mut p = ConnectParams::new(EngineId::POSTGRESQL, tcp());
+        // A jump host without verification, the last hop strict.
+        let t = TunnelInfo::new("ignored", 1).with_hops(vec![
+            SshHop::new("jump1.example.test", 22, Strict),
+            SshHop::new("jump2.example.test", 2222, Disabled),
+            SshHop::new("db-bastion.example.test", 22, Strict),
+        ]);
+        assert_eq!(t.ssh_host, "db-bastion.example.test");
+        assert_eq!(t.jump_hosts, 2);
+        assert_eq!(t.host_key, Disabled, "summary is the weakest hop");
+        p.tunnel = Some(t);
+        let w = p.security_warnings();
+        assert!(w.contains(&SecurityWarning::SshHostKeyNotVerified));
+        assert!(w.contains(&SecurityWarning::SshHopHostKeyNotVerified { hop: 1 }));
+        assert!(!w.contains(&SecurityWarning::SshHopHostKeyNotVerified { hop: 0 }));
+
+        // A summary that claims Strict while a hop is Disabled still warns (fails safe).
+        let mut t = TunnelInfo::new("db-bastion.example.test", 22);
+        t.hops = vec![
+            SshHop::new("jump.example.test", 22, Disabled),
+            SshHop::new("db-bastion.example.test", 22, Strict),
+        ];
+        assert_eq!(t.host_key, Strict);
+        assert_eq!(t.weakest_host_key(), Disabled);
+        p.tunnel = Some(t);
+        assert!(
+            p.security_warnings()
+                .contains(&SecurityWarning::SshHostKeyNotVerified)
+        );
+
+        // All strict: no warning.
+        p.tunnel = Some(TunnelInfo::new("x", 22).with_hops(vec![
+            SshHop::new("a.example.test", 22, Strict),
+            SshHop::new("b.example.test", 22, Strict),
+        ]));
+        assert!(p.security_warnings().is_empty());
+        assert_eq!(
+            TunnelInfo::new("x", 22).with_hops(Vec::new()),
+            TunnelInfo::new("x", 22)
+        );
     }
 
     #[test]
@@ -777,6 +973,42 @@ mod tests {
         props.insert("fetchSize".to_owned(), PropertyValue::Plain("100".into()));
         assert!(check_properties(&props, &[]).is_ok());
         assert!(check_properties(&props, &["connect_timeout"]).is_err());
+    }
+
+    /// Integration review: the normalization keeps digits, drops separators and never lets a
+    /// non-ASCII character hide a reserved key.
+    #[test]
+    fn property_key_normalization_edges() {
+        for key in [
+            "ssl2mode",
+            "SSL_MODE_2",
+            "use-ssl-v2",
+            "tls13",
+            "init_sql_1",
+            "x509cert",
+            "ssl\u{200b}mode",
+            "s\u{0455}lmode",
+            "ｓｓｌｍｏｄｅ",
+            "ssl\u{0}mode",
+            "readonly\t",
+            "\u{feff}user",
+            "pässword",
+            "_",
+            "--",
+            "",
+            "日本語",
+        ] {
+            assert!(is_reserved_property(key), "{key:?}");
+        }
+        for key in [
+            "fetchSize",
+            "connect_timeout_2",
+            "tcp.keepalive",
+            "Application Name",
+            "x1",
+        ] {
+            assert!(!is_reserved_property(key), "{key:?}");
+        }
     }
 
     #[test]

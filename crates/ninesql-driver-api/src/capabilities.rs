@@ -22,10 +22,16 @@
 //! | [`server_side_timeout`](Capabilities::server_side_timeout) | Engine enforces a statement timeout itself | Timeout enforced by the stream wrapper only |
 //! | [`tls`](Capabilities::tls) | TLS modes the engine supports | TLS section disabled |
 //! | [`parameters`](Capabilities::parameters) | Bind parameters in statements | Parameter prompt not offered |
+//! | [`extra_reserved_properties`](Capabilities::extra_reserved_properties) | Driver properties this driver reserves on top of the global rule | The connection dialog and import refuse them too |
+//! | [`retains_secret_for_reconnect`](Capabilities::retains_secret_for_reconnect) | The driver keeps the secret in memory after connect, for automatic reconnects | "Reconnect" asks the core for the secret again |
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
-use crate::params::{EngineId, TlsMode};
+use crate::error::DriverResult;
+use crate::params::{
+    EngineId, PropertyValue, TlsMode, check_properties, is_reserved_property,
+    normalize_property_key,
+};
 
 /// Everything one engine supports through its driver. See the module documentation.
 ///
@@ -61,6 +67,21 @@ pub struct Capabilities {
     pub tls: BTreeSet<TlsMode>,
     /// Bind parameters are supported in [`Statement`](crate::Statement)s.
     pub parameters: bool,
+    /// Engine-specific driver property keys this driver reserves **on top of**
+    /// [`is_reserved_property`] (keys of its client library that touch TLS, credentials,
+    /// access mode, multi-statements or lexical modes under a name the global rule does not
+    /// catch). Compared after the same normalization. The driver passes them to
+    /// [`check_properties`] at connect time ([`Capabilities::check_properties`] does both), and
+    /// `ninesql-core` validates connections against them through
+    /// [`Capabilities::is_reserved_property`], so the dialog never stores a connection the
+    /// driver would refuse (integration review).
+    pub extra_reserved_properties: BTreeSet<String>,
+    /// The driver keeps the connection secret (password, token, key passphrase) in memory after
+    /// the handshake, zeroized on drop, to re-authenticate on automatic reconnects (L5). `false`
+    /// means the secret is dropped as soon as the handshake is done and a reconnect needs a new
+    /// [`ConnectParams`](crate::ConnectParams) from the core. Declared per driver and listed in
+    /// `docs/08-engine-capabilities.md`.
+    pub retains_secret_for_reconnect: bool,
 }
 
 impl Capabilities {
@@ -84,7 +105,40 @@ impl Capabilities {
             server_side_timeout: false,
             tls: BTreeSet::new(),
             parameters: false,
+            extra_reserved_properties: BTreeSet::new(),
+            retains_secret_for_reconnect: false,
         }
+    }
+
+    /// `true` when `key` is reserved for this engine: the global rule
+    /// ([`is_reserved_property`]) or one of [`extra_reserved_properties`](Self::extra_reserved_properties).
+    /// This is what `ninesql-core` validates driver properties against.
+    #[must_use]
+    pub fn is_reserved_property(&self, key: &str) -> bool {
+        if is_reserved_property(key) {
+            return true;
+        }
+        let k = normalize_property_key(key);
+        self.extra_reserved_properties
+            .iter()
+            .any(|r| normalize_property_key(r) == k)
+    }
+
+    /// [`check_properties`] with this engine's [`extra_reserved_properties`](Self::extra_reserved_properties).
+    ///
+    /// # Errors
+    /// [`DriverError::InvalidParams`](crate::DriverError::InvalidParams) naming the first
+    /// reserved key (never its value).
+    pub fn check_properties(
+        &self,
+        properties: &BTreeMap<String, PropertyValue>,
+    ) -> DriverResult<()> {
+        let extra: Vec<&str> = self
+            .extra_reserved_properties
+            .iter()
+            .map(String::as_str)
+            .collect();
+        check_properties(properties, &extra)
     }
 
     /// `true` when `feature` is declared.
@@ -367,6 +421,24 @@ mod tests {
         assert!(!c.supports(Feature::Editing));
         assert!(!c.supports(Feature::Documents));
         assert!(!c.supports(Feature::Metadata(ObjectKind::Table)));
+    }
+
+    #[test]
+    fn extra_reserved_properties_extend_the_global_rule() {
+        let mut c = Capabilities::minimal(EngineId::POSTGRESQL);
+        assert!(c.is_reserved_property("sslmode"));
+        assert!(!c.is_reserved_property("target_session_attrs"));
+        c.extra_reserved_properties
+            .insert("target_session_attrs".to_owned());
+        assert!(c.is_reserved_property("targetSessionAttrs"));
+        assert!(c.is_reserved_property("TARGET-SESSION-ATTRS"));
+        let props = BTreeMap::from([(
+            "target_session_attrs".to_owned(),
+            PropertyValue::Plain("read-write".into()),
+        )]);
+        let err = c.check_properties(&props).unwrap_err();
+        assert!(!err.to_string().contains("read-write"));
+        assert!(!c.retains_secret_for_reconnect);
     }
 
     #[test]

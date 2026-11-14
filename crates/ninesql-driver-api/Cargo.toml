@@ -19,12 +19,14 @@ mock = []
 
 [dependencies]
 arrow-array.workspace = true
+arrow-data.workspace = true
 arrow-schema.workspace = true
 async-trait.workspace = true
 futures-core.workspace = true
 futures-util.workspace = true
 thiserror.workspace = true
-tokio = { workspace = true, features = ["sync", "time", "macros"] }
+# `rt`: the result stream's timeout watchdog task (spawned on the current runtime).
+tokio = { workspace = true, features = ["rt", "sync", "time", "macros"] }
 tracing.workspace = true
 zeroize.workspace = true
 

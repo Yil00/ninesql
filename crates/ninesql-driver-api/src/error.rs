@@ -94,16 +94,219 @@ pub fn redact_secret(message: &str, secret: &Secret) -> String {
     message.replace(value, "***")
 }
 
-/// Masks credentials in text that may contain a connection string, a URL, JSON or HTTP headers:
+/// Masks credentials in text that may contain a connection string, a URL, JSON, HTTP headers,
+/// SQL or a command line:
 /// - `scheme://user:password@host` user-info passwords (up to the last `@` before the next
 ///   whitespace, so passwords containing `/`, `#` or `@` are covered);
+/// - `user:password@host` without a scheme (Go DSNs such as `user:pw@tcp(host:3306)/db`);
 /// - `key=value`, `key: value`, `"key":"value"` pairs whose key contains `password`, `passwd`,
 ///   `secret`, `token`, `apikey`, `credential` or `authorization`, or is `pwd` / `pass` / `auth`
-///   (case-insensitive, separators ignored: `trustStorePassword`, `PGPASSWORD`, `api-key`);
-/// - the credential after an `Authorization: Bearer|Basic|Token …` scheme.
+///   (case-insensitive, separators ignored: `trustStorePassword`, `PGPASSWORD`, `api-key`),
+///   including prefixed literals (`N'…'`, `E'…'`) and `PASSWORD('…')` calls;
+/// - the credential after an `Authorization: Bearer|Basic|Token …` scheme;
+/// - SQL forms: `PASSWORD '…'`, `IDENTIFIED BY '…'`, `IDENTIFIED WITH plugin BY '…'`,
+///   `IDENTIFIED BY PASSWORD '…'`, `SET PASSWORD = PASSWORD('…')`;
+/// - command-line forms: `-p secret`, `-psecret`, `--password secret` (`-p` is also the port
+///   flag of some tools: masking a port is accepted over-redaction).
+///
+/// Redaction is best effort over free text: it never replaces passing structured parameters
+/// and never makes it acceptable to log a statement or an error that may carry a secret.
 #[must_use]
 pub fn redact_connection_string(text: &str) -> String {
-    redact_kv_pairs(&redact_userinfo(text))
+    let text = redact_userinfo(text);
+    let text = redact_bare_userinfo(&text);
+    let text = redact_sql_forms(&text);
+    let text = redact_kv_pairs(&text);
+    redact_cli_flags(&text)
+}
+
+fn is_segment_end(c: char) -> bool {
+    c.is_whitespace() || matches!(c, '"' | '\'' | '<' | '>' | '`')
+}
+
+/// `user:password@host` without `://`: in each whitespace-delimited segment that has an `@`
+/// after a `:`, masks from the first `:` to the last `@`.
+fn redact_bare_userinfo(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while !rest.is_empty() {
+        let start = rest
+            .find(|c: char| !is_segment_end(c))
+            .unwrap_or(rest.len());
+        out.push_str(&rest[..start]);
+        rest = &rest[start..];
+        let end = rest.find(is_segment_end).unwrap_or(rest.len());
+        let segment = &rest[..end];
+        let masked = (!segment.contains("://"))
+            .then(|| {
+                let at = segment.rfind('@')?;
+                let colon = segment[..at].find(':')?;
+                // A user name must precede the colon: `x:y@h`, `DSN=x:y@h`.
+                let user = &segment[..colon];
+                let user_ok = user
+                    .bytes()
+                    .last()
+                    .is_some_and(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-' | b'.'));
+                (user_ok && at > colon + 1)
+                    .then(|| format!("{}:***{}", &segment[..colon], &segment[at..]))
+            })
+            .flatten();
+        out.push_str(masked.as_deref().unwrap_or(segment));
+        rest = &rest[end..];
+    }
+    out
+}
+
+fn eq_word(bytes: &[u8], start: usize, end: usize, word: &str) -> bool {
+    end - start == word.len() && bytes[start..end].eq_ignore_ascii_case(word.as_bytes())
+}
+
+/// Masks the quoted literal starting at `k` (after optional blanks, an optional `(` and an
+/// optional one-letter prefix such as `N` / `E`). Returns `(open_quote, close_end)`.
+fn literal_at(bytes: &[u8], k: usize) -> Option<(usize, usize)> {
+    let mut k = skip_blanks(bytes, k);
+    if bytes.get(k) == Some(&b'(') {
+        k = skip_blanks(bytes, k + 1);
+    }
+    if bytes
+        .get(k)
+        .is_some_and(|b| matches!(b, b'N' | b'n' | b'E' | b'e' | b'B' | b'b'))
+        && matches!(bytes.get(k + 1), Some(b'\'' | b'"'))
+    {
+        k += 1;
+    }
+    match bytes.get(k) {
+        Some(b'\'' | b'"') => Some((k, value_end(bytes, k))),
+        _ => None,
+    }
+}
+
+/// SQL forms that carry a password literal: `PASSWORD '…'`, `PASSWORD('…')`,
+/// `IDENTIFIED [WITH plugin] BY [PASSWORD] '…'`.
+fn redact_sql_forms(text: &str) -> String {
+    let bytes = text.as_bytes();
+    let mut out = String::with_capacity(text.len());
+    let mut last = 0;
+    let mut i = 0;
+    let mut identified_at: Option<usize> = None;
+    while i < bytes.len() {
+        if !(bytes[i].is_ascii_alphabetic() || bytes[i] == b'_')
+            || (i > 0 && is_key_byte(bytes[i - 1]))
+        {
+            i += 1;
+            continue;
+        }
+        let mut j = i;
+        while j < bytes.len() && (bytes[j].is_ascii_alphanumeric() || bytes[j] == b'_') {
+            j += 1;
+        }
+        let expects_literal = if eq_word(bytes, i, j, "identified") {
+            identified_at = Some(j);
+            false
+        } else if eq_word(bytes, i, j, "by") {
+            // `IDENTIFIED BY`, or `IDENTIFIED WITH plugin BY` (a few words in between).
+            identified_at.is_some_and(|at| i - at < 64)
+        } else {
+            eq_word(bytes, i, j, "password") || eq_word(bytes, i, j, "passwd")
+        };
+        // The literal follows after whitespace or `(`: `"password":"…"` (a JSON key) is a
+        // key-value pair, handled later.
+        let expects_literal =
+            expects_literal && matches!(bytes.get(j), Some(b' ' | b'\t' | b'\n' | b'\r' | b'('));
+        let literal_from = if expects_literal && !eq_word(bytes, i, j, "by") {
+            skip_password_for(bytes, j)
+        } else {
+            j
+        };
+        if expects_literal
+            && let Some((open, end)) = literal_at(bytes, literal_from)
+            && end > open + 1
+        {
+            out.push_str(&text[last..=open]);
+            out.push_str("***");
+            if end - open >= 2 && bytes[end - 1] == bytes[open] {
+                out.push_str(&text[end - 1..end]);
+            }
+            last = end;
+            i = end;
+            identified_at = None;
+            continue;
+        }
+        i = j;
+    }
+    out.push_str(&text[last..]);
+    out
+}
+
+/// After `PASSWORD`: skips `FOR <user> =` (`SET PASSWORD FOR app = '…'`) and a bare `=`, so the
+/// literal that follows is found. Returns `j` unchanged otherwise.
+fn skip_password_for(bytes: &[u8], j: usize) -> usize {
+    let k = skip_blanks(bytes, j);
+    let mut e = k;
+    while e < bytes.len() && bytes[e].is_ascii_alphabetic() {
+        e += 1;
+    }
+    let mut k = if eq_word(bytes, k, e, "for") {
+        // The user: a quoted or bare token, possibly `'u'@'h'`, up to `=`.
+        let mut t = skip_blanks(bytes, e);
+        while t < bytes.len() && bytes[t] != b'=' && bytes[t] != b'\n' && t - e < 256 {
+            t += 1;
+        }
+        t
+    } else {
+        k
+    };
+    if bytes.get(k) == Some(&b'=') {
+        k += 1;
+    } else if k != skip_blanks(bytes, j) {
+        // `FOR` without `=`: not the form we know.
+        return j;
+    }
+    k
+}
+
+/// `-p secret`, `-psecret`, `--password secret`, `--pass secret` (the `=` forms are key-value
+/// pairs).
+fn redact_cli_flags(text: &str) -> String {
+    let bytes = text.as_bytes();
+    let mut out = String::with_capacity(text.len());
+    let mut last = 0;
+    let mut i = 0;
+    while i < bytes.len() {
+        let at_token = bytes[i] == b'-' && (i == 0 || bytes[i - 1].is_ascii_whitespace());
+        if !at_token {
+            i += 1;
+            continue;
+        }
+        let mut j = i;
+        while j < bytes.len() && !bytes[j].is_ascii_whitespace() {
+            j += 1;
+        }
+        let flag = &text[i..j];
+        let value = if flag == "-p" || flag == "--password" || flag == "--pass" {
+            let k = skip_blanks(bytes, j);
+            let mut e = k;
+            while e < bytes.len() && !bytes[e].is_ascii_whitespace() {
+                e += 1;
+            }
+            (e > k && !text[k..e].starts_with('-')).then_some((k, e))
+        } else if flag.len() > 2 && flag.starts_with("-p") && !flag.starts_with("-p=") {
+            Some((i + 2, j))
+        } else {
+            None
+        };
+        match value {
+            Some((k, e)) if &text[k..e] != "***" => {
+                out.push_str(&text[last..k]);
+                out.push_str("***");
+                last = e;
+                i = e;
+            }
+            _ => i = j,
+        }
+    }
+    out.push_str(&text[last..]);
+    out
 }
 
 fn redact_userinfo(text: &str) -> String {
@@ -231,7 +434,24 @@ fn redact_kv_pairs(text: &str) -> String {
             }
         }
         k = skip_blanks(bytes, k);
+        // `N'…'` / `E'…'` (SQL Server, PostgreSQL): the literal starts at the quote.
+        if bytes
+            .get(k)
+            .is_some_and(|b| matches!(b, b'N' | b'n' | b'E' | b'e' | b'B' | b'b'))
+            && matches!(bytes.get(k + 1), Some(b'\'' | b'"'))
+        {
+            out.push_str(&text[last..=k]);
+            last = k + 1;
+            k += 1;
+        }
         let mut end = value_end(bytes, k);
+        // `PASSWORD('…')`: a function call whose argument is the secret.
+        if end > k && bytes[end - 1] == b'(' && matches!(bytes.get(end), Some(b'\'' | b'"')) {
+            out.push_str(&text[last..end]);
+            last = end;
+            k = end;
+            end = value_end(bytes, k);
+        }
         // `Authorization: Bearer <credential>`: keep the scheme, mask the credential.
         let first = text[k..end].to_ascii_lowercase();
         if AUTH_SCHEMES.contains(&first.as_str()) {
@@ -314,6 +534,52 @@ mod tests {
             redact_connection_string("password authentication failed for user \"nine\""),
             "password authentication failed for user \"nine\""
         );
+    }
+
+    /// F7 of the P0-B security review.
+    #[test]
+    fn redacts_sql_and_cli_forms() {
+        for s in [
+            "CREATE ROLE app LOGIN PASSWORD 'Pa55word'",
+            "ALTER USER app WITH PASSWORD 'Pa55word' VALID UNTIL 'infinity'",
+            "alter role app password \"Pa55word\"",
+            "CREATE USER 'app'@'%' IDENTIFIED BY 'Pa55word'",
+            "ALTER USER app IDENTIFIED WITH mysql_native_password BY 'Pa55word'",
+            "ALTER USER app IDENTIFIED WITH caching_sha2_password BY \"Pa55word\" PASSWORD EXPIRE",
+            "GRANT ALL ON *.* TO app IDENTIFIED BY PASSWORD '*Pa55word'",
+            "SET PASSWORD = PASSWORD('Pa55word')",
+            "SET PASSWORD FOR app = 'Pa55word'",
+            "ALTER LOGIN app WITH PASSWORD = N'Pa55word'",
+            "dial tcp: nine:Pa55word@tcp(db.example.test:3306)/app",
+            "dsn=nine:Pa55word@db.example.test:5432/app failed",
+            "mysql -u nine -pPa55word app",
+            "mysql -u nine -p Pa55word app",
+            "pg_dump --password Pa55word",
+            "sshpass -p Pa55word ssh host",
+        ] {
+            let r = redact_connection_string(s);
+            assert!(!r.contains("Pa55word"), "{s} -> {r}");
+            assert!(r.contains("***"), "{s} -> {r}");
+        }
+        assert_eq!(
+            redact_connection_string("CREATE USER 'app'@'%' IDENTIFIED BY 'x1'"),
+            "CREATE USER 'app'@'%' IDENTIFIED BY '***'"
+        );
+        assert_eq!(
+            redact_connection_string("nine:secret@db.example.test"),
+            "nine:***@db.example.test"
+        );
+        // Not secrets: `user@host:port`, emails, times, plain prose.
+        for s in [
+            "connect to nine@db.example.test:5432 refused",
+            "mail admin@example.test about it",
+            "at 12:30 the server restarted",
+            "password authentication failed for user \"nine\"",
+            "the password is too short",
+            "column \"identified\" does not exist",
+        ] {
+            assert_eq!(redact_connection_string(s), s);
+        }
     }
 
     #[test]
@@ -399,6 +665,24 @@ mod tests {
         #[test]
         fn never_panics(s in "\\PC{0,200}") {
             let _ = redact_connection_string(&s);
+        }
+
+        #[test]
+        fn sql_form_passwords_never_survive(
+            pw in "[A-Za-z0-9!$%*+.~#@-]{6,24}",
+            form in 0usize..6,
+            quote in prop::sample::select(vec!['\'', '"']),
+        ) {
+            let s = match form {
+                0 => format!("CREATE ROLE r LOGIN PASSWORD {quote}{pw}{quote}"),
+                1 => format!("CREATE USER u IDENTIFIED BY {quote}{pw}{quote}"),
+                2 => format!("ALTER USER u IDENTIFIED WITH mysql_native_password BY {quote}{pw}{quote}"),
+                3 => format!("SET PASSWORD = PASSWORD({quote}{pw}{quote})"),
+                4 => format!("ALTER LOGIN l WITH PASSWORD = N{quote}{pw}{quote}"),
+                _ => format!("error: u:{pw}@tcp(db:3306)/x"),
+            };
+            let r = redact_connection_string(&s);
+            prop_assert!(!r.contains(&pw), "{} -> {}", s, r);
         }
     }
 }

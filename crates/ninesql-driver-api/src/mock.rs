@@ -10,6 +10,8 @@
 //! | `SELECT * FROM slow_numbers(N, MS)` | Same, waiting `MS` ms before each batch (timeout / cancel tests) |
 //! | `SELECT * FROM wide(N, BYTES)` | `N` rows with `BYTES`-byte labels, cut at the value budget and flagged |
 //! | `SELECT * FROM documents(N)` | `N` documents |
+//! | `SELECT * FROM wide_documents(N, BYTES)` | `N` documents with a `BYTES`-byte `payload`, cut at the value / row budget and wrapped in [`DocValue::Truncated`] |
+//! | `SELECT 1 AS <identifier>` | One row, one column named after the (ANSI-quoted) identifier (quoting conformance) |
 //! | `SELECT * FROM notices(N)` | `N` notices |
 //! | `SELECT mock_write()` | A write the classifier cannot see (rejected by the simulated server in read-only mode) |
 //! | `SELECT mock_lift_read_only()` | Lifts the simulated engine-side read-only setting (detected; the session is closed) |
@@ -24,6 +26,13 @@
 //! rejected again by the simulated server. [`MockStats`] exposes counters (rows generated,
 //! server-side cancels, connects) so tests can prove that streaming stops at the budget and that
 //! cancel reaches the "server".
+//!
+//! Cancellation behaves like PostgreSQL (M6): the simulated server's cancel targets "whatever
+//! the session runs", the session uses an [`ExecutionTracker`] so handles are scoped to one
+//! execution, and a cancelled stream ends only when the simulated server notices the cancel
+//! (at its next batch): until then the session is busy. The mock declares
+//! [`MOCK_RESERVED_PROPERTY`] as an extra reserved property key and does not retain the secret
+//! after connect.
 
 use std::collections::BTreeSet;
 use std::sync::Arc;
@@ -41,21 +50,33 @@ use crate::capabilities::{
 use crate::dialect::{AnsiDialect, Dialect, StatementClass, ensure_single_statement};
 use crate::driver::{Driver, Session};
 use crate::error::{DriverError, DriverResult};
+use crate::execution::{ExecutionGuard, ExecutionTracker};
 use crate::metadata::{
     ColumnInfo, Metadata, ObjectDetails, ObjectInfo, ObjectPath, Page, PageRequest, TableInfo,
 };
-use crate::params::{Auth, ConnectParams, EngineId, check_properties};
+use crate::params::{Auth, ConnectParams, Endpoint, EngineId, TlsMode};
 use crate::result::{
     CancelHandle, DocValue, Document, Notice, NoticeSeverity, RawResultStream, ResultItem,
     ResultSetHeader, ResultSetKind, ResultStream, TRUNCATED_VALUES_METADATA_KEY,
 };
 use crate::secret::Secret;
-use crate::statement::{BatchLimiter, ExecOptions, FetchBudget, Statement, truncate_str};
+use crate::statement::{
+    BatchLimiter, ExecOptions, FetchBudget, RowBudget, Statement, truncate_str,
+};
 
 /// Engine id served by the mock driver.
 pub const MOCK_ENGINE: EngineId = EngineId::from_static("mock");
 
 static MOCK_ENGINES: [EngineId; 1] = [MOCK_ENGINE];
+
+/// Extra reserved driver property declared by the mock in
+/// [`Capabilities::extra_reserved_properties`].
+pub const MOCK_RESERVED_PROPERTY: &str = "mock_backdoor";
+
+/// Host name the mock treats as a TLS endpoint with a self-signed certificate: connecting to it
+/// over TCP with `verify-ca` / `verify-full` and no extra CA file fails with
+/// [`DriverError::Tls`] (for `conformance::assert_verify_full_rejects_untrusted_certificate`).
+pub const MOCK_SELF_SIGNED_HOST: &str = "self-signed.mock.invalid";
 
 /// Number of tables listed in the mock `public` schema (enough to exercise paging).
 pub const MOCK_TABLE_COUNT: usize = 50;
@@ -136,6 +157,8 @@ pub fn full_capabilities() -> Capabilities {
         server_side_timeout: false,
         tls: BTreeSet::new(),
         parameters: true,
+        extra_reserved_properties: BTreeSet::from([MOCK_RESERVED_PROPERTY.to_owned()]),
+        retains_secret_for_reconnect: false,
     }
 }
 
@@ -233,7 +256,16 @@ impl Driver for MockDriver {
 
     async fn connect(&self, params: ConnectParams) -> DriverResult<Box<dyn Session>> {
         Self::check_engine(&params.engine)?;
-        check_properties(&params.properties, &[])?;
+        self.capabilities.check_properties(&params.properties)?;
+        if let Endpoint::Tcp { host, .. } = &params.endpoint
+            && host == MOCK_SELF_SIGNED_HOST
+            && matches!(params.tls.mode, TlsMode::VerifyCa | TlsMode::VerifyFull)
+            && params.tls.ca_file.is_none()
+        {
+            return Err(DriverError::Tls(
+                "invalid peer certificate: UnknownIssuer (self-signed)".into(),
+            ));
+        }
         if let Some(expected) = &self.password {
             match &params.auth {
                 Auth::Password {
@@ -255,6 +287,7 @@ impl Driver for MockDriver {
         capabilities.server_version = Some("mock 1.0".to_owned());
         let mut session = MockSession {
             server: Arc::new(ServerState::default()),
+            tracker: ExecutionTracker::new(),
             stats: Arc::clone(&self.stats),
             capabilities,
             auto_commit: true,
@@ -286,28 +319,48 @@ impl Driver for MockDriver {
 struct ServerState {
     /// Engine-side read-only setting.
     read_only: AtomicBool,
-    /// A result stream is alive.
-    streaming: Arc<AtomicBool>,
+    /// A cancel request reached the backend; it stops whatever runs (like PostgreSQL).
+    cancel_requested: Arc<AtomicBool>,
 }
 
-/// Clears the session's busy flag when the raw stream is dropped.
-struct BusyGuard(Arc<AtomicBool>);
+/// The execution's ownership of the session, held by the raw stream. The simulated server
+/// confirms the end as soon as the stream ends or is dropped (portal closed).
+struct BusyGuard(Option<ExecutionGuard>);
 
 impl Drop for BusyGuard {
     fn drop(&mut self) {
-        self.0.store(false, Ordering::SeqCst);
+        if let Some(g) = self.0.take() {
+            g.complete();
+        }
     }
 }
 
+/// The simulated server's (unscoped) cancel: like a PostgreSQL cancel request, it hits
+/// whatever the session runs. The session scopes it with its [`ExecutionTracker`].
 struct MockCancel {
     stats: Arc<MockStats>,
+    flag: Arc<AtomicBool>,
 }
 
 #[async_trait::async_trait]
 impl CancelHandle for MockCancel {
     async fn cancel(&self) -> DriverResult<()> {
         self.stats.server_cancels.fetch_add(1, Ordering::SeqCst);
+        self.flag.store(true, Ordering::SeqCst);
         Ok(())
+    }
+
+    fn confirms_end(&self) -> bool {
+        true
+    }
+}
+
+/// The error the simulated server sends when it stops a cancelled statement.
+fn server_cancelled() -> DriverError {
+    DriverError::Query {
+        code: Some("57014".into()),
+        message: "canceling statement due to user request".into(),
+        position: None,
     }
 }
 
@@ -315,6 +368,7 @@ impl CancelHandle for MockCancel {
 #[derive(Debug)]
 pub struct MockSession {
     server: Arc<ServerState>,
+    tracker: ExecutionTracker,
     stats: Arc<MockStats>,
     capabilities: Capabilities,
     auto_commit: bool,
@@ -348,19 +402,25 @@ fn numbers_batch(
     let mut truncated = false;
     let mut i = from;
     while i < total && !limiter.is_full() {
+        // Per-row bound (F5): the id's 8 bytes, then the label within what is left.
+        let mut row = RowBudget::new(budget);
+        row.add_fixed(8);
         let label = match label_len {
-            None => format!("row-{i:08}"),
+            None => {
+                let full = format!("row-{i:08}");
+                let keep = row.allow(full.len() as u64);
+                truncate_str(&full, keep).0.to_owned()
+            }
             Some(n) => {
-                let produced = "x".repeat(usize::try_from(n.min(max_value)).unwrap_or(0));
-                truncated |= n > max_value;
-                produced
+                // The simulated server never materializes more than the budget allows.
+                let keep = row.allow(n).min(max_value);
+                "x".repeat(usize::try_from(keep).unwrap_or(0))
             }
         };
-        let (label, cut) = truncate_str(&label, max_value);
-        truncated |= cut;
-        limiter.add_row(8 + 4 + label.len() as u64);
+        truncated |= row.was_truncated();
+        limiter.add_row(row.used() + 4);
         ids.push(i64::try_from(i).unwrap_or(i64::MAX));
-        labels.push(label.to_owned());
+        labels.push(label);
         i += 1;
     }
     let schema = if truncated {
@@ -389,6 +449,54 @@ fn numbers_batch(
     RecordBatch::try_new(schema, cols).map_err(|e| DriverError::Protocol(e.to_string()))
 }
 
+/// Document `i` of the mock collection; with `payload`, a string field of that many bytes cut
+/// at the value / row budget.
+fn mock_document(i: u64, payload: Option<u64>, budget: &FetchBudget) -> Document {
+    let mut row = RowBudget::new(budget);
+    row.add_fixed(8);
+    let mut fields = vec![
+        (
+            "_id".to_owned(),
+            DocValue::Int(i64::try_from(i).unwrap_or(0)),
+        ),
+        ("name".to_owned(), DocValue::String(format!("doc-{i:08}"))),
+        (
+            "tags".to_owned(),
+            DocValue::Array(vec![DocValue::String("nine".to_owned())]),
+        ),
+    ];
+    if let Some(n) = payload {
+        let keep = row.allow(n);
+        let value = DocValue::String("y".repeat(usize::try_from(keep).unwrap_or(0)));
+        let value = if keep < n {
+            DocValue::truncated(value, Some(n))
+        } else {
+            value
+        };
+        fields.push(("payload".to_owned(), value));
+    }
+    Document::new(fields)
+}
+
+/// `SELECT 1 AS <identifier>`: the identifier, ANSI-unquoted (`"a""b"` → `a"b`; a bare name is
+/// lower-cased). `None` for any other statement or a malformed identifier.
+fn alias_query(text: &str) -> Option<String> {
+    let t = text.trim().trim_end_matches(';').trim_end();
+    let prefix = "select 1 as ";
+    if t.len() < prefix.len() || !t[..prefix.len()].eq_ignore_ascii_case(prefix) {
+        return None;
+    }
+    let rest = t[prefix.len()..].trim();
+    if let Some(inner) = rest.strip_prefix('"').and_then(|r| r.strip_suffix('"')) {
+        if inner.replace("\"\"", "").contains('"') {
+            return None;
+        }
+        return Some(inner.replace("\"\"", "\""));
+    }
+    (!rest.is_empty() && rest.chars().all(|c| c.is_ascii_alphanumeric() || c == '_'))
+        .then(|| rest.to_ascii_lowercase())
+}
+
 /// Parses the integer arguments of `name(a, b…)` in `text` (lower-cased).
 fn call_args(text: &str, name: &str) -> Option<Vec<u64>> {
     let start = text.find(&format!("{name}("))? + name.len() + 1;
@@ -411,6 +519,7 @@ impl MockSession {
     ) -> RawResultStream {
         let schema = numbers_schema();
         let stats = Arc::clone(&self.stats);
+        let cancelled = Arc::clone(&self.server.cancel_requested);
         let header = ResultItem::ResultSet(ResultSetHeader {
             index: 0,
             kind: ResultSetKind::Tabular(Arc::clone(&schema)),
@@ -418,12 +527,18 @@ impl MockSession {
         let rows = futures_util::stream::unfold((0u64, guard), move |(next, guard)| {
             let schema = Arc::clone(&schema);
             let stats = Arc::clone(&stats);
+            let cancelled = Arc::clone(&cancelled);
             async move {
                 if next >= total {
                     return None;
                 }
                 if let Some(d) = delay {
                     tokio::time::sleep(d).await;
+                }
+                // The simulated server notices a cancel between batches and confirms the end
+                // with an error; the stream then ends and the guard frees the session.
+                if cancelled.load(Ordering::SeqCst) {
+                    return Some((Err(server_cancelled()), (total, guard)));
                 }
                 // Rows are produced only when the consumer polls: nothing runs ahead, and a
                 // batch ends at the budget's row or byte limit.
@@ -443,37 +558,40 @@ impl MockSession {
         ))
     }
 
-    fn documents_stream(&self, total: u64, batch_rows: u32, guard: BusyGuard) -> RawResultStream {
+    fn documents_stream(
+        &self,
+        total: u64,
+        payload: Option<u64>,
+        budget: FetchBudget,
+        guard: BusyGuard,
+    ) -> RawResultStream {
         let stats = Arc::clone(&self.stats);
+        let cancelled = Arc::clone(&self.server.cancel_requested);
         let header = ResultItem::ResultSet(ResultSetHeader {
             index: 0,
             kind: ResultSetKind::Documents,
         });
-        let batch = u64::from(batch_rows);
         let docs = futures_util::stream::unfold((0u64, guard), move |(next, guard)| {
             let stats = Arc::clone(&stats);
+            let cancelled = Arc::clone(&cancelled);
             async move {
                 if next >= total {
                     return None;
                 }
-                let count = batch.min(total - next);
-                stats.rows_generated.fetch_add(count, Ordering::SeqCst);
-                let docs = (next..next + count)
-                    .map(|i| Document {
-                        fields: vec![
-                            (
-                                "_id".to_owned(),
-                                DocValue::Int(i64::try_from(i).unwrap_or(0)),
-                            ),
-                            ("name".to_owned(), DocValue::String(format!("doc-{i:08}"))),
-                            (
-                                "tags".to_owned(),
-                                DocValue::Array(vec![DocValue::String("nine".to_owned())]),
-                            ),
-                        ],
-                    })
-                    .collect();
-                Some((Ok(ResultItem::Documents(docs)), (next + count, guard)))
+                if cancelled.load(Ordering::SeqCst) {
+                    return Some((Err(server_cancelled()), (total, guard)));
+                }
+                let mut limiter = BatchLimiter::new(&budget);
+                let mut docs = Vec::new();
+                let mut i = next;
+                while i < total && !limiter.is_full() {
+                    let doc = mock_document(i, payload, &budget);
+                    limiter.add_row(doc.estimated_size());
+                    docs.push(doc);
+                    i += 1;
+                }
+                stats.rows_generated.fetch_add(i - next, Ordering::SeqCst);
+                Some((Ok(ResultItem::Documents(docs)), (i, guard)))
             }
         });
         Box::pin(futures_util::StreamExt::chain(
@@ -496,11 +614,10 @@ impl MockSession {
                 None,
                 &FetchBudget::default(),
             )?)),
-            Ok(ResultItem::Notice(Notice {
-                severity: NoticeSeverity::Info,
-                code: None,
-                message: "second result set follows".to_owned(),
-            })),
+            Ok(ResultItem::Notice(Notice::new(
+                NoticeSeverity::Info,
+                "second result set follows",
+            ))),
             Ok(ResultItem::ResultSet(ResultSetHeader {
                 index: 1,
                 kind: ResultSetKind::Tabular(Arc::clone(&schema)),
@@ -520,6 +637,26 @@ impl MockSession {
                 Ok(ResultItem::UpdateCount(None))
             }),
         )))
+    }
+
+    /// Starts an execution: the session is busy until the stream's guard confirms the end.
+    fn start_execution(
+        &self,
+    ) -> DriverResult<(BusyGuard, Arc<dyn CancelHandle>, crate::ExecutionId)> {
+        let guard = self.tracker.begin()?;
+        let id = guard.id();
+        // A new statement starts with a clean backend cancel flag (no cancel can be in flight:
+        // the tracker refuses `begin` while one is).
+        self.server.cancel_requested.store(false, Ordering::SeqCst);
+        let canceller = self.tracker.cancel_handle(id, self.engine_cancel());
+        Ok((BusyGuard(Some(guard)), canceller, id))
+    }
+
+    fn engine_cancel(&self) -> Arc<dyn CancelHandle> {
+        Arc::new(MockCancel {
+            stats: Arc::clone(&self.stats),
+            flag: Arc::clone(&self.server.cancel_requested),
+        })
     }
 
     fn single(&mut self, item: DriverResult<ResultItem>, options: &ExecOptions) -> ResultStream {
@@ -565,7 +702,7 @@ impl Session for MockSession {
         if self.closed {
             return Err(DriverError::Closed("session closed".into()));
         }
-        if self.server.streaming.load(Ordering::SeqCst) {
+        if self.tracker.is_busy() {
             return Err(DriverError::Busy);
         }
         // One statement per call: what runs is what was classified (H1).
@@ -615,8 +752,21 @@ impl Session for MockSession {
 
         match class {
             StatementClass::Read => {
-                let batch_rows = options.budget.effective_batch_rows();
                 let budget = options.budget;
+                if let Some(name) = alias_query(&statement.text) {
+                    let schema =
+                        Arc::new(Schema::new(vec![Field::new(name, DataType::Int64, false)]));
+                    let batch = RecordBatch::try_new(
+                        Arc::clone(&schema),
+                        vec![Arc::new(Int64Array::from(vec![1_i64]))],
+                    )
+                    .map_err(|e| DriverError::Protocol(e.to_string()))?;
+                    let items = vec![
+                        Ok(ResultItem::ResultSet(ResultSetHeader::tabular(0, schema))),
+                        Ok(ResultItem::Rows(batch)),
+                    ];
+                    return Ok(ResultStream::from_items(items, &options));
+                }
                 if let Some(args) = call_args(&lower, "slow_numbers") {
                     let [n, ms] = args[..] else {
                         return Err(DriverError::Query {
@@ -625,18 +775,29 @@ impl Session for MockSession {
                             position: None,
                         });
                     };
-                    self.server.streaming.store(true, Ordering::SeqCst);
-                    let guard = BusyGuard(Arc::clone(&self.server.streaming));
+                    let (guard, canceller, id) = self.start_execution()?;
                     let delay = Some(Duration::from_millis(ms));
                     let raw = self.tabular_stream(n, delay, None, budget, guard);
-                    return Ok(ResultStream::new(raw, &options, self.cancel_handle()));
+                    return Ok(ResultStream::new(raw, &options, canceller).with_execution(id));
+                }
+                if let Some(args) = call_args(&lower, "wide_documents") {
+                    let [n, len] = args[..] else {
+                        return Err(DriverError::Query {
+                            code: Some("42883".into()),
+                            message: "wide_documents(docs, value_bytes) expects two arguments"
+                                .into(),
+                            position: None,
+                        });
+                    };
+                    let (guard, canceller, id) = self.start_execution()?;
+                    let raw = self.documents_stream(n, Some(len), budget, guard);
+                    return Ok(ResultStream::new(raw, &options, canceller).with_execution(id));
                 }
                 if let Some(args) = call_args(&lower, "numbers") {
                     let n = args.first().copied().unwrap_or(0);
-                    self.server.streaming.store(true, Ordering::SeqCst);
-                    let guard = BusyGuard(Arc::clone(&self.server.streaming));
+                    let (guard, canceller, id) = self.start_execution()?;
                     let raw = self.tabular_stream(n, None, None, budget, guard);
-                    return Ok(ResultStream::new(raw, &options, self.cancel_handle()));
+                    return Ok(ResultStream::new(raw, &options, canceller).with_execution(id));
                 }
                 if let Some(args) = call_args(&lower, "wide") {
                     let [n, len] = args[..] else {
@@ -646,10 +807,9 @@ impl Session for MockSession {
                             position: None,
                         });
                     };
-                    self.server.streaming.store(true, Ordering::SeqCst);
-                    let guard = BusyGuard(Arc::clone(&self.server.streaming));
+                    let (guard, canceller, id) = self.start_execution()?;
                     let raw = self.tabular_stream(n, None, Some(len), budget, guard);
-                    return Ok(ResultStream::new(raw, &options, self.cancel_handle()));
+                    return Ok(ResultStream::new(raw, &options, canceller).with_execution(id));
                 }
                 if lower.contains("mock_write(") {
                     return Ok(self.single(Ok(ResultItem::UpdateCount(Some(1))), &options));
@@ -658,11 +818,10 @@ impl Session for MockSession {
                     let n = args.first().copied().unwrap_or(0);
                     let items: Vec<_> = (0..n)
                         .map(|i| {
-                            Ok(ResultItem::Notice(Notice {
-                                severity: NoticeSeverity::Info,
-                                code: None,
-                                message: format!("notice {i}"),
-                            }))
+                            Ok(ResultItem::Notice(Notice::new(
+                                NoticeSeverity::Info,
+                                format!("notice {i}"),
+                            )))
                         })
                         .collect();
                     return Ok(ResultStream::new(
@@ -673,16 +832,14 @@ impl Session for MockSession {
                 }
                 if let Some(args) = call_args(&lower, "documents") {
                     let n = args.first().copied().unwrap_or(0);
-                    self.server.streaming.store(true, Ordering::SeqCst);
-                    let guard = BusyGuard(Arc::clone(&self.server.streaming));
-                    let raw = self.documents_stream(n, batch_rows, guard);
-                    return Ok(ResultStream::new(raw, &options, self.cancel_handle()));
+                    let (guard, canceller, id) = self.start_execution()?;
+                    let raw = self.documents_stream(n, None, budget, guard);
+                    return Ok(ResultStream::new(raw, &options, canceller).with_execution(id));
                 }
                 if call_args(&lower, "multi").is_some() {
-                    self.server.streaming.store(true, Ordering::SeqCst);
-                    let guard = BusyGuard(Arc::clone(&self.server.streaming));
+                    let (guard, canceller, id) = self.start_execution()?;
                     let raw = Self::multi_stream(guard)?;
-                    return Ok(ResultStream::new(raw, &options, self.cancel_handle()));
+                    return Ok(ResultStream::new(raw, &options, canceller).with_execution(id));
                 }
                 if lower.contains("error(") {
                     return Ok(self.single(
@@ -727,9 +884,8 @@ impl Session for MockSession {
     }
 
     fn cancel_handle(&self) -> Arc<dyn CancelHandle> {
-        Arc::new(MockCancel {
-            stats: Arc::clone(&self.stats),
-        })
+        // Scoped to the execution running now; a no-op when idle or once it ended (M6).
+        self.tracker.current_cancel_handle(self.engine_cancel())
     }
 
     fn auto_commit(&self) -> bool {
