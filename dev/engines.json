@@ -73,7 +73,15 @@
         "healthcheck": true,
         "seed_service": null
       },
-      "notes": "root password: nine_dev_only_root"
+      "tls": {
+    "$comment": "Test-only TLS (dev/tls/mysql-tls.sh): certificate for these names, signed by a CA generated in the container at first start; read the CA (public) with ca_sql.",
+    "server_names": [
+     "localhost",
+     "127.0.0.1"
+    ],
+    "ca_sql": "SELECT ca_pem FROM nine.ninesql_tls"
+   },
+   "notes": "root password: nine_dev_only_root"
     },
     {
       "id": "mariadb",
@@ -95,7 +103,15 @@
         "healthcheck": true,
         "seed_service": null
       },
-      "notes": "root password: nine_dev_only_root"
+      "tls": {
+    "$comment": "Test-only TLS (dev/tls/mysql-tls.sh): certificate for these names, signed by a CA generated in the container at first start; read the CA (public) with ca_sql.",
+    "server_names": [
+     "localhost",
+     "127.0.0.1"
+    ],
+    "ca_sql": "SELECT ca_pem FROM nine.ninesql_tls"
+   },
+   "notes": "root password: nine_dev_only_root"
     },
     {
       "id": "sqlite",
