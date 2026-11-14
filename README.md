@@ -37,7 +37,7 @@
   </p>
 </div>
 
-> ⚠️ **Pre-alpha.** Nothing is released yet and nothing is usable end to end: the application shell, the PostgreSQL driver, SSH tunnels, the secret stores and the DBeaver parser exist as crates, but there is no connection UI yet. See the [roadmap](docs/ROADMAP.md) for the MVP plan.
+> ⚠️ **Pre-alpha.** Nothing is released yet and nothing is usable end to end: the application shell, the PostgreSQL and MySQL / MariaDB drivers, SSH tunnels, the secret stores and the DBeaver parser exist as crates, but there is no connection UI yet. See the [roadmap](docs/ROADMAP.md) for the MVP plan.
 
 ## Why NineSQL
 DBeaver is the de facto universal database client, but it runs on the JVM and Eclipse RCP: high memory use, slow cold start, and uneven HiDPI / Wayland behavior on Linux.
@@ -55,8 +55,8 @@ The 20 most used **open-source, self-hostable** engines. Cloud-only services (Sn
 | Engine | Family | Planned in | Status |
 |:--|:--|:--|:--|
 | **PostgreSQL** | SQL · pg-wire | MVP (v0.1) | 🚧 Driver landed (P1-B), not usable from the UI yet |
-| **MySQL** | SQL · mysql-wire | MVP (v0.1) | 🗓 Planned |
-| **MariaDB** | SQL · mysql-wire | MVP (v0.1) | 🗓 Planned |
+| **MySQL** | SQL · mysql-wire | MVP (v0.1) | 🚧 Driver landed (P1-B), not usable from the UI yet |
+| **MariaDB** | SQL · mysql-wire | MVP (v0.1) | 🚧 Driver landed (P1-B), not usable from the UI yet |
 | **SQLite** | SQL · embedded | MVP (v0.1) | 🗓 Planned |
 | **TimescaleDB** | SQL · pg-wire | MVP (v0.1) | 🗓 Planned |
 | **YugabyteDB** (YSQL) | SQL · pg-wire | MVP (v0.1) | 🗓 Planned |
