@@ -19,3 +19,14 @@ ninesql-secrets.workspace = true
 ninesql-ssh.workspace = true
 ninesql-transfer.workspace = true
 ninesql-dbeaver.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+uuid.workspace = true
+secrecy.workspace = true
+
+[dev-dependencies]
+ninesql-secrets = { workspace = true, features = ["memory-store"] }
+proptest.workspace = true
+tempfile.workspace = true

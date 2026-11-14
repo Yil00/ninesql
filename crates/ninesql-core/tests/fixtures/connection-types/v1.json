@@ -1,0 +1,27 @@
+{
+  "schema_version": 1,
+  "types": [
+    {
+      "id": "dev",
+      "name": "Development",
+      "color": "#FFFFFF",
+      "auto_commit": true,
+      "confirm_destructive": false,
+      "confirm_every_write": false,
+      "read_only": false,
+      "log_query_text": true,
+      "production": false
+    },
+    {
+      "id": "staging",
+      "name": "Staging",
+      "color": "#FFD966",
+      "auto_commit": true,
+      "confirm_destructive": true,
+      "confirm_every_write": false,
+      "read_only": false,
+      "log_query_text": true,
+      "production": false
+    }
+  ]
+}

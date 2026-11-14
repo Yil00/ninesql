@@ -1,0 +1,110 @@
+{
+  "schema_version": 1,
+  "connections": [
+    {
+      "id": "0b0c6c0e-6f0a-4d4e-9c47-1f1e0f3a9a01",
+      "name": "Orders (prod)",
+      "description": "Primary orders database",
+      "engine": "postgresql",
+      "endpoint": {
+        "kind": "tcp",
+        "host": "db.example.test",
+        "port": 5432,
+        "database": "orders"
+      },
+      "auth": {
+        "method": "password",
+        "username": "app_ro",
+        "secret": {
+          "source": "stored",
+          "store": "keyring",
+          "id": "0b0c6c0e-6f0a-4d4e-9c47-1f1e0f3a9a01:auth"
+        }
+      },
+      "ssh": {
+        "host": "bastion.example.test",
+        "port": 2222,
+        "username": "deploy",
+        "auth": {
+          "method": "public-key",
+          "key_path": "/home/user/.ssh/id_ed25519",
+          "passphrase": {
+            "source": "stored",
+            "store": "keyring",
+            "id": "0b0c6c0e-6f0a-4d4e-9c47-1f1e0f3a9a01:ssh"
+          }
+        },
+        "jump_hosts": [
+          {
+            "host": "edge.example.test",
+            "port": 22,
+            "username": "jump",
+            "auth": { "method": "agent" }
+          }
+        ]
+      },
+      "tls": {
+        "mode": "verify-full",
+        "ca_file": "/etc/ssl/example-ca.pem",
+        "client_certificate": {
+          "cert_file": "/home/user/certs/client.pem",
+          "key_file": "/home/user/certs/client.key",
+          "passphrase": { "source": "prompt" }
+        }
+      },
+      "connection_type": "prod",
+      "read_only": true,
+      "folder": ["Customers", "EU"],
+      "properties": {
+        "application_name": "NineSQL",
+        "connect_timeout": "10"
+      },
+      "init_sql": ["SET search_path TO orders, public"],
+      "origin": { "kind": "native" }
+    },
+    {
+      "id": "5d3b2a4e-1c6f-4b8a-a2d9-7e6f5a4b3c02",
+      "name": "Local MySQL",
+      "engine": "mysql",
+      "endpoint": { "kind": "tcp", "host": "127.0.0.1" },
+      "auth": { "method": "password", "username": "root", "secret": { "source": "prompt" } },
+      "tls": { "mode": "disable" },
+      "connection_type": "dev",
+      "origin": { "kind": "dbeaver", "dbeaver_id": "mysql8-18c0f4b1e2a-6a1b2c3d4e5f", "project": "General" }
+    },
+    {
+      "id": "9a8b7c6d-5e4f-4a3b-8c2d-1e0f9a8b7c03",
+      "name": "Analytics file",
+      "engine": "duckdb",
+      "endpoint": { "kind": "file", "path": "/home/user/data/analytics.duckdb" },
+      "auth": { "method": "none" },
+      "tls": { "mode": "verify-full" },
+      "connection_type": "test",
+      "enabled": false,
+      "origin": { "kind": "native" }
+    },
+    {
+      "id": "c4d3e2f1-a0b9-4c8d-9e7f-6a5b4c3d2e04",
+      "name": "Local socket",
+      "engine": "postgresql",
+      "endpoint": { "kind": "unix-socket", "path": "/run/postgresql", "database": "postgres" },
+      "auth": { "method": "username", "username": "postgres" },
+      "tls": { "mode": "verify-full" },
+      "connection_type": "dev",
+      "origin": { "kind": "native" }
+    },
+    {
+      "id": "e5f4a3b2-c1d0-4e9f-8a7b-6c5d4e3f2a05",
+      "name": "Cache",
+      "engine": "redis",
+      "endpoint": { "kind": "tcp", "host": "cache.example.test", "port": 6380 },
+      "auth": {
+        "method": "token",
+        "secret": { "source": "stored", "store": "vault", "id": "e5f4a3b2-c1d0-4e9f-8a7b-6c5d4e3f2a05:auth" }
+      },
+      "tls": { "mode": "require" },
+      "connection_type": "staging",
+      "origin": { "kind": "native" }
+    }
+  ]
+}
