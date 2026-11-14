@@ -247,6 +247,8 @@ pub struct Properties {
     pub entries: Vec<(String, Scalar)>,
     /// Keys whose value was not a scalar (object, array, null): not imported.
     pub non_scalar: Vec<String>,
+    /// The keys of [`Properties::non_scalar`] whose value was empty (`null`, `[]` or `{}`).
+    pub empty_non_scalar: Vec<String>,
 }
 
 impl Properties {
@@ -256,7 +258,15 @@ impl Properties {
             match Scalar::from_value(value) {
                 Ok(s) => out.entries.push((key, s)),
                 Err(mut v) => {
+                    let empty = match &v {
+                        Value::Array(a) => a.is_empty(),
+                        Value::Object(m) => m.is_empty(),
+                        _ => v.is_null(),
+                    };
                     scrub(&mut v);
+                    if empty {
+                        out.empty_non_scalar.push(key.clone());
+                    }
                     out.non_scalar.push(key);
                 }
             }

@@ -802,6 +802,90 @@ fn ssh_jump_servers_are_mapped_or_fail_closed() {
     }
 }
 
+// ---- P2-A review L-a: blank profile values ----
+
+#[test]
+fn blank_profile_values_count_in_every_scope() {
+    let handler = |extra: &str, props: &str| {
+        format!(
+            r#"{{"host":"db.example.test","port":"5432","handlers":{{"postgre_ssl":{{"type":"CONFIG",
+            "enabled":true{extra},"properties":{{"sslmode":"verify-full"{props}}}}}}}}}"#
+        )
+    };
+    let connection_scope = |value: &str| {
+        one(
+            "postgresql",
+            "postgres-jdbc",
+            r#"{"host":"db.example.test","port":"5432"}"#,
+        )
+        .replace(
+            r#""name":"c","#,
+            &format!(r#""name":"c","config-profile":{value},"#),
+        )
+    };
+    let cases = |value: &str| {
+        vec![
+            ("connection", connection_scope(value)),
+            (
+                "configuration",
+                one(
+                    "postgresql",
+                    "postgres-jdbc",
+                    &format!(
+                        r#"{{"host":"db.example.test","port":"5432","config-profile":{value}}}"#
+                    ),
+                ),
+            ),
+            (
+                "handler",
+                one(
+                    "postgresql",
+                    "postgres-jdbc",
+                    &handler(&format!(r#","config-profile":{value}"#), ""),
+                ),
+            ),
+            (
+                "handler properties",
+                one(
+                    "postgresql",
+                    "postgres-jdbc",
+                    &handler("", &format!(r#","config-profile":{value}"#)),
+                ),
+            ),
+        ]
+    };
+    // DBeaver does not trim: a blank value is a (broken) profile reference, fail closed.
+    for value in [
+        r#"" ""#,
+        r#""\t""#,
+        r#""\u00a0""#,
+        r#""bastion""#,
+        "false",
+        "0",
+        r#"["p"]"#,
+        r#"{"id":"p"}"#,
+    ] {
+        for (scope, json) in cases(value) {
+            let p = map(&json, None);
+            assert_eq!(
+                p.connections[0].status(),
+                Status::ImportedDisabled,
+                "{scope}: {value}"
+            );
+            assert!(
+                issue(&p, IssueKind::Disabled, Some("config-profile")),
+                "{scope}: {value}"
+            );
+        }
+    }
+    // Only an absent value does not: null, the empty string, an empty array or object.
+    for value in ["null", r#""""#, "[]", "{}"] {
+        for (scope, json) in cases(value) {
+            assert_eq!(status_of(&json), Status::Imported, "{scope}: {value}");
+        }
+    }
+}
+
 #[test]
 fn inline_ssh_key_is_a_secret() {
     let p = map(

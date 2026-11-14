@@ -1527,6 +1527,12 @@ fn map_connection(
     // DBeaver writes `configuration."config-profile"` (and `"config-profile-source"`, e.g.
     // `global`: the profile may live outside this file), so any non-empty value under a key
     // containing `profile` disables, whether or not the file defines `network-profiles`.
+    // The same value test applies in every scope (connection, `configuration`, handler, handler
+    // properties): see `is_profile_reference`.
+    let profile_like = |key: &str| {
+        let norm = normalize_key(key);
+        norm.contains("profile") || (ctx.network_profiles && norm.starts_with("network"))
+    };
     let mut profile_keys: Vec<String> = Vec::new();
     let mut scopes: Vec<(String, &crate::model::Extra)> = vec![
         (String::new(), &def.extra),
@@ -1536,17 +1542,19 @@ fn map_connection(
         scopes.push((format!("configuration.handlers.{}", h.id), &h.extra));
         let props_prefix = format!("configuration.handlers.{}.properties", h.id);
         for (key, value) in &h.properties.entries {
-            if normalize_key(key).contains("profile") && !value.as_text().trim().is_empty() {
+            if profile_like(key) && is_profile_reference_scalar(value) {
+                profile_keys.push(join(&props_prefix, key));
+            }
+        }
+        for key in &h.properties.non_scalar {
+            if profile_like(key) && !h.properties.empty_non_scalar.contains(key) {
                 profile_keys.push(join(&props_prefix, key));
             }
         }
     }
     for (scope, extra) in scopes {
         for (key, value) in extra.iter() {
-            let norm = normalize_key(key);
-            let profile_like =
-                norm.contains("profile") || (ctx.network_profiles && norm.starts_with("network"));
-            if profile_like && !is_empty_json(value) {
+            if profile_like(key) && is_profile_reference(value) {
                 profile_keys.push(join(&scope, key));
             }
         }
@@ -1794,6 +1802,27 @@ fn is_empty_json(value: &serde_json::Value) -> bool {
         serde_json::Value::Array(a) => a.is_empty(),
         serde_json::Value::Object(m) => m.is_empty(),
         serde_json::Value::Bool(_) | serde_json::Value::Number(_) => false,
+    }
+}
+
+/// Whether the value of a profile-like key may reference a DBeaver network profile. Fail closed:
+/// only `null`, the empty string and an empty array or object do not. A blank string (`" "`)
+/// counts, because DBeaver does not trim the value it looks a profile up by.
+fn is_profile_reference(value: &serde_json::Value) -> bool {
+    match value {
+        serde_json::Value::Null => false,
+        serde_json::Value::String(s) => !s.is_empty(),
+        serde_json::Value::Array(a) => !a.is_empty(),
+        serde_json::Value::Object(m) => !m.is_empty(),
+        serde_json::Value::Bool(_) | serde_json::Value::Number(_) => true,
+    }
+}
+
+/// [`is_profile_reference`] for a scalar property value.
+fn is_profile_reference_scalar(value: &Scalar) -> bool {
+    match value {
+        Scalar::Text(s) => !s.is_empty(),
+        Scalar::Bool(_) | Scalar::Number(_) => true,
     }
 }
 
