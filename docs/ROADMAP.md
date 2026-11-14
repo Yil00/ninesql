@@ -33,43 +33,40 @@ P0-A and P0-B gate phase 1. P2 (interop) only depends on P0-D and runs in parall
 **Exit status** (2026-11-14): the driver API is frozen. The dev-environment CI job brought every profile to ready on [#2](https://github.com/Yil00/ninesql/pull/2). Not met yet: real-GPU measurements of the spike (only software-rendered numbers exist). Phase 1 starts in parallel; both items stay open above.
 
 ### Phase 0 follow-ups
-Items deferred by the phase 0 security reviews and spikes. The deadline is when the item must have landed.
+Items deferred by the phase 0 security reviews and spikes. The deadline is when the item must have landed. Items that have landed are listed after the table.
 
 | Origin | Item | Must land |
 |---|---|---|
 | P0-A | Real-GPU measurements on Wayland and X11 (`spike-measure.sh`, maintainer) | Before the phase 0 exit criterion is declared met |
-| P0-A | Patch the X11 IME crash (`xim-ctext` / `zed-xim`, `[patch.crates-io]` under ADR-0013's rules) and report it upstream | P1 (P1-A) |
 | P0-A | Test accessibility with Orca | Before P6 |
 | P0-A | Trim the build packages of `docs/10-supported-platforms.md`; check Ubuntu 22.04 and Debian 12 builds and Vulkan adapters | P1 |
-| P0-B review | M6: cancel races. Keep the session busy until the server confirms the cancelled statement ended, and scope cancel handles to one execution so a late or stale cancel cannot hit the next statement | Before the first P1 driver (P1-B) |
-| P0-B review | L1: one SSH host-key policy covers every hop; document it as the weakest across hops or store one per hop. L2: the timeout is only checked while the consumer polls; add a watchdog or document it. L3: a sliced batch keeps the whole buffer alive while only the slice is counted | Before the first P1 driver (P1-B) |
-| P0-B review | L4: calls with side effects (`dblink_exec`, user functions) classify as `Read`; document the limit. L5: declare per driver whether the secret is retained for reconnects; the metadata connection applies the same TLS and read-only settings; bind `PageRequest.filter` | Before the first P1 driver (P1-B) |
-| P0-B review | F1: decode or classify `U&"…"` Unicode-escaped identifiers. F2: extend the side-effect function list (replication slots, `pg_stat_reset*`, `pg_backup_*`…). F4: a truncation flag for document values. F5: a per-row size bound and counting `ResultSet` headers in the budget. F7: redact SQL-form secrets (`PASSWORD '…'`, `IDENTIFIED BY`), `user:pass@host` without a scheme, `-p secret` | Before the first P1 driver (P1-B) |
-| P0-B review | Conformance helpers still missing: verify-full rejects an untrusted certificate, batches stay within `max_batch_bytes` / `max_value_bytes`, per-driver identifier quoting; make `WRITES` engine-neutral. `Document` is still exhaustive with public fields | Before the first P1 driver (P1-B) |
 | P0-B | Per-engine SQL that lifts read-only (liftable mechanisms), with tests | P1-B, per engine |
 | P0-C | Build the wide table of the "nine" dataset (ADR-0009) | Before P3-B grid work relies on it |
 | P0-D | Secret Service round trip on GNOME Keyring and KWallet, Debian 12 and Ubuntu 24.04 ([ADR-0012](adr/0012-secret-service-client-and-msrv.md)) | Before P1-D ships the Secret Service backend |
-| P0-D review | N1: the redaction rule keeps any backtick text after "expected"; restrict it to the list right after `expected` / `expected one of`. N3: secret detection misses Go DSNs without a scheme, `token=` / `apikey=` / `secret=` pairs and more SQL forms (`SET PASSWORD = PASSWORD(…)`, `ALTER LOGIN … WITH PASSWORD = N'…'`, `IDENTIFIED WITH … BY`) | Before P1-D |
-| P0-D review | N6: keyring items are keyed by the mutable project name; use a stable project UUID from `project.json`. N7.2: when a plaintext secret is found on load, rewrite the file at once instead of waiting for the next save. N7.4: zeroize dropped property values | Before P1-D |
-| P0-D review | L2: check workspace directory ownership (`ensure_private_dir` still follows directory symlinks). L5: review the `secret-service` 6.0.0-rc.1 internals (key material not zeroized) before the feature is on by default. L6: characters that matter in DSNs are allowed in host / user / database; drivers must pass structured config (contract). L8: lock against two NineSQL processes writing the workspace | Before P1-D |
-| P0-D review | L-B: a stale duplicate that cannot be deleted makes `get` return `Ambiguous`; prefer the default-collection item and skip the prune if the created path is not among the matches. L-C: value-shape checks for allowlisted keys. Remove `PENDING_RESERVED_KEYS` in `ninesql-core` now that the driver API reserves `gssencmode` | Before P1-D |
-| Integration review | Widen the core property test alphabet (digits, non-ASCII) and add `replication` to its newly-refused list; expose each driver's extra reserved keys (for example through `Capabilities`) so core validation sees them | P1-B, with the first driver |
-| P0-D review | Scrub secret-looking values (not only keys) from the `.bak` written by a migration | Before the first workspace schema bump |
 | ADR-0012 | Move `secret-service` from `=6.0.0-rc.1` to a stable 6.x; revisit the `ctutils` lock (RUSTSEC-2026-0385) | Stable release available; checked at each phase-end review |
-| ADR-0013 | `cargo vet` or a checked-in audit log | Before `gpui-kit` becomes a normal dependency in P1 |
+
+Moved to [Phase 1 follow-ups](#phase-1-follow-ups): the X11 IME patch (P0-A, now a P1-A follow-up) and review item L5 of P0-D (`secret-service` release-candidate internals).
+
+**Landed in phase 1, wave 1** (2026-11-14):
+- P0-B review, in the driver API hardening: M6 (execution-scoped cancel handles, session `Busy` until the server confirms the end), L1 (weakest policy across hops plus per-hop list in `TunnelInfo`), L2 (timeout watchdog), L3 (copy-on-slice), L4 (classifier limit documented), L5 (`retains_secret_after_connect`, metadata connections under the session's TLS / read-only / property rules, bound `PageRequest.filter`), F1 (`U&"…"` decoded), F2 (wider side-effect function list), F4 (`DocValue::Truncated`), F5 (`max_row_bytes`, result-set headers counted), F7 (SQL-form secret redaction), and the missing conformance helpers (verify-full against an untrusted certificate, batch budgets, identifier quoting, engine-neutral `WRITES`, non-exhaustive `Document`). Details in [docs/08](08-engine-capabilities.md).
+- Integration review: the core property test alphabet covers digits and non-ASCII and refuses `replication`; drivers expose their extra reserved keys through `Capabilities::extra_reserved_properties`. Core validation against them is a [phase 1 follow-up](#phase-1-follow-ups).
+- P0-D review, in the storage / core / secrets follow-ups: N1 (redaction rule), N3 (wider secret detectors), N6 (keyring items scoped by the project UUID of `project.json` v2), N7.2 (immediate rewrite when a plaintext secret is found on load), N7.4 (removed property values zeroized), L2 (directory ownership and symlink checks), L6 (structured config documented as a driver contract in docs/08), L8 (workspace lock `ninesql.lock`), L-B (duplicate resolution), L-C (value-shape checks; `PENDING_RESERVED_KEYS` removed), and the `.bak` scrub (JSON migration backups re-encoded from the scrubbed value). These change ADR-0008: see [ADR-0017](adr/0017-workspace-lock-rewrite-on-load-and-project-identity.md) (proposed).
+- ADR-0013: the checked-in audit log is [docs/audits/gpui-snapshot.md](audits/gpui-snapshot.md), started when `gpui-kit` became a normal dependency of `ninesql-ui` (P1-A). `cargo vet` is not set up.
 
 ## Phase 1 – Application shell, connections, first drivers
 *Objective: connect to PostgreSQL, MySQL, MariaDB and SQLite (directly, over TLS and over SSH) from a real NineSQL window, with secrets in the keyring.*
 
 | Workstream | Owner | Tasks |
 |----------|--------------|--------|
-| P1-A Shell | `ui-engineer` | [ ] Main window: navigator dock, editor area with tabs and splits, status bar, multiple windows (F-WS-01) · [ ] Command palette, actions and default key bindings, overridable in `settings.toml` (F-WS-02) · [ ] Light / dark themes, fonts, fractional scaling (F-WS-03) |
+| P1-A Shell | `ui-engineer` | [x] Main window: navigator dock, editor area with tabs and splits, status bar, multiple windows (F-WS-01): `ninesql` binary, wave 1 · [x] Command palette, actions and default key bindings, overridable in `settings.toml` (F-WS-02): 19 actions, each with a binding and a palette entry; `settings.toml` is read at startup only, and a symlinked `settings.toml` is refused · [x] Light / dark / system themes, fonts, zoom; fractional scaling through GPUI's window scale factor (F-WS-03). *Still open: settings are not persisted from the UI yet; the X11 IME crash is not patched; screenshots and checks on a real GPU (Wayland, X11, fractional scaling) are pending. See [Phase 1 follow-ups](#phase-1-follow-ups)* |
 | P1-B Drivers (MVP families) | `driver-engineer` | [ ] `ninesql-driver-pgwire`: PostgreSQL connect, TLS modes, execute, stream, cancel, read-only (engine-side), capabilities · [ ] `ninesql-driver-mysqlwire`: MySQL and MariaDB, same scope · [ ] `ninesql-driver-sqlite`: file open (read-only mode), same scope · [ ] Integration tests against `dev/` including the read-only write-must-fail test |
 | P1-C Connections UI | `ui-engineer` | [ ] Connection dialog: engine picker, endpoint / URL (F-CON-12), auth, TLS (F-CON-06), SSH (F-CON-05), properties (F-CON-08), type (F-CON-03), test connection (F-CON-01) · [ ] Connection list with folders (F-CON-02), duplicate / delete · [ ] Production visuals: colored frame, type badge, read-only badge (ADR-0007) |
-| P1-D Core services | `core-engineer` | [ ] Driver runtime (Tokio) and the bridge to GPUI entities (ADR-0004) · [ ] `ninesql-secrets`: Secret Service backend, vault fallback with Argon2id + XChaCha20-Poly1305, "ask every time" (F-CON-04, ADR-0005) · [ ] `ninesql-ssh`: russh tunnels, jump hosts, agent, `known_hosts` checks (ADR-0011) · [ ] Test: no secret in any workspace file after create / edit / connect (I1) |
+| P1-D Core services | `core-engineer` | [ ] Driver runtime (Tokio) and the bridge to GPUI entities (ADR-0004) · [ ] `ninesql-secrets`: Secret Service backend, vault fallback with Argon2id + XChaCha20-Poly1305, "ask every time" (F-CON-04, ADR-0005). *Secret Service items are now scoped by the project UUID with duplicate resolution (P0-D follow-ups); the vault and "ask every time" are open* · [x] `ninesql-ssh`: russh tunnels, jump hosts, agent, `known_hosts` checks (ADR-0011), per-hop host-key policies ([ADR-0016](adr/0016-ssh-rsa-and-host-key-policies.md)), wave 1. *RSA key files are refused (ADR-0016); no HTTP CONNECT / SOCKS5 proxy in front of the first hop yet; not wired into `ninesql-core` yet (wave 2)* · [ ] Test: no secret in any workspace file after create / edit / connect (I1) |
 | P1-E Review | `security-reviewer` | [ ] Review of secrets, SSH, TLS defaults and read-only enforcement · [ ] End-of-phase review |
 
 **Exit criterion**: from a clean install, create a PostgreSQL connection over SSH with `verify-full` TLS, password in the keyring; connect; restart NineSQL; reconnect without retyping; `grep` finds no password under `$XDG_*/ninesql`. Same for MySQL, MariaDB and SQLite. A read-only session rejects a write engine-side.
+
+**Status** (2026-11-14): phase 1 in progress. Wave 1 landed the P1-A shell, `ninesql-ssh` (P1-D), the driver API hardening and the P0-D follow-ups, together with the P2-A parser. Wave 2: the P1-B drivers and the rest of P1-D (driver runtime bridge, vault, SSH wiring in the core). Wave 3: P1-C. The exit criterion is not met.
 
 ### Phase 1 follow-ups
 Items deferred by phase 1 decisions and reviews. The deadline is when the item must have landed.
@@ -81,13 +78,36 @@ Items deferred by phase 1 decisions and reviews. The deadline is when the item m
 | ADR-0016 | Per-hop host-key policy field in the `ninesql-core` connection model (`SshHop`) | P1-D |
 | ADR-0015 | Consider `include-dev = true` in the `[licenses]` section of `deny.toml` so test-only crates are license-checked | P1 |
 | P1 review | SHA-pin the actions used in `.github/workflows/codeql.yml` | P1 |
+| P0-A / P1-A | Patch the X11 IME crash (`xim-ctext` / `zed-xim`, `[patch.crates-io]` under ADR-0013's rules) and report it upstream | P1 (P1-A follow-up) |
+| P1-A | Persist settings changed from the UI (theme, fonts, zoom, key bindings) to `settings.toml` with atomic writes; today the file is only read at startup | P1 |
+| P1-A | Decide whether a symlinked `settings.toml` (dotfile managers) stays refused or is followed under ownership checks; record the choice | P1 |
+| P1-A | Screenshots and checks on a real GPU: Wayland and X11, fractional scaling (maintainer, local) | Before the P1-A items are reviewed at phase end |
+| P0-D review (L5) | Review the internals of `secret-service` 6.0.0-rc.1 (key material not zeroized) before the Secret Service feature is on by default | Before P1-D enables the backend by default |
+| P1-D (SSH) | Cross-process lock on `known_hosts` writes (reuse `ninesql_storage::DirLock`) | Before P1-C lets users confirm host keys |
+| P1-D (SSH) | Supply-chain tracking of the `ssh-key` release candidate pulled by russh (pin, advisories, move to a stable release) | Checked at each phase-end review |
+| P1-D (core) | Validate connection properties with `Capabilities::is_reserved_property`, so each driver's `extra_reserved_properties` are refused at save and import time, not only at connect | With the first P1-B driver |
+| P1-D (core) | Handle `Busy` after a cancel: the session stays busy until the server confirms the end; the core waits or reports it instead of failing the next statement | With the driver runtime bridge |
+| P1-B (pgwire) | Close an idle cursor on cancel, set `idle_in_transaction_session_timeout`, and test that a paused cursor's locks are released after the deadline (docs/08 idle-cursor contract); settle `krbsrvname` and `target_session_attrs` as extra reserved keys | With `ninesql-driver-pgwire` |
+| P1-B (mysqlwire) | Decide between `retains_secret_after_connect = true` and a control connection opened during `connect` for `KILL QUERY` | With `ninesql-driver-mysqlwire` |
+| P1-C (UI) | Show `LoadIssues` (rewritten files, refused properties) and the reason a property was refused; show `SshHopHostKeyNotVerified`, `other_key_types` and `Tunnel::security_warnings`; keep truncated documents and columns non-editable | P1-C |
+| P2-A | Run both cargo-fuzz targets (time-boxed) and record the result | Before the P2-D review |
+| ADR-0016 / P2-A | Flag imported SSH connections that use an RSA key file in the import report (ADR-0016 §1.2) | Before P2-B shows the preview |
+| P2-A review (L-a) | A blank (whitespace-only) `config-profile` value: treat it consistently in every scope and test it | Before P2-C |
+| P2-A review (L-b) | Jump-host selection: iterate indices `0..count`, stop at the first disabled hop, use canonical indices, fail on a non-boolean `enabled` | Before P2-C |
+| P2-C | Convert the mirror model to `ninesql_core::Connection` and run `sanitize()` / `validate()` before persisting, with an I1 test (no imported secret in any workspace file) | P2-C |
+| P2-C | Persist the disabled reason, so that a connection disabled for a missing hop, profile or handler cannot simply be re-enabled without fixing it | P2-C |
+| P2-C | Imported connection types never overwrite a built-in type and never weaken an existing type (confirmations, auto-commit, read-only rules) | P2-C |
+| P2-C | Move imported secrets to the keyring and drop the imported values (zeroized); use `import_project`, not `map_sources` | P2-C |
+| P2-C / P1-B | Drivers open files flagged as inside `DBeaverData` read-only (I4) | P2-C |
+| P2-C (core) | Core fields for the default schema / catalog and per-connection auto-commit, so the mapped DBeaver `bootstrap` values are not lost | P2-C |
+| P3-C | Init SQL (F-CON-09): either run it before read-only is enforced, or re-assert and verify read-only after it ran; apply the production confirmation to it | P3-C |
 
 ## Phase 2 – DBeaver import
 *Objective: a DBeaver user switches in one click.*
 
 | Workstream | Owner | Tasks |
 |----------|--------------|--------|
-| P2-A Parser | `interop-engineer` | [ ] Workspace detection: native, Flatpak, Snap, custom folder (ADR-0006) · [ ] `data-sources*.json` model with an `extra` map for unknown keys; folders; connection types · [ ] `credentials-config.json` decryption into zeroized buffers; master-password-protected files detected and skipped · [ ] Mapping to NineSQL connections: engines in the v1 set, the others as disabled connections; JDBC URL and driver properties → NineSQL options; SSH and TLS handlers · [ ] Fixtures from P0-E, property tests, fuzz targets for both decoders |
+| P2-A Parser | `interop-engineer` | [x] Workspace detection: native, Flatpak, Snap, custom folder (ADR-0006). *The Flatpak and Snap paths are not verified on a real install* · [x] `data-sources*.json` model with an `extra` map for unknown keys; folders; connection types · [x] `credentials-config.json` decryption into zeroized buffers; master-password-protected files detected and skipped · [x] Mapping to NineSQL connections: engines in the v1 set, the others as disabled connections; JDBC URL and driver properties → NineSQL options; SSH and TLS handlers; fail-closed rules ([docs/06](06-dbeaver-interop.md#import-rules-enforced-by-the-parser-p2-a)). *Output is a mirror model, not yet persisted (P2-C); the engine mappings marked "to verify" in docs/06 have no fixture* · [x] Fixtures from P0-E, property tests, fuzz targets for both decoders. *The cargo-fuzz targets exist but have not been run yet* |
 | P2-B Import flow | `ui-engineer` | [ ] First-run "Import from DBeaver" screen and a menu entry · [ ] Preview: connections, what maps, what does not, secrets to move · [ ] Import report saved in the project; idempotent re-import by `origin.dbeaver_id` (F-CON-14) |
 | P2-C Core | `core-engineer` | [ ] Persist imported connections and move secrets to the store; optional copy of DBeaver SQL scripts into the project |
 | P2-D Review | `security-reviewer` | [ ] Review: I1 and I4 (no write to DBeaver files, no secret on disk or in logs), parser robustness |
