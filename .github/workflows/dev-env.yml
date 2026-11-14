@@ -45,15 +45,17 @@ jobs:
   profile:
     name: Profile ${{ matrix.profile }}
     needs: check
-    if: >-
-      github.event_name != 'workflow_dispatch' ||
-      inputs.profile == 'all' || inputs.profile == matrix.profile
+    # The matrix context is not available in a job-level `if`, so a manual run
+    # narrows the matrix itself; a manual "heavy" run is handled by the heavy job.
+    if: github.event_name != 'workflow_dispatch' || inputs.profile != 'heavy'
     runs-on: ubuntu-24.04
     timeout-minutes: 45
     strategy:
       fail-fast: false
       matrix:
-        profile: [core, sql, nosql]
+        profile: >-
+          ${{ fromJSON(github.event_name == 'workflow_dispatch' && inputs.profile != 'all'
+          && format('["{0}"]', inputs.profile) || '["core","sql","nosql"]') }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Free disk space for the images
