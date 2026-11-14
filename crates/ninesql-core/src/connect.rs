@@ -3,7 +3,7 @@
 //! ADR-0016).
 //!
 //! Secrets (I1): saved secrets are read from [`SecretStores`] (blocking: the session manager
-//! runs [`resolve_secrets`] on the runtime's blocking pool), secrets of
+//! runs [`resolve_secrets_bounded`] on the runtime's blocking pool, with a timeout), secrets of
 //! [`SecretSource::Prompt`] fields come from the UI ([`SecretPrompt`]). They travel as
 //! [`SecretString`] (zeroized on drop) in a [`SecretBag`], are moved one by one into the
 //! [`HopAuth`]s and the driver's [`Secret`]s, and the bag is dropped before the driver connects.
@@ -315,6 +315,73 @@ pub fn resolve_secrets(
         bag.secrets.insert(slot, value);
     }
     // Values supplied for fields that do not prompt are dropped (zeroized) here.
+    drop(prompted);
+    Ok(bag)
+}
+
+/// Default time a connect waits for the saved secrets of one open (all store calls together)
+/// before giving up: long enough to type a keyring password in an unlock prompt, short enough
+/// that an ignored prompt does not leave the open hanging.
+pub const DEFAULT_SECRET_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// [`resolve_secrets`] for the async connect flow: each saved secret is read on the runtime's
+/// blocking pool, and all of them together get at most `timeout`.
+///
+/// When the deadline passes (for example an unlock prompt the user ignores), or the blocking
+/// task panics, the field fails with [`ninesql_secrets::SecretError::Unavailable`]. The future
+/// is cancel-safe: dropping it stops waiting at once. A store call already running on a blocking
+/// thread cannot be interrupted: it ends with the store's own limits (the Secret Service method
+/// timeout, the prompt's end) and its value, if any, is dropped (zeroized) unused.
+///
+/// # Errors
+/// As [`resolve_secrets`].
+pub async fn resolve_secrets_bounded(
+    connection: &Connection,
+    stores: &SecretStores,
+    prompted: Vec<(SecretSlot, SecretString)>,
+    timeout: Duration,
+) -> Result<SecretBag, CoreError> {
+    let deadline = tokio::time::Instant::now() + timeout;
+    let mut prompted: HashMap<SecretSlot, SecretString> = prompted.into_iter().collect();
+    let mut bag = SecretBag::default();
+    for (slot, _, source) in credential_fields(connection) {
+        let value = match source {
+            SecretSource::Stored(reference) => {
+                let store = reference.store;
+                let unavailable = |detail: String| CoreError::Secret {
+                    slot,
+                    source: ninesql_secrets::SecretError::Unavailable { store, detail },
+                };
+                let stores = stores.clone();
+                let reference = reference.clone();
+                let task = tokio::task::spawn_blocking(move || stores.resolve(&reference));
+                match tokio::time::timeout_at(deadline, task).await {
+                    Ok(Ok(result)) => {
+                        result.map_err(|source| CoreError::Secret { slot, source })?
+                    }
+                    Ok(Err(join)) => {
+                        tracing::warn!(
+                            store = %store,
+                            panicked = join.is_panic(),
+                            "secret store task failed"
+                        );
+                        return Err(unavailable("the secret store task failed".into()));
+                    }
+                    Err(_) => {
+                        tracing::info!(store = %store, "secret store did not answer in time");
+                        return Err(unavailable(format!(
+                            "no answer within {} s (an unlock prompt may be waiting)",
+                            timeout.as_secs()
+                        )));
+                    }
+                }
+            }
+            SecretSource::Prompt => prompted
+                .remove(&slot)
+                .ok_or(ConnectionError::NoSuchSecretSlot(slot))?,
+        };
+        bag.secrets.insert(slot, value);
+    }
     drop(prompted);
     Ok(bag)
 }

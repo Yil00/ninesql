@@ -207,6 +207,10 @@ pub struct ManagerConfig {
     pub workers: usize,
     /// Connect timeout, per SSH hop and for the driver's connect.
     pub connect_timeout: Duration,
+    /// How long an open waits for its saved secrets (every store call together, an unlock
+    /// prompt included) before failing with [`SecretError::Unavailable`](ninesql_secrets::SecretError::Unavailable).
+    /// Default: [`connect::DEFAULT_SECRET_TIMEOUT`] (60 s).
+    pub secret_timeout: Duration,
     /// How long a statement waits for the previous, cancelled one to be confirmed ended before
     /// failing with [`CoreError::StillCancelling`]. Default: the driver API's
     /// [`SERVER_CANCEL_GRACE`](ninesql_driver_api::SERVER_CANCEL_GRACE) plus one second.
@@ -234,6 +238,7 @@ impl ManagerConfig {
         Self {
             workers: DEFAULT_WORKERS,
             connect_timeout: ninesql_driver_api::ConnectParams::DEFAULT_CONNECT_TIMEOUT,
+            secret_timeout: connect::DEFAULT_SECRET_TIMEOUT,
             busy_wait: ninesql_driver_api::SERVER_CANCEL_GRACE + Duration::from_secs(1),
             result_queue: 4,
             command_queue: 16,
@@ -723,15 +728,29 @@ impl SessionManager {
     /// secrets read on the blocking pool; the SSH tunnel, if any, opened with each hop's host key
     /// policy ([`OpenOutcome::HostKeyNeedsConfirmation`]); the driver's connect, with the policy's
     /// read-only, auto-commit and production flags; a check that a read-only connection got a
-    /// read-only session (I3). Secrets are dropped (zeroized) before the driver returns. If the
-    /// [`Reply`] is dropped before the answer, a session opened meanwhile is closed.
+    /// read-only session (I3). Secrets are dropped (zeroized) before the driver returns.
+    ///
+    /// Saved secrets get at most [`ManagerConfig::secret_timeout`] (an ignored keyring unlock
+    /// prompt fails the open with [`SecretError::Unavailable`](ninesql_secrets::SecretError::Unavailable)).
+    /// If the [`Reply`] is dropped before the answer, the open is abandoned where it stands (no
+    /// more waiting on a secret store, the tunnel or the driver; a tunnel already opened is shut
+    /// down), and a session opened meanwhile is closed.
     pub fn open(&self, request: OpenRequest) -> Reply<Result<OpenOutcome, CoreError>> {
-        let (tx, reply) = Reply::channel();
+        let (mut tx, reply) = Reply::channel();
         let shared = Arc::clone(&self.shared);
         self.runtime.spawn(async move {
             let id = request.connection.id;
             let details = request.policy.log_query_text;
-            let outcome = open_session(&shared, request).await;
+            // `open_session` registers the session with no await point after it, so abandoning
+            // it here never leaves a half-registered session.
+            let outcome = tokio::select! {
+                biased;
+                outcome = open_session(&shared, request) => outcome,
+                () = tx.closed() => {
+                    tracing::debug!(connection = %id, "open request abandoned before the answer");
+                    return;
+                }
+            };
             if let Err(e) = &outcome {
                 // Engine and SSH messages may name hosts, users or objects: only the kind at
                 // info, the message at trace and never for production (ADR-0007 §6).
@@ -891,13 +910,13 @@ async fn open_session(
     }
 
     let connection = Arc::new(connection);
-    let mut bag = {
-        let stores = shared.stores.clone();
-        let c = Arc::clone(&connection);
-        tokio::task::spawn_blocking(move || connect::resolve_secrets(&c, &stores, prompted))
-            .await
-            .map_err(|_| CoreError::Runtime("the secret resolution task failed".into()))??
-    };
+    let mut bag = connect::resolve_secrets_bounded(
+        &connection,
+        &shared.stores,
+        prompted,
+        shared.config.secret_timeout,
+    )
+    .await?;
 
     let timeout = shared.config.connect_timeout;
     let mut tunnel = None;
