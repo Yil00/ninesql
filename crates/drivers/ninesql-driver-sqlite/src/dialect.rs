@@ -1,11 +1,14 @@
 //! SQLite dialect: ANSI defaults with SQLite's lexical rules (`` `…` `` and `[…]` identifiers,
-//! no backslash escapes, non-nested block comments), `EXPLAIN QUERY PLAN` and `?` parameters.
+//! Tcl-style bind variables, no backslash escapes, non-nested block comments),
+//! `EXPLAIN QUERY PLAN` and `?` parameters.
 //!
-//! The shared lexer of `ninesql-driver-api` has no switch for `[…]` identifiers (an SQL Server
-//! habit SQLite accepts). Before splitting or classifying, [`bracket_idents_as_quotes`] rewrites
-//! every `[…]` identifier that starts in code (not inside a string, a quoted identifier or a
-//! comment) into a `"…"` identifier of the same byte length, so offsets stay valid and a `;` or
-//! a quote inside brackets cannot hide a statement from the classifier.
+//! The shared lexer of `ninesql-driver-api` knows neither `[…]` identifiers (an SQL Server habit
+//! SQLite accepts) nor SQLite's Tcl-style variables (`$a(…)`, `:a(…)`, `@a(…)`, `#a(…)`,
+//! `$a::b(…)`, whose parenthesised part swallows everything up to whitespace or `)`, quotes
+//! included). Before splitting or classifying, [`lexer_view`] follows SQLite's tokenizer and
+//! rewrites both into forms the shared lexer reads as one token, keeping every byte offset, so
+//! a quote, a comment marker or a `;` inside them cannot hide a statement from the classifier
+//! (security review H1).
 
 use ninesql_driver_api::dialect::{classify_with_rules, split_with_rules};
 use ninesql_driver_api::{Dialect, ExplainFormat, LexicalRules, StatementClass, StatementSpan};
@@ -22,27 +25,42 @@ impl SqliteDialect {
     }
 }
 
-/// Rewrites `[…]` identifiers that start in code into `"…"` identifiers of the same length:
-/// `[` and the closing `]` become `"`, and a `"` inside the brackets becomes `_` (SQLite has
-/// no escape inside brackets: the first `]` ends the identifier). An unterminated `[` runs to
-/// the end of the text, as in SQLite's tokenizer. Strings (`'…'`, `x'…'`), `"…"` and `` `…` ``
-/// identifiers, `--` and `/* … */` comments are copied unchanged.
+/// SQLite's `IdChar`: ASCII letters and digits, `_`, `$` and every byte of a multi-byte
+/// UTF-8 character.
+fn is_id_char(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || b == b'_' || b == b'$' || b >= 0x80
+}
+
+/// SQLite's `sqlite3Isspace`.
+fn is_space(b: u8) -> bool {
+    matches!(b, b' ' | b'\t' | b'\n' | 0x0b | 0x0c | b'\r')
+}
+
+/// The text as the shared lexer must see it to agree with SQLite's tokenizer, byte for byte:
+/// - a `[…]` identifier becomes a `"…"` identifier: `[` and the closing `]` become `"`, a `"`
+///   inside becomes `_` (the first `]` ends it; an unterminated one runs to the end);
+/// - in a variable `$name`, `:name`, `@name` or `#name` (SQLite's `CC_VARALPHA` / `CC_DOLLAR`
+///   loop: identifier characters, `::` segments, then an optional `(` that runs to the next
+///   whitespace or `)`), the parenthesised part becomes `_` bytes;
+/// - identifiers and numbers are consumed whole (`a$b(` is a function call, not a variable).
+///
+/// Strings (`'…'`, `x'…'`), `"…"` and `` `…` `` identifiers and comments are copied unchanged.
+/// Only ASCII bytes are written and only over whole tokens, so the result is valid UTF-8 of the
+/// same length, with the same character boundaries at every token edge.
 #[must_use]
-pub fn bracket_idents_as_quotes(text: &str) -> String {
+pub fn lexer_view(text: &str) -> String {
     let src = text.as_bytes();
-    if !src.contains(&b'[') {
-        return text.to_owned();
-    }
     let mut out = src.to_vec();
     let mut i = 0;
     while i < src.len() {
-        match src[i] {
-            q @ (b'\'' | b'"' | b'`') => {
+        let c = src[i];
+        match c {
+            b'\'' | b'"' | b'`' => {
                 // Quoted token: a doubled quote stays inside it.
                 i += 1;
                 while i < src.len() {
-                    if src[i] == q {
-                        if src.get(i + 1) == Some(&q) {
+                    if src[i] == c {
+                        if src.get(i + 1) == Some(&c) {
                             i += 2;
                             continue;
                         }
@@ -78,11 +96,76 @@ pub fn bracket_idents_as_quotes(text: &str) -> String {
                 }
                 i += 1;
             }
+            b'$' | b':' | b'@' | b'#' => {
+                // SQLite's variable loop (tokenize.c, CC_VARALPHA / CC_DOLLAR).
+                let mut n = 0;
+                i += 1;
+                while i < src.len() {
+                    let d = src[i];
+                    if is_id_char(d) {
+                        n += 1;
+                    } else if d == b'(' && n > 0 {
+                        let open = i;
+                        loop {
+                            i += 1;
+                            if i >= src.len() || is_space(src[i]) || src[i] == b')' {
+                                break;
+                            }
+                        }
+                        if i < src.len() && src[i] == b')' {
+                            i += 1;
+                        }
+                        for b in &mut out[open..i] {
+                            *b = b'_';
+                        }
+                        break;
+                    } else if d == b':' && src.get(i + 1) == Some(&b':') {
+                        i += 1;
+                    } else {
+                        break;
+                    }
+                    i += 1;
+                }
+            }
+            _ if c.is_ascii_alphanumeric() || c == b'_' || c >= 0x80 => {
+                while i < src.len()
+                    && (is_id_char(src[i]) || (c.is_ascii_digit() && src[i] == b'.'))
+                {
+                    i += 1;
+                }
+            }
             _ => i += 1,
         }
     }
-    // Only ASCII bytes were replaced by ASCII bytes, so the text stays valid UTF-8.
+    // Only whole tokens were rewritten with ASCII bytes; fall back to the original otherwise.
     String::from_utf8(out).unwrap_or_else(|_| text.to_owned())
+}
+
+/// `true` when `text` starts (after blanks, comments and opening parentheses) with `WITH`.
+fn starts_with_with(view: &str) -> bool {
+    let mut rest = view.trim_start();
+    loop {
+        if let Some(r) = rest.strip_prefix("--") {
+            rest = r.split_once('\n').map_or("", |(_, r)| r).trim_start();
+        } else if let Some(r) = rest.strip_prefix("/*") {
+            rest = r.split_once("*/").map_or("", |(_, r)| r).trim_start();
+        } else if let Some(r) = rest.strip_prefix('(') {
+            rest = r.trim_start();
+        } else {
+            break;
+        }
+    }
+    rest.get(..4)
+        .is_some_and(|w| w.eq_ignore_ascii_case("with"))
+        && !rest.as_bytes().get(4).copied().is_some_and(is_id_char)
+}
+
+/// `true` when a DML keyword appears anywhere in `text`, strings and comments included.
+fn mentions_dml(text: &str) -> bool {
+    let upper = text.to_ascii_uppercase();
+    ["INSERT", "UPDATE", "DELETE", "REPLACE"]
+        .iter()
+        .any(|w| upper.contains(w))
 }
 
 /// Pragmas that only read the schema, with an argument (`PRAGMA table_info(t)`) or as the
@@ -203,19 +286,23 @@ impl Dialect for SqliteDialect {
     }
 
     fn split_statements(&self, script: &str) -> Vec<StatementSpan> {
-        split_with_rules(&bracket_idents_as_quotes(script), LexicalRules::SQLITE)
+        split_with_rules(&lexer_view(script), LexicalRules::SQLITE)
     }
 
     fn classify(&self, text: &str) -> StatementClass {
-        let rewritten = bracket_idents_as_quotes(text);
-        let class = classify_with_rules(&rewritten, LexicalRules::SQLITE);
+        let view = lexer_view(text);
+        let class = classify_with_rules(&view, LexicalRules::SQLITE);
         // The shared classifier knows a few schema pragmas only; the reading forms the
         // read-only authorizer allows are reads here too.
-        if class == StatementClass::ChangesAccessMode && is_read_pragma(&rewritten) {
-            StatementClass::Read
-        } else {
-            class
+        if class == StatementClass::ChangesAccessMode && is_read_pragma(&view) {
+            return StatementClass::Read;
         }
+        // Belt and braces: a `WITH` statement that mentions a DML keyword anywhere (even in a
+        // string or a comment the lexers might disagree about) is never a mere read.
+        if class <= StatementClass::Session && starts_with_with(&view) && mentions_dml(text) {
+            return StatementClass::Unknown;
+        }
+        class
     }
 
     fn explain(&self, query: &str, format: ExplainFormat) -> Option<String> {
@@ -238,22 +325,13 @@ mod tests {
 
     #[test]
     fn brackets_become_quotes_of_the_same_length() {
-        assert_eq!(bracket_idents_as_quotes("SELECT [a;b]"), "SELECT \"a;b\"");
-        assert_eq!(bracket_idents_as_quotes("SELECT [a\"b]"), "SELECT \"a_b\"");
-        assert_eq!(bracket_idents_as_quotes("SELECT '[x'"), "SELECT '[x'");
-        assert_eq!(bracket_idents_as_quotes("SELECT \"[x\""), "SELECT \"[x\"");
-        assert_eq!(
-            bracket_idents_as_quotes("-- [x\nSELECT 1"),
-            "-- [x\nSELECT 1"
-        );
-        assert_eq!(
-            bracket_idents_as_quotes("/* [ */ SELECT 1"),
-            "/* [ */ SELECT 1"
-        );
-        assert_eq!(
-            bracket_idents_as_quotes("SELECT [unterminated"),
-            "SELECT \"unterminated"
-        );
+        assert_eq!(lexer_view("SELECT [a;b]"), "SELECT \"a;b\"");
+        assert_eq!(lexer_view("SELECT [a\"b]"), "SELECT \"a_b\"");
+        assert_eq!(lexer_view("SELECT '[x'"), "SELECT '[x'");
+        assert_eq!(lexer_view("SELECT \"[x\""), "SELECT \"[x\"");
+        assert_eq!(lexer_view("-- [x\nSELECT 1"), "-- [x\nSELECT 1");
+        assert_eq!(lexer_view("/* [ */ SELECT 1"), "/* [ */ SELECT 1");
+        assert_eq!(lexer_view("SELECT [unterminated"), "SELECT \"unterminated");
     }
 
     #[test]
@@ -355,10 +433,68 @@ mod tests {
         );
     }
 
+    /// Security review H1: Tcl-style variables swallow quotes and comment markers in SQLite.
+    #[test]
+    fn tcl_variables_cannot_hide_a_write() {
+        let d = SqliteDialect;
+        for sql in [
+            "WITH c AS (SELECT $a(')) DELETE FROM t WHERE b <> '--'",
+            "WITH c AS (SELECT :a(')) DELETE FROM t WHERE b <> '--'",
+            "WITH c AS (SELECT @a(')) DELETE FROM t WHERE b <> '--'",
+            "WITH c AS (SELECT #a(')) DELETE FROM t WHERE b <> '--'",
+            "WITH c AS (SELECT $a::b(')) DELETE FROM t WHERE b <> '--'",
+            "WITH c AS (SELECT $a(')) UPDATE t SET b = 1 WHERE b <> '--'",
+            "WITH c AS (SELECT $a([)) DELETE FROM t WHERE b <> ']'",
+            "WITH c AS (SELECT $a(/*)) DELETE FROM t WHERE b <> '*/'",
+        ] {
+            let class = d.classify(sql);
+            assert!(class.is_write(), "{sql} -> {class:?}");
+            // The lexer view alone already fixes it (without the `WITH` safety net).
+            let lexed = classify_with_rules(&lexer_view(sql), LexicalRules::SQLITE);
+            assert!(lexed.is_write(), "{sql} -> {lexed:?}");
+            assert_eq!(d.split_statements(sql).len(), 1, "{sql}");
+        }
+        assert_eq!(lexer_view("SELECT $a(')) x"), "SELECT $a___) x");
+        // A `;` inside the variable's parentheses is not a separator for SQLite either.
+        assert_eq!(d.split_statements("SELECT $a(;) FROM t").len(), 1);
+        // `a$b(` is a function call, not a variable.
+        assert_eq!(lexer_view("SELECT a$b(')')"), "SELECT a$b(')')");
+        // Plain variables keep reads as reads.
+        for sql in ["SELECT $a, :b, @c, #d, ?1 FROM t", "SELECT $a(x) FROM t"] {
+            assert_eq!(d.classify(sql), StatementClass::Read, "{sql}");
+        }
+    }
+
+    fn junk() -> impl Strategy<Value = String> {
+        let frag = prop::sample::select(vec![
+            "$a(", ":a(", "@a(", "#a(", "$a::b(", "'", "\"", "`", "[", "]", ")", "(", "--", "/*",
+            "*/", ";", " ", "\n", "x", "1", "$", ":", "::", "e'", "X'00'", "a$b(",
+        ]);
+        prop::collection::vec(frag, 0..12).prop_map(|v| v.concat())
+    }
+
     proptest! {
+        /// A `WITH` whose main statement is a write never classifies as a read, whatever
+        /// lexical junk precedes it.
+        #[test]
+        fn with_dml_is_never_read(
+            j in junk(),
+            dml in prop::sample::select(vec![
+                "INSERT INTO t VALUES (1)",
+                "UPDATE t SET b = 1",
+                "DELETE FROM t",
+                "REPLACE INTO t VALUES (1)",
+            ]),
+            tail in junk(),
+        ) {
+            let sql = format!("WITH c AS (SELECT {j}) {dml} {tail}");
+            let class = SqliteDialect.classify(&sql);
+            prop_assert!(class > StatementClass::Session, "{} -> {:?}", sql, class);
+        }
+
         #[test]
         fn rewrite_keeps_length_and_boundaries(text in "\\PC{0,200}") {
-            let out = bracket_idents_as_quotes(&text);
+            let out = lexer_view(&text);
             prop_assert_eq!(out.len(), text.len());
             for (i, _) in text.char_indices() {
                 prop_assert!(out.is_char_boundary(i));

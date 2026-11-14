@@ -38,7 +38,7 @@ use ninesql_driver_api::{
     Statement, TransactionCapabilities,
 };
 
-pub use dialect::{SqliteDialect, bracket_idents_as_quotes};
+pub use dialect::{SqliteDialect, lexer_view};
 pub use session::{SqliteMetadata, SqliteSession};
 pub use worker::PAUSED_RESULT_TIMEOUT;
 
