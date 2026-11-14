@@ -10,10 +10,11 @@ New ADR: copy [template.md](template.md), take the next number, status `Proposed
 | [0002](0002-licensing-and-dependency-policy.md) | Licensing and dependency policy | Accepted |
 | [0003](0003-supported-engines-v1.md) | Supported engines for v1 and driver families | Accepted |
 | [0004](0004-driver-api-runtime-and-results.md) | Driver API, async runtime and result model | Accepted |
-| [0005](0005-secrets-storage.md) | Secrets storage | Accepted |
+| [0005](0005-secrets-storage.md) | Secrets storage | Accepted, partially superseded by [0012](0012-secret-service-client-and-msrv.md) |
 | [0006](0006-dbeaver-interoperability.md) | DBeaver interoperability | Accepted |
 | [0007](0007-production-safety-model.md) | Production safety model | Accepted |
 | [0008](0008-workspace-and-config-storage.md) | Workspace and configuration storage | Accepted |
 | [0009](0009-container-first-test-environment.md) | Container-first test environment, runnable in CI and cloud agent sandboxes | Accepted |
 | [0010](0010-packaging-and-distribution.md) | Packaging and distribution | Accepted |
 | [0011](0011-tls-and-ssh-defaults.md) | TLS and SSH defaults | Accepted |
+| [0012](0012-secret-service-client-and-msrv.md) | Secret Service client crate and minimum Rust version | Accepted |

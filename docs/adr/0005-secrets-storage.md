@@ -1,6 +1,6 @@
 # ADR-0005: Secrets storage
 
-- **Status**: Accepted
+- **Status**: Accepted. Partially superseded by [ADR-0012](0012-secret-service-client-and-msrv.md) for the client crate (`secret-service` 6 instead of `keyring`) and the Secret Service item attributes; everything else stands.
 - **Date**: 2026-11-14
 
 ## Context
