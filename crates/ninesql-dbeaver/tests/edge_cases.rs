@@ -402,7 +402,13 @@ fn network_profile_references_disable_the_connection() {
         status_of(&with_profiles(cfg, r#"{"p1":{}}"#)),
         Status::ImportedDisabled
     );
-    assert_eq!(status_of(&with_profiles(cfg, "{}")), Status::Imported);
+    // Any non-empty *profile* value disables, even without `network-profiles` in the file.
+    assert_eq!(
+        status_of(&with_profiles(cfg, "{}")),
+        Status::ImportedDisabled
+    );
+    let empty = r#"{"host":"db.example.test","profileId":""}"#;
+    assert_eq!(status_of(&with_profiles(empty, "{}")), Status::Imported);
     let cfg = r#"{"host":"db.example.test","networkHandlerRef":"p1"}"#;
     assert_eq!(
         status_of(&with_profiles(cfg, r#"{"p1":{}}"#)),
@@ -466,7 +472,7 @@ fn ssh_forwarding_target() {
 #[test]
 fn file_endpoints_inside_the_workspace_are_read_only() {
     let tmp = tempfile::tempdir().unwrap_or_else(|e| panic!("{e}"));
-    let ws = tmp.path().join("workspace6");
+    let ws = tmp.path().join("DBeaverData").join("workspace6");
     std::fs::create_dir_all(ws.join(".metadata")).unwrap_or_default();
     let inside = ws.join("General").join("data.sqlite");
     let outside = tmp.path().join("elsewhere.sqlite");
@@ -491,6 +497,21 @@ fn file_endpoints_inside_the_workspace_are_read_only() {
 
     let picked = open_folder(&project).unwrap_or_else(|e| panic!("{e}"));
     assert_eq!(picked.projects[0].workspace, ws);
+    // Inside DBeaverData but outside the workspace, and a file that does not exist yet.
+    let sibling = tmp.path().join("DBeaverData").join("drivers.sqlite");
+    std::fs::write(&sibling, b"").unwrap_or_default();
+    let extra = format!(
+        r#","sib":{{"provider":"sqlite","driver":"sqlite_jdbc","name":"sib","configuration":{{"database":"{}"}}}},
+        "missing":{{"provider":"sqlite","driver":"sqlite_jdbc","name":"missing","configuration":{{"database":"{}"}}}}}}}}"#,
+        sibling.display(),
+        ws.join("General").join("not-yet.sqlite").display()
+    );
+    let ds = project.join(".dbeaver").join("data-sources.json");
+    let mut text = std::fs::read_to_string(&ds).unwrap_or_default();
+    let trimmed = text.trim_end().len();
+    text.truncate(trimmed - 2);
+    text.push_str(&extra);
+    std::fs::write(&ds, text).unwrap_or_default();
     let p = import_project(&picked.projects[0]);
     let get = |id: &str| {
         p.connections
@@ -498,7 +519,7 @@ fn file_endpoints_inside_the_workspace_are_read_only() {
             .find(|c| c.dbeaver_id == id)
             .unwrap_or_else(|| panic!("{id}"))
     };
-    for id in ["in", "link"] {
+    for id in ["in", "link", "sib", "missing"] {
         let c = get(id);
         assert_eq!(c.imported().and_then(|c| c.read_only), Some(true), "{id}");
         assert!(
@@ -618,5 +639,163 @@ fn tls_review_fixes() {
             .any(|i| i.kind == IssueKind::TlsConverted
                 && i.severity == ninesql_dbeaver::Severity::Warning
                 && i.message.contains("MariaDB"))
+    );
+}
+
+// ---- Follow-up review (N-H1, N-H2, N-M1, N-M2, N-L2) ----
+
+#[test]
+fn dbeaver_config_profile_keys_disable() {
+    for cfg in [
+        r#"{"host":"db.example.test","config-profile":"bastion"}"#,
+        r#"{"host":"db.example.test","config-profile-source":"global"}"#,
+        r#"{"host":"db.example.test","config-profile":"bastion","config-profile-source":"global"}"#,
+    ] {
+        let p = map(&one("postgresql", "postgres-jdbc", cfg), None);
+        assert_eq!(p.connections[0].status(), Status::ImportedDisabled, "{cfg}");
+        assert!(
+            issue(
+                &p,
+                IssueKind::Disabled,
+                Some("configuration.config-profile")
+            ),
+            "{cfg}"
+        );
+    }
+    // In a handler too.
+    let cfg = r#"{"host":"db.example.test","handlers":{"postgre_ssl":{"type":"CONFIG","enabled":true,
+        "config-profile":"tls-profile","properties":{}}}}"#;
+    assert_eq!(
+        status_of(&one("postgresql", "postgres-jdbc", cfg)),
+        Status::ImportedDisabled
+    );
+}
+
+fn ssh_with(props: &str) -> String {
+    one(
+        "postgresql",
+        "postgres-jdbc",
+        &format!(
+            r#"{{"host":"db.example.test","handlers":{{"ssh_tunnel":{{"type":"TUNNEL","enabled":true,
+            "user":"nine_ssh","properties":{{"host":"bastion.example.test"{props}}}}}}}}}"#
+        ),
+    )
+}
+
+#[test]
+fn ssh_jump_servers_are_mapped_or_fail_closed() {
+    let p = map(
+        &ssh_with(
+            r#","jumpServer.count":"2",
+            "jumpServer0.enabled":"true","jumpServer0.host":"jump1.example.test","jumpServer0.port":"2201",
+            "jumpServer0.user":"nine_jump","jumpServer0.authType":"PUBLIC_KEY","jumpServer0.keyPath":"/home/nine_user/.ssh/j",
+            "jumpServer0.keyValue":"-----BEGIN fixture-key-not-a-secret",
+            "jumpServer1.enabled":true,"jumpServer1.host":"jump2.example.test","jumpServer1.user":"nine_jump",
+            "jumpServer2.enabled":false,"jumpServer2.host":"off.example.test""#,
+        ),
+        None,
+    );
+    let c = only(&p);
+    let ssh = c.ssh.as_ref().unwrap_or_else(|| panic!("no ssh"));
+    let hops: Vec<(&str, u16)> = ssh
+        .jump_hosts
+        .iter()
+        .map(|h| (h.host.as_str(), h.port))
+        .collect();
+    assert_eq!(
+        hops,
+        [("jump1.example.test", 2201), ("jump2.example.test", 22)]
+    );
+    assert_eq!(
+        ssh.jump_hosts[0].auth,
+        SshAuth::PublicKey {
+            key_path: std::path::PathBuf::from("/home/nine_user/.ssh/j"),
+            passphrase: Some(SecretState::Prompt),
+        }
+    );
+    assert_eq!(
+        ssh.jump_hosts[1].auth,
+        SshAuth::Password {
+            secret: SecretState::Prompt
+        }
+    );
+    assert!(issue(
+        &p,
+        IssueKind::SecretRemoved,
+        Some("jumpServer0.keyValue")
+    ));
+    assert!(!format!("{p:?}").contains("not-a-secret"));
+    // A host without an `enabled` flag counts as active.
+    let p = map(
+        &ssh_with(r#","jumpServer0.host":"jump1.example.test","jumpServer0.user":"u""#),
+        None,
+    );
+    assert_eq!(only(&p).ssh.as_ref().map(|s| s.jump_hosts.len()), Some(1));
+    // Unreadable or incomplete jump servers fail the connection: the hop is never skipped.
+    for props in [
+        r#","jumpServer0.enabled":true,"jumpServer0.host":"jump1.example.test""#,
+        r#","jumpServer0.enabled":true,"jumpServer0.user":"u""#,
+        r#","jumpServer0.enabled":true,"jumpServer0.host":"-x","jumpServer0.user":"u""#,
+        r#","jumpServerX.host":"jump1.example.test""#,
+        r#","jumpServer99.host":"jump1.example.test""#,
+        r#","jumpServer0.host":{"a":1}"#,
+    ] {
+        assert_eq!(status_of(&ssh_with(props)), Status::Failed, "{props}");
+    }
+}
+
+#[test]
+fn inline_ssh_key_is_a_secret() {
+    let p = map(
+        &ssh_with(r#","keyValue":"-----BEGIN fixture-key-not-a-secret""#),
+        None,
+    );
+    assert!(issue(
+        &p,
+        IssueKind::SecretRemoved,
+        Some("properties.keyValue")
+    ));
+    assert!(!format!("{p:?}").contains("not-a-secret"));
+}
+
+#[test]
+fn many_types_with_one_base_stay_fast_and_capped() {
+    let mut json = String::from(r#"{"connection-types":{"#);
+    for i in 0..5_000 {
+        if i > 0 {
+            json.push(',');
+        }
+        // All sanitize to the base `x-`.
+        json.push_str(&format!(
+            r#""X{}":{{}}"#,
+            "!".repeat(i % 7 + 1) + &" ".repeat(i / 7)
+        ));
+    }
+    json.push_str("}}");
+    let start = std::time::Instant::now();
+    let p = map(&json, None);
+    assert!(start.elapsed() < std::time::Duration::from_secs(20));
+    assert_eq!(p.connection_types.len(), 1_000);
+    assert!(issue(&p, IssueKind::Truncated, None));
+    let ids: std::collections::BTreeSet<&str> =
+        p.connection_types.iter().map(|t| t.id.as_str()).collect();
+    assert_eq!(ids.len(), 1_000, "type ids must be unique");
+}
+
+#[test]
+fn unreadable_handler_data_disables() {
+    for handlers in [r#"["ssh_tunnel"]"#, r#"{"ssh_tunnel":"on"}"#, r#""yes""#] {
+        let cfg = format!(r#"{{"host":"db.example.test","handlers":{handlers}}}"#);
+        let p = map(&one("postgresql", "postgres-jdbc", &cfg), None);
+        assert_eq!(
+            p.connections[0].status(),
+            Status::ImportedDisabled,
+            "{handlers}"
+        );
+    }
+    let cfg = r#"{"host":"db.example.test","handlers":{}}"#;
+    assert_eq!(
+        status_of(&one("postgresql", "postgres-jdbc", cfg)),
+        Status::Imported
     );
 }

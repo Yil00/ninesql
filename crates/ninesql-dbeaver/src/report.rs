@@ -126,10 +126,50 @@ mod tests {
     }
 }
 
+/// Report entries left for one project, shared by all its [`Issues`] collectors so the cap is
+/// enforced when an entry is added (not after the fact).
+#[derive(Debug, Clone)]
+pub(crate) struct Budget {
+    left: std::rc::Rc<std::cell::Cell<usize>>,
+    exhausted: std::rc::Rc<std::cell::Cell<bool>>,
+}
+
+impl Budget {
+    pub(crate) fn new(max: usize) -> Self {
+        Self {
+            left: std::rc::Rc::new(std::cell::Cell::new(max)),
+            exhausted: std::rc::Rc::new(std::cell::Cell::new(false)),
+        }
+    }
+
+    /// Whether entries were dropped because the budget ran out.
+    pub(crate) fn exhausted(&self) -> bool {
+        self.exhausted.get()
+    }
+
+    fn take(&self) -> bool {
+        match self.left.get() {
+            0 => {
+                self.exhausted.set(true);
+                false
+            }
+            n => {
+                self.left.set(n - 1);
+                true
+            }
+        }
+    }
+}
+
+/// Collects issues for one scope, optionally drawing on a shared [`Budget`].
 #[derive(Debug, Default)]
-pub(crate) struct Issues(pub(crate) Vec<ImportIssue>);
+pub(crate) struct Issues(pub(crate) Vec<ImportIssue>, Option<Budget>);
 
 impl Issues {
+    pub(crate) fn with_budget(budget: &Budget) -> Self {
+        Self(Vec::new(), Some(budget.clone()))
+    }
+
     pub(crate) fn push(
         &mut self,
         severity: Severity,
@@ -137,6 +177,9 @@ impl Issues {
         key: Option<String>,
         message: impl Into<String>,
     ) {
+        if self.1.as_ref().is_some_and(|b| !b.take()) {
+            return;
+        }
         self.0.push(ImportIssue::new(severity, kind, key, message));
     }
 

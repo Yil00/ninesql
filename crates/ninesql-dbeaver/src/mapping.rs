@@ -36,7 +36,7 @@ use crate::model::{
     ConnectionDef, ConnectionTypeDef, DataSources, FolderDef, HandlerDef, Properties, Scalar,
     parse_data_sources,
 };
-use crate::report::{ImportIssue, IssueKind, Issues, MAX_IDENT, ident};
+use crate::report::{Budget, ImportIssue, IssueKind, Issues, MAX_IDENT, ident};
 
 // ---------------------------------------------------------------------------------------------
 // Output model
@@ -519,9 +519,29 @@ pub(crate) fn import_project(project: &Project) -> ProjectImport {
 }
 
 /// Canonicalizes file endpoints and forces read-only on database files that live inside the
-/// DBeaver workspace (I4: NineSQL must never modify a file under a DBeaver directory).
+/// DBeaver data directory (I4: NineSQL must never modify a file under a DBeaver directory).
+///
+/// Protected: the workspace and, when the workspace sits in a `DBeaverData` directory (or is
+/// named `workspace6`), that whole parent. A file that does not exist is resolved through its
+/// parent directory.
 fn check_file_endpoints(out: &mut ProjectImport, workspace: &std::path::Path) {
-    let workspace_canon = fsread::canonicalize(workspace);
+    let mut roots = vec![workspace.to_path_buf()];
+    if let Some(data) = workspace
+        .ancestors()
+        .skip(1)
+        .find(|a| a.file_name().is_some_and(|n| n == "DBeaverData"))
+    {
+        roots.push(data.to_path_buf());
+    } else if workspace.file_name().is_some_and(|n| n == "workspace6")
+        && let Some(parent) = workspace.parent()
+    {
+        roots.push(parent.to_path_buf());
+    }
+    let canon_roots: Vec<PathBuf> = roots
+        .iter()
+        .filter_map(|r| fsread::canonicalize(r))
+        .collect();
+    roots.extend(canon_roots);
     for entry in &mut out.connections {
         let Outcome::Imported(c) = &mut entry.outcome else {
             continue;
@@ -529,36 +549,46 @@ fn check_file_endpoints(out: &mut ProjectImport, workspace: &std::path::Path) {
         let Endpoint::File { path } = &mut c.endpoint else {
             continue;
         };
-        let lexical_inside = path.starts_with(workspace);
-        if let Some(canon) = fsread::canonicalize(path) {
+        let lexical_inside = roots.iter().any(|r| path.starts_with(r));
+        if let Some(canon) = canonicalize_maybe_missing(path) {
             *path = canon;
         }
-        let inside = lexical_inside
-            || path.starts_with(workspace)
-            || workspace_canon
-                .as_ref()
-                .is_some_and(|w| path.starts_with(w));
-        if inside {
+        if lexical_inside || roots.iter().any(|r| path.starts_with(r)) {
             c.read_only = Some(true);
             entry.issues.push(ImportIssue::new(
                 crate::report::Severity::Warning,
                 IssueKind::FileInsideDbeaver,
                 Some("configuration.database".to_owned()),
-                "the database file is inside the DBeaver workspace: imported read-only, and the \
-                 driver must open it in read-only mode (NineSQL never modifies DBeaver files)",
+                "the database file is inside DBeaver's data directory: imported read-only, and \
+                 the driver must open it in read-only mode (NineSQL never modifies DBeaver files)",
             ));
         }
     }
 }
 
+/// The canonical path, or for a missing file its canonical parent joined with the file name.
+fn canonicalize_maybe_missing(path: &std::path::Path) -> Option<PathBuf> {
+    if let Some(c) = fsread::canonicalize(path) {
+        return Some(c);
+    }
+    let parent = fsread::canonicalize(path.parent()?)?;
+    Some(parent.join(path.file_name()?))
+}
+
 /// Maps already parsed files of one project. `credentials` is `None` when the project has no
 /// `credentials-config.json`.
+///
+/// **Use [`crate::import_project`] for real imports** (P2-C): this function does not know where
+/// the DBeaver workspace is, so it skips the file-endpoint check that canonicalizes database
+/// file paths and forces read-only on files inside DBeaver's data directory (I4). It exists for
+/// tests, fuzzing and callers that run that check themselves.
 pub fn map_sources(
     project: &str,
     sources: &[DataSources],
     credentials: Option<Result<Credentials, CredentialsError>>,
 ) -> ProjectImport {
-    let mut issues = Issues::default();
+    let budget = Budget::new(MAX_ISSUES);
+    let mut issues = Issues::with_budget(&budget);
     let (credentials_status, mut creds) = match credentials {
         None => (CredentialsStatus::NotFound, None),
         Some(Ok(c)) => (
@@ -596,6 +626,7 @@ pub fn map_sources(
     let mut network_profiles = false;
     let mut truncated_connections = false;
     let mut truncated_folders = false;
+    let mut truncated_types = false;
     for ds in sources {
         coverage::report_extra(Scope::TopLevel, "", &ds.extra, &mut issues);
         network_profiles |= ds.extra.get("network-profiles").is_some_and(|v| match v {
@@ -619,6 +650,10 @@ pub fn map_sources(
             folder_defs.entry(f.key.as_str()).or_insert(f);
         }
         for t in &ds.connection_types {
+            if type_defs.len() >= MAX_CONNECTION_TYPES && !type_defs.contains_key(t.id.as_str()) {
+                truncated_types = true;
+                continue;
+            }
             type_defs.entry(t.id.as_str()).or_insert(t);
         }
         for c in &ds.connections {
@@ -642,6 +677,16 @@ pub fn map_sources(
             format!("more than {MAX_CONNECTIONS} connections: the others are not imported"),
         );
     }
+    if truncated_types {
+        issues.warn(
+            IssueKind::Truncated,
+            None,
+            format!(
+                "more than {MAX_CONNECTION_TYPES} connection types: the others are not imported \
+                 (their connections get production rules)"
+            ),
+        );
+    }
     if truncated_folders {
         issues.warn(
             IssueKind::Truncated,
@@ -661,6 +706,7 @@ pub fn map_sources(
             CredentialsStatus::Unreadable(_) | CredentialsStatus::ReadFailed
         ),
         network_profiles,
+        budget: &budget,
     };
     let mut folder_paths: BTreeSet<Vec<String>> = folders.iter().map(|f| f.path.clone()).collect();
     let mut connections = Vec::with_capacity(conn_defs.len());
@@ -704,7 +750,16 @@ pub fn map_sources(
         connections,
         issues: issues.0,
     };
-    cap_issues(&mut out);
+    if budget.exhausted() {
+        // One entry beyond the cap, so the report says it is incomplete. Connection state
+        // (disabled, read-only, TLS mode) is never affected: only explanations are dropped.
+        out.issues.push(ImportIssue::new(
+            crate::report::Severity::Warning,
+            IssueKind::Truncated,
+            None,
+            format!("more than {MAX_ISSUES} report entries: the others are not shown"),
+        ));
+    }
     tracing::debug!(
         connections = out.connections.len(),
         secrets = out.secret_count(),
@@ -720,6 +775,8 @@ struct Ctx<'a> {
     credentials_unreadable: bool,
     /// The files define DBeaver network profiles (shared SSH / proxy settings).
     network_profiles: bool,
+    /// Report entries left for the project.
+    budget: &'a Budget,
 }
 
 /// Most data-sources files read per project.
@@ -728,36 +785,12 @@ pub(crate) const MAX_DATA_SOURCE_FILES: usize = 64;
 pub(crate) const MAX_PROJECT_BYTES: u64 = 64 * 1024 * 1024;
 /// Most connections imported per project.
 pub(crate) const MAX_CONNECTIONS: usize = 10_000;
+/// Most connection types imported per project.
+pub(crate) const MAX_CONNECTION_TYPES: usize = 1_000;
 /// Most folders imported per project.
 pub(crate) const MAX_FOLDERS: usize = 10_000;
 /// Most report entries per project (project and connection issues together).
 pub(crate) const MAX_ISSUES: usize = 50_000;
-
-/// Keeps at most [`MAX_ISSUES`] report entries, then adds one "truncated" entry. Connection
-/// state (disabled, read-only, TLS mode) is not affected: only the explanations are cut.
-fn cap_issues(out: &mut ProjectImport) {
-    let mut left = MAX_ISSUES;
-    let mut cut = false;
-    let mut take = |v: &mut Vec<ImportIssue>| {
-        if v.len() > left {
-            v.truncate(left);
-            cut = true;
-        }
-        left -= v.len();
-    };
-    take(&mut out.issues);
-    for c in &mut out.connections {
-        take(&mut c.issues);
-    }
-    if cut {
-        out.issues.push(ImportIssue::new(
-            crate::report::Severity::Warning,
-            IssueKind::Truncated,
-            None,
-            format!("more than {MAX_ISSUES} report entries: the others are not shown"),
-        ));
-    }
-}
 
 // ---------------------------------------------------------------------------------------------
 // Folders
@@ -853,15 +886,18 @@ fn map_connection_types(
         by_dbeaver_id: BTreeMap::new(),
     };
     let mut used: BTreeSet<String> = BTreeSet::new();
+    // Next suffix to try per base id, so that many types sanitizing to the same base stay
+    // linear (each suffix is tried once overall).
+    let mut next_suffix: BTreeMap<String, usize> = BTreeMap::new();
     for (dbeaver_id, def) in defs {
         let prefix = format!("connection-types.{dbeaver_id}");
         let builtin = BUILTIN_TYPES.contains(dbeaver_id);
         let mut id = sanitize_type_id(dbeaver_id);
         let base = id.clone();
-        let mut n = 2;
         while used.contains(&id) || (!builtin && BUILTIN_TYPES.contains(&id.as_str())) {
+            let n = next_suffix.entry(base.clone()).or_insert(2);
             id = format!("{}-{n}", truncate_bytes(&base, 60));
-            n += 1;
+            *n += 1;
         }
         if id != *dbeaver_id {
             issues.info(
@@ -1208,7 +1244,7 @@ fn map_connection(
     ctx: &Ctx<'_>,
 ) -> ConnectionImport {
     let mut st = ConnState {
-        issues: Issues::default(),
+        issues: Issues::with_budget(ctx.budget),
         disabled: Vec::new(),
         secrets: Vec::new(),
         tls: TlsHints::default(),
@@ -1418,12 +1454,27 @@ fn map_connection(
     let auth = map_auth(def, file_engine, saved.as_mut(), ctx, &mut st);
 
     // Handlers.
-    for hid in &cfg.invalid_handlers {
+    // Handler data that is not an object cannot be read: it may configure a tunnel or proxy,
+    // so the connection is disabled (fail closed, I2).
+    let mut unreadable_handlers: Vec<String> = cfg
+        .invalid_handlers
+        .iter()
+        .map(|hid| format!("configuration.handlers.{hid}"))
+        .collect();
+    if cfg.extra.get("handlers").is_some_and(|v| !is_empty_json(v)) {
+        unreadable_handlers.push("configuration.handlers".to_owned());
+    }
+    for key in &unreadable_handlers {
         st.issues.warn(
-            IssueKind::InvalidValue,
-            Some(format!("configuration.handlers.{hid}")),
-            "not imported: not a JSON object",
+            IssueKind::Disabled,
+            Some(key.clone()),
+            "network handler data that is not a JSON object: imported disabled so that it never \
+             bypasses a tunnel or proxy it may configure",
         );
+    }
+    if !unreadable_handlers.is_empty() {
+        st.disabled
+            .push("unreadable network handler settings".to_owned());
     }
     let mut ssh = None;
     for h in &cfg.handlers {
@@ -1473,31 +1524,45 @@ fn map_connection(
 
     // Network profiles (shared SSH / proxy settings, F-CON-17): not supported yet, so a
     // connection that may use one is disabled rather than imported without its hops (I2).
+    // DBeaver writes `configuration."config-profile"` (and `"config-profile-source"`, e.g.
+    // `global`: the profile may live outside this file), so any non-empty value under a key
+    // containing `profile` disables, whether or not the file defines `network-profiles`.
+    let mut profile_keys: Vec<String> = Vec::new();
     let mut scopes: Vec<(String, &crate::model::Extra)> = vec![
         (String::new(), &def.extra),
         ("configuration".to_owned(), &cfg.extra),
     ];
     for h in &cfg.handlers {
         scopes.push((format!("configuration.handlers.{}", h.id), &h.extra));
-    }
-    for (scope, extra) in scopes {
-        for key in extra.keys() {
-            let norm = normalize_key(key);
-            let references_profile = is_network_profile_key(&norm)
-                || (ctx.network_profiles
-                    && (norm.starts_with("network") || norm.starts_with("profile")));
-            if references_profile {
-                st.issues.warn(
-                    IssueKind::Disabled,
-                    Some(join(&scope, key)),
-                    "the connection uses a DBeaver network profile, which is not supported yet \
-                     (F-CON-17): imported disabled so that it never bypasses the profile's \
-                     tunnel or proxy",
-                );
-                st.disabled
-                    .push("DBeaver network profile not supported yet".to_owned());
+        let props_prefix = format!("configuration.handlers.{}.properties", h.id);
+        for (key, value) in &h.properties.entries {
+            if normalize_key(key).contains("profile") && !value.as_text().trim().is_empty() {
+                profile_keys.push(join(&props_prefix, key));
             }
         }
+    }
+    for (scope, extra) in scopes {
+        for (key, value) in extra.iter() {
+            let norm = normalize_key(key);
+            let profile_like =
+                norm.contains("profile") || (ctx.network_profiles && norm.starts_with("network"));
+            if profile_like && !is_empty_json(value) {
+                profile_keys.push(join(&scope, key));
+            }
+        }
+    }
+    for key in &profile_keys {
+        st.issues.warn(
+            IssueKind::Disabled,
+            Some(key.clone()),
+            "the connection uses a DBeaver network profile, which is not supported yet \
+             (F-CON-17): imported disabled so that it never bypasses the profile's tunnel or \
+             proxy",
+        );
+    }
+    if !profile_keys.is_empty() {
+        st.disabled
+            .push("DBeaver network profile not supported yet".to_owned());
     }
 
     // Saved credentials left over (sections NineSQL does not use).
@@ -1721,10 +1786,15 @@ fn map_endpoint(
     })
 }
 
-/// Normalized key naming a network profile (`network-profile`, `networkProfile`,
-/// `network_profile_id`…).
-fn is_network_profile_key(norm: &str) -> bool {
-    norm.contains("networkprofile")
+/// Whether a JSON value is empty (`null`, blank string, `[]`, `{}`).
+fn is_empty_json(value: &serde_json::Value) -> bool {
+    match value {
+        serde_json::Value::Null => true,
+        serde_json::Value::String(s) => s.trim().is_empty(),
+        serde_json::Value::Array(a) => a.is_empty(),
+        serde_json::Value::Object(m) => m.is_empty(),
+        serde_json::Value::Bool(_) | serde_json::Value::Number(_) => false,
+    }
 }
 
 /// A TLS-only handler that cannot route traffic: `type` exactly `CONFIG`, an id that names TLS,
@@ -1938,7 +2008,15 @@ fn map_ssh(
         "remotePort",
     ];
     for (key, _) in &props.entries {
-        if CONSUMED.contains(&key.as_str()) {
+        if CONSUMED.contains(&key.as_str()) || key.starts_with("jumpServer") {
+            continue;
+        }
+        if is_inline_key(key) {
+            st.issues.warn(
+                IssueKind::SecretRemoved,
+                Some(join(&props_prefix, key)),
+                "an inline private key is never imported: save it to a file and set its path",
+            );
             continue;
         }
         if is_secret_like_key(key) {
@@ -2051,6 +2129,7 @@ fn map_ssh(
         "the SSH host key is not trusted on import: the first connection shows its fingerprint \
          and asks (ADR-0011)",
     );
+    let jump_hosts = map_jump_hosts(props, &props_prefix, st)?;
     Ok(SshTunnel {
         server: SshHop {
             host,
@@ -2058,8 +2137,137 @@ fn map_ssh(
             username,
             auth,
         },
-        jump_hosts: Vec::new(),
+        jump_hosts,
     })
+}
+
+/// Highest jump server index accepted (DBeaver offers up to 5).
+const MAX_JUMP_INDEX: usize = 31;
+
+/// `keyValue` / `jumpServer<i>.keyValue`: an inline private key, a secret.
+fn is_inline_key(key: &str) -> bool {
+    normalize_key(key).ends_with("keyvalue")
+}
+
+/// DBeaver SSH jump servers: `jumpServer.count`, then `jumpServer<i>.enabled`, `.host`, `.port`,
+/// `.user`, `.authType`, `.keyPath`… They map to [`SshTunnel::jump_hosts`] in index order
+/// (assumed to be the ProxyJump order: to verify against a DBeaver-written workspace). Their
+/// saved secrets are not imported (storage format not verified): NineSQL asks for them.
+/// Anything unreadable fails the connection, so a jump hop is never skipped (I2).
+fn map_jump_hosts(
+    props: &Properties,
+    props_prefix: &str,
+    st: &mut ConnState,
+) -> Result<Vec<SshHop>, &'static str> {
+    if props.non_scalar.iter().any(|k| k.starts_with("jumpServer")) {
+        return Err("unreadable SSH jump server settings");
+    }
+    let mut servers: BTreeMap<usize, Vec<(&str, &Scalar)>> = BTreeMap::new();
+    for (key, value) in &props.entries {
+        let Some(rest) = key.strip_prefix("jumpServer") else {
+            continue;
+        };
+        let Some((index, field)) = rest.split_once('.') else {
+            return Err("unreadable SSH jump server settings");
+        };
+        if index.is_empty() {
+            // `jumpServer.count`: the indices present are what counts.
+            if field != "count" {
+                coverage::report_key(Scope::SshProperties, props_prefix, key, &mut st.issues);
+            }
+            continue;
+        }
+        let Some(i) = index.parse::<usize>().ok().filter(|i| *i <= MAX_JUMP_INDEX) else {
+            return Err("unreadable SSH jump server settings");
+        };
+        servers.entry(i).or_default().push((field, value));
+    }
+    let mut hops = Vec::new();
+    for (i, fields) in servers {
+        let get = |name: &str| fields.iter().find(|(f, _)| *f == name).map(|(_, v)| *v);
+        let text = |name: &str| {
+            get(name)
+                .map(|v| v.as_text().trim().to_owned())
+                .filter(|v| !v.is_empty())
+        };
+        let hop_prefix = join(props_prefix, &format!("jumpServer{i}"));
+        let enabled = get("enabled").and_then(Scalar::as_bool);
+        let host = text("host");
+        let active = enabled == Some(true) || (enabled.is_none() && host.is_some());
+        if !active {
+            continue;
+        }
+        for (field, _) in &fields {
+            let path = join(&hop_prefix, field);
+            match *field {
+                "enabled" | "host" | "port" | "user" | "authType" | "keyPath" => {}
+                f if is_inline_key(f) => st.issues.warn(
+                    IssueKind::SecretRemoved,
+                    Some(path),
+                    "an inline private key is never imported: save it to a file and set its path",
+                ),
+                f if is_secret_like_key(f) => st.issues.warn(
+                    IssueKind::SecretRemoved,
+                    Some(path),
+                    "looks like a secret: removed, not imported",
+                ),
+                f => coverage::report_key(Scope::SshProperties, &hop_prefix, f, &mut st.issues),
+            }
+        }
+        let host = host.ok_or("SSH jump server without a host")?;
+        if !is_valid_host(&host) {
+            return Err("an SSH jump server host is not a valid host name or IP address");
+        }
+        let port = match get("port") {
+            None => 22,
+            Some(p) => match p.as_u16() {
+                Some(port) if port != 0 => port,
+                _ => return Err("an SSH jump server port is not valid"),
+            },
+        };
+        let username = text("user").ok_or("SSH jump server without a user name")?;
+        if !is_valid_short(&username) || username.starts_with('-') {
+            return Err(
+                "an SSH jump server user name is too long, starts with `-` or has \
+                        control characters",
+            );
+        }
+        let auth = match text("authType")
+            .unwrap_or_else(|| "PASSWORD".to_owned())
+            .to_ascii_uppercase()
+            .as_str()
+        {
+            "PASSWORD" => SshAuth::Password {
+                secret: SecretState::Prompt,
+            },
+            "PUBLIC_KEY" => SshAuth::PublicKey {
+                key_path: PathBuf::from(
+                    text("keyPath").ok_or("SSH jump server public-key auth without a key path")?,
+                ),
+                passphrase: Some(SecretState::Prompt),
+            },
+            "AGENT" => SshAuth::Agent,
+            _ => return Err("unknown SSH jump server authentication type"),
+        };
+        hops.push(SshHop {
+            host,
+            port,
+            username,
+            auth,
+        });
+    }
+    if !hops.is_empty() {
+        st.issues.info(
+            IssueKind::Credentials,
+            Some(props_prefix.to_owned()),
+            format!(
+                "{} SSH jump host(s) imported; their saved secrets are not imported (format not \
+                 verified): NineSQL will ask for them",
+                hops.len()
+            ),
+        );
+    }
+    Ok(hops)
 }
 
 /// `remoteHost` / `remotePort`: the address the SSH server forwards to. NineSQL forwards to the
