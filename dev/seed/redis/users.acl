@@ -1,0 +1,2 @@
+user default on >nine_dev_only ~* &* +@all
+user nine_ro on >nine_dev_only ~* &* -@all +@read +@connection

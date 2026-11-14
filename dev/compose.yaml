@@ -1,0 +1,480 @@
+# NineSQL development and integration-test databases (ADR-0009).
+#
+#   python3 dev/ready.py up core      # start a profile, wait for engines and seeds
+#   docker compose -f dev/compose.yaml --profile all down -v
+#
+# Rules: official images pinned by digest; every port bound to 127.0.0.1;
+# fake "nine" data only; dev-only credentials, never reused anywhere else.
+# dev/engines.json mirrors this file (ports, images, readiness) and is checked
+# against it by `python3 dev/ready.py check`.
+#
+# Profiles: core = PostgreSQL, MySQL, MariaDB; sql = core + the other SQL
+# engines; nosql; heavy; all. Each "<engine>-seed" service is a one-shot job
+# that loads the dataset into an engine whose image has no init directory.
+
+name: ninesql-dev
+
+x-healthcheck: &healthcheck
+  interval: 10s
+  timeout: 10s
+  retries: 6
+  start_period: 600s
+  start_interval: 3s
+
+services:
+  # ---------------------------------------------------------------- core ---
+  postgresql:
+    image: postgres:18.7@sha256:9f4fd4aa918f52ae3d6f3b687f1de90d8f867cd4d520021545a9a50c120eae3b
+    profiles: [core, sql, all]
+    environment:
+      POSTGRES_USER: nine
+      POSTGRES_PASSWORD: nine_dev_only
+      POSTGRES_DB: nine
+      PGPASSWORD: nine_dev_only
+    ports: ["127.0.0.1:15432:5432"]
+    volumes:
+      - ./seed/postgresql/01-nine.sql:/docker-entrypoint-initdb.d/01-nine.sql:ro
+    healthcheck:
+      <<: *healthcheck
+      test: ["CMD-SHELL", "psql -h 127.0.0.1 -U nine -d nine -tAc \"SELECT value FROM nine_meta WHERE key = 'seed_version'\" | grep -qx 1"]
+
+  mysql:
+    image: mysql:8.4.13@sha256:a81d043930e51745522bd5c430961cf8286f0a23f0a9a2a6e0108f7ea71b0902
+    profiles: [core, sql, all]
+    environment:
+      MYSQL_ROOT_PASSWORD: nine_dev_only_root
+      MYSQL_DATABASE: nine
+      MYSQL_USER: nine
+      MYSQL_PASSWORD: nine_dev_only
+    ports: ["127.0.0.1:13306:3306"]
+    volumes:
+      - ./seed/mysql/01-nine.sql:/docker-entrypoint-initdb.d/01-nine.sql:ro
+    healthcheck:
+      <<: *healthcheck
+      test: ["CMD-SHELL", "mysql -h 127.0.0.1 -u nine -p\"$$MYSQL_PASSWORD\" nine -NBe \"SELECT value FROM nine_meta WHERE \\`key\\` = 'seed_version'\" 2>/dev/null | grep -qx 1"]
+
+  mariadb:
+    image: mariadb:11.8.9@sha256:d36f18d65a0459510b8b0f643b226a6d299e3206486e2b64ff20754a6d291707
+    profiles: [core, sql, all]
+    environment:
+      MARIADB_ROOT_PASSWORD: nine_dev_only_root
+      MARIADB_DATABASE: nine
+      MARIADB_USER: nine
+      MARIADB_PASSWORD: nine_dev_only
+    ports: ["127.0.0.1:13307:3306"]
+    volumes:
+      - ./seed/mysql/01-nine.sql:/docker-entrypoint-initdb.d/01-nine.sql:ro
+    healthcheck:
+      <<: *healthcheck
+      test: ["CMD-SHELL", "mariadb -h 127.0.0.1 -u nine -p\"$$MARIADB_PASSWORD\" nine -NBe \"SELECT value FROM nine_meta WHERE \\`key\\` = 'seed_version'\" 2>/dev/null | grep -qx 1"]
+
+  # ----------------------------------------------------------------- sql ---
+  timescaledb:
+    image: timescale/timescaledb:2.32.0-pg18@sha256:83952d54cfc74d9aebe4aba6ecf2af829c2bcf1f30058dded4c18ab3720a247a
+    profiles: [sql, all]
+    environment:
+      POSTGRES_USER: nine
+      POSTGRES_PASSWORD: nine_dev_only
+      POSTGRES_DB: nine
+      PGPASSWORD: nine_dev_only
+      TIMESCALEDB_TELEMETRY: "off"
+      TS_TUNE_MEMORY: 1GB
+    ports: ["127.0.0.1:15433:5432"]
+    volumes:
+      - ./seed/postgresql/01-nine.sql:/docker-entrypoint-initdb.d/101-nine.sql:ro
+      - ./seed/timescaledb/02-timescale.sql:/docker-entrypoint-initdb.d/102-timescale.sql:ro
+    healthcheck:
+      <<: *healthcheck
+      test: ["CMD-SHELL", "psql -h 127.0.0.1 -U nine -d nine -tAc \"SELECT value FROM nine_meta WHERE key = 'timescale_seed_version'\" | grep -qx 1"]
+
+  yugabytedb:
+    image: yugabytedb/yugabyte:2026.1.3.0-b100@sha256:c1ddbf9c189f6ef33f03c648efadb1b1e82b5e7c8be472c56b1357c024221528
+    profiles: [sql, all]
+    hostname: yugabytedb
+    command: ["bin/yugabyted", "start", "--background=false", "--callhome=false"]
+    environment:
+      YSQL_USER: nine
+      YSQL_PASSWORD: nine_dev_only
+      YSQL_DB: nine
+      PGPASSWORD: nine_dev_only
+    ports: ["127.0.0.1:15434:5433"]
+    healthcheck:
+      <<: *healthcheck
+      test: ["CMD-SHELL", "postgres/bin/ysqlsh -h yugabytedb -U nine -d nine -tAc \"SELECT value FROM nine_meta WHERE key = 'seed_version'\" | grep -qx 1"]
+
+  yugabytedb-seed:
+    image: yugabytedb/yugabyte:2026.1.3.0-b100@sha256:c1ddbf9c189f6ef33f03c648efadb1b1e82b5e7c8be472c56b1357c024221528
+    profiles: [sql, all]
+    depends_on: {yugabytedb: {condition: service_started}}
+    restart: "no"
+    environment:
+      PGPASSWORD: nine_dev_only
+    volumes:
+      - ./seed/postgresql/01-nine.sql:/seed/01-nine.sql:ro
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        set -e
+        until postgres/bin/ysqlsh -h yugabytedb -U nine -d nine -c 'SELECT 1' >/dev/null 2>&1; do sleep 3; done
+        postgres/bin/ysqlsh -h yugabytedb -U nine -d nine -v ON_ERROR_STOP=1 -f /seed/01-nine.sql
+
+  questdb:
+    image: questdb/questdb:10.2.0@sha256:bbf5b3cb0dfb08ad667a008dbcc48794bf942d18d1ad832cb6ecb7ff87314694
+    profiles: [sql, all]
+    environment:
+      QDB_PG_USER: nine
+      QDB_PG_PASSWORD: nine_dev_only
+      QDB_PG_READONLY_USER_ENABLED: "true"
+      QDB_PG_READONLY_USER: nine_ro
+      QDB_PG_READONLY_PASSWORD: nine_dev_only
+      QDB_TELEMETRY_ENABLED: "false"
+    ports:
+      - "127.0.0.1:18812:8812"   # pg-wire
+      - "127.0.0.1:19000:9000"   # HTTP (REST + web console)
+    healthcheck:
+      <<: *healthcheck
+      test: ["CMD-SHELL", "curl -fsG http://127.0.0.1:9000/exec --data-urlencode \"query=SELECT value FROM nine_meta WHERE key = 'seed_version'\" | grep -q '\"1\"'"]
+
+  questdb-seed:
+    image: postgres:18.7@sha256:9f4fd4aa918f52ae3d6f3b687f1de90d8f867cd4d520021545a9a50c120eae3b
+    profiles: [sql, all]
+    depends_on: {questdb: {condition: service_started}}
+    restart: "no"
+    environment:
+      PGPASSWORD: nine_dev_only
+    volumes:
+      - ./seed/questdb/nine.sql:/seed/nine.sql:ro
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        set -e
+        q() { psql -h questdb -p 8812 -U nine -d qdb -v ON_ERROR_STOP=1 "$$@"; }
+        until q -c 'SELECT 1' >/dev/null 2>&1; do sleep 2; done
+        if q -tAc "SELECT value FROM nine_meta WHERE key = 'seed_version'" 2>/dev/null | grep -qx 1; then
+          echo 'nine dataset already present, skipping'; exit 0
+        fi
+        q -f /seed/nine.sql
+
+  tidb:
+    image: pingcap/tidb:v8.5.8@sha256:df168c764bf2dfdb166dc37a5c3b0e210d29d5f3ab2d33317fd0fdf7b32037f5
+    profiles: [sql, all]
+    command: ["--store=unistore", "--path=/data/tidb", "--advertise-address=tidb"]
+    ports:
+      - "127.0.0.1:14000:4000"   # MySQL protocol
+      - "127.0.0.1:14080:10080"  # status API
+    healthcheck:
+      <<: *healthcheck
+      test: ["CMD-SHELL", "wget -q -O - http://127.0.0.1:10080/status | grep -q connections"]
+
+  tidb-seed:
+    image: mysql:8.4.13@sha256:a81d043930e51745522bd5c430961cf8286f0a23f0a9a2a6e0108f7ea71b0902
+    profiles: [sql, all]
+    depends_on: {tidb: {condition: service_started}}
+    restart: "no"
+    volumes:
+      - ./seed/tidb/nine.sql:/seed/nine.sql:ro
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        set -e
+        root() { mysql -h tidb -P 4000 -u root "$$@"; }
+        nine() { mysql -h tidb -P 4000 -u nine -pnine_dev_only "$$@"; }
+        until root -e 'SELECT 1' >/dev/null 2>&1 || nine -e 'SELECT 1' >/dev/null 2>&1; do sleep 2; done
+        if nine -NBe "SELECT value FROM nine.nine_meta WHERE \`key\` = 'seed_version'" 2>/dev/null | grep -qx 1; then
+          echo 'nine dataset already present, skipping'; exit 0
+        fi
+        # First start: root has no password yet.
+        root -e "CREATE DATABASE IF NOT EXISTS nine;
+                 CREATE USER IF NOT EXISTS 'nine'@'%' IDENTIFIED BY 'nine_dev_only';
+                 GRANT ALL PRIVILEGES ON nine.* TO 'nine'@'%';
+                 ALTER USER 'root'@'%' IDENTIFIED BY 'nine_dev_only_root';"
+        nine nine < /seed/nine.sql
+
+  clickhouse:
+    image: clickhouse/clickhouse-server:26.8.37.168@sha256:a56702852d7c8055a021a42a3a60f49daa49e9204a949ea033e51bb327948648
+    profiles: [sql, all]
+    hostname: clickhouse
+    environment:
+      CLICKHOUSE_USER: nine
+      CLICKHOUSE_PASSWORD: nine_dev_only
+      CLICKHOUSE_DB: nine
+      CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT: 1
+    ports:
+      - "127.0.0.1:18123:8123"   # HTTP interface (used by the driver)
+    volumes:
+      - ./seed/clickhouse/01-nine.sql:/docker-entrypoint-initdb.d/01-nine.sql:ro
+    healthcheck:
+      <<: *healthcheck
+      # Connects through the container hostname: the init-time server only
+      # listens on localhost, so this passes once the real server is up.
+      test: ["CMD-SHELL", "clickhouse-client --host clickhouse --user nine --password \"$$CLICKHOUSE_PASSWORD\" -q \"SELECT value FROM nine.nine_meta WHERE key = 'seed_version'\" | grep -qx 1"]
+
+  trino:
+    image: trinodb/trino:484@sha256:2704eb53935af5e582d63d6033e9bf99d20c325e9b0e30b1016ef59a4773979f
+    profiles: [sql, all]
+    mem_limit: 2g   # the image sizes the JVM heap as a share of available memory
+    ports: ["127.0.0.1:18080:8080"]
+    volumes:
+      - ./seed/trino/catalog:/etc/trino/catalog:ro
+    healthcheck:
+      <<: *healthcheck
+      # The image has no grep: compare the output in the shell.
+      test: ["CMD-SHELL", "test \"$$(trino --server http://127.0.0.1:8080 --user nine --output-format TSV --execute \"SELECT value FROM memory.nine.nine_meta WHERE key = 'seed_version'\" 2>/dev/null)\" = 1"]
+
+  trino-seed:
+    image: trinodb/trino:484@sha256:2704eb53935af5e582d63d6033e9bf99d20c325e9b0e30b1016ef59a4773979f
+    profiles: [sql, all]
+    depends_on: {trino: {condition: service_started}}
+    restart: "no"
+    volumes:
+      - ./seed/trino/nine.sql:/seed/nine.sql:ro
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        set -e
+        t() { trino --server http://trino:8080 --user nine "$$@"; }
+        until t --execute 'SELECT 1' >/dev/null 2>&1; do sleep 3; done
+        if [ "$$(t --output-format TSV --execute "SELECT value FROM memory.nine.nine_meta WHERE key = 'seed_version'" 2>/dev/null)" = 1 ]; then
+          echo 'nine dataset already present, skipping'; exit 0
+        fi
+        t --file /seed/nine.sql
+
+  firebird:
+    image: firebirdsql/firebird:5.0.4@sha256:1529560400fc7847f015c57fc9d70729c44d9a9d8f9000df19c5ce1950b4c202
+    profiles: [sql, all]
+    hostname: firebird
+    environment:
+      FIREBIRD_ROOT_PASSWORD: nine_dev_only_root
+      FIREBIRD_USER: nine
+      FIREBIRD_PASSWORD: nine_dev_only
+      FIREBIRD_DATABASE: nine.fdb
+      FIREBIRD_DATABASE_DEFAULT_CHARSET: UTF8
+    ports: ["127.0.0.1:13050:3050"]
+    volumes:
+      - ./seed/firebird/01-nine.sql:/docker-entrypoint-initdb.d/01-nine.sql:ro
+    healthcheck:
+      <<: *healthcheck
+      test: ["CMD-SHELL", "echo \"SELECT 'seed=' || \\\"VALUE\\\" FROM nine_meta WHERE \\\"KEY\\\" = 'seed_version';\" | /opt/firebird/bin/isql -q -user nine -password \"$$FIREBIRD_PASSWORD\" firebird:/var/lib/firebird/data/nine.fdb | grep -q 'seed=1'"]
+
+  influxdb:
+    image: influxdb:3.12.2-core@sha256:f349b303abfc33e5be9ab67f475d544c4ef53ed5b3b68267842aedb112756b82
+    profiles: [sql, all]
+    command:
+      - influxdb3
+      - serve
+      - --node-id=nine
+      - --object-store=file
+      - --data-dir=/var/lib/influxdb3/data
+      - --admin-token-file=/etc/influxdb3/admin-token.json
+      - --disable-telemetry-upload
+    environment:
+      INFLUXDB3_AUTH_TOKEN: apiv3_nine-dev-only-token
+    ports: ["127.0.0.1:18181:8181"]
+    volumes:
+      - ./seed/influxdb/admin-token.json:/etc/influxdb3/admin-token.json:ro
+    healthcheck:
+      <<: *healthcheck
+      test: ["CMD-SHELL", "influxdb3 query --database nine --format csv \"SELECT value FROM nine_meta WHERE key = 'seed_version'\" | grep -qx 1"]
+
+  influxdb-seed:
+    image: influxdb:3.12.2-core@sha256:f349b303abfc33e5be9ab67f475d544c4ef53ed5b3b68267842aedb112756b82
+    profiles: [sql, all]
+    depends_on: {influxdb: {condition: service_started}}
+    restart: "no"
+    environment:
+      INFLUXDB3_HOST_URL: http://influxdb:8181
+      INFLUXDB3_AUTH_TOKEN: apiv3_nine-dev-only-token
+    volumes:
+      - ./seed/influxdb/seed.sh:/seed/seed.sh:ro
+    entrypoint: ["/bin/sh", "/seed/seed.sh"]
+
+  # --------------------------------------------------------------- nosql ---
+  mongodb:
+    image: mongo:8.0.38@sha256:d97fea17ccb8d004cd137be8dab54d70d0df11be69c9f422aefe4484c8414ab7
+    profiles: [nosql, all]
+    hostname: mongodb
+    environment:
+      MONGO_INITDB_ROOT_USERNAME: nine
+      MONGO_INITDB_ROOT_PASSWORD: nine_dev_only
+      MONGO_INITDB_DATABASE: nine
+    ports: ["127.0.0.1:27117:27017"]
+    volumes:
+      - ./seed/mongodb/01-nine.js:/docker-entrypoint-initdb.d/01-nine.js:ro
+    healthcheck:
+      <<: *healthcheck
+      # Through the container hostname: the init-time mongod only listens on
+      # localhost, so this passes once the real server is up.
+      test: ["CMD-SHELL", "mongosh --quiet \"mongodb://nine:$$MONGO_INITDB_ROOT_PASSWORD@mongodb:27017/nine?authSource=admin\" --eval \"db.nine_meta.countDocuments({_id: 'seed_version'})\" | grep -qx 1"]
+
+  redis:
+    image: redis:8.8.4@sha256:6e61ab45b3e867bacbef2fdd969ec74f4e0f8aaca8cc946cb8ac0c494035e7e7
+    profiles: [nosql, all]
+    command: ["redis-server", "--aclfile", "/etc/redis/users.acl", "--save", "", "--appendonly", "no"]
+    environment:
+      REDISCLI_AUTH: nine_dev_only
+    ports: ["127.0.0.1:16379:6379"]
+    volumes:
+      - ./seed/redis/users.acl:/etc/redis/users.acl:ro
+    healthcheck:
+      <<: *healthcheck
+      test: ["CMD-SHELL", "redis-cli --no-auth-warning HGET nine:meta seed_version | grep -qx 1"]
+
+  redis-seed:
+    image: redis:8.8.4@sha256:6e61ab45b3e867bacbef2fdd969ec74f4e0f8aaca8cc946cb8ac0c494035e7e7
+    profiles: [nosql, all]
+    depends_on: {redis: {condition: service_started}}
+    restart: "no"
+    environment:
+      REDISCLI_AUTH: nine_dev_only
+    volumes:
+      - ./seed/redis/seed.sh:/seed/seed.sh:ro
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        until redis-cli --no-auth-warning -h redis PING 2>/dev/null | grep -q PONG; do sleep 1; done
+        exec /bin/sh /seed/seed.sh redis
+
+  valkey:
+    image: valkey/valkey:9.1.3@sha256:3add1a336a920ea54770a001ab6feb3da5fceea96a40373a3a2cd469b815f0b7
+    profiles: [nosql, all]
+    command: ["valkey-server", "--aclfile", "/etc/valkey/users.acl", "--save", "", "--appendonly", "no"]
+    environment:
+      REDISCLI_AUTH: nine_dev_only
+    ports: ["127.0.0.1:16380:6379"]
+    volumes:
+      - ./seed/redis/users.acl:/etc/valkey/users.acl:ro
+    healthcheck:
+      <<: *healthcheck
+      test: ["CMD-SHELL", "valkey-cli --no-auth-warning HGET nine:meta seed_version | grep -qx 1"]
+
+  valkey-seed:
+    image: valkey/valkey:9.1.3@sha256:3add1a336a920ea54770a001ab6feb3da5fceea96a40373a3a2cd469b815f0b7
+    profiles: [nosql, all]
+    depends_on: {valkey: {condition: service_started}}
+    restart: "no"
+    environment:
+      REDISCLI_AUTH: nine_dev_only
+      CLI: valkey-cli
+    volumes:
+      - ./seed/redis/seed.sh:/seed/seed.sh:ro
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        until valkey-cli --no-auth-warning -h valkey PING 2>/dev/null | grep -q PONG; do sleep 1; done
+        exec /bin/sh /seed/seed.sh valkey
+
+  # --------------------------------------------------------------- heavy ---
+  elasticsearch:
+    image: elasticsearch:9.5.5@sha256:b7b0f24e9b5e90656ffe69804b3a48907499ab2b9cd67f02b7af3aff1b026a89
+    profiles: [heavy, all]
+    environment:
+      discovery.type: single-node
+      ELASTIC_PASSWORD: nine_dev_only
+      xpack.security.enabled: "true"
+      xpack.security.http.ssl.enabled: "false"
+      xpack.security.transport.ssl.enabled: "false"
+      xpack.ml.enabled: "false"
+      ES_JAVA_OPTS: -Xms1g -Xmx1g
+    ports: ["127.0.0.1:19200:9200"]
+    healthcheck:
+      <<: *healthcheck
+      test: ["CMD-SHELL", "printf 'user = \"elastic:%s\"\\n' \"$$ELASTIC_PASSWORD\" | curl -fs -K - http://127.0.0.1:9200/nine_meta/_doc/seed_version | grep -q '\"found\":true'"]
+
+  elasticsearch-seed:
+    image: elasticsearch:9.5.5@sha256:b7b0f24e9b5e90656ffe69804b3a48907499ab2b9cd67f02b7af3aff1b026a89
+    profiles: [heavy, all]
+    depends_on: {elasticsearch: {condition: service_started}}
+    restart: "no"
+    environment:
+      SEARCH_USER: elastic
+      SEARCH_PASSWORD: nine_dev_only
+    volumes:
+      - ./seed/search/seed.sh:/seed/seed.sh:ro
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        until printf 'user = "%s:%s"\n' "$$SEARCH_USER" "$$SEARCH_PASSWORD" | curl -fs -K - 'http://elasticsearch:9200/_cluster/health?wait_for_status=yellow&timeout=5s' >/dev/null; do sleep 3; done
+        exec /bin/sh /seed/seed.sh http://elasticsearch:9200
+
+  opensearch:
+    image: opensearchproject/opensearch:3.9.0@sha256:3b55f6b6249cfdb92b52ee59adc8a266203ba9ef9f5d82544fad6f1af2f3609e
+    profiles: [heavy, all]
+    environment:
+      discovery.type: single-node
+      DISABLE_SECURITY_PLUGIN: "true"
+      DISABLE_INSTALL_DEMO_CONFIG: "true"
+      OPENSEARCH_JAVA_OPTS: -Xms1g -Xmx1g
+    ports: ["127.0.0.1:19201:9200"]
+    healthcheck:
+      <<: *healthcheck
+      test: ["CMD-SHELL", "curl -fs http://127.0.0.1:9200/nine_meta/_doc/seed_version | grep -q '\"found\":true'"]
+
+  opensearch-seed:
+    image: opensearchproject/opensearch:3.9.0@sha256:3b55f6b6249cfdb92b52ee59adc8a266203ba9ef9f5d82544fad6f1af2f3609e
+    profiles: [heavy, all]
+    depends_on: {opensearch: {condition: service_started}}
+    restart: "no"
+    volumes:
+      - ./seed/search/seed.sh:/seed/seed.sh:ro
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        until curl -fs 'http://opensearch:9200/_cluster/health?wait_for_status=yellow&timeout=5s' >/dev/null; do sleep 3; done
+        exec /bin/sh /seed/seed.sh http://opensearch:9200
+
+  cassandra:
+    image: cassandra:5.0.9@sha256:acd754f07c73f3a166bb477354b56ce9a05690c3e5e2aaacc1aab2afddba6436
+    profiles: [heavy, all]
+    environment:
+      CASSANDRA_CLUSTER_NAME: nine
+      MAX_HEAP_SIZE: 1G
+      HEAP_NEWSIZE: 256M
+    ports: ["127.0.0.1:19042:9042"]
+    healthcheck:
+      <<: *healthcheck
+      test: ["CMD-SHELL", "cqlsh -e \"SELECT value FROM nine.nine_meta WHERE key = 'seed_version'\" | grep -q ' 1$$'"]
+
+  cassandra-seed:
+    image: cassandra:5.0.9@sha256:acd754f07c73f3a166bb477354b56ce9a05690c3e5e2aaacc1aab2afddba6436
+    profiles: [heavy, all]
+    depends_on: {cassandra: {condition: service_started}}
+    restart: "no"
+    volumes:
+      - ./seed/cassandra:/seed:ro
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        until cqlsh cassandra 9042 -e 'DESCRIBE KEYSPACES' >/dev/null 2>&1; do sleep 5; done
+        exec /bin/sh /seed/seed.sh cassandra
+
+  neo4j:
+    image: neo4j:2026.10.2-community@sha256:4a2fd4f41ce384aa7d6a74b399f22c202e154f3966119c28a18ed9a500904f5e
+    profiles: [heavy, all]
+    environment:
+      # Every NEO4J_* variable becomes a server setting: no other names here.
+      NEO4J_AUTH: neo4j/nine_dev_only
+      NEO4J_server_memory_heap_max__size: 1G
+      NEO4J_server_memory_pagecache_size: 512M
+      NEO4J_dbms_usage__report_enabled: "false"
+    ports:
+      - "127.0.0.1:17687:7687"   # Bolt
+      - "127.0.0.1:17474:7474"   # HTTP (browser)
+    healthcheck:
+      <<: *healthcheck
+      test: ["CMD-SHELL", "cypher-shell -a bolt://127.0.0.1:7687 -u neo4j -p \"$${NEO4J_AUTH#neo4j/}\" --format plain 'MATCH (m:NineMeta) RETURN count(m)' | tail -n 1 | grep -qx 1"]
+
+  neo4j-seed:
+    image: neo4j:2026.10.2-community@sha256:4a2fd4f41ce384aa7d6a74b399f22c202e154f3966119c28a18ed9a500904f5e
+    profiles: [heavy, all]
+    depends_on: {neo4j: {condition: service_started}}
+    restart: "no"
+    environment:
+      NEO4J_USERNAME: neo4j
+      NEO4J_PASSWORD: nine_dev_only
+    volumes:
+      - ./seed/neo4j:/seed:ro
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        until cypher-shell -a bolt://neo4j:7687 'RETURN 1' >/dev/null 2>&1; do sleep 3; done
+        exec /bin/sh /seed/seed.sh bolt://neo4j:7687

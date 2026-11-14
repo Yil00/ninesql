@@ -52,16 +52,16 @@ The mock driver (feature `mock` of `ninesql-driver-api`, engine id `mock`) decla
 | `clickhouse` | ClickHouse | clickhouse | 8123 (HTTP) | `clickhouse/clickhouse-server` | sql | v0.2 |
 | `trino` | Trino | trino | 8080 | `trinodb/trino` | sql | v0.2 |
 | `firebird` | Firebird | firebird | 3050 | `firebirdsql/firebird` | sql | v0.2 |
-| `influxdb` | InfluxDB 3 Core | influxdb | 8181 | `influxdb` (3-core tag) | sql | v0.2 |
+| `influxdb` | InfluxDB 3 Core | influxdb | 8181 | `influxdb` (`3.x-core` tags) | sql | v0.2 |
 | `mongodb` | MongoDB | mongodb | 27017 | `mongo` | nosql | v0.3 |
 | `redis` | Redis | redis | 6379 | `redis` | nosql | v0.3 |
 | `valkey` | Valkey | redis | 6379 | `valkey/valkey` | nosql | v0.3 |
-| `elasticsearch` | Elasticsearch | search | 9200 | `docker.elastic.co/elasticsearch/elasticsearch` | heavy | v0.4 |
+| `elasticsearch` | Elasticsearch | search | 9200 | `elasticsearch` (Docker Official Image, maintained by Elastic) | heavy | v0.4 |
 | `opensearch` | OpenSearch | search | 9200 | `opensearchproject/opensearch` | heavy | v0.4 |
 | `cassandra` | Apache Cassandra | cassandra | 9042 | `cassandra` | heavy | v0.4 |
 | `neo4j` | Neo4j Community | neo4j | 7687 (Bolt) | `neo4j` | heavy | v0.4 |
 
-Ports in `dev/` are remapped to avoid clashes; `dev/engines.json` (P0-C) is authoritative. Image names, ports and the InfluxDB 3 tag are verified in P0-C.
+Ports in `dev/` are remapped to avoid clashes; [`dev/engines.json`](../dev/engines.json) is authoritative for host ports, pinned images and dev credentials. Image names, default ports and the InfluxDB 3 tag were verified in P0-C: every image above starts and loads the "nine" dataset ([dev/README.md](../dev/README.md)).
 
 ## Read-only mechanism (ADR-0007, I3)
 | Engine | Planned engine-side mechanism | Status |
