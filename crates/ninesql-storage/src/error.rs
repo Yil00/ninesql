@@ -34,6 +34,25 @@ pub enum StorageError {
         /// What was expected (`directory`, `regular file`).
         expected: &'static str,
     },
+    /// A NineSQL directory or file belongs to another user. NineSQL refuses to use it: whoever owns
+    /// it could read or replace workspace files.
+    #[error(
+        "{path} belongs to another user (uid {owner}); NineSQL only uses directories and files owned by the current user"
+    )]
+    NotOwned {
+        /// Path concerned.
+        path: PathBuf,
+        /// Owner found.
+        owner: u32,
+    },
+    /// Another NineSQL process holds the workspace lock.
+    #[error(
+        "another NineSQL process is using this workspace ({path} is locked); close it before starting a new one"
+    )]
+    Locked {
+        /// Lock file.
+        path: PathBuf,
+    },
     /// A file is larger than NineSQL accepts for its kind.
     #[error("{path} is too large ({size} bytes, the limit is {limit} bytes)")]
     TooLarge {

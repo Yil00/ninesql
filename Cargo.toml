@@ -48,6 +48,8 @@ secrecy = "0.10"
 secret-service = { version = "=6.0.0-rc.1", default-features = false, features = ["rt-default", "crypto-rust"] }
 tempfile = "3"
 libc = "0.2"
+# Safe `geteuid` for the workspace ownership check (already in the graph through tempfile).
+rustix = { version = "1", default-features = false, features = ["std", "process"] }
 
 # Driver API (ADR-0004): Arrow sub-crates only, async contract.
 arrow-array = { version = "60.1", default-features = false }

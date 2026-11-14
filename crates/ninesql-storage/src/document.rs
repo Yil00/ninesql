@@ -4,7 +4,12 @@
 //! Rules:
 //! - A file with a **newer** version is refused and left untouched (no silent downgrade).
 //! - An **older** file is migrated step by step (`from` → `from + 1`) on a JSON value; the original
-//!   bytes are kept as `<file>.bak` and the migrated file is written atomically.
+//!   is kept as `<file>.bak` and the migrated file is written atomically. The backup is built from
+//!   a **scrubbed** copy of the original: secret-looking keys are stripped and
+//!   [`Document::scrub`] removes secret-looking values; when neither changes anything, the
+//!   original bytes are kept verbatim.
+//! - A file holding secret-looking keys is rewritten **at once** without them (atomic, `0600`),
+//!   instead of waiting for the next save (I1).
 //! - Unknown fields are ignored on read (models must not use `deny_unknown_fields`) and dropped on
 //!   the next save. A later NineSQL that adds fields bumps `schema_version`.
 //! - Parse errors never echo string values from the file (they could be a misplaced secret).
@@ -14,6 +19,8 @@ use std::path::{Path, PathBuf};
 use serde::de::DeserializeOwned;
 use serde::{Serialize, Serializer};
 use serde_json::Value;
+
+use zeroize::Zeroizing;
 
 use crate::error::StorageError;
 use crate::fs::{self, DEFAULT_READ_LIMIT};
@@ -66,6 +73,18 @@ pub trait Document: Serialize + DeserializeOwned {
     fn migrations() -> &'static [Migration] {
         &[]
     }
+
+    /// Removes secret-looking **values** from the raw content of a file at `schema_version`
+    /// (which may be older than [`Self::SCHEMA_VERSION`]), in place. Called on the copy written as
+    /// the migration backup (`<file>.bak`), after secret-looking keys are stripped, so a misplaced
+    /// secret is never copied into one more file (I1).
+    ///
+    /// The default removes nothing. A model with free-form fields (driver properties, init SQL)
+    /// applies the same rules here as on load, and must accept every layout from version 1 on.
+    /// Implementations zeroize what they remove ([`hygiene::zeroize_value`]).
+    fn scrub(value: &mut Value, schema_version: u32) {
+        let _ = (value, schema_version);
+    }
 }
 
 /// Result of a load.
@@ -81,29 +100,22 @@ pub struct Loaded<D> {
 
 /// Loads a document, migrating it on disk if it is older. Returns `None` if the file is missing.
 ///
+/// If the file holds secret-looking keys that the model drops (unknown keys), it is rewritten at
+/// once without them. Secret-looking entries the model keeps (free-form maps) are left to the
+/// caller, which sanitizes and saves (see [`Loaded::secret_like_keys`]).
+///
 /// # Errors
 /// I/O, parse, version and migration errors. The file is never modified on error.
 pub fn load<D: Document>(path: &Path) -> Result<Option<Loaded<D>>, StorageError> {
     let Some(bytes) = fs::read_private(path, DEFAULT_READ_LIMIT)? else {
         return Ok(None);
     };
+    // The raw content may hold a misplaced secret: zeroized when dropped.
+    let bytes = Zeroizing::new(bytes);
     let loaded = decode::<D>(path, &bytes)?;
-    if !loaded.secret_like_keys.is_empty() {
-        tracing::warn!(
-            path = %path.display(),
-            keys = ?loaded.secret_like_keys,
-            "keys that look like secrets were found and will be dropped on the next save"
-        );
-    }
     if let Some(from) = loaded.migrated_from {
         let bak = backup_path(path);
-        if loaded.secret_like_keys.is_empty() {
-            fs::write_atomic(&bak, &bytes)?;
-        } else {
-            // Never copy a misplaced secret into one more file (I1): the backup keeps everything
-            // but the secret-looking keys.
-            fs::write_atomic(&bak, &scrubbed_backup::<D>(path, &bytes)?)?;
-        }
+        fs::write_atomic(&bak, &backup_bytes::<D>(path, &bytes, from)?)?;
         save(path, &loaded.document)?;
         tracing::info!(
             path = %path.display(),
@@ -112,35 +124,71 @@ pub fn load<D: Document>(path: &Path) -> Result<Option<Loaded<D>>, StorageError>
             backup = %bak.display(),
             "migrated workspace file"
         );
+    } else if !loaded.secret_like_keys.is_empty() {
+        let remaining = serde_json::to_value(&loaded.document)
+            .map(|v| hygiene::find_secret_like_keys(&v).len())
+            .unwrap_or(usize::MAX);
+        if remaining < loaded.secret_like_keys.len() {
+            save(path, &loaded.document)?;
+            tracing::warn!(
+                path = %path.display(),
+                keys = ?loaded.secret_like_keys,
+                "keys that look like secrets were found and removed from the file"
+            );
+        }
+    }
+    if !loaded.secret_like_keys.is_empty() {
+        tracing::warn!(
+            path = %path.display(),
+            keys = ?loaded.secret_like_keys,
+            "keys that look like secrets were found in a workspace file"
+        );
     }
     Ok(Some(loaded))
 }
 
-/// The original file re-encoded in its own format, without its secret-looking keys.
-fn scrubbed_backup<D: Document>(path: &Path, bytes: &[u8]) -> Result<Vec<u8>, StorageError> {
+/// Content of the migration backup: the original file with secret-looking keys stripped and
+/// [`Document::scrub`] applied for `version`. The original bytes when that changes nothing
+/// (keeps comments and layout of hand-edited files), else the scrubbed value re-encoded in the
+/// file's own format.
+fn backup_bytes<D: Document>(
+    path: &Path,
+    bytes: &[u8],
+    version: u32,
+) -> Result<Zeroizing<Vec<u8>>, StorageError> {
     let err = |detail: String| StorageError::Migration {
         path: path.to_path_buf(),
-        from: 0,
-        detail: format!("cannot write a backup without its secret-looking keys: {detail}"),
+        from: version,
+        detail: format!("cannot write a backup without its secret-looking values: {detail}"),
     };
-    let mut value: Value = match D::FORMAT {
+    let mut original: Value = match D::FORMAT {
         Format::Json => serde_json::from_slice(bytes).map_err(|_| err("unreadable".into()))?,
         Format::Toml => std::str::from_utf8(bytes)
             .ok()
             .and_then(|t| toml::from_str(t).ok())
             .ok_or_else(|| err("unreadable".into()))?,
     };
-    hygiene::strip_secret_like_keys(&mut value);
-    match D::FORMAT {
-        Format::Json => {
-            let mut out = serde_json::to_vec_pretty(&value).map_err(|e| err(e.to_string()))?;
-            out.push(b'\n');
-            Ok(out)
+    let mut scrubbed = original.clone();
+    hygiene::strip_secret_like_keys(&mut scrubbed);
+    D::scrub(&mut scrubbed, version);
+    let out = if scrubbed == original {
+        Ok(Zeroizing::new(bytes.to_vec()))
+    } else {
+        match D::FORMAT {
+            Format::Json => serde_json::to_vec_pretty(&scrubbed)
+                .map(|mut out| {
+                    out.push(b'\n');
+                    Zeroizing::new(out)
+                })
+                .map_err(|e| err(e.to_string())),
+            Format::Toml => toml::to_string_pretty(&scrubbed)
+                .map(|t| Zeroizing::new(t.into_bytes()))
+                .map_err(|e| err(e.to_string())),
         }
-        Format::Toml => toml::to_string_pretty(&value)
-            .map(String::into_bytes)
-            .map_err(|e| err(e.to_string())),
-    }
+    };
+    hygiene::zeroize_value(&mut original);
+    hygiene::zeroize_value(&mut scrubbed);
+    out
 }
 
 /// Saves a document atomically with its `schema_version`. The parent directory must exist.
@@ -286,11 +334,14 @@ impl<D: Serialize> Serialize for Envelope<'_, D> {
 /// error message or a log (I1):
 /// - double-quoted literals (`invalid type: string "…"`) are always replaced by `"…"`;
 /// - backtick-quoted text is replaced by `` `…` `` unless it is a key name (right after
-///   `field`) or part of the schema's expectation list (after `expected`), which only hold names
-///   from NineSQL's own models.
+///   `field`) or an item of the schema's expectation list: the contiguous list that starts right
+///   after `expected` or `expected one of` and continues only through `, `, ` or ` and `, or `
+///   separators. Both only hold names from NineSQL's own models; any other text breaks the list.
 pub fn redact(message: &str) -> String {
     let mut out = String::with_capacity(message.len());
     let mut chars = message.char_indices().peekable();
+    // End (byte index) of the last backtick item kept as part of an expectation list.
+    let mut list_end: Option<usize> = None;
     while let Some((i, c)) = chars.next() {
         match c {
             '"' => {
@@ -305,13 +356,21 @@ pub fn redact(message: &str) -> String {
                     }
                 }
                 out.push_str("\"…\"");
+                list_end = None;
             }
             '`' => {
-                let before = &message[..i];
-                let keep = before.trim_end().ends_with("field") || before.contains("expected");
+                let before = message[..i].trim_end();
+                let starts_list =
+                    before.ends_with("expected") || before.ends_with("expected one of");
+                let continues_list =
+                    list_end.is_some_and(|end| matches!(&message[end..i], ", " | " or " | ", or "));
+                let in_list = starts_list || continues_list;
+                let keep = in_list || before.ends_with("field");
                 let mut inner = String::new();
-                for (_, d) in chars.by_ref() {
+                let mut end = message.len();
+                for (j, d) in chars.by_ref() {
                     if d == '`' {
+                        end = j + 1;
                         break;
                     }
                     inner.push(d);
@@ -319,6 +378,7 @@ pub fn redact(message: &str) -> String {
                 out.push('`');
                 out.push_str(if keep { &inner } else { "…" });
                 out.push('`');
+                list_end = in_list.then_some(end);
             }
             _ => out.push(c),
         }
@@ -353,6 +413,41 @@ mod tests {
             "missing field `connection_type`"
         );
         assert_eq!(redact("open `abc"), "open `…`");
+    }
+
+    /// N1: only the contiguous list right after `expected` / `expected one of` is kept.
+    #[test]
+    fn keeps_only_the_expectation_list() {
+        assert_eq!(
+            redact("unknown variant `x`, expected `tcp` or `file`"),
+            "unknown variant `…`, expected `tcp` or `file`"
+        );
+        assert_eq!(
+            redact("expected one of `a`, `b`, or `c`"),
+            "expected one of `a`, `b`, or `c`"
+        );
+        assert_eq!(
+            redact("unknown field `x`, expected one of `a`, `b`"),
+            "unknown field `x`, expected one of `a`, `b`"
+        );
+        // Backtick text after the list, or later in a message that mentions "expected", is
+        // redacted.
+        assert_eq!(
+            redact("expected `a` at line 1 near `Hunter2-Secret`"),
+            "expected `a` at line 1 near `…`"
+        );
+        assert_eq!(
+            redact("expected a string, found `Hunter2-Secret`"),
+            "expected a string, found `…`"
+        );
+        assert_eq!(
+            redact("invalid value `Hunter2-Secret` where `a` was expected, near `s3cret`"),
+            "invalid value `…` where `…` was expected, near `…`"
+        );
+        assert_eq!(
+            redact("expected `a`, \"x\" `Hunter2`"),
+            "expected `a`, \"…\" `…`"
+        );
     }
 
     #[test]

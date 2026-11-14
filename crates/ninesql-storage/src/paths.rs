@@ -6,6 +6,7 @@
 //!                                             connection-types.json, scripts/, diagrams/}
 //! $XDG_DATA_HOME/ninesql/vault.bin
 //! $XDG_DATA_HOME/ninesql/known_hosts
+//! $XDG_DATA_HOME/ninesql/ninesql.lock
 //! $XDG_STATE_HOME/ninesql/{history.sqlite, ninesql.log}
 //! ```
 
@@ -141,6 +142,13 @@ impl Paths {
     #[must_use]
     pub fn known_hosts_file(&self) -> PathBuf {
         self.data_dir.join("known_hosts")
+    }
+
+    /// `$XDG_DATA_HOME/ninesql/ninesql.lock`: the advisory lock held while a NineSQL process uses
+    /// the workspace ([`crate::lock`]).
+    #[must_use]
+    pub fn lock_file(&self) -> PathBuf {
+        self.data_dir.join("ninesql.lock")
     }
 
     /// `$XDG_STATE_HOME/ninesql/history.sqlite`.
@@ -308,6 +316,7 @@ mod tests {
         assert_eq!(p.workspace_dir(), Path::new("/d/ninesql/workspace"));
         assert_eq!(p.vault_file(), Path::new("/d/ninesql/vault.bin"));
         assert_eq!(p.known_hosts_file(), Path::new("/d/ninesql/known_hosts"));
+        assert_eq!(p.lock_file(), Path::new("/d/ninesql/ninesql.lock"));
         assert_eq!(p.history_file(), Path::new("/s/ninesql/history.sqlite"));
         assert_eq!(p.log_file(), Path::new("/s/ninesql/ninesql.log"));
         let proj = p.project(&ProjectName::default_project());

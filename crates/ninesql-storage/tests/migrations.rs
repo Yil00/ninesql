@@ -2,7 +2,7 @@
 #![allow(clippy::unwrap_used, clippy::expect_used)] // Tests may panic (AGENTS.md).
 
 use std::fs;
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
 use ninesql_storage::document::{self, backup_path};
@@ -324,4 +324,102 @@ fn migration_backup_drops_secret_like_keys() {
             .unwrap()
             .contains("Hunter2-Secret")
     );
+}
+
+/// `Sample` with a `scrub` hook that removes tags starting with `pw:` (a stand-in for a model with
+/// free-form values, like driver properties).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+struct Scrubbed {
+    items: Vec<Item>,
+}
+
+impl Document for Scrubbed {
+    const NAME: &'static str = "scrubbed";
+    const FORMAT: Format = Format::Json;
+    const SCHEMA_VERSION: u32 = 3;
+    fn migrations() -> &'static [Migration] {
+        MIGRATIONS
+    }
+    fn scrub(value: &mut Value, schema_version: u32) {
+        assert_eq!(
+            schema_version, 1,
+            "the hook sees the version of the original file"
+        );
+        for item in value["items"].as_array_mut().into_iter().flatten() {
+            if let Some(tags) = item.get_mut("tags").and_then(Value::as_array_mut) {
+                tags.retain(|t| !t.as_str().is_some_and(|t| t.starts_with("pw:")));
+            }
+        }
+    }
+}
+
+#[test]
+fn migration_backup_goes_through_the_scrub_hook() {
+    let tmp = tempfile::tempdir().unwrap();
+    let path = tmp.path().join("scrubbed.json");
+    let content = br#"{ "schema_version": 1, "items": [
+        { "host": "h", "port": 1, "tags": ["blue", "pw:Hunter2-Secret"] } ] }"#;
+    fs::write(&path, content).unwrap();
+    let loaded = document::load::<Scrubbed>(&path).unwrap().unwrap();
+    assert_eq!(loaded.migrated_from, Some(1));
+    // No secret-looking key: only the hook could catch this value.
+    assert!(loaded.secret_like_keys.is_empty());
+    let bak = fs::read_to_string(backup_path(&path)).unwrap();
+    assert!(!bak.contains("Hunter2-Secret"), "{bak}");
+    assert!(bak.contains("\"blue\""), "{bak}");
+    assert!(bak.contains("\"schema_version\": 1"), "{bak}");
+    assert_eq!(
+        fs::metadata(backup_path(&path))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777,
+        0o600
+    );
+}
+
+#[test]
+fn clean_migration_backup_keeps_the_original_bytes() {
+    let tmp = tempfile::tempdir().unwrap();
+    let path = tmp.path().join("scrubbed.json");
+    let content = b"{ \"schema_version\": 1,\n  \"items\": [ { \"host\": \"h\", \"port\": 1, \"tags\": [\"blue\"] } ] }";
+    fs::write(&path, content).unwrap();
+    document::load::<Scrubbed>(&path).unwrap().unwrap();
+    assert_eq!(fs::read(backup_path(&path)).unwrap(), content);
+}
+
+/// N7.2: a plaintext secret found on load is removed from disk at once, not at the next save.
+#[test]
+fn secret_like_keys_are_removed_from_disk_on_load() {
+    let tmp = tempfile::tempdir().unwrap();
+    let path = tmp.path().join("sample.json");
+    let content = br#"{ "schema_version": 3,
+        "items": [ { "hostname": "h", "endpoint": { "port": 1 }, "password": "Hunter2-Secret" } ] }"#;
+    fs::write(&path, content).unwrap();
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
+    let loaded = document::load::<Sample>(&path).unwrap().unwrap();
+    assert_eq!(loaded.secret_like_keys, ["items[0].password"]);
+    assert_eq!(loaded.migrated_from, None);
+    let text = fs::read_to_string(&path).unwrap();
+    assert!(!text.contains("Hunter2-Secret"), "{text}");
+    assert!(text.contains("\"hostname\": \"h\""), "{text}");
+    assert_eq!(
+        fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+        0o600
+    );
+    // No backup of a same-version file, and nothing else left in the directory.
+    let names: Vec<_> = fs::read_dir(tmp.path())
+        .unwrap()
+        .map(|e| e.unwrap().file_name())
+        .collect();
+    assert_eq!(names, [std::ffi::OsString::from("sample.json")]);
+}
+
+/// A clean file is never rewritten on load.
+#[test]
+fn clean_file_is_not_rewritten_on_load() {
+    let (_tmp, path) = workspace_copy("v3.json");
+    let before = fs::metadata(&path).unwrap().ino();
+    document::load::<Sample>(&path).unwrap().unwrap();
+    assert_eq!(fs::metadata(&path).unwrap().ino(), before);
 }
