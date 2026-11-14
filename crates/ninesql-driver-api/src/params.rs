@@ -375,7 +375,11 @@ impl fmt::Debug for PropertyValue {
 /// - `allowpublickeyretrieval` (MySQL): lets the server send its RSA key unauthenticated, so a
 ///   man in the middle on a non-TLS connection can obtain the password;
 /// - MongoDB `authSource` / `authMechanism` are reserved through the `auth` fragment until typed
-///   fields exist (fails closed).
+///   fields exist (fails closed);
+/// - `replication` (PostgreSQL): switches the backend to a walsender, which accepts replication
+///   commands instead of ordinary SQL and so bypasses the session's read-only transaction;
+/// - `gssencmode` (PostgreSQL): GSSAPI encryption is negotiated before, and instead of, TLS, so
+///   it could replace the verified TLS channel chosen in the connection's TLS settings.
 pub const RESERVED_PROPERTY_KEYS: &[&str] = &[
     "uri",
     "nodes",
@@ -406,6 +410,8 @@ pub const RESERVED_PROPERTY_KEYS: &[&str] = &[
     "allowloadlocalinfile",
     "allowlocalinfile",
     "localinfile",
+    "replication",
+    "gssencmode",
 ];
 
 /// Fragments that make a normalized property key reserved wherever they appear: TLS and
@@ -745,6 +751,11 @@ mod tests {
             "allowPublicKeyRetrieval",
             "authSource",
             "authMechanism",
+            "replication",
+            "REPLICATION",
+            "gssencmode",
+            "gssEncMode",
+            "gss_enc_mode",
         ] {
             assert!(is_reserved_property(key), "{key}");
             let mut props = BTreeMap::new();
