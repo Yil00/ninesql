@@ -2,6 +2,10 @@
 -- server-side (cross joins of a digits table). Runs once, on first start,
 -- from /docker-entrypoint-initdb.d in the database "nine".
 
+-- The image's init client picks its character set from the locale (latin1 in the
+-- container), which would store the UTF-8 samples below double-encoded.
+SET NAMES utf8mb4;
+
 CREATE TABLE digits (d TINYINT UNSIGNED PRIMARY KEY);
 INSERT INTO digits VALUES (0),(1),(2),(3),(4),(5),(6),(7),(8),(9);
 

@@ -4576,6 +4576,29 @@ dependencies = [
 ]
 
 [[package]]
+name = "ninesql-driver-mysqlwire"
+version = "0.0.0"
+dependencies = [
+ "arrow-array",
+ "arrow-schema",
+ "async-trait",
+ "base64 0.22.1",
+ "futures-util",
+ "ninesql-driver-api",
+ "proptest",
+ "ring",
+ "rustls",
+ "rustls-native-certs",
+ "rustls-pki-types",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "tokio-rustls",
+ "tracing",
+ "zeroize",
+]
+
+[[package]]
 name = "ninesql-driver-pgwire"
 version = "0.0.0"
 dependencies = [
