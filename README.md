@@ -57,7 +57,7 @@ The 20 most used **open-source, self-hostable** engines. Cloud-only services (Sn
 | **PostgreSQL** | SQL · pg-wire | MVP (v0.1) | 🚧 Driver landed (P1-B), not usable from the UI yet |
 | **MySQL** | SQL · mysql-wire | MVP (v0.1) | 🚧 Driver landed (P1-B), not usable from the UI yet |
 | **MariaDB** | SQL · mysql-wire | MVP (v0.1) | 🚧 Driver landed (P1-B), not usable from the UI yet |
-| **SQLite** | SQL · embedded | MVP (v0.1) | 🗓 Planned |
+| **SQLite** | SQL · embedded | MVP (v0.1) | 🚧 Driver landed (P1-B), not usable from the UI yet |
 | **TimescaleDB** | SQL · pg-wire | MVP (v0.1) | 🗓 Planned |
 | **YugabyteDB** (YSQL) | SQL · pg-wire | MVP (v0.1) | 🗓 Planned |
 | **QuestDB** | SQL · pg-wire | MVP (v0.1) | 🗓 Planned |
