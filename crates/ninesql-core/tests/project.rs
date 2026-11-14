@@ -66,10 +66,12 @@ fn project_v1_fixture_migrates_to_an_id() {
     fs::copy(fixture("project/v1.json"), dir.project_file()).unwrap();
     let ws = Workspace::open(p.clone(), project.clone()).unwrap();
     let id = ws.project_id();
+    // JSON backups are re-encoded from the scrubbed value: same content as the original.
+    let bak: serde_json::Value =
+        serde_json::from_slice(&fs::read(backup_path(&dir.project_file())).unwrap()).unwrap();
     assert_eq!(
-        fs::read(backup_path(&dir.project_file())).unwrap(),
-        bytes,
-        "a clean file is backed up verbatim"
+        bak,
+        serde_json::from_slice::<serde_json::Value>(&bytes).unwrap()
     );
     drop(ws);
     assert_eq!(Workspace::open(p, project).unwrap().project_id(), id);

@@ -494,3 +494,33 @@ fn connections_backup_scrub_uses_the_load_rules() {
     ninesql_core::ConnectionsFile::scrub(&mut other, 1);
     assert_eq!(other, before);
 }
+
+/// Security review L7: when one connection is invalid the load fails, but a secret held by
+/// another connection is still removed from disk; the invalid data stays for the user to fix.
+#[test]
+fn failed_load_still_removes_secrets_from_disk() {
+    const SECRET: &str = "Failed-Load-Secret-41d0";
+    let env = env();
+    let mut with_secret = serde_json::to_value(full_connection()).unwrap();
+    with_secret["properties"] = serde_json::json!({
+        "sslpassword": SECRET,
+        "application_name": "NineSQL"
+    });
+    with_secret["init_sql"] = serde_json::json!([format!("SET PASSWORD = PASSWORD('{SECRET}')")]);
+    let mut invalid = serde_json::to_value(full_connection()).unwrap();
+    invalid["id"] = "00000000-0000-4000-8000-000000000001".into();
+    invalid["name"] = "Broken".into();
+    invalid["endpoint"]["host"] = "bad host with spaces".into();
+    let file = serde_json::json!({ "schema_version": 1, "connections": [with_secret, invalid] });
+    let path = env.workspace.project_paths().connections_file();
+    fs::write(&path, serde_json::to_vec_pretty(&file).unwrap()).unwrap();
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+
+    let err = without_secret_in_logs(&[SECRET], || env.workspace.load_connections().unwrap_err());
+    assert!(err.to_string().contains("Broken"), "{err}");
+    assert_no_secret_on_disk(&env.root, &[SECRET]);
+    let text = fs::read_to_string(&path).unwrap();
+    assert!(text.contains("bad host with spaces"), "{text}");
+    assert!(text.contains("\"application_name\": \"NineSQL\""), "{text}");
+    assert_private_tree(&env.root.join("data"));
+}

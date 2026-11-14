@@ -653,9 +653,17 @@ fn reserved_keys_win_over_benign_lists() {
     assert!(!ninesql_storage::hygiene::is_secret_like_key(
         "passwordCharacterEncoding"
     ));
+    let mut c = basic();
+    c.properties
+        .insert("passwordCharacterEncoding".into(), "UTF-8".into());
+    assert!(matches!(
+        c.validate(),
+        Err(ConnectionError::ReservedProperty { .. })
+    ));
+    // With a value that is not a charset it is treated as a misplaced secret.
     assert!(matches!(
         with_property("passwordCharacterEncoding").validate(),
-        Err(ConnectionError::ReservedProperty { .. })
+        Err(ConnectionError::SecretInProperties { .. })
     ));
 }
 

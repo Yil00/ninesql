@@ -149,34 +149,24 @@ pub fn reserved(key: &str) -> Option<Reserved> {
     Some(class)
 }
 
-/// Key fragments that make a `key=value` pair a credential, matched right before `=` in the
-/// value with whitespace removed (`Password = x`, `client_secret=x`, `access_token=x`).
-const SECRET_PAIR_KEYS: &[&str] = &[
-    "password=",
-    "pwd=",
-    "passwd=",
-    "token=",
-    "apikey=",
-    "api_key=",
-    "api-key=",
-    "secret=",
-];
-
 /// Whether a property value embeds a credential:
 /// - a URL with `user:password@` user info (`postgres://u:p@h/db`, also after `jdbc:`);
 /// - user info without a scheme, as in Go DSNs (`user:pass@tcp(h:3306)/db`,
-///   `user:pass@unix(/s)/db`, `user:pass@/db`): a word with a `:`, then at least one character,
-///   then `@` and something after it. Words are separated by whitespace, quotes and `;`. This
-///   fails closed on look-alikes such as `mailto:a@b`;
-/// - a `password=` / `pwd=` / `passwd=` / `token=` (`access_token=`…) / `apikey=` / `api_key=` /
-///   `secret=` (`client_secret=`…) pair, connection-string style.
+///   `user:pass@unix(/s)/db`, `user:pass@/db`) and Oracle thin URLs with credentials
+///   (`jdbc:oracle:thin:scott/tiger@h:1521/s`): a word with a `:`, then at least one character,
+///   then `@` and something after it. Words are separated by whitespace, quotes and `;`. Two
+///   narrow look-alikes are exempt: the MySQL assignment `@a:=@b` (`:=` right before `@`) and
+///   an Oracle thin URL without credentials (`…:thin:@h`). Others, such as `mailto:a@b`, fail
+///   closed;
+/// - a `key=value` or `key: value` pair (also `"key":"value"`) whose key looks like a secret per
+///   [`ninesql_storage::hygiene::is_secret_like_entry`]: `password`, `pwd`, `pass`, `passphrase`,
+///   `token` (`access_token`, `csrftoken`…), `apikey`, `secret` (`client_secret`,
+///   `aws_secret_access_key`…), `private_key`, `credential`… with a non-empty value. This is the
+///   same fail-closed fragment rule as for property keys, so `token_type=bearer` is refused too.
 #[must_use]
 pub fn value_carries_secret(value: &str) -> bool {
     let lower = value.to_lowercase();
-    url_userinfo(&lower) || schemeless_userinfo(&lower) || {
-        let compact: String = lower.chars().filter(|c| !c.is_whitespace()).collect();
-        SECRET_PAIR_KEYS.iter().any(|p| compact.contains(p))
-    }
+    url_userinfo(&lower) || schemeless_userinfo(&lower) || secret_pair(&lower)
 }
 
 fn url_userinfo(lower: &str) -> bool {
@@ -199,19 +189,82 @@ fn schemeless_userinfo(lower: &str) -> bool {
         .split(|c: char| c.is_whitespace() || matches!(c, '\'' | '"' | '`' | ';'))
         .filter(|word| !word.contains("://"))
         .any(|word| {
-            word.find(':').is_some_and(|colon| {
-                let rest = &word[colon + 1..];
-                rest.find('@')
-                    .is_some_and(|at| at > 0 && at + 1 < rest.len())
+            word.match_indices('@').any(|(at, _)| {
+                let user_info = &word[..at];
+                let exempt = user_info.ends_with(":=") || user_info.ends_with(":thin:");
+                !exempt
+                    && at + 1 < word.len()
+                    && user_info
+                        .find(':')
+                        .is_some_and(|colon| colon + 1 < user_info.len())
             })
         })
 }
 
+/// Characters of a key in a `key=value` / `key: value` pair.
+fn is_key_char(c: char) -> bool {
+    c.is_alphanumeric() || matches!(c, '_' | '-' | '.')
+}
+
+/// Whether a lower-cased value holds a `key=value` / `key: value` pair with a secret-like key and
+/// a non-empty value. `==`, `!=`, `<=`, `>=`, `:=`, `::` and `://` are not pair separators.
+fn secret_pair(lower: &str) -> bool {
+    let chars: Vec<char> = lower.chars().collect();
+    for (i, &c) in chars.iter().enumerate() {
+        if c != '=' && c != ':' {
+            continue;
+        }
+        let prev = i.checked_sub(1).map(|j| chars[j]);
+        let next = chars.get(i + 1).copied();
+        let not_a_separator = match c {
+            '=' => matches!(prev, Some('=' | '!' | '<' | '>' | ':')) || next == Some('='),
+            _ => matches!(next, Some(':' | '/' | '=')) || prev == Some(':'),
+        };
+        if not_a_separator {
+            continue;
+        }
+        // Key: back over spaces and one closing quote, then key characters.
+        let mut k = i;
+        while k > 0 && chars[k - 1] == ' ' {
+            k -= 1;
+        }
+        if k > 0 && matches!(chars[k - 1], '"' | '\'') {
+            k -= 1;
+        }
+        let key_end = k;
+        while k > 0 && is_key_char(chars[k - 1]) {
+            k -= 1;
+        }
+        let key: String = chars[k..key_end].iter().collect();
+        // Value: over spaces and one opening quote, up to a delimiter.
+        let mut v = i + 1;
+        while v < chars.len() && chars[v] == ' ' {
+            v += 1;
+        }
+        if v < chars.len() && matches!(chars[v], '"' | '\'') {
+            v += 1;
+        }
+        let value: String = chars[v..]
+            .iter()
+            .take_while(|c| {
+                !c.is_whitespace() && !matches!(c, '"' | '\'' | ';' | '&' | ',' | '}' | ')')
+            })
+            .collect();
+        if !key.is_empty() && ninesql_storage::hygiene::is_secret_like_entry(&key, &value) {
+            return true;
+        }
+    }
+    false
+}
+
 /// Whether an init SQL statement contains an obvious credential:
-/// - `IDENTIFIED BY …` and `IDENTIFIED WITH <plugin> BY …` (MySQL / MariaDB / Oracle);
+/// - `IDENTIFIED BY …`, `IDENTIFIED WITH <plugin> BY …` and `IDENTIFIED WITH <plugin> AS
+///   '<hash>'` (MySQL / MariaDB / Oracle; a password hash is credential material too);
+/// - `SET PASSWORD [FOR 'u'@'h'] = <literal>` (MySQL);
 /// - `PASSWORD` followed (after an optional `=`, `TO` and opening parentheses) by a string
 ///   literal, including prefixed literals: `'…'`, `"…"`, `$$…$$`, `E'…'`, `N'…'`, `U&'…'`,
-///   `B'…'`, `X'…'` and charset introducers (`_utf8mb4'…'`). This covers
+///   `B'…'`, `X'…'`, charset introducers (`_utf8mb4'…'`) and hexadecimal hashes (`0x…`, SQL
+///   Server `WITH PASSWORD = 0x… HASHED`). This covers
 ///   `PASSWORD '…'`, `SET PASSWORD = PASSWORD('…')`, `ALTER LOGIN … WITH PASSWORD = N'…'` and
 ///   `IDENTIFIED VIA … USING PASSWORD('…')`;
 /// - anything [`value_carries_secret`] reports (`dblink_connect('… password=…')`, DSNs with user
@@ -238,8 +291,28 @@ fn sql_text_carries_secret(sql: &str) -> bool {
     while let Some(pos) = rest.find("identified with") {
         let after = &rest[pos + "identified with".len()..];
         let statement = after.split(';').next().unwrap_or_default();
-        if statement.contains(" by ") || statement.contains(" by'") {
+        if [" by ", " by'", " as ", " as'"]
+            .iter()
+            .any(|w| statement.contains(w))
+        {
             return true;
+        }
+        rest = after;
+    }
+    let mut rest = flat.as_str();
+    while let Some(pos) = rest.find("set password") {
+        let after = &rest[pos + "set password".len()..];
+        let statement = after.split(';').next().unwrap_or_default();
+        // Word boundary: not `set password_encryption`.
+        let whole_word = !statement.starts_with(is_key_char);
+        if whole_word && let Some(eq) = statement.find('=') {
+            let mut value = statement[eq + 1..].trim_start();
+            while let Some(inner) = value.strip_prefix('(') {
+                value = inner.trim_start();
+            }
+            if starts_with_literal(value) {
+                return true;
+            }
         }
         rest = after;
     }
@@ -262,7 +335,7 @@ fn sql_text_carries_secret(sql: &str) -> bool {
 /// Whether lower-cased SQL text starts with a string literal, possibly prefixed.
 fn starts_with_literal(s: &str) -> bool {
     let quoted = |t: &str| t.starts_with(['\'', '"', '$']);
-    if quoted(s) {
+    if quoted(s) || s.starts_with("0x") {
         return true;
     }
     if ["u&", "e", "n", "b", "x"]
@@ -423,6 +496,19 @@ mod tests {
             "secret=abc123",
             "client_secret=abc123",
             "a=1;Password=Hunter2",
+            // Security review L3: JSON / YAML-style pairs and more secret key names.
+            r#"{"password":"Hunter2"}"#,
+            "password: Hunter2",
+            "secret_key=abc123",
+            "aws_secret_access_key=abc123",
+            "private_key=abc123",
+            "pass=Hunter2",
+            "passphrase = Hunter2",
+            "x=1&client_secret=abc",
+            // Fails closed like the key rule (the key `token_type` is refused as a property too).
+            "token_type=bearer",
+            // Oracle thin URL with credentials.
+            "jdbc:oracle:thin:scott/tiger@db:1521/orcl",
         ] {
             assert!(value_carries_secret(bad), "{bad}");
         }
@@ -437,8 +523,16 @@ mod tests {
             "12:30",
             "user:@tcp(db)/app",
             "UTF-8",
-            "token_type=bearer",
             "Europe/Paris",
+            // Security review L5: narrow look-alikes that are not credentials.
+            "jdbc:oracle:thin:@db:1521/orcl",
+            "jdbc:oracle:thin:@//db:1521/orcl",
+            "@a:=@b",
+            "password_encryption=scram-sha-256",
+            "passwordCharacterEncoding: UTF-8",
+            "a==b",
+            "x::text",
+            "token=",
         ] {
             assert!(!value_carries_secret(ok), "{ok}");
         }
@@ -472,6 +566,12 @@ mod tests {
             "SELECT 1 -- ALTER USER app IDENTIFIED BY 'Hunter2'",
             // Connection strings inside SQL.
             "SELECT dblink_connect('host=h user=u password=Hunter2')",
+            // Security review L3.
+            "SET PASSWORD FOR 'app'@'%' = 'Hunter2'",
+            "SET PASSWORD FOR app@localhost = _utf8mb4'Hunter2'",
+            "CREATE USER app IDENTIFIED WITH mysql_native_password AS '*2470C0C06DEE42FD1618BB99005ADCA2EC9D1E19'",
+            "ALTER LOGIN app WITH PASSWORD = 0x0200A1B2C3D4 HASHED",
+            "SET @cfg = '{\"api_key\": \"abc123\"}'",
         ] {
             assert!(sql_carries_secret(bad), "{bad}");
         }
@@ -483,6 +583,8 @@ mod tests {
             "SELECT '--' AS dashes, 'a#b' AS hash",
             "CREATE USER app IDENTIFIED WITH auth_socket",
             "SET application_name = 'NineSQL /* x */'",
+            "SET @a := @b",
+            "SET PASSWORD_ENCRYPTION = 'scram-sha-256'",
         ] {
             assert!(!sql_carries_secret(ok), "{ok}");
         }

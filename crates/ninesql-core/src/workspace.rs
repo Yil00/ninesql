@@ -339,7 +339,7 @@ impl Workspace {
     }
 
     /// Stable identifier of the project, from `project.json`. Secret Service stores of this
-    /// project are scoped with it (`SecretServiceStore::new(workspace.project_id().to_string())`),
+    /// project are scoped with it (`SecretServiceStore::new(&workspace.project_id().to_string())`),
     /// never with the mutable project name (N6).
     #[must_use]
     pub fn project_id(&self) -> ProjectId {
@@ -374,9 +374,9 @@ impl Workspace {
     /// invalid data fails the load.
     ///
     /// # Errors
-    /// Storage errors, invalid or duplicate connections. On a validation error the file is not
-    /// rewritten by this function (secret-looking unknown keys may already have been removed by
-    /// the storage layer, which leaves every other field as it was).
+    /// Storage errors, invalid or duplicate connections. On a validation error the file keeps its
+    /// invalid data for the user to fix, but secret-bearing properties, init SQL and
+    /// secret-looking keys are removed from it first (atomic rewrite of the raw file).
     #[must_use = "load issues (removed connection data) must be shown to the user"]
     pub fn load_connections(&self) -> Result<LoadedConnections, WorkspaceError> {
         let path = self.project_paths.connections_file();
@@ -394,13 +394,19 @@ impl Workspace {
                     problem,
                 });
             }
-            c.validate()
-                .map_err(|source| WorkspaceError::InvalidConnection {
-                    name: c.name.clone(),
-                    source,
-                })?;
+            if let Err(source) = c.validate() {
+                let name = c.name.clone();
+                self.scrub_after_failed_load(&path);
+                return Err(WorkspaceError::InvalidConnection { name, source });
+            }
         }
-        let connections = Connections::from_vec(items)?;
+        let connections = match Connections::from_vec(items) {
+            Ok(connections) => connections,
+            Err(e) => {
+                self.scrub_after_failed_load(&path);
+                return Err(e.into());
+            }
+        };
         if !issues.is_empty() {
             self.save_connections(&connections)?;
             tracing::warn!(
@@ -415,6 +421,26 @@ impl Workspace {
             issues,
             secret_like_keys: loaded.secret_like_keys,
         })
+    }
+
+    /// After a load that parsed but failed validation, removes secret-looking data from the file
+    /// as it is on disk ([`document::scrub_file`] with [`ConnectionsFile::scrub`]), so a secret in
+    /// another connection does not stay on disk until the user fixes the invalid data (I1). The
+    /// invalid data itself is kept for the user to fix. Failures are logged: the validation error
+    /// is what the caller reports.
+    fn scrub_after_failed_load(&self, path: &std::path::Path) {
+        match document::scrub_file::<ConnectionsFile>(path) {
+            Ok(true) => tracing::warn!(
+                project = %self.project,
+                "removed secret-looking data from connections.json, which has invalid data"
+            ),
+            Ok(false) => {}
+            Err(e) => tracing::warn!(
+                project = %self.project,
+                error = %e,
+                "could not remove secret-looking data from connections.json"
+            ),
+        }
     }
 
     /// Validates and atomically writes `connections.json`.
