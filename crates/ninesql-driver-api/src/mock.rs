@@ -369,9 +369,10 @@ fn numbers_batch(
             .iter()
             .map(|f| {
                 if f.name() == "label" {
-                    f.as_ref().clone().with_metadata(
-                        [(TRUNCATED_VALUES_METADATA_KEY.to_owned(), "true".to_owned())].into(),
-                    )
+                    f.as_ref().clone().with_metadata([(
+                        TRUNCATED_VALUES_METADATA_KEY.to_owned(),
+                        "true".to_owned(),
+                    )])
                 } else {
                     f.as_ref().clone()
                 }

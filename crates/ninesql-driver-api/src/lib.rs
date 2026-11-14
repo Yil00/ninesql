@@ -66,7 +66,11 @@ pub use statement::{
     truncate_str,
 };
 
-/// Re-exported Arrow array crate, so drivers and the grid use the exact same version.
+/// Re-exported Arrow array crate (Arrow 60), so drivers and the grid use the exact same version.
 pub use arrow_array;
-/// Re-exported Arrow schema crate.
+/// Re-exported Arrow schema crate (Arrow 60).
+///
+/// Since Arrow 60, field and schema metadata is an [`arrow_schema::Metadata`] map rather than a
+/// `HashMap<String, String>`: read the `ninesql.*` keys with `field.metadata().get(key)` and set
+/// them with `Field::with_metadata([(key, value)])`.
 pub use arrow_schema;
