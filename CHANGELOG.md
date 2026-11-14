@@ -16,9 +16,9 @@ All notable changes to this project are documented here. The format follows [Kee
 - SSH tunnels (`ninesql-ssh`, P1-D): russh with `ring`, jump hosts, `ssh-agent`, Ed25519 / ECDSA key files, `known_hosts` checks and per-hop host-key policies (ADR-0016). RSA key files are refused until RSA support is enabled. Not wired into the core yet.
 - DBeaver workspace parser (`ninesql-dbeaver`, P2-A): read-only detection of native, Flatpak, Snap and custom workspaces; `data-sources*.json` model; `credentials-config.json` decryption into zeroized buffers; mapping to a mirror of the core connection model with fail-closed rules (network profiles, unknown or unreadable handlers, SSH forwarding target mismatch), per-project limits and a `verify-full` TLS default; cargo-fuzz targets for both decoders (not run yet). Import flow and persistence are not done.
 - Driver API: execution-scoped cancel with a busy-until-confirmed rule, timeout watchdog, per-row and header budget accounting, document truncation and depth limit, `extra_reserved_properties`, `retains_secret_after_connect`, wider side-effect classification and SQL-form secret redaction, new conformance helpers.
-- Workspace storage: single-writer lock `$XDG_DATA_HOME/ninesql/ninesql.lock`, immediate rewrite of files holding a plaintext secret, scrubbed migration backups, directory ownership and symlink checks; `project.json` v2 with a stable project UUID that scopes Secret Service items, with duplicate resolution (ADR-0017 proposed).
+- Workspace storage: single-writer lock `$XDG_DATA_HOME/ninesql/ninesql.lock`, immediate rewrite of files holding a plaintext secret, scrubbed migration backups, directory ownership and symlink checks; `project.json` v2 with a stable project UUID that scopes Secret Service items, with duplicate resolution (ADR-0017).
 - GPUI snapshot audit log (`docs/audits/gpui-snapshot.md`).
-- ADR-0015 (0BSD license allowed), ADR-0016 (SSH RSA keys and host-key policies); ADR-0017 (workspace lock, rewrite-on-load and project identity) proposed.
+- ADR-0015 (0BSD license allowed), ADR-0016 (SSH RSA keys and host-key policies); ADR-0017 (workspace lock, rewrite-on-load and project identity) accepted.
 
 ### Changed
 - Minimum Rust version raised to 1.89 (ADR-0012).

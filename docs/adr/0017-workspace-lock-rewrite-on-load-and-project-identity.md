@@ -1,6 +1,6 @@
 # ADR-0017: Workspace lock, rewrite-on-load and project identity
 
-- **Status**: Proposed. Amends [ADR-0008](0008-workspace-and-config-storage.md) Decision §1 (a lock file in `$XDG_DATA_HOME/ninesql`, a stable id in `project.json`), §2 (contents of migration backups) and §3 (single writer); amends [ADR-0012](0012-secret-service-client-and-msrv.md) Decision §4 (two more item attributes). Every other point of both ADRs stands.
+- **Status**: Accepted (maintainer, 2026-11-14). Amends [ADR-0008](0008-workspace-and-config-storage.md) Decision §1 (a lock file in `$XDG_DATA_HOME/ninesql`, a stable id in `project.json`), §2 (contents of migration backups) and §3 (single writer); amends [ADR-0012](0012-secret-service-client-and-msrv.md) Decision §4 (two more item attributes). Every other point of both ADRs stands.
 - **Date**: 2026-11-14
 
 ## Context
