@@ -153,8 +153,9 @@ pub struct LoadIssue {
     pub problem: ConnectionError,
 }
 
-/// Result of [`Workspace::load_connections`].
+/// Result of [`Workspace::load_connections`]. Callers must show `issues` to the user.
 #[derive(Debug, Default)]
+#[must_use = "load issues (removed connection data) must be shown to the user"]
 pub struct LoadedConnections {
     /// The connections, sanitized and valid.
     pub connections: Connections,
@@ -234,6 +235,7 @@ impl Workspace {
     ///
     /// # Errors
     /// Storage errors, invalid or duplicate connections. The file is left untouched on error.
+    #[must_use = "load issues (removed connection data) must be shown to the user"]
     pub fn load_connections(&self) -> Result<LoadedConnections, WorkspaceError> {
         let path = self.project_paths.connections_file();
         let Some(loaded) = document::load::<ConnectionsFile>(&path)? else {

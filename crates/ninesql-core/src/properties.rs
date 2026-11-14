@@ -3,8 +3,8 @@
 //! Driver properties must not carry what the typed model already owns: TLS settings (they would
 //! bypass `TlsConfig` and its warnings, I5), the endpoint, credentials (I1) or the read-only mode
 //! (I3). They must not carry a secret value either. The denylist below is shared by validation
-//! and load-time sanitizing; `ninesql-driver-api` (P0-B) keeps an aligned denylist for TLS, host,
-//! port, credential and read-only keys at the driver boundary.
+//! and load-time sanitizing. **The P0-B driver boundary (`ninesql-driver-api`) must mirror this
+//! denylist and allowlist** for TLS, host, port, credential and read-only keys.
 
 /// What a reserved property key collides with.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -32,15 +32,27 @@ impl Reserved {
     }
 }
 
-/// TLS keys of the main drivers (libpq, JDBC MySQL / MariaDB / SQL Server, MongoDB, Redis…),
-/// normalized (lower case, without `-`, `_`, `.`). Any key starting with `ssl` or `tls` also
-/// counts.
+/// Known-benign keys (normalized) checked **before** every heuristic below and before the
+/// secret-like key check, so that common driver options are never refused or dropped on load.
+/// `passwordcharacterencoding` / `passwordencryption` come from
+/// [`ninesql_storage::hygiene::BENIGN_SECRET_LIKE_KEYS`].
+pub const BENIGN_KEYS: &[&str] = &[
+    // MySQL Connector/J: lets the driver fetch the server RSA key for password exchange on
+    // non-TLS connections (DBeaver sets it on MySQL 8 connections). Not a TLS setting.
+    "allowpublickeyretrieval",
+    // PostgreSQL: GSSAPI encryption, independent from TLS.
+    "gssencmode",
+];
+
+/// TLS keys that do not contain `ssl` or `tls` (normalized). Any key containing `ssl` or `tls`,
+/// starting with `verify`, or one of these counts as TLS.
 pub const TLS_KEYS: &[&str] = &[
-    "usessl",
-    "requiressl",
-    "verifyservercertificate",
-    "trustservercertificate",
+    // ClickHouse / generic: `secure=false` means plaintext.
+    "secure",
+    "insecure",
+    "insecuremode",
     "encrypt",
+    "trustservercertificate",
     "hostnameincertificate",
     "servercertificate",
     "truststore",
@@ -50,12 +62,11 @@ pub const TLS_KEYS: &[&str] = &[
     "keystoretype",
     "trustcertificatekeystoreurl",
     "clientcertificatekeystoreurl",
-    "serversslcert",
-    "allowpublickeyretrieval",
-    "disablesslhostnameverification",
 ];
-/// Normalized key prefixes that are TLS settings.
-pub const TLS_PREFIXES: &[&str] = &["ssl", "tls"];
+/// Normalized substrings that make a key a TLS setting.
+pub const TLS_FRAGMENTS: &[&str] = &["ssl", "tls"];
+/// Normalized prefixes that make a key a TLS setting (`verifyServerCertificate`, `verify_ssl`…).
+pub const TLS_PREFIXES: &[&str] = &["verify"];
 /// Normalized endpoint keys.
 pub const ENDPOINT_KEYS: &[&str] = &["host", "hostaddr", "hostname", "port", "server"];
 /// Normalized credential keys (password-like keys are caught as secrets).
@@ -64,17 +75,28 @@ pub const CREDENTIAL_KEYS: &[&str] = &["user", "username", "uid", "userid"];
 pub const READ_ONLY_KEYS: &[&str] = &["readonly", "defaulttransactionreadonly"];
 
 fn normalize(key: &str) -> String {
-    key.chars()
-        .filter(|c| !matches!(c, '-' | '_' | '.' | ' '))
-        .flat_map(char::to_lowercase)
-        .collect()
+    ninesql_storage::hygiene::normalize_key(key)
+}
+
+/// Whether a key is a known-benign driver option (see [`BENIGN_KEYS`]).
+#[must_use]
+pub fn is_benign(key: &str) -> bool {
+    let k = normalize(key);
+    BENIGN_KEYS.contains(&k.as_str())
+        || ninesql_storage::hygiene::BENIGN_SECRET_LIKE_KEYS.contains(&k.as_str())
 }
 
 /// Whether a property key collides with a typed model field.
 #[must_use]
 pub fn reserved(key: &str) -> Option<Reserved> {
+    if is_benign(key) {
+        return None;
+    }
     let k = normalize(key);
-    if TLS_KEYS.contains(&k.as_str()) || TLS_PREFIXES.iter().any(|p| k.starts_with(p)) {
+    if TLS_KEYS.contains(&k.as_str())
+        || TLS_FRAGMENTS.iter().any(|f| k.contains(f))
+        || TLS_PREFIXES.iter().any(|p| k.starts_with(p))
+    {
         Some(Reserved::Tls)
     } else if ENDPOINT_KEYS.contains(&k.as_str()) {
         Some(Reserved::Endpoint)

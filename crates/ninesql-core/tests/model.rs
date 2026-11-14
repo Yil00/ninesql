@@ -467,3 +467,28 @@ proptest! {
         prop_assert_eq!(back, id);
     }
 }
+
+#[test]
+fn benign_look_alike_properties_survive_sanitize() {
+    let mut c = basic();
+    for key in [
+        "passwordCharacterEncoding",
+        "allowPublicKeyRetrieval",
+        "gssencmode",
+        "rewriteBatchedStatements",
+    ] {
+        c.properties.insert(key.into(), "true".into());
+    }
+    assert!(c.sanitize().is_empty());
+    assert_eq!(c.properties.len(), 4);
+    c.validate().unwrap();
+    // The value check still applies to allowlisted keys.
+    c.properties.insert(
+        "passwordCharacterEncoding".into(),
+        "jdbc:mysql://root:Hunter2@db/x".into(),
+    );
+    assert!(matches!(
+        c.validate(),
+        Err(ConnectionError::SecretInPropertyValue { .. })
+    ));
+}

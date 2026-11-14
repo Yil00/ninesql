@@ -698,7 +698,9 @@ impl Connection {
 
 /// Why a driver property cannot be kept, if it cannot. Never includes the value.
 fn property_problem(key: &str, value: &str) -> Option<ConnectionError> {
-    if ninesql_storage::hygiene::is_secret_like_key(key) {
+    // Known-benign keys skip the key heuristics; their value is still checked.
+    let benign = crate::properties::is_benign(key);
+    if !benign && ninesql_storage::hygiene::is_secret_like_key(key) {
         return Some(ConnectionError::SecretInProperties {
             key: key.to_owned(),
         });
