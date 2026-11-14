@@ -1,6 +1,6 @@
 # ADR-0003: Supported engines for v1 and driver families
 
-- **Status**: Accepted
+- **Status**: Accepted; partially superseded by [ADR-0014](0014-dev-environment-profiles.md) for the dev environment profiles
 - **Date**: 2026-11-14
 
 ## Context

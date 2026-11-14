@@ -8,7 +8,7 @@ New ADR: copy [template.md](template.md), take the next number, status `Proposed
 |---|-------|--------|
 | [0001](0001-native-stack-rust-gpui.md) | Native stack – Rust and GPUI | Accepted, partially superseded by [0013](0013-gpui-source-and-supply-chain.md) |
 | [0002](0002-licensing-and-dependency-policy.md) | Licensing and dependency policy | Accepted, partially superseded by [0013](0013-gpui-source-and-supply-chain.md) |
-| [0003](0003-supported-engines-v1.md) | Supported engines for v1 and driver families | Accepted |
+| [0003](0003-supported-engines-v1.md) | Supported engines for v1 and driver families | Accepted, partially superseded by [0014](0014-dev-environment-profiles.md) |
 | [0004](0004-driver-api-runtime-and-results.md) | Driver API, async runtime and result model | Accepted |
 | [0005](0005-secrets-storage.md) | Secrets storage | Accepted, partially superseded by [0012](0012-secret-service-client-and-msrv.md) |
 | [0006](0006-dbeaver-interoperability.md) | DBeaver interoperability | Accepted |
@@ -19,4 +19,4 @@ New ADR: copy [template.md](template.md), take the next number, status `Proposed
 | [0011](0011-tls-and-ssh-defaults.md) | TLS and SSH defaults | Accepted |
 | [0012](0012-secret-service-client-and-msrv.md) | Secret Service client crate and minimum Rust version | Accepted |
 | [0013](0013-gpui-source-and-supply-chain.md) | GPUI source (gpui-kit / gpui-pre from crates.io) and supply-chain controls | Accepted |
-| [0014](0014-dev-environment-profiles.md) | Dev environment profiles follow ADR-0009 | Proposed (would partially supersede [0003](0003-supported-engines-v1.md)) |
+| [0014](0014-dev-environment-profiles.md) | Dev environment profiles follow ADR-0009 | Accepted |

@@ -1,6 +1,6 @@
 # ADR-0014: Dev environment profiles follow ADR-0009
 
-- **Status**: Proposed
+- **Status**: Accepted (maintainer, 2026-11-14)
 - **Date**: 2026-11-14
 
 ## Context
