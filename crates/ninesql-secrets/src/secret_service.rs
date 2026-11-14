@@ -33,6 +33,10 @@
 //! the id (`<connection uuid>:<slot>`, kind allowed for the slot); if there is not exactly one,
 //! the read fails with [`SecretError::Ambiguous`] rather than guess.
 //!
+//! Deleting removes every item stored under the id in this project, duplicates included; it
+//! fails only if the default-collection item (the one reads use) could not be deleted, or if
+//! nothing could be deleted.
+//!
 //! Calls block the current thread (zbus runs its own executor); run them on a blocking thread,
 //! never on the GPUI foreground.
 
@@ -117,20 +121,6 @@ impl SecretServiceStore {
 
     fn connect<'a>() -> Result<SecretService<'a>, SecretError> {
         SecretService::connect(EncryptionType::Dh).map_err(map_error)
-    }
-
-    /// The single item stored under `id`, if any.
-    fn find<'a>(
-        &self,
-        ss: &'a SecretService<'a>,
-        id: &SecretId,
-    ) -> Result<Option<Item<'a>>, SecretError> {
-        let mut items = self.search(ss, id)?;
-        match items.len() {
-            0 => Ok(None),
-            1 => Ok(items.pop()),
-            _ => Err(SecretError::Ambiguous(id.clone())),
-        }
     }
 
     /// The item to read under `id`: the only one, or among duplicates the single one that
@@ -256,15 +246,60 @@ impl SecretStore for SecretServiceStore {
         write_then_prune(&mut ops, id)
     }
 
+    /// Deletes **every** item stored under `id` in this project (stale duplicates included).
+    /// See [`delete_matches`] for the outcome when some deletions fail.
     fn delete(&self, id: &SecretId) -> Result<bool, SecretError> {
         let ss = Self::connect()?;
-        match self.find(&ss, id)? {
-            Some(item) => {
-                item.delete().map_err(map_error)?;
-                Ok(true)
-            }
-            None => Ok(false),
+        let items = self.search(&ss, id)?;
+        if items.is_empty() {
+            return Ok(false);
         }
+        let in_default: Vec<String> = ss
+            .get_default_collection()
+            .and_then(|c| {
+                c.search_items(self.lookup(id))
+                    .map(|found| found.iter().map(|i| i.item_path.to_string()).collect())
+            })
+            .map_err(map_error)?;
+        let flagged: Vec<(&Item<'_>, bool)> = items
+            .iter()
+            .map(|item| (item, in_default.contains(&item.item_path.to_string())))
+            .collect();
+        delete_matches(id, &flagged, |item| item.delete().map_err(map_error))
+    }
+}
+
+/// Deletes every item found under `id`, logging each failure. Returns:
+/// - `Ok(false)` when there is no item;
+/// - the error of a default-collection item that could not be deleted (the credential NineSQL
+///   reads is still there);
+/// - otherwise `Ok(true)` if at least one item was deleted, else the first error.
+fn delete_matches<P>(
+    id: &SecretId,
+    items: &[(P, bool)],
+    mut delete: impl FnMut(&P) -> Result<(), SecretError>,
+) -> Result<bool, SecretError> {
+    let mut deleted_any = false;
+    let mut default_failure = None;
+    let mut first_failure = None;
+    for (item, in_default) in items {
+        match delete(item) {
+            Ok(()) => deleted_any = true,
+            Err(e) => {
+                tracing::warn!(id = %id, in_default_collection = in_default, error = %e, "could not delete a secret item");
+                if *in_default && default_failure.is_none() {
+                    default_failure = Some(e);
+                } else if first_failure.is_none() {
+                    first_failure = Some(e);
+                }
+            }
+        }
+    }
+    match (default_failure, first_failure) {
+        (Some(e), _) => Err(e),
+        (None, _) if deleted_any => Ok(true),
+        (None, Some(e)) => Err(e),
+        (None, None) => Ok(false),
     }
 }
 
@@ -490,6 +525,43 @@ mod tests {
         fake.matching = Err(());
         write_then_prune(&mut fake, &id()).unwrap();
         assert_eq!(fake.log, ["create", "matching"]);
+    }
+
+    /// Security review L8: delete removes every match and succeeds unless the default-collection
+    /// item stays.
+    #[test]
+    fn delete_removes_every_match() {
+        let id = id();
+        let mut seen = Vec::new();
+        let items = [(1u32, false), (2, true), (3, false)];
+        let ok = delete_matches(&id, &items, |p| {
+            seen.push(*p);
+            if *p == 3 {
+                Err(SecretError::Locked(StoreKind::Keyring))
+            } else {
+                Ok(())
+            }
+        });
+        assert!(ok.unwrap());
+        assert_eq!(seen, [1, 2, 3]);
+        // The default-collection item could not be deleted: error, after trying the others.
+        let mut seen = Vec::new();
+        let err = delete_matches(&id, &items, |p| {
+            seen.push(*p);
+            if *p == 2 {
+                Err(SecretError::Locked(StoreKind::Keyring))
+            } else {
+                Ok(())
+            }
+        });
+        assert!(matches!(err, Err(SecretError::Locked(_))));
+        assert_eq!(seen, [1, 2, 3]);
+        // Nothing deleted at all: the first error.
+        let err = delete_matches(&id, &[(1u32, false)], |_| {
+            Err(SecretError::Locked(StoreKind::Keyring))
+        });
+        assert!(matches!(err, Err(SecretError::Locked(_))));
+        assert!(!delete_matches(&id, &[] as &[(u32, bool)], |_| Ok(())).unwrap());
     }
 
     #[test]
