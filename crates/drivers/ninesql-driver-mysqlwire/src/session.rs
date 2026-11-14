@@ -96,6 +96,15 @@ impl MySession {
         } else {
             "SET SESSION TRANSACTION READ WRITE"
         };
+        // The control connection first (it only runs `KILL QUERY`), bounded: if it does not
+        // answer, the operation fails and the session keeps its previous mode.
+        if let Err(e) = self.control.setup(sql).await {
+            return Err(if read_only {
+                DriverError::ReadOnly(format!("cannot enable read-only mode: {e}"))
+            } else {
+                e
+            });
+        }
         // The verification inside `internal` must not see the old flag mid-change.
         let was = self.link.shared.read_only.swap(false, Ordering::SeqCst);
         if let Err(e) = self.run(sql).await {
@@ -129,10 +138,6 @@ impl MySession {
             .shared
             .read_only
             .store(read_only, Ordering::SeqCst);
-        // Same mechanism on the control connection (it only runs `KILL QUERY`).
-        if let Err(e) = self.control.setup(sql).await {
-            tracing::warn!(error = ?std::mem::discriminant(&e), "control connection mode not changed");
-        }
         Ok(())
     }
 

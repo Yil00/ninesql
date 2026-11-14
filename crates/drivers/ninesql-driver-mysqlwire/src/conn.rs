@@ -946,6 +946,30 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn stuck_control_connection_setup_times_out_and_is_dropped() {
+        let conn = after_ok(|mut s| async move {
+            let _query = read_frame(&mut s).await;
+            // Never answers.
+            tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+        })
+        .await;
+        let control = crate::cancel::Control::new(conn);
+        let started = std::time::Instant::now();
+        assert!(matches!(
+            control.setup("SET SESSION TRANSACTION READ ONLY").await,
+            Err(DriverError::Timeout(_))
+        ));
+        assert!(started.elapsed() < std::time::Duration::from_secs(10));
+        // Dropped: nothing left to configure.
+        assert!(
+            control
+                .setup("SET SESSION TRANSACTION READ ONLY")
+                .await
+                .is_ok()
+        );
+    }
+
+    #[tokio::test]
     async fn oversized_column_definitions_are_refused() {
         let mut conn = after_ok(|mut s| async move {
             let _query = read_frame(&mut s).await.unwrap();

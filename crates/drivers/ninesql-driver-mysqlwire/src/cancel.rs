@@ -46,18 +46,41 @@ impl Control {
         control
     }
 
-    /// Runs a statement on the control connection (setup only: read-only mode).
+    /// Runs a statement on the control connection (setup only: read-only mode), bounded by
+    /// [`SERVER_CANCEL_GRACE`]. A lost control connection has nothing to configure (`Ok`); a
+    /// control connection that does not answer in time is dropped and the call fails with
+    /// [`DriverError::Timeout`].
     pub(crate) async fn setup(&self, sql: &str) -> DriverResult<()> {
-        let mut g = self.conn.lock().await;
-        let c = g
-            .as_mut()
-            .ok_or_else(|| DriverError::Closed("control connection lost".into()))?;
-        match c.query(sql).await? {
-            Ok(_) => Ok(()),
-            Err(e) => Err(DriverError::Connect(format!(
-                "control connection setup failed: {}",
-                e.display()
-            ))),
+        let run = async {
+            let mut g = self.conn.lock().await;
+            let Some(c) = g.as_mut() else {
+                tracing::debug!("control connection lost: nothing to configure");
+                return Ok(());
+            };
+            match c.query(sql).await {
+                Ok(Ok(_)) => Ok(()),
+                Ok(Err(e)) => Err(DriverError::Connect(format!(
+                    "control connection setup failed: {}",
+                    e.display()
+                ))),
+                Err(e) => {
+                    *g = None;
+                    Err(e)
+                }
+            }
+        };
+        match tokio::time::timeout(SERVER_CANCEL_GRACE, run).await {
+            Ok(r) => r,
+            Err(_) => {
+                // The connection is in an unknown state: drop it (the timed-out future released
+                // the lock).
+                if let Ok(mut g) = self.conn.try_lock()
+                    && let Some(mut c) = g.take()
+                {
+                    drop(tokio::spawn(async move { c.quit().await }));
+                }
+                Err(DriverError::Timeout(SERVER_CANCEL_GRACE))
+            }
         }
     }
 
