@@ -37,12 +37,13 @@ pub enum ConnectionError {
         /// Property key.
         key: String,
     },
-    /// A driver property that shadows a typed field (TLS, endpoint, user, read-only).
-    #[error("the driver property `{key}` is not allowed; set it with `{use_instead}` instead")]
+    /// A driver property reserved by the driver API rule (TLS, endpoint, credentials, read-only,
+    /// init SQL, session modes…), see [`crate::properties::reserved`].
+    #[error("the driver property `{key}` is reserved: {use_instead}")]
     ReservedProperty {
         /// Property key.
         key: String,
-        /// Model field to use instead.
+        /// What to do instead, as a sentence fragment ([`crate::properties::Reserved::model_field`]).
         use_instead: &'static str,
     },
     /// A driver property whose value embeds a credential (URL user info, `password=`). The value
