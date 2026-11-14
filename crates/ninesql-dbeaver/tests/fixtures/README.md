@@ -18,6 +18,12 @@ DBeaver is only a test-data generator. It is downloaded outside the repository, 
 
 Tarballs come from `https://dbeaver.io/files/<version>/<tarball>` (from 26.x the link redirects to the GitHub release asset). Each bundles its own JRE. Note the file name change at 25.x (`linux.gtk.x86_64` became `linux-x86_64`).
 
+The same SHA-256 values are hard-coded in `generate.sh`, which refuses to extract a tarball that does not match. To check a download by hand:
+
+```sh
+echo "a0dce46bb01cd2447c2d51388a39d3cda7ac58930fc558ebf3945aca5b859360  dbeaver-ce-26.2.4-linux-x86_64.tar.gz" | sha256sum -c
+```
+
 ## Layout
 
 Each fixture keeps DBeaver's relative layout of a default Linux workspace (`~/.local/share/DBeaverData/workspace6/`):
@@ -29,7 +35,7 @@ dbeaver-<version>/workspace6/
     ├── .project                             Eclipse project file with the DBeaver nature
     └── .dbeaver/
         ├── data-sources.json                connections, folders, connection types (plain JSON)
-        └── credentials-config.json          saved users / passwords (encrypted, see below)
+        └── credentials-config.json          saved users / passwords, obfuscated (fixed-key AES, see below)
 ```
 
 Only the files NineSQL reads are copied. Left out: `.metadata/.plugins/`, logs, `dbeaver-instance.properties` (local port), `workspace-id`, `General/.settings/`, and the `.data-sources.json.bak` / `.credentials-config.json.bak` backups DBeaver writes next to the real files (an importer must ignore these dot-files). DBeaver did not create `project-settings.json` or `Scripts/` in these flows, so they are not covered yet.
@@ -69,36 +75,45 @@ Connection types present: `dev`, `prod`, `test` (DBeaver built-ins, written by D
 | `oracle-legacy` | `nine_user` / `fixture-not-a-secret` | — |
 | `roundtrip-marker` | `nine_user` / (none) | — |
 
-## `credentials-config.json` encryption
+## `credentials-config.json`: obfuscated, not protected
 
-Verified on all five versions (same scheme, same decrypted structure):
+Because the key is the same for every installation, this is obfuscation, not protection: anyone who can read the file can recover the passwords. Treat a DBeaver credentials-config.json as plaintext secrets.
+
+Scheme, verified on all five versions (same scheme, same decrypted structure):
 
 - AES-128-CBC with PKCS#5/7 padding.
 - Key: the fixed key from DBeaver Community's source code, hex `babb4a9f774ab853c96c2d653dfe544a` (identical for every installation; that is why NineSQL moves the secrets to the keyring, ADR-0005).
 - File = 16-byte IV followed by the ciphertext.
 - Plaintext: compact JSON, `{ "<connection id>": { "#connection": { "user": …, "password": … }, "network/ssh_tunnel": { "user": …, "password": … } } }`. Keys are omitted when no value is saved; connections with nothing saved have no entry.
 
-Decrypted values are for tests only and must stay in memory (I1); never print them in test output or snapshots.
+Decrypted values are for tests only and must stay in memory (I1); never print them in test output or snapshots. `tests/fixtures_layout.rs` decrypts every fixture and checks that each user is one of `nine_user`, `nine_ro`, `nine_ssh`, each password starts with `fixture-`, and each entry belongs to a connection of the sibling `data-sources.json`; its messages name connection ids only.
 
 ## How the fixtures were generated
 
-Run on Ubuntu 24.04 (x86_64) with `xvfb`, `xdotool`, `xauth` and the GTK 3 runtime (`libgtk-3-0t64`) installed through `apt-get`. For each version:
+Run on Ubuntu 24.04 (x86_64) with `xvfb`, `xdotool`, `xauth` and the GTK 3 runtime (`libgtk-3-0t64`) installed through `apt-get`; `sha256sum`, `setsid` and `unshare` come from coreutils / util-linux. For each version:
 
 ```sh
-# outside the repository, one new empty directory per version
-mkdir -p "$SCRATCH/$VERSION" && tar -xzf "dbeaver-ce-$VERSION-<suffix>.tar.gz" -C "$SCRATCH/$VERSION"
-crates/ninesql-dbeaver/tests/fixtures/generate.sh "$VERSION" "$SCRATCH/$VERSION/dbeaver" \
+# $SCRATCH/run-$VERSION must be new or empty and outside the repository (the script checks both)
+crates/ninesql-dbeaver/tests/fixtures/generate.sh "$VERSION" "dbeaver-ce-$VERSION-<suffix>.tar.gz" \
   "$SCRATCH/run-$VERSION" crates/ninesql-dbeaver/tests/fixtures/dbeaver-$VERSION
 ```
 
 [`generate.sh`](generate.sh) does the following:
 
-1. Starts DBeaver under `Xvfb` with a fresh workspace (`-data`), a throw-away `HOME`, `-Duser.name=nine_user`, no proxy variables (DBeaver gets no network access), and one `-con "driver=…|name=…|…|save=true|connect=false"` per connection, plus `-quit`. First-run dialogs (sample database, tips) are dismissed with `xdotool`. On 26.x the first-run "Product Configuration" wizard is suppressed with `-Dproduct.config.disable=true`.
-2. Applies [`hand-edit.py`](hand-edit.py) to `data-sources.json` (see below).
-3. Starts DBeaver again with one more `-con` (`roundtrip-marker`). Saving it makes DBeaver re-read the hand-edited file and re-serialize **the whole registry** in its own format: plaintext handler credentials are moved into `credentials-config.json`, connection-type definitions are rewritten from DBeaver's own registry, and anything DBeaver does not understand is dropped. The committed files are this second output, so every field in them was written by DBeaver.
-4. Copies the files listed under [Layout](#layout).
+1. Verifies the tarball's SHA-256 against its table and extracts it into the scratch directory.
+2. Starts DBeaver under `Xvfb` with a fresh workspace (`-data`), `-Duser.name=nine_user` and an isolated environment:
+   - an empty environment (`env -i`): only `PATH`, a throw-away `HOME`, `XDG_DATA_HOME` / `XDG_CONFIG_HOME` / `XDG_CACHE_HOME` / `XDG_RUNTIME_DIR` inside it, `DISPLAY`, `LANG`, `USER`. No proxy variables, no `DBUS_SESSION_BUS_ADDRESS`, no `SSH_AUTH_SOCK`;
+   - its own network namespace (`unshare -rn`, or `bwrap --unshare-net`), so DBeaver has no network at all (its update check and driver-catalog requests fail with `UnknownHostException`). Xvfb is reached over its Unix socket. When neither tool works, the script prints a warning and runs with the host network;
+   - its own process group (`setsid`), so it can be stopped without matching command lines.
 
-DBeaver 25.x and 26.x exit on their own after `-quit`; 22.x to 24.x do not when started headless, so the script stops them with `SIGTERM` once the expected connections are on disk (DBeaver writes both files synchronously when a connection is saved; the script checks the connection count after exit).
+   DBeaver gets one `-con "driver=…|name=…|…|save=true|connect=false"` per connection, plus `-quit`. First-run dialogs (sample database, tips) are dismissed with `xdotool`. On 26.x the first-run "Product Configuration" wizard is suppressed with `-Dproduct.config.disable=true`.
+3. Applies [`hand-edit.py`](hand-edit.py) to `data-sources.json` (see below).
+4. Starts DBeaver again with one more `-con` (`roundtrip-marker`). Saving it makes DBeaver re-read the hand-edited file and re-serialize **the whole registry** in its own format: plaintext handler credentials are moved into `credentials-config.json`, connection-type definitions are rewritten from DBeaver's own registry, and anything DBeaver does not understand is dropped. The committed files are this second output, so every field in them was written by DBeaver.
+5. Copies the files listed under [Layout](#layout).
+
+The committed fixtures were first generated before the namespace and `env -i` isolation existed, with only the proxy variables cleared (the build sandbox has no direct outbound route, so DBeaver's update and driver-catalog requests failed). 22.3.5 and 26.2.4 were then regenerated with the isolated script: the output is identical apart from the generated connection ids.
+
+DBeaver 25.x and 26.x usually exit on their own after `-quit` (26.2.4 did not in one of the isolated runs); 22.x to 24.x never do when started headless. When DBeaver does not exit, the script stops its process group with `SIGTERM` once the expected connections are on disk (DBeaver writes both files synchronously when a connection is saved; the script checks the connection count after exit).
 
 ### Hand edits
 
