@@ -79,6 +79,11 @@ const DENIED_FUNCTIONS: &[&str] = &[
     "edit",
 ];
 
+/// Pragmas no session may set: they would lift a protection the driver applies to every
+/// connection (`trusted_schema`, `cell_size_check`) or rewrite the schema (`writable_schema`,
+/// also neutralised by the defensive flag).
+const PROTECTION_PRAGMAS: &[&str] = &["trusted_schema", "cell_size_check", "writable_schema"];
+
 /// Pragmas only the driver itself sets (while [`Worker::privileged`] is on).
 const DRIVER_PRAGMAS: &[&str] = &[
     "query_only",
@@ -364,6 +369,19 @@ pub(crate) fn authorize(
         } else {
             Authorization::Allow
         };
+    }
+    // In every session: the pragmas that would undo the driver's protections against hostile
+    // files (review L1). Reading them is allowed; the driver alone sets `cell_size_check`.
+    if let AuthAction::Pragma {
+        pragma_name,
+        pragma_value: Some(_),
+    } = action
+    {
+        let name = pragma_name.to_ascii_lowercase();
+        if PROTECTION_PRAGMAS.contains(&name.as_str()) && !(privileged && name == "cell_size_check")
+        {
+            return Authorization::Deny;
+        }
     }
     if !read_only {
         return Authorization::Allow;
@@ -684,6 +702,12 @@ impl Worker {
         c.set_db_config(DbConfig::SQLITE_DBCONFIG_DEFENSIVE, true)
             .map_err(cfg)?;
         c.set_db_config(DbConfig::SQLITE_DBCONFIG_TRUSTED_SCHEMA, false)
+            .map_err(cfg)?;
+        // A double-quoted name that matches no column must not silently become a string
+        // literal (an edit's `WHERE "id" = ?` would then match every row; review L2).
+        c.set_db_config(DbConfig::SQLITE_DBCONFIG_DQS_DML, false)
+            .map_err(cfg)?;
+        c.set_db_config(DbConfig::SQLITE_DBCONFIG_DQS_DDL, false)
             .map_err(cfg)?;
         if ro {
             c.set_db_config(DbConfig::SQLITE_DBCONFIG_ENABLE_ATTACH_CREATE, false)
@@ -1116,15 +1140,21 @@ impl Worker {
             stmt.raw_bind_parameter(i + 1, v).map_err(|e| fail(&e))?;
         }
         let ncols = stmt.column_count();
-        // Names and declared types of a hostile file may not be valid UTF-8, which the client
-        // library treats as a bug (it panics): turn that into an error.
-        let columns = catch_unwind(AssertUnwindSafe(|| {
-            stmt.columns()
-                .map(|c| {
-                    let (name, _) = truncate_str(c.name(), MAX_COLUMN_NAME as u64);
-                    (name.to_owned(), c.decl_type().map(str::to_owned))
-                })
-                .collect::<Vec<_>>()
+        // Names come from `Statement::column_name`, which reports a bad index as an error; but
+        // rusqlite 0.42 still `expect`s valid UTF-8 in it and in declared types (column.rs), and
+        // a hostile file can hold any bytes: the panic is caught and becomes an error (review
+        // L4). This needs unwinding: see the `panic = "abort"` note in this crate's Cargo.toml.
+        let columns = catch_unwind(AssertUnwindSafe(|| -> rusqlite::Result<Vec<_>> {
+            let mut out = Vec::with_capacity(ncols);
+            for i in 0..ncols {
+                let (name, _) = truncate_str(stmt.column_name(i)?, MAX_COLUMN_NAME as u64);
+                out.push(name.to_owned());
+            }
+            let decls: Vec<Option<String>> = stmt
+                .columns()
+                .map(|c| c.decl_type().map(str::to_owned))
+                .collect();
+            Ok(out.into_iter().zip(decls).collect::<Vec<_>>())
         }))
         .map_err(|_| {
             Stop::Failed(DriverError::Query {
@@ -1132,7 +1162,8 @@ impl Worker {
                 message: "a column name or declared type is not valid UTF-8".into(),
                 position: None,
             })
-        })?;
+        })?
+        .map_err(|e| fail(&e))?;
         let (names, decls): (Vec<String>, Vec<Option<String>>) = columns.into_iter().unzip();
         let writes = !stmt.readonly();
         let mut rows = stmt.raw_query();
@@ -1746,11 +1777,48 @@ mod tests {
         assert!(raw(&w, "SELECT * FROM evil").is_err());
         assert!(raw(&w, "INSERT INTO t VALUES (1)").is_err());
         assert!(raw(&w, "SELECT load_extension('/nonexistent/evil')").is_err());
-        raw(&w, "PRAGMA writable_schema = ON").unwrap();
+        // The protections cannot be lifted, read-write or not (review L1).
+        for sql in [
+            "PRAGMA writable_schema = ON",
+            "PRAGMA trusted_schema = 1",
+            "PRAGMA main.trusted_schema(1)",
+            "PRAGMA cell_size_check = 0",
+        ] {
+            assert!(raw(&w, sql).is_err(), "{sql}");
+        }
+        raw(&w, "PRAGMA trusted_schema").unwrap();
         assert!(raw(&w, "UPDATE sqlite_schema SET sql = 'x' WHERE name = 't'").is_err());
+        // Double-quoted strings are identifiers only (review L2).
+        assert!(raw(&w, "SELECT * FROM t WHERE a = \"no_such_column\"").is_err());
         // Ordinary writes work.
         raw(&w, "CREATE TABLE ok (a)").unwrap();
         raw(&w, "INSERT INTO ok VALUES (1)").unwrap();
+    }
+
+    /// With `DQS_DDL` off, a schema written by an older tool with double-quoted string literals
+    /// still loads and works (SQLite parses stored schemas leniently).
+    #[test]
+    fn legacy_double_quoted_schema_still_opens() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("legacy.db");
+        {
+            let c = Connection::open(&path).unwrap();
+            c.set_db_config(DbConfig::SQLITE_DBCONFIG_DQS_DDL, true)
+                .unwrap();
+            c.execute_batch(
+                "CREATE TABLE t (a TEXT DEFAULT \"x\", b INTEGER CHECK (a <> \"bad\")); \
+                 INSERT INTO t (b) VALUES (1);",
+            )
+            .unwrap();
+        }
+        for ro in [true, false] {
+            let w = open(&path, ro);
+            raw(&w, "SELECT a, b FROM t").unwrap();
+            if !ro {
+                raw(&w, "INSERT INTO t (b) VALUES (2)").unwrap();
+                assert!(raw(&w, "INSERT INTO t (a, b) VALUES ('bad', 3)").is_err());
+            }
+        }
     }
 
     #[test]

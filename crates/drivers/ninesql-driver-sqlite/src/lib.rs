@@ -118,8 +118,7 @@ pub const EXTRA_RESERVED_PROPERTIES: &[&str] = &[
 /// Driver properties the SQLite driver accepts (normalized keys). Any other key is refused at
 /// connect (fails closed):
 /// - `busy_timeout`: milliseconds to wait for a lock, `0..=600000` (default 5000);
-/// - `cache_size`: `PRAGMA cache_size`, an integer in `-1048576..=1000000` (pages, or KiB when
-///   negative);
+/// - `cache_size`: `PRAGMA cache_size` in its KiB form only, `-1048576..=-1` (at most 1 GiB);
 /// - `foreign_keys`: `PRAGMA foreign_keys`, `on` / `off` (`true` / `false`, `1` / `0`); on by
 ///   default in the bundled build.
 pub const ACCEPTED_PROPERTIES: &[&str] = &["busytimeout", "cachesize", "foreignkeys"];
@@ -225,8 +224,10 @@ fn accepted_properties(
                 busy = Duration::from_millis(ms);
             }
             "cachesize" => {
+                // KiB only (negative form), at most 1 GiB: a page count would scale with the
+                // page size of the file (review L3).
                 let n: i64 = v.parse().map_err(|_| invalid())?;
-                if !(-1_048_576..=1_000_000).contains(&n) {
+                if !(-1_048_576..=-1).contains(&n) {
                     return Err(invalid());
                 }
                 pragmas.push(format!("PRAGMA cache_size = {n}"));
@@ -452,6 +453,8 @@ mod tests {
             ("busy_timeout", "+5"),
             ("busy_timeout", "9999999"),
             ("cache_size", "1e9"),
+            ("cache_size", "262144"),
+            ("cache_size", "-1048577"),
             ("foreign_keys", "maybe-secret"),
             ("temp_store", "MEMORY"),
             ("whatever", "secret-value"),
