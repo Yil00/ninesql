@@ -21,14 +21,39 @@ P0-A and P0-B gate phase 1. P2 (interop) only depends on P0-D and runs in parall
 
 | Workstream | Owner | Tasks |
 |----------|--------------|--------|
-| P0-A GPUI spike | `ui-engineer` | [ ] Pin a `zed-industries/zed` revision and the matching `gpui-component` revision in the workspace `Cargo.toml` (ADR-0001) · [ ] `crates/ninesql-ui/examples/spike.rs`: a window with tabs, a dock, a text input with tree-sitter SQL highlighting, and a virtual table of 1 000 000 synthetic rows · [ ] Builds in CI on `ubuntu-24.04` with the system packages listed in `docs/10-supported-platforms.md` · [ ] Measured locally and written in the PR: cold start to first frame, idle RSS, RSS with 1 M rows, scroll smoothness (frame times) on Wayland and X11 · [ ] Go / no-go note: anything GPUI or `gpui-component` cannot do for phases 1 to 5 (editor, table, IME, clipboard, drag-and-drop, accessibility) and the workaround |
-| P0-B Driver API | `driver-engineer` | [ ] `ninesql-driver-api`: `Driver`, `Session`, `Metadata`, `Dialect`, `Capabilities`, `ConnectParams` with a secret handle, `ResultStream` (Arrow batches, documents, update counts, notices, `Truncated`), errors (ADR-0004) · [ ] A mock driver used by UI and core tests · [ ] Capability model documented in rustdoc and mirrored in `docs/08-engine-capabilities.md` · [ ] **Freeze**: `security-reviewer` review, then the API changes only through reviewed PRs |
-| P0-C Dev environment | `driver-engineer` | [ ] `dev/compose.yaml` with all 20 engines, official images pinned by digest, `127.0.0.1` only, profiles `core` / `sql` / `nosql` / `heavy` / `all` (ADR-0009) · [ ] `dev/engines.json` (id, service, port, image, readiness, profile) · [ ] "nine" sample dataset per engine, fake data only, including a 1 M-row table and an all-types table · [ ] `dev/README.md`: start / stop, ports, dev credentials, the no-Docker path for cloud sandboxes · [ ] CI job that brings up each profile and checks readiness (`heavy` nightly) |
-| P0-D Storage | `core-engineer` | [ ] `ninesql-storage`: XDG paths, `schema_version`, atomic writes, `0700` / `0600`, migrations with fixtures (ADR-0008) · [ ] Connection model in `ninesql-core` (engine id, endpoint, auth with secret reference, SSH, TLS, type, folder, properties, `origin`) · [ ] `ninesql-secrets` skeleton: trait + in-memory test store; Secret Service backend spike on Debian 12 and Ubuntu 24.04 (GNOME and KDE) |
-| P0-E Parity audit | `docs-keeper` | [ ] Re-check every row of `docs/07-feature-parity.md` (edition column, missing features) against the current DBeaver documentation and release notes · [ ] Collect anonymized DBeaver workspaces from at least three DBeaver versions as interop fixtures (with `interop-engineer`) |
+| P0-A GPUI spike | `ui-engineer` | [x] Pin GPUI and `gpui-component` in the workspace `Cargo.toml`: done as an exact pin of `gpui-kit` 0.9.1 from crates.io instead of a git revision of `zed-industries/zed` ([ADR-0013](adr/0013-gpui-source-and-supply-chain.md) supersedes ADR-0001 §2) · [x] `crates/ninesql-ui/examples/spike.rs`: a window with tabs, a dock, a text input with tree-sitter SQL highlighting, and a virtual table of 1 000 000 synthetic rows · [x] Builds in CI on `ubuntu-24.04` with the system packages listed in `docs/10-supported-platforms.md` (`gpui-spike.yml`, software-rendered smoke test under Xvfb) · [ ] Measured locally on a real GPU and written in the PR: cold start to first frame, idle RSS, RSS with 1 M rows, scroll smoothness (frame times) on Wayland and X11. *Not done: only software-rendered numbers (llvmpipe, cloud sandbox) exist; the maintainer runs `crates/ninesql-ui/examples/spike-measure.sh` on a real GPU* · [x] Go / no-go note: **GO with workarounds** ([docs/spikes/p0-a-gpui.md](spikes/p0-a-gpui.md)); X11 IME crash to patch in P1, Orca not tested |
+| P0-B Driver API | `driver-engineer` | [x] `ninesql-driver-api`: `Driver`, `Session`, `Metadata`, `Dialect`, `Capabilities`, `ConnectParams` with a secret handle, `ResultStream` (Arrow batches, documents, update counts, notices, `Truncated`), errors (ADR-0004) · [x] A mock driver used by UI and core tests (feature `mock`, with conformance helpers) · [x] Capability model documented in rustdoc and mirrored in `docs/08-engine-capabilities.md` · [x] **Freeze**: `security-reviewer` review approved; from now on the API changes only through reviewed PRs. Deferred review items: [Phase 0 follow-ups](#phase-0-follow-ups) |
+| P0-C Dev environment | `driver-engineer` | [x] `dev/compose.yaml` with all 20 engines, official images pinned by digest, `127.0.0.1` only, profiles `core` / `sql` / `nosql` / `heavy` / `all` (ADR-0009; the ADR-0003 / ADR-0009 profile wording is reconciled by the proposed [ADR-0014](adr/0014-dev-environment-profiles.md)). *YugabyteDB and Elasticsearch reached ready only with a local disk override that is not committed; the Cassandra / heavy profile was not re-run as a whole after the last changes* · [x] `dev/engines.json` (id, service, port, image, readiness, profile) · [x] "nine" sample dataset per engine, fake data only, including a 1 M-row table and an all-types table. *The wide table of ADR-0009 is not built yet* · [x] `dev/README.md`: start / stop, ports, dev credentials, the no-Docker path for cloud sandboxes · [ ] CI job that brings up each profile and checks readiness (`heavy` nightly). *Written (`.github/workflows/dev-env.yml`), never run yet: done after its first green run* |
+| P0-D Storage | `core-engineer` | [x] `ninesql-storage`: XDG paths, `schema_version`, atomic writes, `0700` / `0600`, migrations with fixtures (ADR-0008) · [x] Connection model in `ninesql-core` (engine id, endpoint, auth with secret reference, SSH, TLS, type, folder, properties, `origin`) · [x] `ninesql-secrets` skeleton: trait + in-memory test store; Secret Service backend written on `secret-service` 6 ([ADR-0012](adr/0012-secret-service-client-and-msrv.md)) · [ ] Secret Service backend validated on Debian 12 and Ubuntu 24.04 (GNOME and KDE). *Not done: only checked on a private session bus without a provider; the real round trip is an ignored test left to the maintainer* |
+| P0-E Parity audit | `docs-keeper` | [x] Re-check every row of `docs/07-feature-parity.md` (edition column, missing features) against the current DBeaver documentation and release notes (DBeaver 26.2.4: 91 rows checked, 22 corrected, 14 added, 2 unverified) · [x] DBeaver workspaces from at least three DBeaver versions as interop fixtures (with `interop-engineer`): synthetic workspaces written by five DBeaver CE builds, 22.3.5 to 26.2.4, fake content only ([fixtures README](../crates/ninesql-dbeaver/tests/fixtures/README.md)) |
 | P0-F Repository | `docs-keeper` | [x] Documentation, ADR-0001 to ADR-0011, agent definitions, CI (fmt, clippy, tests, `cargo deny`, links), crate skeleton · [x] Repository settings (maintainer, see [RELEASE.md](../RELEASE.md#5-repository-configuration-one-time-maintainer)): `dev` as default branch, branch rulesets on `main` / `dev` with the `CI result` required check, squash into `dev` / merge commit into `main`, private vulnerability reporting enabled; CodeQL workflow added |
 
 **Exit criterion**: the GPUI spike shows 1 M rows scrolling smoothly on Ubuntu 24.04 (Wayland and X11) with measured numbers; the driver API is frozen; `docker compose --profile all up` brings all 20 engines to ready in CI.
+
+**Exit status** (2026-11-14): the driver API is frozen. Not met yet: real-GPU measurements of the spike (only software-rendered numbers exist) and a green run of the dev-environment CI job. Phase 1 starts in parallel; both items stay open above.
+
+### Phase 0 follow-ups
+Items deferred by the phase 0 security reviews and spikes. The detail of each review item is in the review comments of its task; the deadline is when the item must have landed.
+
+| Origin | Item | Must land |
+|---|---|---|
+| P0-A | Real-GPU measurements on Wayland and X11 (`spike-measure.sh`, maintainer) | Before the phase 0 exit criterion is declared met |
+| P0-A | Patch the X11 IME crash (`xim-ctext` / `zed-xim`, `[patch.crates-io]` under ADR-0013's rules) and report it upstream | P1 (P1-A) |
+| P0-A | Test accessibility with Orca | Before P6 |
+| P0-A | Trim the build packages of `docs/10-supported-platforms.md`; check Ubuntu 22.04 and Debian 12 builds and Vulkan adapters | P1 |
+| P0-B review | M6: cancel races | Before the first P1 driver (P1-B) |
+| P0-B review | L1, L2, L3, L4, L5 | Before the first P1 driver (P1-B) |
+| P0-B review | F1, F2, F4, F5, F7 | Before the first P1 driver (P1-B) |
+| P0-B | Per-engine SQL that lifts read-only (liftable mechanisms), with tests | P1-B, per engine |
+| P0-C | Commit a fix for the YugabyteDB / Elasticsearch disk requirement, re-run the heavy profile whole, first green `dev-env.yml` run | Before the first P1 driver integration test in CI |
+| P0-C | Build the wide table of the "nine" dataset (ADR-0009) | Before P3-B grid work relies on it |
+| P0-D | Secret Service round trip on GNOME Keyring and KWallet, Debian 12 and Ubuntu 24.04 ([ADR-0012](adr/0012-secret-service-client-and-msrv.md)) | Before P1-D ships the Secret Service backend |
+| P0-D review | N1, N3, N4, N6, N7.2, N7.4 | Before P1-D |
+| P0-D review | L2, L5, L6, L8 | Before P1-D |
+| P0-D review | L-A (`gsslib`), L-B (ambiguous duplicate), L-C | Before P1-D |
+| P0-D review | Scrub secret-looking values (not only keys) from the `.bak` written by a migration | Before the first workspace schema bump |
+| ADR-0012 | Move `secret-service` from `=6.0.0-rc.1` to a stable 6.x; revisit the `ctutils` lock (RUSTSEC-2026-0385) | Stable release available; checked at each phase-end review |
+| ADR-0013 | `cargo vet` or a checked-in audit log | Before `gpui-kit` becomes a normal dependency in P1 |
 
 ## Phase 1 – Application shell, connections, first drivers
 *Objective: connect to PostgreSQL, MySQL, MariaDB and SQLite (directly, over TLS and over SSH) from a real NineSQL window, with secrets in the keyring.*
@@ -108,7 +133,7 @@ P0-A and P0-B gate phase 1. P2 (interop) only depends on P0-D and runs in parall
 ## Phase 7 – Analytical SQL engines (v0.2)
 | Workstream | Owner | Tasks |
 |----------|--------------|--------|
-| P7-A Embedded / analytical | `driver-engineer` | [ ] DuckDB (file and in-memory, read-only open, `spawn_blocking`) · [ ] ClickHouse (HTTP, TLS, query cancel via `KILL QUERY` / query id) · [ ] Trino (client protocol, paging via `nextUri`, cancel via `DELETE`) · [ ] Firebird (pure-Rust wire, read-only transactions) · [ ] InfluxDB 3 (SQL over HTTP, token in secret store) |
+| P7-A Embedded / analytical | `driver-engineer` | [ ] DuckDB (file and in-memory, read-only open, `spawn_blocking`) · [ ] ClickHouse (HTTP, TLS, query cancel via `KILL QUERY` / query id) · [ ] Trino (client protocol, paging via `nextUri`, cancel via `DELETE`) · [ ] Firebird (pure-Rust wire, read-only transactions) · [ ] InfluxDB 3 (SQL over HTTP, token in secret store) (F-NOSQL-06) |
 | P7-B UI | `ui-engineer` | [ ] Engine-specific connection fields, file pickers for DuckDB, metadata views for catalogs (Trino), databases / tables (ClickHouse) |
 
 ## Phase 8 – Document and key-value engines (v0.3)
@@ -130,14 +155,14 @@ P0-A and P0-B gate phase 1. P2 (interop) only depends on P0-D and runs in parall
 | P10-A Schema tools | `ui-engineer` + `driver-engineer` | [ ] Create / alter / drop forms with script preview (F-NAV-08), dependencies (F-NAV-09), users / roles / grants (F-NAV-10), data search (F-NAV-11), schema compare (F-NAV-12) |
 | P10-B ER diagrams | `ui-engineer` | [ ] GPU canvas, auto layout, custom diagrams, PNG / SVG export (F-ERD-01 to F-ERD-03) |
 | P10-C Explain and outline | `ui-engineer` + `driver-engineer` | [ ] Visual explain plans per engine (F-SQL-13), outline and go to definition (F-SQL-14) |
-| P10-D Data | `ui-engineer` + `core-engineer` | [ ] FK lookups (F-DATA-08), grouping / color rules (F-DATA-11), GIS viewer (F-DATA-12), auto-refresh (F-DATA-13) · [ ] XLSX / XML / Parquet export (F-XFER-02), table-to-table transfer (F-XFER-04), saved tasks (F-XFER-05) |
-| P10-E Admin tools | `driver-engineer` + `ui-engineer` | [ ] Native backup / restore (F-TOOL-01), sessions (F-TOOL-02), locks (F-TOOL-03), maintenance (F-TOOL-04), dashboards (F-TOOL-05), multi-connection scripts (F-TOOL-06) |
-| P10-F Workspace | `core-engineer` | [ ] Multiple projects (F-CON-13), local engine detection (F-CON-16), bookmarks (F-WS-05), git-friendly projects (F-WS-07) |
+| P10-D Data | `ui-engineer` + `core-engineer` | [ ] FK lookups (F-DATA-08), grouping / color rules (F-DATA-11), GIS viewer (F-DATA-12), auto-refresh (F-DATA-13), virtual keys and virtual columns (F-DATA-16) · [ ] XLSX / XML / Parquet export (F-XFER-02), table-to-table transfer (F-XFER-04), saved tasks (F-XFER-05) |
+| P10-E Admin tools | `driver-engineer` + `ui-engineer` | [ ] Native backup / restore (F-TOOL-01), sessions (F-TOOL-02), locks (F-TOOL-03), maintenance (F-TOOL-04), dashboards (F-TOOL-05), multi-connection scripts (F-TOOL-06), script execution through the native client (F-TOOL-07) |
+| P10-F Workspace | `core-engineer` | [ ] Multiple projects (F-CON-13), local engine detection (F-CON-16), network profiles (F-CON-17), bookmarks (F-WS-05), git-friendly projects (F-WS-07) |
 
 ## Phase 11 – v1.0 parity completion
 | Workstream | Owner | Tasks |
 |----------|--------------|--------|
-| P11-A Beyond CE | per item | [ ] Visual query builder (F-SQL-17), data compare (F-DATA-14), scheduling (F-XFER-06), mock data (F-XFER-07), schema edit from ERD (F-ERD-04) |
+| P11-A Beyond CE | per item | [ ] Visual query builder (F-SQL-17), data compare (F-DATA-14), scheduling (F-XFER-06), mock data (F-XFER-07), schema edit from ERD (F-ERD-04), charts from results (F-DATA-15), XLSX / XML import (F-XFER-08) |
 | P11-B Ecosystem | per item | [ ] Opt-in AI assistant with a user-provided endpoint (F-WS-08, needs an ADR on data sent), translations (F-WS-09) |
 | P11-C Parity audit | `docs-keeper` + `security-reviewer` | [ ] Every `F-…` row done or `won't do` with a reason; end-of-v1 security review |
 

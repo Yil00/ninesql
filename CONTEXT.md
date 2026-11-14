@@ -6,9 +6,10 @@ Project context for every contributor, human or AI agent. Read it **before** any
 NineSQL is an open-source (Apache 2.0) native database client for Debian and Ubuntu, written in Rust with a GPU-rendered GPUI interface, that aims at DBeaver feature parity on the 20 most used open-source engines and imports DBeaver workspaces.
 
 ## Where the project stands
-- **Current phase**: 0 – Foundations (see [docs/ROADMAP.md](docs/ROADMAP.md)), not started.
-- Done: repository bootstrap (documentation, ADR-0001 to ADR-0011, agent definitions, CI for format / lint / tests / licenses / links, empty crate skeleton that compiles without GPUI). Repository settings applied: `dev` is the default branch, `main` and `dev` are protected by rulesets (PR required, `CI result` required, no force-push), private vulnerability reporting is on.
-- Next: the GPUI spike (P0-A) and the driver API contract (P0-B) gate everything else. The dev environment (P0-C) can start in parallel.
+- **Current phase**: 0 – Foundations is essentially done; **phase 1** (shell, connections, first drivers) is next (see [docs/ROADMAP.md](docs/ROADMAP.md)).
+- Done: repository bootstrap and settings (P0-F); GPUI spike with a GO verdict and workarounds, GPUI taken from crates.io through `gpui-kit` 0.9.1 under supply-chain controls (P0-A, [docs/spikes/p0-a-gpui.md](docs/spikes/p0-a-gpui.md)); driver API with mock driver, security-reviewed and **frozen** (P0-B); dev environment with the 20 engines and the "nine" dataset (P0-C, [dev/README.md](dev/README.md)); workspace storage, connection model and secrets skeleton with a Secret Service backend on `secret-service` 6 (P0-D); feature parity audit against DBeaver 26.2.4 and synthetic DBeaver fixtures from five versions (P0-E). ADR-0001 to ADR-0013 are accepted; ADR-0014 (dev profiles) is proposed.
+- Still open from phase 0: real-GPU measurements of the spike on Wayland and X11 (maintainer); a first green run of the dev-environment CI job; the Secret Service round trip on GNOME and KDE desktops (Debian 12, Ubuntu 24.04); the deferred security-review items listed under [Phase 0 follow-ups](docs/ROADMAP.md#phase-0-follow-ups), most of which must land before the first P1 driver or P1-D.
+- Next: phase 1 – P1-A shell, P1-B pg-wire / mysql-wire / SQLite drivers, P1-C connections UI, P1-D core services (driver runtime, secrets, SSH). P2 (DBeaver import) can start in parallel on the P0-E fixtures.
 
 ## Invariants (non-negotiable)
 | # | Invariant | Source |

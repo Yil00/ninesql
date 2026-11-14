@@ -36,7 +36,7 @@ Parity means the user can do the same job, not that the UI is a copy: NineSQL ma
 | F-CON-14 | Import connections from DBeaver (connections, folders, types, SSH, TLS, passwords, scripts) | — | 2 | planned | verified: NineSQL-specific |
 | F-CON-15 | Export connections to DBeaver format (no passwords) | — | 5 | planned | verified: NineSQL-specific |
 | F-CON-16 | Open a local database file (SQLite / DuckDB) directly; local engine detection (sockets) | CE (file open only) | 10 | planned | corrected: DBeaver opens SQLite / DuckDB files from the File menu (release notes 25.3.4); automatic detection of local engines has no DBeaver equivalent |
-| F-CON-17 | Network profiles: reusable SSH / proxy settings shared by several connections, global or per project | CE | — | planned | added (`Network-profiles`, release notes 26.1.3) |
+| F-CON-17 | Network profiles: reusable SSH / proxy settings shared by several connections, global or per project | CE | 10 | planned | added (`Network-profiles`, release notes 26.1.3) |
 | F-CON-18 | Password retrieved from a shell command at connect time | CE | — | planned | added (`Password-from-Shell-Command`, release notes 26.1.4; 26.2.3 added a confirmation before the command runs) |
 | F-CON-19 | Change the current user's database password, including an expired password at login | CE | — | planned | added (`Change-current-user-password`: PostgreSQL and MySQL in CE, some other engines PRO) |
 | F-CON-20 | Import connections from other tools (DataGrip, pgAdmin 4, DbVisualizer, MySQL Workbench, Navicat, SQL Developer, SQuirreL, Toad, CSV) | CE | — | planned | added (`How-to-import-Connections-from-External-Tools`); DBeaver does not import their secrets |
@@ -101,8 +101,8 @@ Parity means the user can do the same job, not that the UI is a copy: NineSQL ma
 | F-DATA-12 | Spatial / GIS viewer (map for geometry columns) | CE / PRO (some engines) | 10 | planned | verified: CE for PostGIS, MySQL / MariaDB, SQLite GeoPackage, DuckDB, ClickHouse; Oracle, SQL Server and some cloud engines are PRO (`Working-with-Spatial-GIS-data`) |
 | F-DATA-13 | Auto-refresh of results | CE | 10 | planned | verified (`Data-Refresh`) |
 | F-DATA-14 | Compare two result sets / data compare | PRO (EE/UE) | 11 | planned | corrected: Enterprise and Ultimate only, not Lite (`Data-compare`) |
-| F-DATA-15 | Charts from result sets | PRO | — | planned | added (`Managing-Charts`) |
-| F-DATA-16 | Virtual model: virtual keys and foreign keys, calculated (virtual) columns, saved per connection | CE | — | planned | added (`Virtual-Keys`, `Virtual-column-expressions`) |
+| F-DATA-15 | Charts from result sets | PRO | 11 | planned | added (`Managing-Charts`) |
+| F-DATA-16 | Virtual model: virtual keys and foreign keys, calculated (virtual) columns, saved per connection | CE | 10 | planned | added (`Virtual-Keys`, `Virtual-column-expressions`) |
 
 ## Data transfer (`XFER`)
 | Id | Feature | Edition | Phase | Status | Audit |
@@ -114,7 +114,7 @@ Parity means the user can do the same job, not that the UI is a copy: NineSQL ma
 | F-XFER-05 | Saved tasks (re-runnable exports / transfers) | CE | 10 | planned | verified (`Task-Management`, `SQL-Script-Task`); not in Lite |
 | F-XFER-06 | Task scheduling | PRO (EE/UE) | 11 | planned | corrected: `Task-Scheduler` says Enterprise and Ultimate, while `Task-Management` says Lite, Enterprise and Ultimate. Composite tasks are also EE/UE (`Composite-Tasks`) |
 | F-XFER-07 | Mock data generation | PRO (EE/UE) | 11 | planned | corrected: Enterprise and Ultimate only, not Lite (`Mock-Data-Generation`) |
-| F-XFER-08 | Import from XLSX and XML files | PRO | — | planned | added (`Data-transfer`) |
+| F-XFER-08 | Import from XLSX and XML files | PRO | 11 | planned | added (`Data-transfer`) |
 
 ## Database tools (`TOOL`)
 | Id | Feature | Edition | Phase | Status | Audit |
@@ -125,7 +125,7 @@ Parity means the user can do the same job, not that the UI is a copy: NineSQL ma
 | F-TOOL-04 | Maintenance: vacuum / analyze / optimize / reindex | CE? | 10 | planned | unverified: no documentation page; only listed as "Analyze and vacuum" in `Enterprise-Edition` |
 | F-TOOL-05 | Server dashboards (connections, throughput, locks) | CE | 10 | planned | verified: predefined for PostgreSQL and MySQL (`Dashboards`); not in Lite |
 | F-TOOL-06 | Execute SQL scripts from files against several connections | CE | 10 | planned | verified (`SQL-Script-Task`; release notes 26.2.3: run script files without opening them) |
-| F-TOOL-07 | Execute a script through the engine's native client (`psql`, `mysql`) | CE | — | planned | added (`Execute-Script-with-Local-Client`) |
+| F-TOOL-07 | Execute a script through the engine's native client (`psql`, `mysql`) | CE | 10 | planned | added (`Execute-Script-with-Local-Client`) |
 
 ## ER diagrams (`ERD`)
 | Id | Feature | Edition | Phase | Status | Audit |
