@@ -1,6 +1,9 @@
 [workspace]
 resolver = "3"
 members = ["crates/*"]
+# Patched copies of third-party crates (ADR-0013 rules, docs/audits/gpui-snapshot.md): reached
+# only through [patch.crates-io] below, never workspace members.
+exclude = ["crates/patches"]
 # Driver crates are added under crates/drivers/ from P1-B (ADR-0003) and listed here.
 
 [workspace.package]
@@ -43,6 +46,8 @@ proptest = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 toml = "0.8"
+# Comment-preserving edits of settings.toml (P1-A); the version toml 0.8 already uses.
+toml_edit = { version = "0.22", default-features = false, features = ["parse", "display"] }
 uuid = { version = "1", features = ["v4", "serde"] }
 secrecy = "0.10"
 secret-service = { version = "=6.0.0-rc.1", default-features = false, features = ["rt-default", "crypto-rust"] }
@@ -107,6 +112,14 @@ opt-level = 3
 
 [profile.dev.package.blake2]
 opt-level = 3
+
+# X11 IME crash fix (P1-A follow-up, docs/spikes/p0-a-gpui.md): exact copies of the crates.io
+# releases locked in Cargo.lock, changed only where a file says "Modified for NineSQL". Each patch
+# keeps the upstream version number, so `cargo update` cannot move it; drop it once upstream
+# ships the fix. The diff summary is in docs/audits/gpui-snapshot.md.
+[patch.crates-io]
+xim-ctext = { path = "crates/patches/xim-ctext" }
+zed-xim = { path = "crates/patches/zed-xim" }
 
 [profile.release]
 lto = "thin"

@@ -51,6 +51,11 @@ jobs:
         with:
           tool: cargo-deny@0.20.2
       - run: cargo deny --locked check
+      # Patched third-party crates (docs/audits/gpui-snapshot.md): allowlisted [patch] entries
+      # under crates/patches/ only, no registry source in Cargo.lock, archive sha256 as recorded,
+      # and every changed file marked "Modified for NineSQL".
+      - name: Patched crates
+        run: scripts/verify-patches.sh
       # ADR-0013 (security review of P0-A): GPUI must never get an HTTP client (I2), and
       # GPUI's credential API must not be used: secrets go through ninesql-secrets (I1).
       - name: Forbidden GPUI APIs under crates/

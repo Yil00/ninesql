@@ -17,6 +17,7 @@ ninesql-core.workspace = true
 ninesql-grid.workspace = true
 ninesql-editor.workspace = true
 toml.workspace = true
+toml_edit.workspace = true
 tracing.workspace = true
 # GPUI and gpui-component through gpui-kit, a normal dependency since P1-A (ADR-0013: controls
 # 1-5 and 7 in place, audit trail in docs/audits/gpui-snapshot.md). Never enable `hot-reload`,
@@ -36,3 +37,11 @@ path = "src/main.rs"
 [dev-dependencies]
 # TestAppContext for view-model tests (AGENTS.md): GPUI's own `test-support`, see root Cargo.toml.
 gpui-pre = { workspace = true, features = ["test-support"] }
+tempfile.workspace = true
+# Regression test of the patched X11 IME decoder ([patch.crates-io] in the root Cargo.toml).
+xim-ctext = { version = "=0.3.0", default-features = false }
+
+# Anchors GPUI's XIM client to the patched release: GPUI asks for `^0.4.0-zed`, so without this exact
+# requirement a newer 0.4.x from crates.io could replace the patched copy on `cargo update`.
+[target.'cfg(any(target_os = "linux", target_os = "freebsd"))'.dev-dependencies]
+zed-xim = { version = "=0.4.0-zed", default-features = false }

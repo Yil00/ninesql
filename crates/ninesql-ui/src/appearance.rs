@@ -4,11 +4,15 @@
 //! `[appearance]` are applied on top and re-applied after every theme switch. Sizes are logical
 //! pixels: GPUI multiplies them by the window scale factor (Wayland `wp_fractional_scale_v1`,
 //! X11 `Xft.dpi` or `GPUI_X11_SCALE_FACTOR`), so fractional scaling needs no code here.
+//!
+//! Changes made from the UI (theme toggle, zoom, fonts) are saved to settings.toml in the
+//! background through [`crate::persist`].
 
 use gpui_kit::component::{Theme, ThemeMode};
 use gpui_kit::{App, Global, Hsla, Pixels, px};
 
-use crate::settings::{Appearance, FONT_SIZE_RANGE, ThemePreference};
+use crate::persist::{self, SettingsChange};
+use crate::settings::{Appearance, FONT_SIZE_RANGE, ThemePreference, ZOOM_RANGE};
 
 /// Step of the font size actions, in pixels.
 const FONT_STEP: f32 = 1.0;
@@ -45,10 +49,13 @@ pub fn resolve_mode(pref: ThemePreference, system_dark: bool) -> ThemeMode {
 pub fn init(appearance: Appearance, cx: &mut App) {
     let system_dark = ThemeMode::from(cx.window_appearance()).is_dark();
     let mode = resolve_mode(appearance.theme, system_dark);
+    let zoom = appearance
+        .zoom
+        .clamp(*ZOOM_RANGE.start(), *ZOOM_RANGE.end());
     cx.set_global(AppearanceState {
         settings: appearance,
         defaults: None,
-        zoom: 0.0,
+        zoom,
     });
     set_mode(mode, cx);
 }
@@ -111,14 +118,53 @@ fn enforce_contrast(cx: &mut App) {
     });
 }
 
-/// Switches between light and dark.
+/// Switches between light and dark, and saves the choice.
 pub fn toggle_mode(cx: &mut App) {
     let next = if Theme::global(cx).mode.is_dark() {
-        ThemeMode::Light
+        ThemePreference::Light
     } else {
-        ThemeMode::Dark
+        ThemePreference::Dark
     };
-    set_mode(next, cx);
+    set_theme_preference(next, cx);
+}
+
+/// Applies a theme preference and saves it.
+pub fn set_theme_preference(pref: ThemePreference, cx: &mut App) {
+    let system_dark = ThemeMode::from(cx.window_appearance()).is_dark();
+    cx.default_global::<AppearanceState>().settings.theme = pref;
+    set_mode(resolve_mode(pref, system_dark), cx);
+    persist::record(SettingsChange::Theme(pref), cx);
+}
+
+/// A font family from the UI: trimmed, `None` when empty or too long.
+fn clean_family(family: Option<String>) -> Option<String> {
+    family
+        .map(|f| f.trim().to_owned())
+        .filter(|f| !f.is_empty() && f.len() <= 128)
+}
+
+/// Sets the interface font (`None` = theme default) and saves it.
+pub fn set_ui_font(family: Option<String>, size: Option<f32>, cx: &mut App) {
+    let family = clean_family(family);
+    let size = size.map(clamp_size);
+    let state = cx.default_global::<AppearanceState>();
+    state.settings.ui_font_family.clone_from(&family);
+    state.settings.ui_font_size = size;
+    apply_fonts(cx);
+    persist::record(SettingsChange::UiFontFamily(family), cx);
+    persist::record(SettingsChange::UiFontSize(size), cx);
+}
+
+/// Sets the editor font (`None` = theme default) and saves it.
+pub fn set_mono_font(family: Option<String>, size: Option<f32>, cx: &mut App) {
+    let family = clean_family(family);
+    let size = size.map(clamp_size);
+    let state = cx.default_global::<AppearanceState>();
+    state.settings.mono_font_family.clone_from(&family);
+    state.settings.mono_font_size = size;
+    apply_fonts(cx);
+    persist::record(SettingsChange::MonoFontFamily(family), cx);
+    persist::record(SettingsChange::MonoFontSize(size), cx);
 }
 
 /// The current theme mode.
@@ -127,14 +173,23 @@ pub fn current_mode(cx: &App) -> ThemeMode {
     Theme::global(cx).mode
 }
 
-/// Changes the zoom offset by `steps` font steps (negative = smaller); `None` resets it.
+/// Changes the zoom offset by `steps` font steps (negative = smaller); `None` resets it. The
+/// new offset is saved.
 pub fn zoom(steps: Option<f32>, cx: &mut App) {
     let state = cx.default_global::<AppearanceState>();
+    let before = state.zoom;
     state.zoom = match steps {
-        Some(steps) => (state.zoom + steps * FONT_STEP).clamp(-8.0, 16.0),
+        Some(steps) => {
+            (state.zoom + steps * FONT_STEP).clamp(*ZOOM_RANGE.start(), *ZOOM_RANGE.end())
+        }
         None => 0.0,
     };
+    let zoom = state.zoom;
+    state.settings.zoom = zoom;
     apply_fonts(cx);
+    if (zoom - before).abs() > f32::EPSILON {
+        persist::record(SettingsChange::Zoom(zoom), cx);
+    }
 }
 
 /// Writes fonts and sizes from [`AppearanceState`] into the theme.

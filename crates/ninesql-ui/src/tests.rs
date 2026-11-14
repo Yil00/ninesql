@@ -22,6 +22,7 @@ fn init(cx: &mut TestAppContext, settings_toml: &str) {
                 path: None,
                 settings,
                 diagnostics,
+                save_blocked: None,
             },
             cx,
         );
@@ -394,4 +395,293 @@ fn every_action_has_a_name_gpui_can_build(cx: &mut TestAppContext) {
         actions::find("NewEditorTab").map(|s| s.name()),
         Some(NewEditorTab.name())
     );
+}
+
+// --- Settings saved from the UI (P1-A follow-up) -------------------------------------------
+
+mod persistence {
+    use std::os::unix::fs::PermissionsExt as _;
+    use std::path::{Path, PathBuf};
+    use std::time::Duration;
+
+    use gpui::TestAppContext;
+    use ninesql_core::storage::{Paths, XdgDirs};
+
+    use super::{open, tab_count};
+    use crate::app;
+    use crate::appearance;
+    use crate::keymap;
+    use crate::persist::{self, DEBOUNCE};
+    use crate::settings::{self, SettingsState, ThemePreference};
+
+    /// A temporary `$HOME` and the NineSQL locations under it.
+    fn temp_paths() -> (tempfile::TempDir, Paths) {
+        let Ok(dir) = tempfile::tempdir() else {
+            panic!("no temp dir");
+        };
+        let home = dir.path().to_path_buf();
+        let Ok(xdg) = XdgDirs::from_lookup(|k| (k == "HOME").then(|| home.clone().into())) else {
+            panic!("no XDG dirs");
+        };
+        (dir, Paths::new(&xdg))
+    }
+
+    fn write_settings(paths: &Paths, text: &str) -> PathBuf {
+        let file = paths.settings_file();
+        assert!(std::fs::create_dir_all(paths.config_dir()).is_ok());
+        assert!(std::fs::write(&file, text).is_ok());
+        file
+    }
+
+    fn start(cx: &mut TestAppContext, paths: &Paths) {
+        let state = settings::load_from_paths(paths);
+        cx.update(|cx| app::init(state, cx));
+    }
+
+    /// Lets the debounce timer fire and the background write run.
+    fn settle(cx: &mut TestAppContext) {
+        cx.executor()
+            .advance_clock(DEBOUNCE + Duration::from_millis(100));
+        cx.run_until_parked();
+    }
+
+    fn read(path: &Path) -> String {
+        std::fs::read_to_string(path).unwrap_or_default()
+    }
+
+    fn mode(path: &Path) -> u32 {
+        std::fs::metadata(path).map_or(0, |m| m.permissions().mode() & 0o777)
+    }
+
+    const HAND_WRITTEN: &str = "# hand-written\nschema_version = 1\nmystery = \"kept\"\n\n\
+        [appearance]\ntheme = \"dark\"  # night owl\nui_font_size = 15\n";
+
+    #[gpui::test]
+    fn theme_and_zoom_are_saved_after_the_debounce(cx: &mut TestAppContext) {
+        let (_dir, paths) = temp_paths();
+        let file = write_settings(&paths, HAND_WRITTEN);
+        start(cx, &paths);
+        let (_, _ws, mut vcx) = open(cx);
+        vcx.simulate_keystrokes("ctrl-k ctrl-t");
+        vcx.simulate_keystrokes("ctrl-= ctrl-=");
+        cx.run_until_parked();
+        // Nothing is written before the debounce delay (and never on the UI thread).
+        assert_eq!(read(&file), HAND_WRITTEN);
+        assert!(cx.update(|cx| persist::has_pending(cx)));
+        settle(cx);
+        assert!(!cx.update(|cx| persist::has_pending(cx)));
+        let text = read(&file);
+        for kept in [
+            "# hand-written",
+            "schema_version = 1",
+            "mystery = \"kept\"",
+            "theme = \"light\"  # night owl",
+            "ui_font_size = 15",
+            "zoom = 2",
+        ] {
+            assert!(text.contains(kept), "missing {kept:?} in:\n{text}");
+        }
+        assert_eq!(mode(&file), 0o600);
+        // The settings in memory follow, and the file reads back the same.
+        let in_memory = cx.read_global::<SettingsState, _>(|s, _| s.settings.clone());
+        assert_eq!(in_memory, settings::load(&file).settings);
+        assert_eq!(in_memory.appearance.theme, ThemePreference::Light);
+    }
+
+    #[gpui::test]
+    fn missing_file_and_directory_are_created_private(cx: &mut TestAppContext) {
+        let (_dir, paths) = temp_paths();
+        start(cx, &paths);
+        cx.update(|cx| {
+            appearance::set_theme_preference(ThemePreference::System, cx);
+            appearance::set_mono_font(Some("  Fira Code ".into()), Some(13.5), cx);
+        });
+        settle(cx);
+        let file = paths.settings_file();
+        let text = read(&file);
+        assert!(text.starts_with("schema_version = 1\n"), "{text}");
+        let loaded = settings::load(&file);
+        assert!(loaded.diagnostics.is_empty(), "{:?}", loaded.diagnostics);
+        let a = loaded.settings.appearance;
+        assert_eq!(a.theme, ThemePreference::System);
+        assert_eq!(a.mono_font_family.as_deref(), Some("Fira Code"));
+        assert_eq!(a.mono_font_size, Some(13.5));
+        assert_eq!(mode(&file), 0o600);
+        assert_eq!(mode(paths.config_dir()), 0o700);
+    }
+
+    #[gpui::test]
+    fn key_binding_overrides_apply_at_once_and_are_saved(cx: &mut TestAppContext) {
+        let (_dir, paths) = temp_paths();
+        let file = write_settings(&paths, "[keybindings]\nSplitDown = \"alt-shift-2\"\n");
+        start(cx, &paths);
+        let widget_bindings = |cx: &mut TestAppContext| {
+            cx.update(|cx| {
+                cx.key_bindings()
+                    .borrow()
+                    .bindings()
+                    .filter(|b| !b.action().name().starts_with("ninesql::"))
+                    .count()
+            })
+        };
+        let before = widget_bindings(cx);
+        let (_, ws, mut vcx) = open(cx);
+        let set =
+            cx.update(|cx| keymap::set_override("NewEditorTab", Some(vec!["alt-n".into()]), cx));
+        assert!(set.is_ok());
+        vcx.run_until_parked();
+        vcx.simulate_keystrokes("ctrl-t");
+        assert_eq!(tab_count(&ws, &mut vcx), 1, "the default is replaced");
+        vcx.simulate_keystrokes("alt-n");
+        assert_eq!(tab_count(&ws, &mut vcx), 2);
+        assert_eq!(
+            widget_bindings(cx),
+            before,
+            "gpui-component bindings are kept"
+        );
+        settle(cx);
+        let text = read(&file);
+        assert!(
+            text.contains("\"ninesql::NewEditorTab\" = \"alt-n\""),
+            "{text}"
+        );
+        assert!(text.contains("SplitDown = \"alt-shift-2\""), "{text}");
+
+        // Invalid bindings change nothing.
+        let bad =
+            cx.update(|cx| keymap::set_override("NewEditorTab", Some(vec!["ctrl-foo".into()]), cx));
+        assert!(bad.is_err());
+
+        // Back to the defaults: the entry is removed.
+        assert!(
+            cx.update(|cx| keymap::set_override("ninesql::NewEditorTab", None, cx))
+                .is_ok()
+        );
+        vcx.run_until_parked();
+        vcx.simulate_keystrokes("ctrl-t");
+        assert_eq!(tab_count(&ws, &mut vcx), 3);
+        settle(cx);
+        let text = read(&file);
+        assert!(!text.contains("NewEditorTab"), "{text}");
+        assert!(text.contains("SplitDown"), "{text}");
+    }
+
+    #[gpui::test]
+    fn files_that_were_not_read_are_never_overwritten(cx: &mut TestAppContext) {
+        for (i, text) in [
+            "schema_version = 2\n[appearance]\ntheme = \"dark\"\n",
+            "[appearance\ntheme = 'dark'",
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let (_dir, paths) = temp_paths();
+            let file = write_settings(&paths, text);
+            if i == 0 {
+                start(cx, &paths);
+            } else {
+                let state = settings::load_from_paths(&paths);
+                cx.update(|cx| cx.set_global(state));
+            }
+            assert!(cx.read_global::<SettingsState, _>(|s, _| s.save_blocked.is_some()));
+            cx.update(appearance::toggle_mode);
+            settle(cx);
+            assert_eq!(read(&file), text);
+        }
+    }
+
+    #[gpui::test]
+    fn a_file_that_became_unwritable_is_reported(cx: &mut TestAppContext) {
+        let (_dir, paths) = temp_paths();
+        let file = write_settings(&paths, "schema_version = 1\n");
+        start(cx, &paths);
+        // Upgraded by a newer NineSQL while this one runs.
+        assert!(std::fs::write(&file, "schema_version = 3\n").is_ok());
+        cx.update(appearance::toggle_mode);
+        settle(cx);
+        assert_eq!(read(&file), "schema_version = 3\n");
+        let problems = cx.read_global::<SettingsState, _>(|s, _| s.diagnostics.clone());
+        assert!(
+            problems.iter().any(|d| d.message().contains("not saved")),
+            "{problems:?}"
+        );
+    }
+
+    #[gpui::test]
+    fn an_owned_symlink_is_written_through(cx: &mut TestAppContext) {
+        let (dir, paths) = temp_paths();
+        let dotfiles = dir.path().join("dotfiles");
+        assert!(std::fs::create_dir_all(&dotfiles).is_ok());
+        let target = dotfiles.join("ninesql.toml");
+        assert!(
+            std::fs::write(
+                &target,
+                "# managed by my dotfiles\n[appearance]\ntheme = \"dark\"\n"
+            )
+            .is_ok()
+        );
+        assert!(std::fs::create_dir_all(paths.config_dir()).is_ok());
+        let link = paths.settings_file();
+        assert!(std::os::unix::fs::symlink(&target, &link).is_ok());
+        start(cx, &paths);
+        let theme = cx.read_global::<SettingsState, _>(|s, _| s.settings.appearance.theme);
+        assert_eq!(theme, ThemePreference::Dark);
+        cx.update(appearance::toggle_mode);
+        settle(cx);
+        let link_meta = std::fs::symlink_metadata(&link);
+        assert!(
+            link_meta.is_ok_and(|m| m.file_type().is_symlink()),
+            "the link stays"
+        );
+        let text = read(&target);
+        assert!(text.contains("# managed by my dotfiles"), "{text}");
+        assert!(text.contains("theme = \"light\""), "{text}");
+    }
+}
+
+/// The X11 IME decoder in the graph is NineSQL's patched `xim-ctext` ([patch.crates-io]): the
+/// preedit that crashed the spike (ibus, m17n `latn-post`, "é" as unescaped ISO 8859-1) and the
+/// GB 2312 / KS C 5601 escapes upstream refused now decode.
+#[test]
+fn x11_ime_compound_text_decodes_without_error() {
+    let decode = |bytes: &[u8]| xim_ctext::compound_text_to_utf8(bytes).ok();
+    assert_eq!(decode(&[0xE9]).as_deref(), Some("é"));
+    assert_eq!(decode(b"\x1b$)A\xd6\xd0").as_deref(), Some("中"));
+    assert_eq!(decode(b"\x1b$)C\xb0\xa1").as_deref(), Some("가"));
+    assert_eq!(decode(b"\x1b%G").as_deref(), Some(""));
+}
+
+/// GPUI's XIM client and its decoder resolve to NineSQL's patched copies under `crates/patches/`
+/// (path sources in Cargo.lock, no registry `source`), at the exact versions the patch was made
+/// from. Fails if a `cargo update` or a GPUI bump lets a crates.io release bypass the patch.
+#[cfg(any(target_os = "linux", target_os = "freebsd"))]
+#[test]
+fn x11_ime_crates_resolve_to_the_patched_copies() {
+    use zed_xim as _;
+
+    let lock_path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../Cargo.lock");
+    let lock = std::fs::read_to_string(lock_path)
+        .unwrap_or_else(|e| panic!("cannot read the workspace Cargo.lock: {e}"));
+    for (name, version) in [("xim-ctext", "0.3.0"), ("zed-xim", "0.4.0-zed")] {
+        let entries: Vec<&str> = lock
+            .split("[[package]]")
+            .filter(|entry| entry.lines().any(|l| l == format!("name = \"{name}\"")))
+            .collect();
+        assert_eq!(
+            entries.len(),
+            1,
+            "{name}: exactly one version in Cargo.lock"
+        );
+        let entry = entries[0];
+        assert!(
+            entry
+                .lines()
+                .any(|l| l == format!("version = \"{version}\"")),
+            "{name}: Cargo.lock must keep {version}, the version patched under crates/patches/"
+        );
+        assert!(
+            !entry.lines().any(|l| l.starts_with("source = ")),
+            "{name}: Cargo.lock resolves it from a registry, so the patch is not applied"
+        );
+    }
 }

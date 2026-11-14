@@ -4,7 +4,8 @@
 //!   (F-WS-01); one workspace per window, any number of windows.
 //! - [`actions`], [`keymap`], [`palette`]: every user-facing action with a default key binding
 //!   and a command palette entry; bindings overridable in settings.toml (F-WS-02).
-//! - [`appearance`], [`settings`]: light / dark themes, fonts, fractional scaling (F-WS-03).
+//! - [`appearance`], [`settings`]: light / dark themes, fonts, fractional scaling (F-WS-03);
+//!   [`persist`] saves changes made from the UI back to settings.toml.
 //! - [`services`]: the seam to `ninesql-core` services (driver runtime: P1-D).
 //!
 //! GPUI comes from `gpui-kit` under the controls of ADR-0013. GPUI's credentials and HTTP
@@ -20,6 +21,7 @@ pub mod keymap;
 pub mod layout;
 pub mod navigator;
 pub mod palette;
+pub mod persist;
 pub mod services;
 pub mod settings;
 pub mod workspace;

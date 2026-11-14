@@ -102,6 +102,11 @@ impl BindingOverrides {
         self.0.insert(action, keys);
     }
 
+    /// Removes the override of `action`: its defaults apply again.
+    pub fn remove(&mut self, action: &str) {
+        self.0.remove(action);
+    }
+
     /// Bindings of `action` if overridden.
     #[must_use]
     pub fn get(&self, action: &str) -> Option<&[String]> {
@@ -191,6 +196,62 @@ impl EffectiveKeymap {
         cx.set_global(self);
         problems
     }
+}
+
+/// Replaces NineSQL's bindings in GPUI's keymap by `keymap`, keeping every other binding
+/// (gpui-component's widgets). Returns the bindings GPUI refused.
+fn reinstall(keymap: EffectiveKeymap, cx: &mut App) -> Vec<Diagnostic> {
+    let others: Vec<KeyBinding> = cx
+        .key_bindings()
+        .borrow()
+        .bindings()
+        .filter(|b| !b.action().name().starts_with("ninesql::"))
+        .cloned()
+        .collect();
+    cx.clear_key_bindings();
+    cx.bind_keys(others);
+    keymap.install(cx)
+}
+
+/// Changes the bindings of `action` from the UI: `Some(keys)` overrides the defaults (an empty
+/// list unbinds the action), `None` restores the defaults. The new bindings apply at once and
+/// are saved to settings.toml in the background ([`crate::persist`]).
+///
+/// # Errors
+/// An unknown action or an invalid binding; nothing is changed then.
+pub fn set_override(
+    action: &str,
+    keys: Option<Vec<String>>,
+    cx: &mut App,
+) -> Result<(), Diagnostic> {
+    let spec = crate::actions::find(action)
+        .ok_or_else(|| Diagnostic::new(format!("unknown action `{action}`")))?;
+    let keys = match keys {
+        None => None,
+        Some(keys) => {
+            let mut normalized = Vec::with_capacity(keys.len());
+            for k in &keys {
+                validate_keys(k)
+                    .map_err(|why| Diagnostic::new(format!("{}: {why}", spec.name())))?;
+                normalized.push(k.split_whitespace().collect::<Vec<_>>().join(" "));
+            }
+            Some(normalized)
+        }
+    };
+    crate::persist::record(
+        crate::persist::SettingsChange::Keybinding(spec.name(), keys),
+        cx,
+    );
+    let overrides = cx
+        .try_global::<crate::settings::SettingsState>()
+        .map(|s| s.settings.keybindings.clone())
+        .unwrap_or_default();
+    let problems = reinstall(EffectiveKeymap::resolve(&overrides), cx);
+    if !problems.is_empty() {
+        let state = cx.default_global::<crate::settings::SettingsState>();
+        state.diagnostics.extend(problems);
+    }
+    Ok(())
 }
 
 /// Formats a binding for display: `ctrl-k ctrl-t` → `Ctrl+K Ctrl+T`.
