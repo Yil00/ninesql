@@ -21,11 +21,12 @@
 use std::fs::File;
 use std::io::{self, Read};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::time::{Duration, Instant};
 
 use data_encoding::BASE64;
 use hmac::{Hmac, KeyInit, Mac};
-use ninesql_storage::DirLock;
+use ninesql_storage::{DirLock, StorageError};
 use sha1::Sha1;
 
 use crate::error::SshError;
@@ -40,6 +41,26 @@ pub const DEFAULT_SSH_PORT: u16 = 22;
 /// Name of the workspace lock file, in the same directory as NineSQL's `known_hosts`
 /// (`Paths::lock_file()` next to `Paths::known_hosts_file()`, both in `$XDG_DATA_HOME/ninesql`).
 const LOCK_FILE_NAME: &str = "ninesql.lock";
+
+/// How long a write waits for another NineSQL process to release the workspace lock (another
+/// process writing its own `known_hosts` entry holds it for milliseconds) before failing.
+const LOCK_WAIT: Duration = Duration::from_secs(2);
+
+/// Pause between two attempts to take the workspace lock.
+const LOCK_RETRY: Duration = Duration::from_millis(20);
+
+/// Serializes writers of NineSQL's file inside this process. [`DirLock`] is shared by every
+/// caller of one process (an `flock` belongs to an open file description), so it only excludes
+/// other processes: two [`KnownHosts`] values of one process, outside one
+/// [`crate::KnownHostsStore`], would otherwise interleave their read-modify-write.
+static WRITERS: Mutex<()> = Mutex::new(());
+
+/// Held while NineSQL's file is read, modified and rewritten: the in-process writer lock and
+/// the cross-process workspace lock. Field order: the workspace lock is released first.
+struct WriteGuard {
+    _dir: Arc<DirLock>,
+    _process: MutexGuard<'static, ()>,
+}
 
 /// Which file a `known_hosts` line comes from.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -515,29 +536,46 @@ impl KnownHosts {
     ///
     /// A process that already holds the workspace lock (the core keeps it for the whole
     /// session) shares it: [`ninesql_storage::DirLock::acquire`] returns the held lock, so this
-    /// never deadlocks against its own process. Within one process, [`crate::KnownHostsStore`]
-    /// serializes writers. Never blocks: another NineSQL process holding the lock is an error.
-    fn lock_own(&self) -> Result<Arc<DirLock>, SshError> {
+    /// never deadlocks against its own process. Within one process, writers are serialized by
+    /// a process-wide mutex taken first. Another NineSQL process holding the lock is waited for
+    /// at most [`LOCK_WAIT`] (blocking: callers are on a blocking thread), then is an error.
+    fn lock_own(&self) -> Result<WriteGuard, SshError> {
+        let process = WRITERS.lock().unwrap_or_else(PoisonError::into_inner);
         let dir = match self.own_path.parent() {
             Some(d) if !d.as_os_str().is_empty() => d,
             _ => Path::new("."),
         };
         ninesql_storage::fs::ensure_private_dir(dir)
             .map_err(|e| SshError::KnownHosts(e.to_string()))?;
-        DirLock::acquire(&dir.join(LOCK_FILE_NAME)).map_err(|e| SshError::KnownHosts(e.to_string()))
+        let lock_path = dir.join(LOCK_FILE_NAME);
+        let deadline = Instant::now() + LOCK_WAIT;
+        let dir_lock = loop {
+            match DirLock::acquire(&lock_path) {
+                Ok(lock) => break lock,
+                Err(StorageError::Locked { .. }) if Instant::now() < deadline => {
+                    std::thread::sleep(LOCK_RETRY);
+                }
+                Err(e) => return Err(SshError::KnownHosts(e.to_string())),
+            }
+        };
+        Ok(WriteGuard {
+            _dir: dir_lock,
+            _process: process,
+        })
     }
 
     /// Adds a key for `host:port` to NineSQL's file after the user confirmed it (or under the
     /// explicit accept-new policy). The read-modify-write runs under the workspace lock
     /// (`ninesql_storage::DirLock` on `Paths::lock_file()`, shared with the core if this process
-    /// already holds it), so two NineSQL processes cannot drop each other's additions; the file is re-read first so earlier additions are kept, then
-    /// rewritten atomically with mode `0600`. Adding a key that is already present for the
+    /// already holds it, waited for at most 2 s when another process holds it), so two NineSQL
+    /// processes cannot drop each other's additions; the file is re-read first so earlier
+    /// additions are kept, then rewritten atomically with mode `0600`. Adding a key that is already present for the
     /// host is a no-op. Refuses to add a key if the host has another supported key on file:
     /// a changed key must be removed explicitly first ([`KnownHosts::remove_host`], ADR-0011 §6).
     ///
     /// # Errors
-    /// [`SshError::KnownHosts`] on I/O errors or when another NineSQL process holds the
-    /// workspace lock, [`SshError::HostKeyChanged`] / [`SshError::HostKeyRevoked`] if the key
+    /// [`SshError::KnownHosts`] on I/O errors or when another NineSQL process keeps the
+    /// workspace lock for more than 2 s, [`SshError::HostKeyChanged`] / [`SshError::HostKeyRevoked`] if the key
     /// cannot be added.
     pub fn add(
         &mut self,
@@ -603,8 +641,8 @@ impl KnownHosts {
     /// Returns the number of lines removed.
     ///
     /// # Errors
-    /// [`SshError::KnownHosts`] on I/O errors or when another NineSQL process holds the
-    /// workspace lock.
+    /// [`SshError::KnownHosts`] on I/O errors or when another NineSQL process keeps the
+    /// workspace lock for more than 2 s.
     pub fn remove_host(&mut self, host: &str, port: u16) -> Result<usize, SshError> {
         let _lock = self.lock_own()?;
         let Some(text) = read_text(&self.own_path, true)? else {
