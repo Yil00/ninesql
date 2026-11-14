@@ -20,6 +20,7 @@
 #![forbid(unsafe_code)]
 
 pub mod backend;
+mod clock;
 mod error;
 #[cfg(any(test, feature = "memory-store"))]
 mod memory;
@@ -42,7 +43,7 @@ pub use registry::SecretStores;
 pub use secrecy::{ExposeSecret, SecretString};
 #[cfg(feature = "secret-service")]
 pub use secret_service::SecretServiceStore;
-pub use session_cache::{CacheLifetime, SessionSecretCache};
+pub use session_cache::{CacheLifetime, MAX_TIMED_LIFETIME, SessionSecretCache};
 pub use store::{SecretMeta, SecretStore};
 pub use vault::{KdfParams, UnlockBackoff, Vault, VaultError, VaultStatus, VaultStore};
 

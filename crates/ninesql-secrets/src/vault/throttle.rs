@@ -4,7 +4,9 @@
 //! logged-in desktop). It does not protect a copied `vault.bin` against offline guessing; the
 //! Argon2id cost does that.
 
-use std::time::{Duration, Instant};
+use std::time::Duration;
+
+use crate::clock::BootInstant;
 
 /// Back-off policy for failed unlock (and change-password) attempts.
 ///
@@ -36,7 +38,7 @@ impl Default for UnlockBackoff {
 pub(crate) struct UnlockThrottle {
     policy: UnlockBackoff,
     failures: u32,
-    next_allowed: Option<Instant>,
+    next_allowed: Option<BootInstant>,
 }
 
 impl UnlockThrottle {
@@ -53,14 +55,14 @@ impl UnlockThrottle {
     }
 
     /// `Err(wait)` while an attempt is not allowed yet.
-    pub(crate) fn check(&self, now: Instant) -> Result<(), Duration> {
+    pub(crate) fn check(&self, now: BootInstant) -> Result<(), Duration> {
         match self.next_allowed {
-            Some(at) if at > now => Err(at - now),
+            Some(at) if at > now => Err(at.saturating_duration_since(now)),
             _ => Ok(()),
         }
     }
 
-    pub(crate) fn record_failure(&mut self, now: Instant) {
+    pub(crate) fn record_failure(&mut self, now: BootInstant) {
         self.failures = self.failures.saturating_add(1);
         if self.failures > self.policy.free_attempts {
             let exponent = (self.failures - self.policy.free_attempts - 1).min(31);
@@ -69,7 +71,7 @@ impl UnlockThrottle {
                 .base_delay
                 .saturating_mul(1u32 << exponent)
                 .min(self.policy.max_delay);
-            self.next_allowed = Some(now + delay);
+            self.next_allowed = Some(now.saturating_add(delay));
         }
     }
 
@@ -92,7 +94,7 @@ mod tests {
     #[test]
     fn free_attempts_then_doubling_capped() {
         let mut t = UnlockThrottle::new(UnlockBackoff::default());
-        let t0 = Instant::now();
+        let t0 = BootInstant::from_since_boot(Duration::from_secs(100));
         for _ in 0..3 {
             assert!(t.check(t0).is_ok());
             t.record_failure(t0);
@@ -101,8 +103,8 @@ mod tests {
         assert!(t.check(t0).is_ok());
         t.record_failure(t0); // 4th failure: wait 1 s
         assert_eq!(t.check(t0), Err(Duration::from_secs(1)));
-        assert!(t.check(t0 + Duration::from_secs(1)).is_ok());
-        let t1 = t0 + Duration::from_secs(1);
+        let t1 = t0.saturating_add(Duration::from_secs(1));
+        assert!(t.check(t1).is_ok());
         t.record_failure(t1); // 5th: 2 s
         assert_eq!(t.check(t1), Err(Duration::from_secs(2)));
         for _ in 0..40 {

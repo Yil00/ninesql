@@ -19,11 +19,19 @@
 //! - A key-check tag in the header separates a wrong master password from a damaged file.
 //!
 //! # Memory
-//! - The master password is only borrowed as [`SecretString`]; the derived key lives in a
-//!   [`Zeroizing`] array, the cipher instance zeroizes its key copy on drop (`chacha20poly1305`
-//!   feature `zeroize`), and the Argon2 working memory (64 MiB by default) is allocated here and
-//!   zeroized after each derivation (the `argon2` crate does not wipe the memory it allocates
-//!   itself).
+//! - The master password is only borrowed as [`SecretString`].
+//! - The derived key is written by Argon2 straight into a heap allocation
+//!   (`Box<Zeroizing<[u8; 32]>>`) made before the derivation, and only that box moves
+//!   afterwards, so moving the unlocked state never copies the key around the stack. It is
+//!   zeroized when the vault locks or is dropped.
+//! - Each encryption or decryption builds a short-lived `XChaCha20Poly1305` instance that holds
+//!   a copy of the key and zeroizes it on drop (`chacha20poly1305` feature `zeroize`). That
+//!   instance lives on the stack and Rust may move it (for example when a function returns it),
+//!   which can leave unwiped copies in stack memory until later calls overwrite them. Safe Rust
+//!   gives no way to build it in place; the window is one call.
+//! - The Argon2 working memory (64 MiB by default) is allocated here, fallibly (an allocation
+//!   failure is [`VaultError::OutOfMemory`], not an abort), and zeroized after each derivation
+//!   (the `argon2` crate does not wipe the memory it allocates itself).
 //! - Plaintext payload buffers are [`Zeroizing`] and allocated with their final capacity, so
 //!   encoding and in-place encryption never reallocate and leave a copy behind.
 //! - While unlocked, the key and the decrypted entries ([`SecretString`]) stay in memory;
@@ -34,7 +42,11 @@
 //! another NineSQL holds it) and starts **locked**. Then [`Vault::create`] (first use) or
 //! [`Vault::unlock`] with the master password; [`Vault::lock`] or the idle timeout
 //! ([`Vault::set_idle_timeout`], enforced at every access and by [`Vault::lock_if_idle`], which the
-//! core calls from a timer) lock it again. [`Vault::change_master_password`] re-encrypts
+//! core calls from a timer) lock it again. Idle time is measured on `CLOCK_BOOTTIME`, so time
+//! spent suspended counts: a vault left unlocked before an overnight suspend is locked at the
+//! first check after resume. The core should also call [`Vault::lock`] on logind's
+//! `PrepareForSleep(true)` and on the session `Lock` signal, so the vault is already locked when
+//! the machine wakes up. [`Vault::change_master_password`] re-encrypts
 //! atomically under a new salt. Failed attempts are slowed down by [`UnlockBackoff`].
 //!
 //! Reading never writes: a wrong password, a damaged, truncated or newer file is reported with a
@@ -68,7 +80,7 @@ use std::fmt;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use argon2::{Algorithm, Argon2, Block, Version};
 use chacha20poly1305::aead::{AeadInOut, KeyInit};
@@ -81,6 +93,7 @@ use zeroize::Zeroizing;
 pub use format::{MAX_CONNECTION_ID_LEN, MAX_ENTRIES, MAX_FILE_LEN, MAX_LABEL_LEN, MAX_SECRET_LEN};
 pub use throttle::UnlockBackoff;
 
+use crate::clock::{self, BootInstant, SharedClock};
 use crate::error::SecretError;
 use crate::project::{InvalidProjectId, normalize_project_id};
 use crate::reference::{SecretId, SecretKind, StoreKind};
@@ -105,8 +118,9 @@ pub enum VaultError {
     /// The vault is locked (at startup, after [`Vault::lock`] or after the idle timeout).
     #[error("the vault is locked; unlock it with the master password")]
     Locked,
-    /// The master password does not open the vault.
-    #[error("wrong master password")]
+    /// The master password does not open the vault (or the part of the header it is checked
+    /// against was damaged: the two cannot be told apart without a new oracle).
+    #[error("wrong master password, or the vault header is damaged")]
     WrongPassword,
     /// The file is not a vault, is truncated or extended, or its content was modified. It was
     /// left untouched.
@@ -144,6 +158,9 @@ pub enum VaultError {
     /// A secret, label, connection id or the whole vault exceeds a size limit.
     #[error("vault limit exceeded: {0}")]
     Limit(&'static str),
+    /// Not enough memory for the Argon2id working memory.
+    #[error("not enough memory for the vault key derivation ({0} KiB)")]
+    OutOfMemory(u32),
     /// The system random number generator failed.
     #[error("the system random number generator failed")]
     Random,
@@ -243,6 +260,15 @@ impl KdfParams {
         })
     }
 
+    /// Whether these parameters are within the bounds accepted for a new vault
+    /// ([`KdfParams::new`]). A vault read from disk may have weaker ones (written by a test build
+    /// or by hand); [`Vault::unlock`] warns about it and [`Vault::change_master_password`] without
+    /// explicit parameters then moves to [`KdfParams::DEFAULT`].
+    #[must_use]
+    pub fn meets_minimum(&self) -> bool {
+        Self::new(self.m_cost_kib, self.t_cost, self.p_cost).is_ok()
+    }
+
     /// Memory cost in KiB.
     #[must_use]
     pub const fn m_cost_kib(&self) -> u32 {
@@ -269,6 +295,7 @@ pub struct Vault {
     // Held for the lifetime of the vault: no other NineSQL process writes `vault.bin` meanwhile.
     _lock: Arc<DirLock>,
     state: Mutex<State>,
+    clock: SharedClock,
 }
 
 struct State {
@@ -291,15 +318,18 @@ struct Entry {
     secret: SecretString,
 }
 
+/// Derived vault key: on the heap from before the derivation, zeroized on drop.
+type Key = Box<Zeroizing<[u8; KEY_LEN]>>;
+
 /// Key and decrypted entries of an open vault. Dropping it zeroizes the key and every secret.
 struct Unlocked {
-    key: Zeroizing<[u8; KEY_LEN]>,
+    key: Key,
     kdf: KdfParams,
     salt: [u8; SALT_LEN],
     check_nonce: [u8; NONCE_LEN],
     check_tag: [u8; TAG_LEN],
     entries: BTreeMap<EntryKey, Entry>,
-    last_used: Instant,
+    last_used: BootInstant,
 }
 
 impl fmt::Debug for Vault {
@@ -331,6 +361,14 @@ impl Vault {
     /// # Errors
     /// See [`Vault::open`].
     pub fn open_at(vault_file: impl Into<PathBuf>, lock_file: &Path) -> Result<Self, VaultError> {
+        Self::open_at_with_clock(vault_file, lock_file, clock::system())
+    }
+
+    fn open_at_with_clock(
+        vault_file: impl Into<PathBuf>,
+        lock_file: &Path,
+        clock: SharedClock,
+    ) -> Result<Self, VaultError> {
         let lock = DirLock::acquire(lock_file)?;
         Ok(Self {
             path: vault_file.into(),
@@ -340,6 +378,7 @@ impl Vault {
                 throttle: UnlockThrottle::new(UnlockBackoff::default()),
                 idle_timeout: None,
             }),
+            clock,
         })
     }
 
@@ -375,7 +414,7 @@ impl Vault {
     /// An I/O error while checking whether the file exists.
     pub fn status(&self) -> Result<VaultStatus, VaultError> {
         let mut st = self.state();
-        expire_if_idle(&mut st, Instant::now());
+        expire_if_idle(&mut st, self.clock.now());
         if st.unlocked.is_some() {
             Ok(VaultStatus::Unlocked)
         } else if self.exists()? {
@@ -389,7 +428,7 @@ impl Vault {
     #[must_use]
     pub fn is_unlocked(&self) -> bool {
         let mut st = self.state();
-        expire_if_idle(&mut st, Instant::now());
+        expire_if_idle(&mut st, self.clock.now());
         st.unlocked.is_some()
     }
 
@@ -405,7 +444,7 @@ impl Vault {
         if self.exists()? {
             return Err(VaultError::AlreadyExists(self.path.clone()));
         }
-        let unlocked = Unlocked::fresh(master, params, BTreeMap::new())?;
+        let unlocked = Unlocked::fresh(master, params, BTreeMap::new(), self.clock.now())?;
         unlocked.persist(&self.path)?;
         tracing::info!(path = %self.path.display(), m_cost_kib = params.m_cost_kib, t_cost = params.t_cost, p_cost = params.p_cost, "vault created");
         st.unlocked = Some(unlocked);
@@ -422,19 +461,28 @@ impl Vault {
     pub fn unlock(&self, master: &SecretString) -> Result<(), VaultError> {
         let mut st = self.state();
         st.throttle
-            .check(Instant::now())
+            .check(self.clock.now())
             .map_err(|retry_after| VaultError::TooManyAttempts { retry_after })?;
         let file = self.read_file()?;
         match self.open_with(&file, master) {
             Ok(unlocked) => {
                 tracing::info!(path = %self.path.display(), entries = unlocked.entries.len(), "vault unlocked");
+                if !unlocked.kdf.meets_minimum() {
+                    tracing::warn!(
+                        path = %self.path.display(),
+                        m_cost_kib = unlocked.kdf.m_cost_kib,
+                        t_cost = unlocked.kdf.t_cost,
+                        p_cost = unlocked.kdf.p_cost,
+                        "the vault uses key derivation parameters below the accepted minimum; change the master password to upgrade them"
+                    );
+                }
                 st.unlocked = Some(unlocked);
                 st.throttle.record_success();
                 Ok(())
             }
             Err(VaultError::WrongPassword) => {
-                st.throttle.record_failure(Instant::now());
-                tracing::warn!(path = %self.path.display(), "vault unlock failed: wrong master password");
+                st.throttle.record_failure(self.clock.now());
+                tracing::warn!(path = %self.path.display(), "vault unlock failed: wrong master password or damaged header");
                 Err(VaultError::WrongPassword)
             }
             Err(e) => {
@@ -461,7 +509,7 @@ impl Vault {
     /// Locks the vault if it has been idle for longer than the idle timeout. Returns `true` if it
     /// locked it now.
     pub fn lock_if_idle(&self) -> bool {
-        expire_if_idle(&mut self.state(), Instant::now())
+        expire_if_idle(&mut self.state(), self.clock.now())
     }
 
     /// Replaces the back-off policy for failed attempts.
@@ -475,8 +523,9 @@ impl Vault {
         self.state().unlocked.as_ref().map(|u| u.kdf)
     }
 
-    /// Re-encrypts the vault under `new` with a new salt (and `params`, or the current
-    /// parameters), atomically: on any error the previous file stays in place. The current
+    /// Re-encrypts the vault under `new` with a new salt and `params`, atomically. With `None`,
+    /// the current parameters are kept if they meet [`KdfParams::meets_minimum`], otherwise
+    /// [`KdfParams::DEFAULT`] is used: on any error the previous file stays in place. The current
     /// password is checked against the file even when the vault is unlocked. Leaves the vault
     /// unlocked.
     ///
@@ -494,22 +543,26 @@ impl Vault {
         }
         let mut st = self.state();
         st.throttle
-            .check(Instant::now())
+            .check(self.clock.now())
             .map_err(|retry_after| VaultError::TooManyAttempts { retry_after })?;
         let file = self.read_file()?;
         let old = match self.open_with(&file, current) {
             Ok(old) => old,
             Err(VaultError::WrongPassword) => {
-                st.throttle.record_failure(Instant::now());
+                st.throttle.record_failure(self.clock.now());
                 tracing::warn!(path = %self.path.display(), "vault password change refused: wrong master password");
                 return Err(VaultError::WrongPassword);
             }
             Err(e) => return Err(e),
         };
         st.throttle.record_success();
-        let kdf = params.unwrap_or(old.kdf);
+        let kdf = params.unwrap_or(if old.kdf.meets_minimum() {
+            old.kdf
+        } else {
+            KdfParams::DEFAULT
+        });
         let Unlocked { entries, .. } = old;
-        let fresh = Unlocked::fresh(new, kdf, entries)?;
+        let fresh = Unlocked::fresh(new, kdf, entries, self.clock.now())?;
         fresh.persist(&self.path)?;
         tracing::info!(path = %self.path.display(), m_cost_kib = kdf.m_cost_kib, t_cost = kdf.t_cost, p_cost = kdf.p_cost, "vault master password changed");
         st.unlocked = Some(fresh);
@@ -589,7 +642,7 @@ impl Vault {
             check_nonce: header.check_nonce,
             check_tag: header.check_tag,
             entries,
-            last_used: Instant::now(),
+            last_used: self.clock.now(),
         })
     }
 
@@ -600,7 +653,7 @@ impl Vault {
         f: impl FnOnce(&mut Unlocked, &Path) -> Result<R, VaultError>,
     ) -> Result<R, VaultError> {
         let mut st = self.state();
-        let now = Instant::now();
+        let now = self.clock.now();
         expire_if_idle(&mut st, now);
         let Some(unlocked) = st.unlocked.as_mut() else {
             return Err(if self.exists()? {
@@ -697,7 +750,7 @@ impl Vault {
 }
 
 /// Locks `st` if its idle timeout has passed. Returns `true` if it locked it.
-fn expire_if_idle(st: &mut State, now: Instant) -> bool {
+fn expire_if_idle(st: &mut State, now: BootInstant) -> bool {
     let expired = match (&st.unlocked, st.idle_timeout) {
         (Some(u), Some(timeout)) => now.saturating_duration_since(u.last_used) >= timeout,
         _ => false,
@@ -715,6 +768,7 @@ impl Unlocked {
         master: &SecretString,
         kdf: KdfParams,
         entries: BTreeMap<EntryKey, Entry>,
+        now: BootInstant,
     ) -> Result<Self, VaultError> {
         let mut salt = [0u8; SALT_LEN];
         random(&mut salt)?;
@@ -738,7 +792,7 @@ impl Unlocked {
             check_nonce,
             check_tag,
             entries,
-            last_used: Instant::now(),
+            last_used: now,
         })
     }
 
@@ -762,7 +816,7 @@ impl Unlocked {
             return Err(VaultError::Limit("the vault would exceed 16 MiB"));
         }
         let mut buf = Zeroizing::new(Vec::with_capacity(len + TAG_LEN));
-        format::encode_payload(&refs, &mut buf);
+        format::encode_payload(&refs, &mut buf).map_err(VaultError::Limit)?;
         let mut nonce = [0u8; NONCE_LEN];
         random(&mut nonce)?;
         let header = Header {
@@ -800,18 +854,24 @@ fn cipher(key: &[u8; KEY_LEN]) -> XChaCha20Poly1305 {
     XChaCha20Poly1305::new(key.into())
 }
 
-/// Argon2id of `master` into a zeroizing key, with working memory zeroized afterwards.
+/// Argon2id of `master` into a zeroizing key allocated on the heap beforehand, with working
+/// memory allocated fallibly and zeroized afterwards.
 fn derive_key(
     master: &SecretString,
     salt: &[u8; SALT_LEN],
     kdf: KdfParams,
-) -> Result<Zeroizing<[u8; KEY_LEN]>, VaultError> {
+) -> Result<Key, VaultError> {
     let params = argon2::Params::new(kdf.m_cost_kib, kdf.t_cost, kdf.p_cost, Some(KEY_LEN))
         .map_err(|_| VaultError::InvalidKdfParams("rejected by Argon2"))?;
     let blocks = params.block_count();
     let argon = Argon2::new(Algorithm::Argon2id, Version::V0x13, params);
-    let mut memory = Zeroizing::new(vec![Block::default(); blocks]);
-    let mut key = Zeroizing::new([0u8; KEY_LEN]);
+    let mut memory: Zeroizing<Vec<Block>> = Zeroizing::new(Vec::new());
+    memory
+        .try_reserve_exact(blocks)
+        .map_err(|_| VaultError::OutOfMemory(kdf.m_cost_kib))?;
+    memory.resize(blocks, Block::default());
+    // Allocated (zero) before the derivation writes into it: the key never sits on the stack.
+    let mut key: Key = Box::new(Zeroizing::new([0u8; KEY_LEN]));
     argon
         .hash_password_into_with_memory(
             master.expose_secret().as_bytes(),

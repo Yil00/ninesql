@@ -12,6 +12,12 @@
 //! Every value is a [`SecretString`], zeroized when it is removed, expires, is replaced, or when
 //! the cache is dropped. Nothing here touches the disk.
 //!
+//! Expiry is measured on `CLOCK_BOOTTIME`, so time spent suspended counts: a value cached "for
+//! 15 minutes" before an overnight suspend is gone at the first access or purge after resume. A
+//! duration too large to represent is capped at [`MAX_TIMED_LIFETIME`] (fail closed: the value
+//! still expires). The core should also call [`SessionSecretCache::clear`] on logind's
+//! `PrepareForSleep(true)` and on the session `Lock` signal.
+//!
 //! Intended use in the core (one cache per open workspace):
 //! 1. On connect, for each slot without a saved reference, look up
 //!    `cache.get(&SecretId("<connection uuid>:<slot>"))`.
@@ -25,30 +31,40 @@
 use std::collections::HashMap;
 use std::fmt;
 use std::sync::{Mutex, MutexGuard};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use secrecy::{ExposeSecret, SecretString};
 
+use crate::clock::{self, BootInstant, SharedClock};
 use crate::reference::SecretId;
+
+/// Longest effective [`CacheLifetime::For`] (100 years); longer durations are capped to it.
+pub const MAX_TIMED_LIFETIME: Duration = Duration::from_secs(100 * 365 * 24 * 60 * 60);
 
 /// How long a cached "ask every time" secret is kept.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CacheLifetime {
     /// Until removed explicitly (disconnect, lock, exit).
     Session,
-    /// Until removed explicitly, or at most this long.
+    /// Until removed explicitly, or at most this long (capped at [`MAX_TIMED_LIFETIME`]).
     For(Duration),
 }
 
 struct Cached {
     secret: SecretString,
-    expires_at: Option<Instant>,
+    expires_at: Option<BootInstant>,
 }
 
 /// In-memory, per-session store of secrets the user typed at connect time. Never persisted.
-#[derive(Default)]
 pub struct SessionSecretCache {
     items: Mutex<HashMap<SecretId, Cached>>,
+    clock: SharedClock,
+}
+
+impl Default for SessionSecretCache {
+    fn default() -> Self {
+        Self::with_clock(clock::system())
+    }
 }
 
 impl fmt::Debug for SessionSecretCache {
@@ -66,6 +82,13 @@ impl SessionSecretCache {
         Self::default()
     }
 
+    pub(crate) fn with_clock(clock: SharedClock) -> Self {
+        Self {
+            items: Mutex::new(HashMap::new()),
+            clock,
+        }
+    }
+
     fn items(&self) -> MutexGuard<'_, HashMap<SecretId, Cached>> {
         self.items
             .lock()
@@ -76,7 +99,9 @@ impl SessionSecretCache {
     pub fn insert(&self, id: SecretId, secret: SecretString, lifetime: CacheLifetime) {
         let expires_at = match lifetime {
             CacheLifetime::Session => None,
-            CacheLifetime::For(d) => Instant::now().checked_add(d),
+            CacheLifetime::For(d) => {
+                Some(self.clock.now().saturating_add(d.min(MAX_TIMED_LIFETIME)))
+            }
         };
         tracing::debug!(id = %id, "caching an ask-every-time secret in memory");
         self.items().insert(id, Cached { secret, expires_at });
@@ -85,10 +110,10 @@ impl SessionSecretCache {
     /// A copy of the cached secret, unless absent or expired (an expired value is dropped).
     #[must_use]
     pub fn get(&self, id: &SecretId) -> Option<SecretString> {
-        self.get_at(id, Instant::now())
+        self.get_at(id, self.clock.now())
     }
 
-    fn get_at(&self, id: &SecretId, now: Instant) -> Option<SecretString> {
+    fn get_at(&self, id: &SecretId, now: BootInstant) -> Option<SecretString> {
         let mut items = self.items();
         let expired = items
             .get(id)
@@ -121,10 +146,10 @@ impl SessionSecretCache {
 
     /// Drops expired secrets. Returns how many.
     pub fn purge_expired(&self) -> usize {
-        self.purge_expired_at(Instant::now())
+        self.purge_expired_at(self.clock.now())
     }
 
-    fn purge_expired_at(&self, now: Instant) -> usize {
+    fn purge_expired_at(&self, now: BootInstant) -> usize {
         let mut items = self.items();
         let before = items.len();
         items.retain(|_, c| c.expires_at.is_none_or(|at| at > now));
@@ -190,25 +215,41 @@ mod tests {
 
     #[test]
     fn timed_lifetime_expires() {
-        let cache = SessionSecretCache::new();
+        let clock = clock::ManualClock::new();
+        let cache = SessionSecretCache::with_clock(clock.clone());
         cache.insert(
             id("c:auth"),
             secret("pw"),
             CacheLifetime::For(Duration::from_secs(60)),
         );
         cache.insert(id("c:ssh"), secret("pw"), CacheLifetime::Session);
-        let now = Instant::now();
-        assert!(cache.get_at(&id("c:auth"), now).is_some());
-        let later = now + Duration::from_secs(61);
-        assert!(cache.get_at(&id("c:auth"), later).is_none());
+        assert!(cache.get(&id("c:auth")).is_some());
+        clock.advance(Duration::from_secs(61));
+        assert!(cache.get(&id("c:auth")).is_none());
         assert_eq!(cache.len(), 1);
         cache.insert(
             id("d:auth"),
             secret("pw"),
             CacheLifetime::For(Duration::ZERO),
         );
-        assert_eq!(cache.purge_expired_at(Instant::now()), 1);
-        assert_eq!(cache.purge_expired_at(later), 0);
+        assert_eq!(cache.purge_expired(), 1);
+        assert_eq!(cache.purge_expired(), 0);
         assert_eq!(cache.len(), 1);
+    }
+
+    /// L6: a duration that overflows is capped, so the value still expires (fail closed).
+    #[test]
+    fn huge_lifetime_is_capped_not_infinite() {
+        let clock = clock::ManualClock::new();
+        let cache = SessionSecretCache::with_clock(clock.clone());
+        cache.insert(
+            id("c:auth"),
+            secret("pw"),
+            CacheLifetime::For(Duration::MAX),
+        );
+        clock.advance(MAX_TIMED_LIFETIME - Duration::from_secs(1));
+        assert!(cache.get(&id("c:auth")).is_some());
+        clock.advance(Duration::from_secs(1));
+        assert!(cache.get(&id("c:auth")).is_none());
     }
 }

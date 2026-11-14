@@ -233,34 +233,69 @@ pub(crate) fn payload_len<'a>(entries: impl Iterator<Item = &'a EntryRef<'a>>) -
 /// payload **and** the AEAD tag, so neither encoding nor in-place encryption reallocates (a
 /// reallocation would leave an unzeroized copy of the plaintext on the heap).
 ///
-/// Field lengths have been checked against the limits by the caller.
-pub(crate) fn encode_payload(entries: &[EntryRef<'_>], out: &mut Vec<u8>) {
+/// The caller checks the limits first; a field that still does not fit its length prefix or
+/// exceeds the limit the decoder enforces is an error (never clamped, which would write a file
+/// that cannot be read back). On error `out` holds a partial plaintext: it must be a zeroizing
+/// buffer.
+pub(crate) fn encode_payload(
+    entries: &[EntryRef<'_>],
+    out: &mut Vec<u8>,
+) -> Result<(), &'static str> {
     let start_capacity = out.capacity();
-    let count = u32::try_from(entries.len()).unwrap_or(u32::MAX);
+    if entries.len() > MAX_ENTRIES {
+        return Err("too many secrets in the vault");
+    }
+    let count = u32::try_from(entries.len()).map_err(|_| "too many secrets in the vault")?;
     out.extend_from_slice(&count.to_le_bytes());
     for e in entries {
-        push_u8_len(out, e.project.as_bytes());
-        push_u8_len(out, e.id.as_bytes());
+        push_u8_len(out, e.project.as_bytes(), "project id too long")?;
+        push_u8_len(out, e.id.as_bytes(), "secret id too long")?;
         out.push(kind_to_byte(e.kind));
-        push_u16_len(out, e.connection_id.as_bytes());
-        push_u16_len(out, e.label.as_bytes());
-        let len = u32::try_from(e.secret.len()).unwrap_or(u32::MAX);
+        push_u16_len(
+            out,
+            e.connection_id.as_bytes(),
+            MAX_CONNECTION_ID_LEN,
+            "connection id longer than 256 bytes",
+        )?;
+        push_u16_len(
+            out,
+            e.label.as_bytes(),
+            MAX_LABEL_LEN,
+            "label longer than 1024 bytes",
+        )?;
+        if e.secret.len() > MAX_SECRET_LEN {
+            return Err("secret longer than 64 KiB");
+        }
+        let len = u32::try_from(e.secret.len()).map_err(|_| "secret longer than 64 KiB")?;
         out.extend_from_slice(&len.to_le_bytes());
         out.extend_from_slice(e.secret);
     }
     let padded = out.len().div_ceil(PAD_TO).max(1) * PAD_TO;
     out.resize(padded, 0);
     debug_assert_eq!(out.capacity(), start_capacity, "payload buffer reallocated");
+    Ok(())
 }
 
-fn push_u8_len(out: &mut Vec<u8>, bytes: &[u8]) {
-    out.push(u8::try_from(bytes.len()).unwrap_or(u8::MAX));
+fn push_u8_len(out: &mut Vec<u8>, bytes: &[u8], err: &'static str) -> Result<(), &'static str> {
+    let len = u8::try_from(bytes.len()).map_err(|_| err)?;
+    out.push(len);
     out.extend_from_slice(bytes);
+    Ok(())
 }
 
-fn push_u16_len(out: &mut Vec<u8>, bytes: &[u8]) {
-    out.extend_from_slice(&u16::try_from(bytes.len()).unwrap_or(u16::MAX).to_le_bytes());
+fn push_u16_len(
+    out: &mut Vec<u8>,
+    bytes: &[u8],
+    max: usize,
+    err: &'static str,
+) -> Result<(), &'static str> {
+    if bytes.len() > max {
+        return Err(err);
+    }
+    let len = u16::try_from(bytes.len()).map_err(|_| err)?;
+    out.extend_from_slice(&len.to_le_bytes());
     out.extend_from_slice(bytes);
+    Ok(())
 }
 
 /// One decoded entry, borrowing from the plaintext buffer.
@@ -476,7 +511,7 @@ mod tests {
                 .collect();
             let len = payload_len(refs.iter());
             let mut buf = Vec::with_capacity(len + TAG_LEN);
-            encode_payload(&refs, &mut buf);
+            encode_payload(&refs, &mut buf).unwrap();
             prop_assert_eq!(buf.len(), len);
             prop_assert_eq!(buf.len() % PAD_TO, 0);
             prop_assert_eq!(buf.capacity(), len + TAG_LEN);
@@ -496,6 +531,79 @@ mod tests {
         fn decode_never_panics(bytes in proptest::collection::vec(any::<u8>(), 0..2048)) {
             let _ = decode_payload(&bytes);
             let _ = Header::decode(&bytes);
+        }
+
+        /// Starts from a valid file and damages it the ways an attacker or a disk would: byte
+        /// flips, overwritten fields, truncation, extension. Decoding never panics, and whatever
+        /// it accepts still satisfies the structural rules.
+        #[test]
+        fn mutated_valid_headers_are_checked(
+            body_len in 16usize..600,
+            flips in proptest::collection::vec((0usize..1024, 1u8..=255), 0..6),
+            field in proptest::option::of((
+                prop_oneof![Just(8usize), Just(12), Just(16), Just(20), Just(104)],
+                any::<u64>(),
+            )),
+            cut in proptest::option::of(0usize..1024),
+            extra in proptest::collection::vec(any::<u8>(), 0..4),
+        ) {
+            let mut h = header();
+            h.ciphertext_len = body_len as u64;
+            let mut file = h.encode().to_vec();
+            file.extend(std::iter::repeat_n(7u8, body_len));
+            for (at, x) in flips {
+                let at = at % file.len();
+                file[at] ^= x;
+            }
+            if let Some((at, v)) = field {
+                let width = match at { 8 => 2, 104 => 8, _ => 4 };
+                file[at..at + width].copy_from_slice(&v.to_le_bytes()[..width]);
+            }
+            if let Some(cut) = cut {
+                file.truncate(cut.min(file.len()));
+            }
+            file.extend_from_slice(&extra);
+            if let Ok((back, body)) = Header::decode(&file) {
+                prop_assert_eq!(body.len() as u64, back.ciphertext_len);
+                prop_assert_eq!(file.len(), HEADER_LEN + body.len());
+                prop_assert!(back.ciphertext_len >= TAG_LEN as u64);
+                prop_assert!(back.kdf.m_cost_kib() <= KdfParams::MAX_M_COST_KIB);
+                prop_assert!(back.kdf.t_cost() <= KdfParams::MAX_T_COST);
+                prop_assert!((1..=KdfParams::MAX_P_COST).contains(&back.kdf.p_cost()));
+                prop_assert_eq!(&file[0..8], &MAGIC);
+                prop_assert_eq!(u16::from_le_bytes([file[8], file[9]]), FORMAT_VERSION);
+            }
+        }
+    }
+
+    /// L8: fields that do not fit are refused, not clamped into an unreadable file.
+    #[test]
+    fn encoding_refuses_oversized_fields() {
+        let long_id = "i".repeat(256);
+        let long_conn = "c".repeat(MAX_CONNECTION_ID_LEN + 1);
+        let long_secret = vec![b's'; MAX_SECRET_LEN + 1];
+        let ok = EntryRef {
+            project: "3f2a6c1e-0b7d-4c51-9e2a-6d8f0a1b2c3d",
+            id: "c:auth",
+            kind: SecretKind::Password,
+            connection_id: "c",
+            label: "l",
+            secret: b"x",
+        };
+        for bad in [
+            EntryRef { id: &long_id, ..ok },
+            EntryRef {
+                connection_id: &long_conn,
+                ..ok
+            },
+            EntryRef {
+                secret: &long_secret,
+                ..ok
+            },
+        ] {
+            let refs = [bad];
+            let mut buf = Vec::with_capacity(payload_len(refs.iter()) + TAG_LEN);
+            assert!(encode_payload(&refs, &mut buf).is_err());
         }
     }
 }

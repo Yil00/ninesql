@@ -33,6 +33,19 @@
 //!    *plain* session the crate would copy the secret unwiped (`secret.to_vec()`); NineSQL always
 //!    asks for [`EncryptionType::Dh`].
 //! 5. `getrandom` failures `expect` (panic) inside the crate instead of returning an error.
+//!    [`crate::detect_secret_service`] runs the probe on its own thread and reports a panic
+//!    there as `Unavailable`; store calls still propagate such a panic to their caller.
+//! 6. The AES-128 key schedule held by the `cbc` `Encryptor` / `Decryptor` that encrypt and
+//!    decrypt each secret is only wiped when the `aes` crate is built with its `zeroize`
+//!    feature. NineSQL enables it through feature unification (an otherwise unused `aes`
+//!    dependency of this crate, behind the `secret-service` feature), so those round keys are
+//!    zeroized on drop.
+//!
+//! Side effects of the probe and of the first call (to check in the ADR-0012 desktop round
+//! trip): connecting to `org.freedesktop.secrets` can make the session bus **D-Bus-activate** a
+//! provider that is installed but not running (`gnome-keyring-daemon`, `ksecretd` /
+//! `kwalletd`). On KDE this may start the KWallet first-run wizard or a "create wallet" dialog,
+//! even though NineSQL reads only the `default` alias and asks for no unlock.
 //!
 //! Impact: the leftovers are an ephemeral DH key and an AES session key that only decrypt the
 //! D-Bus traffic of one short-lived session (this backend connects, and so negotiates new keys,
@@ -184,8 +197,32 @@ impl SecretServiceStore {
 }
 
 /// Probe for [`crate::detect_secret_service`]: connects with an encrypted session and reads the
-/// `default` collection alias. Transfers no secret and triggers no unlock prompt.
+/// `default` collection alias. Transfers no secret and triggers no unlock prompt (but may
+/// D-Bus-activate a provider, see the module documentation).
+///
+/// Runs on a thread of its own so that a panic inside `secret-service` (item 5 of the review)
+/// becomes `Unavailable` instead of unwinding into the caller.
 pub(crate) fn probe() -> crate::backend::SecretServiceAvailability {
+    use crate::backend::SecretServiceAvailability as A;
+    let joined = std::thread::Builder::new()
+        .name("ninesql-secret-service-probe".into())
+        .spawn(probe_on_this_thread)
+        .map_err(|e| {
+            tracing::warn!(error = %e, "could not start the Secret Service probe");
+            "could not start the Secret Service probe"
+        })
+        .and_then(|handle| {
+            handle.join().map_err(|_| {
+                tracing::warn!("the Secret Service probe panicked; using the encrypted vault");
+                "the Secret Service client failed unexpectedly"
+            })
+        });
+    joined.unwrap_or_else(|detail| A::Unavailable {
+        detail: detail.to_owned(),
+    })
+}
+
+fn probe_on_this_thread() -> crate::backend::SecretServiceAvailability {
     use crate::backend::SecretServiceAvailability as A;
     let result = SecretServiceStore::connect()
         .and_then(|ss| ss.get_default_collection().map(|_| ()).map_err(map_error));

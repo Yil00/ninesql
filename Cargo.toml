@@ -51,6 +51,8 @@ secret-service = { version = "=6.0.0-rc.1", default-features = false, features =
 argon2 = { version = "0.6", default-features = false, features = ["alloc", "zeroize"] }
 chacha20poly1305 = { version = "0.11", default-features = false, features = ["alloc", "zeroize"] }
 getrandom = { version = "0.4", default-features = false }
+# Not used directly: enables `zeroize` on the aes 0.9 that secret-service already pulls in.
+aes = { version = "0.9", default-features = false, features = ["zeroize"] }
 tempfile = "3"
 libc = "0.2"
 # Safe `geteuid` for the workspace ownership check (already in the graph through tempfile).

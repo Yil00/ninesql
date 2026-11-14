@@ -4,7 +4,7 @@
 
 use std::fs::{self, File};
 use std::os::unix::fs::PermissionsExt;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::Duration;
 
 use proptest::prelude::*;
@@ -193,7 +193,10 @@ fn wrong_password_is_typed_and_leaves_the_file_untouched() {
     let before = f.bytes();
     let err = f.vault.unlock(&s("not the password")).unwrap_err();
     assert!(matches!(err, VaultError::WrongPassword), "{err}");
-    assert_eq!(err.to_string(), "wrong master password");
+    assert_eq!(
+        err.to_string(),
+        "wrong master password, or the vault header is damaged"
+    );
     assert!(!f.vault.is_unlocked());
     assert_eq!(f.bytes(), before);
     f.vault.unlock(&s(MASTER)).unwrap();
@@ -485,27 +488,79 @@ fn backoff_refuses_attempts_after_repeated_failures() {
     ));
 }
 
+/// Idle time is measured on the injected boot-time clock (`CLOCK_BOOTTIME` in production, so a
+/// suspend counts as idle time).
 #[test]
 fn idle_timeout_locks_the_vault() {
-    let f = Fixture::created();
-    f.vault.set_idle_timeout(Some(Duration::from_millis(200)));
-    assert!(!f.vault.lock_if_idle());
-    assert!(f.vault.is_unlocked());
-    std::thread::sleep(Duration::from_millis(300));
-    assert!(f.vault.lock_if_idle());
-    assert_eq!(f.vault.status().unwrap(), VaultStatus::Locked);
+    let dir = tempfile::tempdir().unwrap();
+    let clock = crate::clock::ManualClock::new();
+    let vault = Arc::new(
+        Vault::open_at_with_clock(
+            dir.path().join("vault.bin"),
+            &dir.path().join("ninesql.lock"),
+            clock.clone(),
+        )
+        .unwrap(),
+    );
+    vault
+        .create(&s(MASTER), KdfParams::insecure_for_tests())
+        .unwrap();
+    let store = VaultStore::new(vault.clone(), PROJECT_A).unwrap();
+    vault.set_idle_timeout(Some(Duration::from_secs(15 * 60)));
+    clock.advance(Duration::from_secs(14 * 60));
+    assert!(!vault.lock_if_idle());
+    assert!(vault.is_unlocked());
+    // An access resets the idle time.
+    assert!(store.ids().unwrap().is_empty());
+    clock.advance(Duration::from_secs(14 * 60));
+    assert!(!vault.lock_if_idle());
+    clock.advance(Duration::from_secs(60));
+    assert!(vault.lock_if_idle());
+    assert_eq!(vault.status().unwrap(), VaultStatus::Locked);
 
-    // Enforced at access time too, without the timer.
-    f.vault.unlock(&s(MASTER)).unwrap();
-    std::thread::sleep(Duration::from_millis(300));
+    // Enforced at access time too, without the timer ("overnight" without any check).
+    vault.unlock(&s(MASTER)).unwrap();
+    clock.advance(Duration::from_secs(8 * 3600));
     assert!(matches!(
-        f.store(PROJECT_A).get(&auth_id()),
+        store.get(&auth_id()),
         Err(SecretError::Locked(StoreKind::Vault))
     ));
-    f.vault.set_idle_timeout(None);
-    f.vault.unlock(&s(MASTER)).unwrap();
-    std::thread::sleep(Duration::from_millis(50));
-    assert!(!f.vault.lock_if_idle());
+    vault.set_idle_timeout(None);
+    vault.unlock(&s(MASTER)).unwrap();
+    clock.advance(Duration::from_secs(8 * 3600));
+    assert!(!vault.lock_if_idle());
+}
+
+/// L2: a vault whose parameters are below the minimum moves to the defaults when the password
+/// changes without explicit parameters; one that meets it keeps its own.
+#[test]
+fn password_change_upgrades_weak_kdf_params() {
+    let f = Fixture::created();
+    assert!(!KdfParams::insecure_for_tests().meets_minimum());
+    assert!(KdfParams::DEFAULT.meets_minimum());
+    f.store(PROJECT_A)
+        .set(&auth_id(), &meta(), &s(SECRET))
+        .unwrap();
+    f.vault
+        .change_master_password(&s(MASTER), &s(NEW_MASTER), None)
+        .unwrap();
+    assert_eq!(f.vault.kdf_params(), Some(KdfParams::DEFAULT));
+    assert_eq!(&f.bytes()[12..16], &(64 * 1024u32).to_le_bytes());
+
+    let min = KdfParams::new(KdfParams::MIN_M_COST_KIB, 2, 1).unwrap();
+    f.vault
+        .change_master_password(&s(NEW_MASTER), &s(MASTER), Some(min))
+        .unwrap();
+    f.vault
+        .change_master_password(&s(MASTER), &s(NEW_MASTER), None)
+        .unwrap();
+    assert_eq!(f.vault.kdf_params(), Some(min));
+    f.vault.lock();
+    f.vault.unlock(&s(NEW_MASTER)).unwrap();
+    assert_eq!(
+        f.store(PROJECT_A).get(&auth_id()).unwrap().expose_secret(),
+        SECRET
+    );
 }
 
 #[test]
@@ -549,104 +604,8 @@ fn size_limits() {
     assert_eq!(a.get(&auth_id()).unwrap().expose_secret(), max);
 }
 
-/// Records every span and event field, to check that nothing secret is logged.
-struct Capture(Arc<Mutex<String>>);
-
-struct Fields<'a>(&'a mut String);
-
-impl tracing::field::Visit for Fields<'_> {
-    fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn fmt::Debug) {
-        use std::fmt::Write;
-        let _ = write!(self.0, " {}={:?}", field.name(), value);
-    }
-}
-
-impl tracing::Subscriber for Capture {
-    fn enabled(&self, _: &tracing::Metadata<'_>) -> bool {
-        true
-    }
-    fn new_span(&self, attrs: &tracing::span::Attributes<'_>) -> tracing::span::Id {
-        attrs.record(&mut Fields(&mut self.0.lock().unwrap()));
-        tracing::span::Id::from_u64(1)
-    }
-    fn record(&self, _: &tracing::span::Id, values: &tracing::span::Record<'_>) {
-        values.record(&mut Fields(&mut self.0.lock().unwrap()));
-    }
-    fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
-    fn event(&self, event: &tracing::Event<'_>) {
-        let mut out = self.0.lock().unwrap();
-        out.push_str(event.metadata().target());
-        event.record(&mut Fields(&mut out));
-        out.push('\n');
-    }
-    fn enter(&self, _: &tracing::span::Id) {}
-    fn exit(&self, _: &tracing::span::Id) {}
-}
-
-/// I1: no secret, master password or label in `vault.bin`, in any other file of the directory,
-/// in the logs or in error messages.
-#[test]
-fn no_plaintext_in_the_file_logs_or_errors() {
-    let logs = Arc::new(Mutex::new(String::new()));
-    let f = Fixture::new();
-    let mut errors = String::new();
-    tracing::subscriber::with_default(Capture(logs.clone()), || {
-        f.vault
-            .create(&s(MASTER), KdfParams::insecure_for_tests())
-            .unwrap();
-        let a = f.store(PROJECT_A);
-        a.set(&auth_id(), &meta(), &s(SECRET)).unwrap();
-        f.vault.lock();
-        errors.push_str(&f.vault.unlock(&s(NEW_MASTER)).unwrap_err().to_string());
-        f.vault.unlock(&s(MASTER)).unwrap();
-        assert_eq!(a.get(&auth_id()).unwrap().expose_secret(), SECRET);
-        errors.push_str(
-            &f.vault
-                .change_master_password(&s(SECRET), &s(NEW_MASTER), None)
-                .unwrap_err()
-                .to_string(),
-        );
-        f.vault
-            .change_master_password(&s(MASTER), &s(NEW_MASTER), None)
-            .unwrap();
-        let mut corrupt = f.bytes();
-        let last = corrupt.len() - 1;
-        corrupt[last] ^= 1;
-        let good = f.bytes();
-        fs::write(f.path(), &corrupt).unwrap();
-        f.vault.lock();
-        errors.push_str(&f.vault.unlock(&s(NEW_MASTER)).unwrap_err().to_string());
-        fs::write(f.path(), &good).unwrap();
-        f.vault.unlock(&s(NEW_MASTER)).unwrap();
-        errors.push_str(&format!("{:?} {:?}", f.vault, a));
-        f.vault.lock();
-    });
-    let logs = logs.lock().unwrap().clone();
-    assert!(logs.contains("vault unlocked"), "capture works: {logs}");
-    for needle in [MASTER, NEW_MASTER, SECRET, LABEL] {
-        assert!(!logs.contains(needle), "{needle:?} in logs");
-        assert!(!errors.contains(needle), "{needle:?} in errors");
-        for entry in fs::read_dir(f.dir.path()).unwrap() {
-            let path = entry.unwrap().path();
-            let bytes = fs::read(&path).unwrap();
-            assert!(
-                !contains(&bytes, needle.as_bytes()),
-                "{needle:?} in {}",
-                path.display()
-            );
-        }
-    }
-    // The connection id and secret id are encrypted too.
-    assert!(!contains(&f.bytes(), CONN.as_bytes()));
-    // No temp file left next to the vault.
-    let names: Vec<_> = fs::read_dir(f.dir.path())
-        .unwrap()
-        .map(|e| e.unwrap().file_name().into_string().unwrap())
-        .collect();
-    let mut names = names;
-    names.sort();
-    assert_eq!(names, ["ninesql.lock", "vault.bin"]);
-}
+// The I1 log / file / error leak test is the integration test `tests/vault_no_leak.rs`: it
+// installs a global tracing subscriber, which needs a test binary of its own.
 
 #[test]
 fn file_size_hides_secret_lengths() {
