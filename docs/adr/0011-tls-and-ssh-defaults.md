@@ -1,6 +1,6 @@
 # ADR-0011: TLS and SSH defaults
 
-- **Status**: Accepted. Partially amended by [ADR-0016](0016-ssh-rsa-and-host-key-policies.md) for Decision §5–§7 (RSA keys disabled for now, opt-in `AcceptNew` / `Disabled` host-key policies) and a clarification of §4 (TLS of imported DBeaver connections).
+- **Status**: Accepted. Partially amended by [ADR-0016](0016-ssh-rsa-and-host-key-policies.md) for Decision §5–§7 (RSA keys disabled for now, opt-in `AcceptNew` / `Disabled` host-key policies) and a clarification of §4 (TLS of imported DBeaver connections). Clarified by [ADR-0019](0019-tls-ca-file-semantics.md) for Decision §1–§2: a per-connection CA file is the only trust anchor (system roots not added), `verify-ca` requires a CA file.
 - **Date**: 2026-11-14
 
 ## Context

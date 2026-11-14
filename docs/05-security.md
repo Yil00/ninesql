@@ -13,7 +13,7 @@ NineSQL holds credentials to production databases and displays their data. Its s
 |---|---|---|
 | Another local process or a backup reads saved passwords | Secret Service or Argon2id + XChaCha20-Poly1305 vault ([notes below](#vault-format-v1)); workspace holds references only; `0600` / `0700`; no plaintext store at all | I1, ADR-0005, ADR-0008 |
 | Secrets leak through logs, history, crash output or exports | No values or passwords in logs; history without parameters; production query text never logged | I1, ADR-0007 |
-| Network attacker intercepts or impersonates a server | `verify-full` TLS by default, rustls; SSH host keys checked, changed keys blocked; non-strict host-key policies only as explicit, flagged per-hop choices | I5, ADR-0011, ADR-0016 |
+| Network attacker intercepts or impersonates a server | `verify-full` TLS by default, rustls; a per-connection CA file is the only trust anchor and `verify-ca` requires one ([ADR-0019](adr/0019-tls-ca-file-semantics.md)); SSH host keys checked, changed keys blocked; non-strict host-key policies only as explicit, flagged per-hop choices | I5, ADR-0011, ADR-0016, ADR-0019 |
 | The client itself leaks data (telemetry, update checks) | No network traffic except declared connections | I2 |
 | Accidental destructive statement in production | Connection types, engine-side read-only, parser-based confirmation, manual commit default | I3, ADR-0007 |
 | Injection through generated SQL (edits, filters, DDL) | Dialect-aware quoting and typed literals; tests with hostile identifiers and values | ADR-0004 |

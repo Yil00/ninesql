@@ -16,7 +16,7 @@ New ADR: copy [template.md](template.md), take the next number, status `Proposed
 | [0008](0008-workspace-and-config-storage.md) | Workspace and configuration storage | Accepted, partially amended by [0017](0017-workspace-lock-rewrite-on-load-and-project-identity.md) |
 | [0009](0009-container-first-test-environment.md) | Container-first test environment, runnable in CI and cloud agent sandboxes | Accepted |
 | [0010](0010-packaging-and-distribution.md) | Packaging and distribution | Accepted |
-| [0011](0011-tls-and-ssh-defaults.md) | TLS and SSH defaults | Accepted, partially amended by [0016](0016-ssh-rsa-and-host-key-policies.md) |
+| [0011](0011-tls-and-ssh-defaults.md) | TLS and SSH defaults | Accepted, partially amended by [0016](0016-ssh-rsa-and-host-key-policies.md), clarified by [0019](0019-tls-ca-file-semantics.md) |
 | [0012](0012-secret-service-client-and-msrv.md) | Secret Service client crate and minimum Rust version | Accepted, partially amended by [0017](0017-workspace-lock-rewrite-on-load-and-project-identity.md) |
 | [0013](0013-gpui-source-and-supply-chain.md) | GPUI source (gpui-kit / gpui-pre from crates.io) and supply-chain controls | Accepted, partially amended by [0018](0018-patched-third-party-crates.md) |
 | [0014](0014-dev-environment-profiles.md) | Dev environment profiles follow ADR-0009 | Accepted |
@@ -24,3 +24,4 @@ New ADR: copy [template.md](template.md), take the next number, status `Proposed
 | [0016](0016-ssh-rsa-and-host-key-policies.md) | SSH – RSA keys disabled until russh moves to rsa ≥ 0.10, and non-strict host-key policies | Accepted |
 | [0017](0017-workspace-lock-rewrite-on-load-and-project-identity.md) | Workspace lock, rewrite-on-load and project identity | Accepted |
 | [0018](0018-patched-third-party-crates.md) | Patched third-party crates | Accepted |
+| [0019](0019-tls-ca-file-semantics.md) | TLS CA-file semantics | Accepted |

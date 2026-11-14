@@ -24,6 +24,7 @@ All notable changes to this project are documented here. The format follows [Kee
 - Encrypted vault (`ninesql-secrets`, P1-D): `vault.bin` format v1, Argon2id (m = 64 MiB, t = 3, p = 1 by default) and XChaCha20-Poly1305 with a key-check tag, padding and size limits, idle lock on `CLOCK_BOOTTIME`, back-off on failed unlocks, master password change; an in-memory "ask every time" cache; backend selection keyring → vault → ask, never plaintext; Secret Service probe (5 s) and method (25 s) timeouts. The Secret Service backend stays off by default.
 - Settings saved from the UI (P1-A): theme, fonts, zoom (`[appearance] zoom`) and key bindings are written back to `settings.toml` with `toml_edit` (comments and unknown keys kept), debounced on a background task, atomically with mode `0600`; never over a newer, invalid or unreadable file.
 - DBeaver import report: SSH key files named as RSA (or of unknown type) are flagged (ADR-0016); first cargo-fuzz runs of both decoders recorded (300 s each, no crash).
+- ADR-0018 (patched third-party crates) and ADR-0019 (TLS CA-file semantics: a CA file is the only trust anchor, `verify-ca` requires one) accepted.
 
 ### Changed
 - Minimum Rust version raised to 1.89 (ADR-0012).
