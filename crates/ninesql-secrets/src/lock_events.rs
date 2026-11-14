@@ -9,8 +9,9 @@
 //! - [`LockHooks`]: the set the application registers once (every open vault, every cache) and
 //!   triggers as a whole.
 //! - With the `secret-service` feature, `DesktopLockWatcher` listens to logind on the
-//!   system bus and calls a hook on `PrepareForSleep(true)` and on the `Lock` signal of the
-//!   current session. Without it, the application calls [`LockHooks::lock_all`] from whatever
+//!   system bus and calls a hook on `PrepareForSleep(true)` (holding a sleep delay inhibitor
+//!   until the hook ran) and when the current session locks (`Lock` signal or `LockedHint`
+//!   turning `true`). Without it, the application calls [`LockHooks::lock_all`] from whatever
 //!   source it has (a menu action, its own screen-lock detection).
 //!
 //! Idle timers keep running across suspend (`CLOCK_BOOTTIME`), so this is a second line: the
