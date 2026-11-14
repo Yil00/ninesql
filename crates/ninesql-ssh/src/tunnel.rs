@@ -313,14 +313,18 @@ impl KnownHostsStore {
                 kh.user_path().map(std::path::Path::to_path_buf),
             )
         })?;
+        let state = Arc::clone(&self.state);
         let io = Arc::clone(&self.io);
-        let fresh = tokio::task::spawn_blocking(move || {
+        tokio::task::spawn_blocking(move || {
             let _io = io.lock().map_err(poisoned)?;
-            KnownHosts::load(&own, user.as_deref())
+            let fresh = KnownHosts::load(&own, user.as_deref())?;
+            // Published while the I/O lock is still held, like `modify`: a concurrent `modify`
+            // cannot then overwrite freshly loaded lines (a new `@revoked` key) with a stale copy.
+            *state.lock().map_err(poisoned)? = fresh;
+            Ok(())
         })
         .await
-        .map_err(|_| SshError::Internal("known_hosts loading task failed"))??;
-        self.with(|kh| *kh = fresh)
+        .map_err(|_| SshError::Internal("known_hosts loading task failed"))?
     }
 
     /// In-memory lookup (no I/O).

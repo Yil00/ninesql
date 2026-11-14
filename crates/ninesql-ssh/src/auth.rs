@@ -180,12 +180,9 @@ fn load_key(
     if mode & 0o077 != 0 {
         return Err(err(KeyFileError::PermissionsTooOpen(mode)));
     }
-    match current_uid() {
-        Some(uid) if meta.uid() != uid && meta.uid() != 0 => {
-            return Err(err(KeyFileError::WrongOwner));
-        }
-        Some(_) => {}
-        None => tracing::warn!("cannot determine the current user; key file owner not checked"),
+    let uid = current_uid();
+    if meta.uid() != uid && meta.uid() != 0 {
+        return Err(err(KeyFileError::WrongOwner));
     }
     let len = usize::try_from(meta.len()).map_err(|_| err(KeyFileError::NotAKeyFile))?;
     // Capacity for the whole file plus one byte, and reads capped at the size seen by fstat:
@@ -213,9 +210,9 @@ fn load_key(
     }
 }
 
-/// Effective uid of this process, from the owner of `/proc/self` (no `unsafe` libc call).
-fn current_uid() -> Option<u32> {
-    std::fs::metadata("/proc/self").ok().map(|m| m.uid())
+/// Effective uid of this process (`geteuid`, which cannot fail; safe wrapper from `rustix`).
+fn current_uid() -> u32 {
+    rustix::process::geteuid().as_raw()
 }
 
 async fn authenticate_agent<H: Handler>(
@@ -353,7 +350,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let p = dir.path().join("f");
         std::fs::write(&p, "x").unwrap();
-        assert_eq!(current_uid(), Some(std::fs::metadata(&p).unwrap().uid()));
+        assert_eq!(current_uid(), std::fs::metadata(&p).unwrap().uid());
     }
 
     #[test]
