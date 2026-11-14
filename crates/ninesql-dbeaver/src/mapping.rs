@@ -441,8 +441,32 @@ pub(crate) fn import_project(project: &Project) -> ProjectImport {
     let mut issues = Issues::default();
     let mut sources = Vec::new();
     let mut source_files = Vec::new();
-    for path in &project.data_source_files {
-        let parsed = fsread::read_limited(path, MAX_DATA_SOURCES_BYTES).map(|bytes| {
+    let mut budget = MAX_PROJECT_BYTES;
+    if project.data_source_files.len() > MAX_DATA_SOURCE_FILES {
+        issues.warn(
+            IssueKind::Truncated,
+            None,
+            format!(
+                "the project has more than {MAX_DATA_SOURCE_FILES} data-sources files: only the \
+                 first {MAX_DATA_SOURCE_FILES} are read"
+            ),
+        );
+    }
+    for path in project.data_source_files.iter().take(MAX_DATA_SOURCE_FILES) {
+        if budget == 0 {
+            issues.warn(
+                IssueKind::Truncated,
+                None,
+                format!(
+                    "more than {MAX_PROJECT_BYTES} bytes of data-sources files: the remaining \
+                     files are not read"
+                ),
+            );
+            break;
+        }
+        let limit = budget.min(MAX_DATA_SOURCES_BYTES);
+        let parsed = fsread::read_limited(path, limit).map(|bytes| {
+            budget = budget.saturating_sub(bytes.len() as u64);
             parse_data_sources(&bytes).map_err(|e| match e {
                 crate::model::ParseError::InvalidJson { line, column } => {
                     crate::DbeaverError::InvalidJson {
@@ -483,13 +507,48 @@ pub(crate) fn import_project(project: &Project) -> ProjectImport {
         },
     };
     let mut out = map_sources(&project.name, &sources, credentials);
+    drop(sources);
     if read_failed {
         out.credentials = CredentialsStatus::ReadFailed;
     }
     out.source_files = source_files;
+    check_file_endpoints(&mut out, &project.workspace);
     issues.0.append(&mut out.issues);
     out.issues = issues.0;
     out
+}
+
+/// Canonicalizes file endpoints and forces read-only on database files that live inside the
+/// DBeaver workspace (I4: NineSQL must never modify a file under a DBeaver directory).
+fn check_file_endpoints(out: &mut ProjectImport, workspace: &std::path::Path) {
+    let workspace_canon = fsread::canonicalize(workspace);
+    for entry in &mut out.connections {
+        let Outcome::Imported(c) = &mut entry.outcome else {
+            continue;
+        };
+        let Endpoint::File { path } = &mut c.endpoint else {
+            continue;
+        };
+        let lexical_inside = path.starts_with(workspace);
+        if let Some(canon) = fsread::canonicalize(path) {
+            *path = canon;
+        }
+        let inside = lexical_inside
+            || path.starts_with(workspace)
+            || workspace_canon
+                .as_ref()
+                .is_some_and(|w| path.starts_with(w));
+        if inside {
+            c.read_only = Some(true);
+            entry.issues.push(ImportIssue::new(
+                crate::report::Severity::Warning,
+                IssueKind::FileInsideDbeaver,
+                Some("configuration.database".to_owned()),
+                "the database file is inside the DBeaver workspace: imported read-only, and the \
+                 driver must open it in read-only mode (NineSQL never modifies DBeaver files)",
+            ));
+        }
+    }
 }
 
 /// Maps already parsed files of one project. `credentials` is `None` when the project has no
@@ -534,8 +593,17 @@ pub fn map_sources(
     let mut folder_defs: BTreeMap<&str, &FolderDef> = BTreeMap::new();
     let mut type_defs: BTreeMap<&str, &ConnectionTypeDef> = BTreeMap::new();
     let mut conn_defs: BTreeMap<&str, &ConnectionDef> = BTreeMap::new();
+    let mut network_profiles = false;
+    let mut truncated_connections = false;
+    let mut truncated_folders = false;
     for ds in sources {
         coverage::report_extra(Scope::TopLevel, "", &ds.extra, &mut issues);
+        network_profiles |= ds.extra.get("network-profiles").is_some_and(|v| match v {
+            serde_json::Value::Object(m) => !m.is_empty(),
+            serde_json::Value::Array(a) => !a.is_empty(),
+            serde_json::Value::Null => false,
+            _ => true,
+        });
         for key in &ds.invalid_entries {
             issues.warn(
                 IssueKind::InvalidValue,
@@ -544,6 +612,10 @@ pub fn map_sources(
             );
         }
         for f in &ds.folders {
+            if folder_defs.len() >= MAX_FOLDERS && !folder_defs.contains_key(f.key.as_str()) {
+                truncated_folders = true;
+                continue;
+            }
             folder_defs.entry(f.key.as_str()).or_insert(f);
         }
         for t in &ds.connection_types {
@@ -556,10 +628,26 @@ pub fn map_sources(
                     Some(format!("connections.{}", c.id)),
                     "defined in several data-sources files: only the first one is imported",
                 );
+            } else if conn_defs.len() >= MAX_CONNECTIONS {
+                truncated_connections = true;
             } else {
                 conn_defs.insert(&c.id, c);
             }
         }
+    }
+    if truncated_connections {
+        issues.warn(
+            IssueKind::Truncated,
+            None,
+            format!("more than {MAX_CONNECTIONS} connections: the others are not imported"),
+        );
+    }
+    if truncated_folders {
+        issues.warn(
+            IssueKind::Truncated,
+            None,
+            format!("more than {MAX_FOLDERS} folders: the others are not imported"),
+        );
     }
 
     let mut folders = map_folders(&folder_defs, &mut issues);
@@ -572,14 +660,17 @@ pub fn map_sources(
             credentials_status,
             CredentialsStatus::Unreadable(_) | CredentialsStatus::ReadFailed
         ),
+        network_profiles,
     };
+    let mut folder_paths: BTreeSet<Vec<String>> = folders.iter().map(|f| f.path.clone()).collect();
     let mut connections = Vec::with_capacity(conn_defs.len());
     for (id, def) in conn_defs {
         let saved = creds.as_mut().and_then(|c| c.connections.remove(id));
         let import = map_connection(def, saved, &ctx);
         if let Some(c) = import.imported()
             && !c.folder.is_empty()
-            && !folders.iter().any(|f| f.path == c.folder)
+            && folder_paths.len() < MAX_FOLDERS
+            && folder_paths.insert(c.folder.clone())
         {
             folders.push(ImportedFolder {
                 path: c.folder.clone(),
@@ -604,7 +695,7 @@ pub fn map_sources(
     folders.sort_by(|a, b| a.path.cmp(&b.path));
     folders.dedup_by(|a, b| a.path == b.path);
 
-    let out = ProjectImport {
+    let mut out = ProjectImport {
         project: project.to_owned(),
         source_files: Vec::new(),
         credentials: credentials_status,
@@ -613,6 +704,7 @@ pub fn map_sources(
         connections,
         issues: issues.0,
     };
+    cap_issues(&mut out);
     tracing::debug!(
         connections = out.connections.len(),
         secrets = out.secret_count(),
@@ -626,6 +718,45 @@ struct Ctx<'a> {
     project: &'a str,
     types: &'a TypeTable,
     credentials_unreadable: bool,
+    /// The files define DBeaver network profiles (shared SSH / proxy settings).
+    network_profiles: bool,
+}
+
+/// Most data-sources files read per project.
+pub(crate) const MAX_DATA_SOURCE_FILES: usize = 64;
+/// Most bytes of data-sources files read per project.
+pub(crate) const MAX_PROJECT_BYTES: u64 = 64 * 1024 * 1024;
+/// Most connections imported per project.
+pub(crate) const MAX_CONNECTIONS: usize = 10_000;
+/// Most folders imported per project.
+pub(crate) const MAX_FOLDERS: usize = 10_000;
+/// Most report entries per project (project and connection issues together).
+pub(crate) const MAX_ISSUES: usize = 50_000;
+
+/// Keeps at most [`MAX_ISSUES`] report entries, then adds one "truncated" entry. Connection
+/// state (disabled, read-only, TLS mode) is not affected: only the explanations are cut.
+fn cap_issues(out: &mut ProjectImport) {
+    let mut left = MAX_ISSUES;
+    let mut cut = false;
+    let mut take = |v: &mut Vec<ImportIssue>| {
+        if v.len() > left {
+            v.truncate(left);
+            cut = true;
+        }
+        left -= v.len();
+    };
+    take(&mut out.issues);
+    for c in &mut out.connections {
+        take(&mut c.issues);
+    }
+    if cut {
+        out.issues.push(ImportIssue::new(
+            crate::report::Severity::Warning,
+            IssueKind::Truncated,
+            None,
+            format!("more than {MAX_ISSUES} report entries: the others are not shown"),
+        ));
+    }
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -1029,9 +1160,11 @@ fn is_valid_short(text: &str) -> bool {
     text.len() <= MAX_SHORT_TEXT && !text.chars().any(char::is_control)
 }
 
-/// Core host rule: non-empty, short, no whitespace, `@`, `/` or `\`.
+/// Core host rule (non-empty, short, no whitespace, `@`, `/` or `\`), and no leading `-` so a
+/// host can never be read as a command-line option by a tool it is passed to.
 fn is_valid_host(host: &str) -> bool {
     !host.trim().is_empty()
+        && !host.starts_with('-')
         && is_valid_short(host)
         && !host
             .chars()
@@ -1269,6 +1402,17 @@ fn map_connection(
         .filter(|q| !q.trim().is_empty())
         .cloned()
         .collect();
+    if !init_sql.is_empty() {
+        st.issues.warn(
+            IssueKind::InitSql,
+            Some("configuration.bootstrap.query".to_owned()),
+            format!(
+                "{} init statement(s) imported: they run on every connect; review them before \
+                 connecting",
+                init_sql.len()
+            ),
+        );
+    }
 
     // Database credentials.
     let auth = map_auth(def, file_engine, saved.as_mut(), ctx, &mut st);
@@ -1285,47 +1429,73 @@ fn map_connection(
     for h in &cfg.handlers {
         let prefix = format!("configuration.handlers.{}", h.id);
         coverage::report_extra(Scope::Handler, &prefix, &h.extra, &mut st.issues);
-        if h.enabled != Some(true) {
+        // An `enabled` value of an unexpected type counts as enabled (fail closed).
+        let enabled = h
+            .enabled
+            .unwrap_or_else(|| h.extra.get("enabled").is_some());
+        if !enabled {
             // Saved but switched off in DBeaver: not used, so not imported.
             continue;
         }
         match h.id.as_str() {
             "ssh_tunnel" => {
                 let section = saved.as_mut().and_then(|s| s.sections.remove(SSH_SECTION));
-                match map_ssh(h, section, &prefix, &mut st) {
+                match map_ssh(h, section, &prefix, &endpoint, &mut st) {
                     Ok(t) => ssh = Some(t),
                     Err(reason) => return failed(id, name, reason, st.issues),
                 }
             }
             "postgre_ssl" => tls_from_postgres_handler(h, &prefix, &mut st),
             "mysql_ssl" => tls_from_mysql_handler(h, &prefix, &mut st),
+            other if is_harmless_tls_handler(other, h.kind.as_deref()) => {
+                st.issues.warn(
+                    IssueKind::Unsupported,
+                    Some(prefix),
+                    "TLS handler not supported yet: its settings are not imported",
+                );
+            }
             other => {
-                let kind = h.kind.as_deref().unwrap_or_default().to_ascii_uppercase();
-                let lower = other.to_ascii_lowercase();
-                if kind == "TUNNEL" || kind == "PROXY" || lower.contains("proxy") {
-                    st.issues.warn(
-                        IssueKind::Disabled,
-                        Some(prefix),
-                        "network handler not supported yet: the connection is imported disabled \
-                         so that it never bypasses the tunnel or proxy",
-                    );
-                    st.disabled.push(format!(
-                        "network handler `{}` not supported yet",
-                        ident(other, MAX_IDENT)
-                    ));
-                } else if lower.contains("ssl") || lower.contains("tls") {
-                    st.issues.warn(
-                        IssueKind::Unsupported,
-                        Some(prefix),
-                        "TLS handler not supported yet: its settings are not imported",
-                    );
-                } else {
-                    st.issues.warn(
-                        IssueKind::Unsupported,
-                        Some(prefix),
-                        "not imported: unknown DBeaver network handler",
-                    );
-                }
+                // Fail closed (I2): any other enabled handler may route traffic (tunnel, proxy,
+                // cloud forwarding…); connecting without it would bypass it.
+                st.issues.warn(
+                    IssueKind::Disabled,
+                    Some(prefix),
+                    "network handler not supported yet: the connection is imported disabled so \
+                     that it never bypasses the tunnel, proxy or forwarding it configures",
+                );
+                st.disabled.push(format!(
+                    "network handler `{}` not supported yet",
+                    ident(other, MAX_IDENT)
+                ));
+            }
+        }
+    }
+
+    // Network profiles (shared SSH / proxy settings, F-CON-17): not supported yet, so a
+    // connection that may use one is disabled rather than imported without its hops (I2).
+    let mut scopes: Vec<(String, &crate::model::Extra)> = vec![
+        (String::new(), &def.extra),
+        ("configuration".to_owned(), &cfg.extra),
+    ];
+    for h in &cfg.handlers {
+        scopes.push((format!("configuration.handlers.{}", h.id), &h.extra));
+    }
+    for (scope, extra) in scopes {
+        for key in extra.keys() {
+            let norm = normalize_key(key);
+            let references_profile = is_network_profile_key(&norm)
+                || (ctx.network_profiles
+                    && (norm.starts_with("network") || norm.starts_with("profile")));
+            if references_profile {
+                st.issues.warn(
+                    IssueKind::Disabled,
+                    Some(join(&scope, key)),
+                    "the connection uses a DBeaver network profile, which is not supported yet \
+                     (F-CON-17): imported disabled so that it never bypasses the profile's \
+                     tunnel or proxy",
+                );
+                st.disabled
+                    .push("DBeaver network profile not supported yet".to_owned());
             }
         }
     }
@@ -1421,7 +1591,7 @@ fn map_endpoint(
         } else {
             host_field.is_none()
         };
-    let url = non_empty(cfg.url.as_deref()).filter(|_| use_url);
+    let url = non_empty(cfg.url.as_ref().map(|u| u.expose_secret())).filter(|_| use_url);
     let parsed = match url {
         Some(u) => match jdbc::parse(u) {
             Some(p) => Some(p),
@@ -1479,6 +1649,13 @@ fn map_endpoint(
         };
         if path.trim() == ":memory:" || path.trim_start().starts_with(":memory:") {
             return Err("in-memory databases cannot be imported");
+        }
+        let path = path.trim();
+        if path.contains("${") {
+            return Err("the database file path contains a DBeaver variable (`${…}`)");
+        }
+        if !std::path::Path::new(path).is_absolute() {
+            return Err("the database file path is not absolute");
         }
         return Ok(Endpoint::File {
             path: PathBuf::from(path),
@@ -1542,6 +1719,23 @@ fn map_endpoint(
         port,
         database,
     })
+}
+
+/// Normalized key naming a network profile (`network-profile`, `networkProfile`,
+/// `network_profile_id`…).
+fn is_network_profile_key(norm: &str) -> bool {
+    norm.contains("networkprofile")
+}
+
+/// A TLS-only handler that cannot route traffic: `type` exactly `CONFIG`, an id that names TLS,
+/// and nothing in the id that suggests a tunnel, proxy or forwarding.
+fn is_harmless_tls_handler(id: &str, kind: Option<&str>) -> bool {
+    let lower = id.to_ascii_lowercase();
+    kind == Some("CONFIG")
+        && (lower.contains("ssl") || lower.contains("tls"))
+        && !["tunnel", "ssh", "proxy", "socks", "ssm", "iap", "forward"]
+            .iter()
+            .any(|w| lower.contains(w))
 }
 
 fn normalize_key(key: &str) -> String {
@@ -1722,6 +1916,7 @@ fn map_ssh(
     h: &HandlerDef,
     section: Option<crate::credentials::Section>,
     prefix: &str,
+    endpoint: &Endpoint,
     st: &mut ConnState,
 ) -> Result<SshTunnel, &'static str> {
     let props_prefix = join(prefix, "properties");
@@ -1733,7 +1928,15 @@ fn map_ssh(
             "not imported: not a scalar value",
         );
     }
-    const CONSUMED: &[&str] = &["host", "port", "authType", "keyPath", "user"];
+    const CONSUMED: &[&str] = &[
+        "host",
+        "port",
+        "authType",
+        "keyPath",
+        "user",
+        "remoteHost",
+        "remotePort",
+    ];
     for (key, _) in &props.entries {
         if CONSUMED.contains(&key.as_str()) {
             continue;
@@ -1767,6 +1970,7 @@ fn map_ssh(
             }
         },
     };
+    check_forwarding_target(props, &props_prefix, endpoint, st);
     let (sec_user, sec_password, other_keys) = match section {
         Some(s) => (s.user, s.password, s.other_keys),
         None => (None, None, Vec::new()),
@@ -1783,8 +1987,8 @@ fn map_ssh(
         .or_else(|| non_empty(h.user.as_deref()).map(str::to_owned))
         .or_else(|| text_prop(props, "user"))
         .ok_or("SSH tunnel without a user name")?;
-    if !is_valid_short(&username) {
-        return Err("the SSH user name is too long or has control characters");
+    if !is_valid_short(&username) || username.starts_with('-') {
+        return Err("the SSH user name is too long, starts with `-` or has control characters");
     }
     let mut password = sec_password;
     if password.is_none()
@@ -1856,6 +2060,45 @@ fn map_ssh(
         },
         jump_hosts: Vec::new(),
     })
+}
+
+/// `remoteHost` / `remotePort`: the address the SSH server forwards to. NineSQL forwards to the
+/// connection's own host and port and has no field for another target, so a different target
+/// disables the connection (connecting elsewhere than DBeaver did would be wrong).
+fn check_forwarding_target(
+    props: &Properties,
+    props_prefix: &str,
+    endpoint: &Endpoint,
+    st: &mut ConnState,
+) {
+    let Endpoint::Tcp { host, port, .. } = endpoint else {
+        return;
+    };
+    let mut differs = Vec::new();
+    if let Some(remote) = text_prop(props, "remoteHost")
+        && !remote.eq_ignore_ascii_case(host)
+    {
+        differs.push("remoteHost");
+    }
+    if let Some(remote) = props
+        .get("remotePort")
+        .filter(|v| !v.as_text().trim().is_empty())
+    {
+        // Without an explicit connection port the target cannot be confirmed: fail closed.
+        if remote.as_u16().is_none() || remote.as_u16() != *port {
+            differs.push("remotePort");
+        }
+    }
+    for key in differs {
+        st.issues.warn(
+            IssueKind::Disabled,
+            Some(join(props_prefix, key)),
+            "the SSH tunnel forwards to another address than the connection's host and port, \
+             which NineSQL does not support yet: imported disabled",
+        );
+        st.disabled
+            .push("SSH forwarding target not supported yet".to_owned());
+    }
 }
 
 fn push_secret(
@@ -2136,19 +2379,22 @@ fn resolve_tls(st: &mut ConnState) -> TlsConfig {
     let mut mode = st.tls.handler_mode.or(st.tls.prop_mode);
     if mode.is_none() {
         mode = st.tls.implied_mode();
-    } else if st.tls.verify_server == Some(false) || st.tls.trust_server == Some(true) {
-        // An explicit "do not verify" flag caps any explicit mode at `require`.
+    }
+    if st.tls.verify_server == Some(false) || st.tls.trust_server == Some(true) {
+        // An explicit "do not verify" flag caps any mode (explicit or implied, such as
+        // `ssl=true`) at `require`.
         mode = mode.map(|m| m.min(TlsMode::Require));
     }
     let mode = match mode {
         Some(m) => m,
         None => {
-            st.issues.info(
+            st.issues.warn(
                 IssueKind::TlsConverted,
                 None,
-                "DBeaver had no TLS setting (its JDBC driver default is opportunistic TLS \
-                 without certificate verification); NineSQL applies `verify-full`: if the server \
-                 has no trusted certificate, choose a weaker mode explicitly",
+                "DBeaver had no TLS setting: depending on the JDBC driver it connected with \
+                 opportunistic TLS without certificate verification (PostgreSQL, MySQL) or \
+                 without TLS at all (MariaDB, ClickHouse…). NineSQL applies `verify-full`: if \
+                 the server has no TLS or no trusted certificate, choose a weaker mode explicitly",
             );
             TlsMode::VerifyFull
         }

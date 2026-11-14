@@ -40,6 +40,13 @@ pub(crate) fn read_limited(path: &Path, limit: u64) -> Result<Zeroizing<Vec<u8>>
         });
     }
     let file = File::open(path).map_err(|e| DbeaverError::io(path, &e))?;
+    // Re-check on the opened file: the path may have been swapped meanwhile (FIFO, device…).
+    let meta = file.metadata().map_err(|e| DbeaverError::io(path, &e))?;
+    if !meta.is_file() {
+        return Err(DbeaverError::NotAFile {
+            path: path.to_path_buf(),
+        });
+    }
     // Pre-size the buffer so it is not reallocated (a reallocation would leave an unzeroized
     // copy of the content behind). The `take` bound protects against a file growing meanwhile.
     let capacity = usize::try_from(meta.len().saturating_add(1)).unwrap_or(0);
@@ -91,6 +98,12 @@ pub(crate) fn list_dir(dir: &Path) -> Result<Vec<Entry>, DbeaverError> {
     }
     out.sort_by(|a, b| a.name.cmp(&b.name));
     Ok(out)
+}
+
+/// Canonical form of an existing path (symlinks resolved); `None` when it does not resolve.
+/// Read-only: only `stat` / `readlink`.
+pub(crate) fn canonicalize(path: &Path) -> Option<PathBuf> {
+    fs::canonicalize(path).ok()
 }
 
 /// Whether `path` is an existing directory (symlinks followed).

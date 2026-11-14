@@ -73,9 +73,6 @@ pub(crate) fn classify(scope: Scope, key: &str) -> Class {
             "a fixed local forwarding address is not supported: NineSQL binds 127.0.0.1 on an \
              ephemeral port (ADR-0011)",
         ),
-        (Scope::SshProperties, "remoteHost" | "remotePort") => {
-            Unsupported("a forwarding target other than the connection host is not supported yet")
-        }
         (Scope::SshProperties, "aliveInterval" | "aliveCount" | "sshConnectTimeout") => {
             Unsupported("SSH keep-alive and timeout settings are not imported")
         }

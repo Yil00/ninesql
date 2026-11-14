@@ -137,11 +137,7 @@ pub struct Extra(Map<String, Value>);
 
 impl Extra {
     fn new(mut map: Map<String, Value>) -> Self {
-        for (key, value) in &mut map {
-            if is_secret_like_key(key) {
-                scrub(value);
-            }
-        }
+        scrub_secret_like(&mut map);
         Self(map)
     }
 
@@ -186,6 +182,26 @@ impl Drop for Extra {
         for value in self.0.values_mut() {
             scrub(value);
         }
+    }
+}
+
+/// Scrubs the value of every secret-like key, at any depth (the key itself is kept so the
+/// report can name it).
+fn scrub_secret_like(map: &mut Map<String, Value>) {
+    for (key, value) in map.iter_mut() {
+        if is_secret_like_key(key) {
+            scrub(value);
+        } else {
+            scrub_secret_like_value(value);
+        }
+    }
+}
+
+fn scrub_secret_like_value(value: &mut Value) {
+    match value {
+        Value::Object(m) => scrub_secret_like(m),
+        Value::Array(items) => items.iter_mut().for_each(scrub_secret_like_value),
+        Value::Null | Value::Bool(_) | Value::Number(_) | Value::String(_) => {}
     }
 }
 
@@ -347,8 +363,9 @@ pub struct ConfigurationDef {
     pub server: Option<String>,
     /// `database`.
     pub database: Option<String>,
-    /// `url`: JDBC URL.
-    pub url: Option<String>,
+    /// `url`: JDBC URL. Held as a secret (zeroized on drop, redacted): it can carry
+    /// `user:password@` or a `password=` parameter.
+    pub url: Option<SecretString>,
     /// `configurationType`: `MANUAL` or `URL`.
     pub configuration_type: Option<String>,
     /// `type`: connection type id.
@@ -563,7 +580,7 @@ fn configuration(map: Map<String, Value>) -> ConfigurationDef {
         port: f.scalar("port"),
         server: f.string("server"),
         database: f.string("database"),
-        url: f.string("url"),
+        url: f.secret("url"),
         configuration_type: f.string("configurationType"),
         type_id: f.string("type"),
         auth_model: f.string("auth-model"),
@@ -779,6 +796,19 @@ mod tests {
         assert_eq!(extra.get("auth-token"), Some(&Value::Null));
         assert_eq!(extra.get("other"), Some(&Value::from("v")));
         assert_eq!(format!("{extra:?}"), r#"{"auth-token", "other"}"#);
+    }
+
+    #[test]
+    fn nested_secret_like_values_are_scrubbed() {
+        let ds = parse_data_sources(
+            br#"{"connections":{"c1":{"future":{"a":[{"apiToken":"fixture-n"}],"b":"kept"}}}}"#,
+        )
+        .unwrap_or_default();
+        let future = ds.connections[0].extra.get("future").cloned();
+        assert_eq!(
+            future,
+            Some(serde_json::json!({"a":[{"apiToken":null}],"b":"kept"}))
+        );
     }
 
     #[test]

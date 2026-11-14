@@ -47,6 +47,12 @@ pub enum IssueKind {
     Credentials,
     /// A data-sources file could not be read or parsed.
     File,
+    /// A per-project limit was reached (files, bytes, connections, folders, report entries).
+    Truncated,
+    /// A database file lives inside the DBeaver workspace: imported read-only (I4).
+    FileInsideDbeaver,
+    /// Init statements were imported: the user should review them.
+    InitSql,
 }
 
 /// One entry of the import report.

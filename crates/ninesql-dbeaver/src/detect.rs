@@ -78,6 +78,10 @@ pub struct Project {
     pub data_source_files: Vec<PathBuf>,
     /// `credentials-config.json`, when present.
     pub credentials_file: Option<PathBuf>,
+    /// The DBeaver workspace holding the project (the project folder itself for a picked
+    /// project whose parent is not a workspace). Database files under it are imported
+    /// read-only (I4).
+    pub workspace: PathBuf,
 }
 
 /// A DBeaver workspace and its projects.
@@ -133,7 +137,14 @@ pub fn open_folder(path: &Path) -> Result<Workspace, DbeaverError> {
             path: path.to_path_buf(),
         });
     }
-    if let Some(project) = read_project(path) {
+    let parent_is_workspace = path
+        .parent()
+        .is_some_and(|p| fsread::is_dir(&p.join(".metadata")));
+    let workspace = match path.parent() {
+        Some(parent) if parent_is_workspace => parent.to_path_buf(),
+        _ => path.to_path_buf(),
+    };
+    if let Some(project) = read_project(path, &workspace) {
         return Ok(Workspace {
             kind: InstallKind::Custom,
             path: path.to_path_buf(),
@@ -169,12 +180,12 @@ pub fn list_projects(workspace: &Path) -> Vec<Project> {
     entries
         .into_iter()
         .filter(|e| e.is_dir && !e.name.starts_with('.'))
-        .filter_map(|e| read_project(&e.path))
+        .filter_map(|e| read_project(&e.path, workspace))
         .collect()
 }
 
 /// Reads one project folder, if it holds at least one data-sources file.
-fn read_project(path: &Path) -> Option<Project> {
+fn read_project(path: &Path, workspace: &Path) -> Option<Project> {
     let dot_dbeaver = path.join(".dbeaver");
     if !fsread::is_dir(&dot_dbeaver) {
         return None;
@@ -205,6 +216,7 @@ fn read_project(path: &Path) -> Option<Project> {
         path: path.to_path_buf(),
         data_source_files: data_source_files.into_iter().map(|(_, _, p)| p).collect(),
         credentials_file: fsread::is_file(&credentials).then_some(credentials),
+        workspace: workspace.to_path_buf(),
     })
 }
 

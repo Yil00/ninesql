@@ -32,6 +32,23 @@ pub(crate) struct JdbcUrl {
     pub(crate) params: Vec<(String, String)>,
 }
 
+impl Drop for JdbcUrl {
+    /// Parameters and the user info can carry credentials: wipe them.
+    fn drop(&mut self) {
+        use zeroize::Zeroize;
+        for (k, v) in &mut self.params {
+            k.zeroize();
+            v.zeroize();
+        }
+        if let Some(u) = &mut self.user {
+            u.zeroize();
+        }
+        if let Some(d) = &mut self.database {
+            d.zeroize();
+        }
+    }
+}
+
 impl std::fmt::Debug for JdbcUrl {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("JdbcUrl")
