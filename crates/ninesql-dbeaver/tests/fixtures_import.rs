@@ -324,6 +324,13 @@ fn every_fixture_maps_as_documented() {
             SecretKind::SshKeyPassphrase,
             "fixture-passphrase-not-a-secret"
         ));
+        // An Ed25519 key by its name: not flagged as a possible RSA key file (ADR-0016 §1.2).
+        assert!(!has_issue(
+            &p,
+            "mariadb-ssh-key",
+            IssueKind::SshKeyType,
+            None
+        ));
         assert_eq!(
             c.tls.mode,
             TlsMode::Require,

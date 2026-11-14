@@ -742,13 +742,15 @@ fn ssh_with(props: &str) -> String {
 
 #[test]
 fn ssh_jump_servers_are_mapped_or_fail_closed() {
+    // Key names as DBeaver's `SSHUtils.saveHostConfigurations` writes them: the user name of a
+    // jump server is `jumpServer<i>.name`.
     let p = map(
         &ssh_with(
             r#","jumpServer.count":"2",
             "jumpServer0.enabled":"true","jumpServer0.host":"jump1.example.test","jumpServer0.port":"2201",
-            "jumpServer0.user":"nine_jump","jumpServer0.authType":"PUBLIC_KEY","jumpServer0.keyPath":"/home/nine_user/.ssh/j",
+            "jumpServer0.name":"nine_jump","jumpServer0.authType":"PUBLIC_KEY","jumpServer0.keyPath":"/home/nine_user/.ssh/id_ed25519",
             "jumpServer0.keyValue":"-----BEGIN fixture-key-not-a-secret",
-            "jumpServer1.enabled":true,"jumpServer1.host":"jump2.example.test","jumpServer1.user":"nine_jump",
+            "jumpServer1.enabled":true,"jumpServer1.host":"jump2.example.test","jumpServer1.name":"nine_jump",
             "jumpServer2.enabled":false,"jumpServer2.host":"off.example.test""#,
         ),
         None,
@@ -764,10 +766,11 @@ fn ssh_jump_servers_are_mapped_or_fail_closed() {
         hops,
         [("jump1.example.test", 2201), ("jump2.example.test", 22)]
     );
+    assert_eq!(ssh.jump_hosts[0].username, "nine_jump");
     assert_eq!(
         ssh.jump_hosts[0].auth,
         SshAuth::PublicKey {
-            key_path: std::path::PathBuf::from("/home/nine_user/.ssh/j"),
+            key_path: std::path::PathBuf::from("/home/nine_user/.ssh/id_ed25519"),
             passphrase: Some(SecretState::Prompt),
         }
     );
@@ -782,23 +785,352 @@ fn ssh_jump_servers_are_mapped_or_fail_closed() {
         IssueKind::SecretRemoved,
         Some("jumpServer0.keyValue")
     ));
+    // Index 2 is past `jumpServer.count`: reported, not imported.
+    assert!(issue(&p, IssueKind::Unsupported, Some("jumpServer2")));
     assert!(!format!("{p:?}").contains("not-a-secret"));
-    // A host without an `enabled` flag counts as active.
-    let p = map(
-        &ssh_with(r#","jumpServer0.host":"jump1.example.test","jumpServer0.user":"u""#),
-        None,
-    );
-    assert_eq!(only(&p).ssh.as_ref().map(|s| s.jump_hosts.len()), Some(1));
     // Unreadable or incomplete jump servers fail the connection: the hop is never skipped.
     for props in [
         r#","jumpServer0.enabled":true,"jumpServer0.host":"jump1.example.test""#,
-        r#","jumpServer0.enabled":true,"jumpServer0.user":"u""#,
-        r#","jumpServer0.enabled":true,"jumpServer0.host":"-x","jumpServer0.user":"u""#,
+        r#","jumpServer0.enabled":true,"jumpServer0.name":"u""#,
+        r#","jumpServer0.enabled":true,"jumpServer0.host":"-x","jumpServer0.name":"u""#,
+        // `user` is not the key DBeaver reads for a jump server: no user name.
+        r#","jumpServer0.enabled":true,"jumpServer0.host":"jump1.example.test","jumpServer0.user":"u""#,
         r#","jumpServerX.host":"jump1.example.test""#,
-        r#","jumpServer99.host":"jump1.example.test""#,
         r#","jumpServer0.host":{"a":1}"#,
+        r#","jumpServer.count":{"a":1}"#,
     ] {
         assert_eq!(status_of(&ssh_with(props)), Status::Failed, "{props}");
+    }
+}
+
+/// A hop for `ssh_with`: `jumpServer<i>.*` with DBeaver's key names, `enabled` written as given.
+fn hop(i: usize, enabled: &str) -> String {
+    format!(
+        r#","jumpServer{i}.enabled":{enabled},"jumpServer{i}.host":"jump{i}.example.test",
+        "jumpServer{i}.name":"nine_jump","jumpServer{i}.authType":"AGENT""#
+    )
+}
+
+/// The jump hosts imported for `props`, or the status when the connection is not imported.
+fn jump_hosts(props: &str) -> Result<Vec<String>, Status> {
+    let p = map(&ssh_with(props), None);
+    match p.connections[0].imported() {
+        Some(c) => Ok(c
+            .ssh
+            .as_ref()
+            .map(|s| s.jump_hosts.iter().map(|h| h.host.clone()).collect())
+            .unwrap_or_default()),
+        None => Err(p.connections[0].status()),
+    }
+}
+
+fn jumps(names: &[usize]) -> Vec<String> {
+    names
+        .iter()
+        .map(|i| format!("jump{i}.example.test"))
+        .collect()
+}
+
+#[test]
+fn jump_servers_follow_dbeaver_selection() {
+    // No `jumpServer.count`: DBeaver reads up to MAX_JUMP_SERVERS (5) indices.
+    let five: String = (0..5).map(|i| hop(i, "true")).collect();
+    assert_eq!(jump_hosts(&five), Ok(jumps(&[0, 1, 2, 3, 4])));
+    // A sixth enabled hop in the chain: more than DBeaver supports, fails (never dropped).
+    let six: String = (0..6).map(|i| hop(i, "true")).collect();
+    assert_eq!(
+        jump_hosts(&format!(r#","jumpServer.count":6{six}"#)),
+        Err(Status::Failed)
+    );
+    // Without a count, index 5 is past the default count: reported, not imported (DBeaver does
+    // not read it either).
+    assert_eq!(jump_hosts(&six), Ok(jumps(&[0, 1, 2, 3, 4])));
+    // A count larger than 5 with a shorter chain is fine.
+    let two = format!("{}{}", hop(0, "true"), hop(1, "true"));
+    assert_eq!(
+        jump_hosts(&format!(r#","jumpServer.count":"9"{two}"#)),
+        Ok(jumps(&[0, 1]))
+    );
+    // The count bounds the indices: number or string, as DBeaver writes it.
+    for count in ["1", r#""1""#] {
+        let props = format!(r#","jumpServer.count":{count}{two}"#);
+        assert_eq!(jump_hosts(&props), Ok(jumps(&[0])), "{count}");
+        let p = map(&ssh_with(&props), None);
+        assert!(issue(&p, IssueKind::Unsupported, Some("jumpServer1")));
+    }
+    // Zero, negative or blank counts.
+    for count in ["0", r#""0""#, "-1", r#""-3""#] {
+        assert_eq!(
+            jump_hosts(&format!(r#","jumpServer.count":{count}{two}"#)),
+            Ok(vec![]),
+            "{count}"
+        );
+    }
+    assert_eq!(
+        jump_hosts(&format!(r#","jumpServer.count":""{two}"#)),
+        Ok(jumps(&[0, 1]))
+    );
+    // An unreadable count fails.
+    for count in [r#""two""#, "1.5", r#""1.5""#, "true", r#"" 1""#] {
+        assert_eq!(
+            jump_hosts(&format!(r#","jumpServer.count":{count}{two}"#)),
+            Err(Status::Failed),
+            "{count}"
+        );
+    }
+    // The chain stops at the first hop that is not enabled; the hops after it must not be
+    // enabled.
+    let off_first = format!("{}{}", hop(0, "false"), hop(1, "false"));
+    assert_eq!(jump_hosts(&off_first), Ok(vec![]));
+    let p = map(&ssh_with(&off_first), None);
+    assert!(issue(&p, IssueKind::Unsupported, Some("jumpServer0")));
+    let tail_off = format!("{}{}", hop(0, "true"), hop(1, r#""FALSE""#));
+    assert_eq!(jump_hosts(&tail_off), Ok(jumps(&[0])));
+    for props in [
+        // Enabled after a disabled one.
+        format!("{}{}", hop(0, "false"), hop(1, "true")),
+        format!("{}{}{}", hop(0, "true"), hop(1, "false"), hop(2, "true")),
+        // Enabled after a missing index.
+        format!("{}{}", hop(0, "true"), hop(2, "true")),
+        hop(1, "true"),
+        // Enabled after a hop without an `enabled` flag (DBeaver reads it as not enabled).
+        format!(
+            r#","jumpServer0.host":"jump0.example.test","jumpServer0.name":"u"{}"#,
+            hop(1, "true")
+        ),
+    ] {
+        assert_eq!(jump_hosts(&props), Err(Status::Failed), "{props}");
+    }
+    // A hop without `enabled` is not used (DBeaver's `getBooleanProperty` default), and said so.
+    let props = r#","jumpServer0.host":"jump0.example.test","jumpServer0.name":"u""#;
+    assert_eq!(jump_hosts(props), Ok(vec![]));
+    assert!(issue(
+        &map(&ssh_with(props), None),
+        IssueKind::Unsupported,
+        Some("jumpServer0")
+    ));
+    // `enabled` must be a boolean or `true` / `false` (any case, not trimmed).
+    assert_eq!(jump_hosts(&hop(0, r#""True""#)), Ok(jumps(&[0])));
+    for enabled in [
+        r#""yes""#,
+        "1",
+        r#""1""#,
+        r#""""#,
+        r#"" true""#,
+        r#""true ""#,
+    ] {
+        assert_eq!(
+            jump_hosts(&hop(0, enabled)),
+            Err(Status::Failed),
+            "{enabled}"
+        );
+    }
+    // Even on a hop past the count: never read as `false`.
+    assert_eq!(
+        jump_hosts(&format!(r#","jumpServer.count":0{}"#, hop(0, r#""yes""#))),
+        Err(Status::Failed)
+    );
+}
+
+#[test]
+fn jump_server_indices_must_be_canonical() {
+    for index in [
+        "00",
+        "01",
+        "+0",
+        "+1",
+        "-1",
+        " 0",
+        "0 ",
+        "1x",
+        "99999999999999999999999",
+    ] {
+        let props = format!(r#","jumpServer{index}.enabled":true"#);
+        assert_eq!(jump_hosts(&props), Err(Status::Failed), "{index:?}");
+    }
+    // Canonical multi-digit indices are accepted (past the count: reported, not imported).
+    let props = hop(10, "true");
+    assert_eq!(jump_hosts(&props), Ok(vec![]));
+    assert!(issue(
+        &map(&ssh_with(&props), None),
+        IssueKind::Unsupported,
+        Some("jumpServer10")
+    ));
+}
+
+// ---- ADR-0016 §1.2: RSA key files ----
+
+fn key_type_issues(p: &ProjectImport) -> Vec<(String, String)> {
+    p.connections
+        .iter()
+        .flat_map(|c| &c.issues)
+        .filter(|i| i.kind == IssueKind::SshKeyType)
+        .map(|i| (i.key.clone().unwrap_or_default(), i.message.clone()))
+        .collect()
+}
+
+#[test]
+fn rsa_key_files_are_flagged() {
+    let with_key = |path: &str| {
+        map(
+            &ssh_with(&format!(r#","authType":"PUBLIC_KEY","keyPath":"{path}""#)),
+            None,
+        )
+    };
+    for path in [
+        "/home/nine_user/.ssh/id_rsa",
+        "/home/nine_user/.ssh/ID_RSA",
+        "/home/nine_user/.ssh/id_rsa_work",
+        "/home/nine_user/keys/deploy-rsa.pem",
+        r"C:\\Users\\nine_user\\.ssh\\id_rsa",
+    ] {
+        let p = with_key(path);
+        // Still imported: NineSQL refuses the key when connecting, the report warns now.
+        assert_eq!(p.connections[0].status(), Status::Imported, "{path}");
+        let issues = key_type_issues(&p);
+        assert_eq!(issues.len(), 1, "{path}");
+        assert!(issues[0].0.ends_with("properties.keyPath"), "{path}");
+        assert!(
+            issues[0].1.starts_with("RSA key files are not supported"),
+            "{path}"
+        );
+        assert!(issues[0].1.contains("ADR-0016"));
+        // The report never shows the path.
+        assert!(!format!("{:?}", p.connections[0].issues).contains("nine_user"));
+    }
+    for path in [
+        "/home/nine_user/.ssh/id_ed25519",
+        "/home/nine_user/.ssh/id_ecdsa",
+        "/home/nine_user/keys/deploy-ed25519.pem",
+        // `rsa` inside a word is not a hint.
+        "/home/nine_user/keys/universal_ed25519",
+    ] {
+        assert!(key_type_issues(&with_key(path)).is_empty(), "{path}");
+    }
+    // A name that says nothing: the type is not checked, the report says so (key files are
+    // never read during import).
+    for path in [
+        "/home/nine_user/.ssh/work_key",
+        "/home/nine_user/.ssh/mykey.pem",
+        "/home/nine_user/.rsa/key",
+        "/home/nine_user/.ssh/id_dsa",
+    ] {
+        let issues = key_type_issues(&with_key(path));
+        assert_eq!(issues.len(), 1, "{path}");
+        assert!(issues[0].1.contains("not checked"), "{path}");
+        assert!(
+            issues[0]
+                .1
+                .contains("RSA key files are not supported (ADR-0016)")
+        );
+    }
+    // Password and agent auth: no key file, nothing to flag.
+    assert!(key_type_issues(&map(&ssh_with(r#","authType":"AGENT""#), None)).is_empty());
+    assert!(key_type_issues(&map(&ssh_with(""), None)).is_empty());
+}
+
+#[test]
+fn rsa_key_files_of_jump_servers_are_flagged() {
+    let p = map(
+        &ssh_with(
+            r#","authType":"PUBLIC_KEY","keyPath":"/home/nine_user/.ssh/id_ed25519",
+            "jumpServer0.enabled":true,"jumpServer0.host":"jump0.example.test","jumpServer0.name":"u",
+            "jumpServer0.authType":"PUBLIC_KEY","jumpServer0.keyPath":"/home/nine_user/.ssh/id_rsa",
+            "jumpServer1.enabled":true,"jumpServer1.host":"jump1.example.test","jumpServer1.name":"u",
+            "jumpServer1.authType":"PUBLIC_KEY","jumpServer1.keyPath":"/home/nine_user/.ssh/bastion""#,
+        ),
+        None,
+    );
+    assert_eq!(p.connections[0].status(), Status::Imported);
+    let issues = key_type_issues(&p);
+    assert_eq!(issues.len(), 2, "{issues:?}");
+    assert!(issues[0].0.ends_with("jumpServer0.keyPath"));
+    assert!(issues[0].1.starts_with("RSA key files are not supported"));
+    assert!(issues[1].0.ends_with("jumpServer1.keyPath"));
+    assert!(issues[1].1.contains("not checked"));
+}
+
+// ---- P2-A review L-a: blank profile values ----
+
+#[test]
+fn blank_profile_values_count_in_every_scope() {
+    let handler = |extra: &str, props: &str| {
+        format!(
+            r#"{{"host":"db.example.test","port":"5432","handlers":{{"postgre_ssl":{{"type":"CONFIG",
+            "enabled":true{extra},"properties":{{"sslmode":"verify-full"{props}}}}}}}}}"#
+        )
+    };
+    let connection_scope = |value: &str| {
+        one(
+            "postgresql",
+            "postgres-jdbc",
+            r#"{"host":"db.example.test","port":"5432"}"#,
+        )
+        .replace(
+            r#""name":"c","#,
+            &format!(r#""name":"c","config-profile":{value},"#),
+        )
+    };
+    let cases = |value: &str| {
+        vec![
+            ("connection", connection_scope(value)),
+            (
+                "configuration",
+                one(
+                    "postgresql",
+                    "postgres-jdbc",
+                    &format!(
+                        r#"{{"host":"db.example.test","port":"5432","config-profile":{value}}}"#
+                    ),
+                ),
+            ),
+            (
+                "handler",
+                one(
+                    "postgresql",
+                    "postgres-jdbc",
+                    &handler(&format!(r#","config-profile":{value}"#), ""),
+                ),
+            ),
+            (
+                "handler properties",
+                one(
+                    "postgresql",
+                    "postgres-jdbc",
+                    &handler("", &format!(r#","config-profile":{value}"#)),
+                ),
+            ),
+        ]
+    };
+    // DBeaver does not trim: a blank value is a (broken) profile reference, fail closed.
+    for value in [
+        r#"" ""#,
+        r#""\t""#,
+        r#""\u00a0""#,
+        r#""bastion""#,
+        "false",
+        "0",
+        r#"["p"]"#,
+        r#"{"id":"p"}"#,
+    ] {
+        for (scope, json) in cases(value) {
+            let p = map(&json, None);
+            assert_eq!(
+                p.connections[0].status(),
+                Status::ImportedDisabled,
+                "{scope}: {value}"
+            );
+            assert!(
+                issue(&p, IssueKind::Disabled, Some("config-profile")),
+                "{scope}: {value}"
+            );
+        }
+    }
+    // Only an absent value does not: null, the empty string, an empty array or object.
+    for value in ["null", r#""""#, "[]", "{}"] {
+        for (scope, json) in cases(value) {
+            assert_eq!(status_of(&json), Status::Imported, "{scope}: {value}");
+        }
     }
 }
 
@@ -855,5 +1187,64 @@ fn unreadable_handler_data_disables() {
     assert_eq!(
         status_of(&one("postgresql", "postgres-jdbc", cfg)),
         Status::Imported
+    );
+}
+
+// ---- Security review of the P2-A follow-ups (Low-2, Low-3) ----
+
+#[test]
+fn skipped_jump_servers_report_secrets_and_hosts() {
+    use ninesql_dbeaver::Severity;
+    // Not enabled, disabled, and past the count: none is imported, each is reported.
+    for props in [
+        r#","jumpServer0.host":"jump0.example.test","jumpServer0.name":"u",
+        "jumpServer0.keyValue":"-----BEGIN fixture-skipped-not-a-secret",
+        "jumpServer0.password":"fixture-skipped-not-a-secret""#,
+        r#","jumpServer0.enabled":false,"jumpServer0.host":"jump0.example.test",
+        "jumpServer0.keyValue":"-----BEGIN fixture-skipped-not-a-secret",
+        "jumpServer0.password":"fixture-skipped-not-a-secret""#,
+        r#","jumpServer.count":0,"jumpServer0.enabled":false,"jumpServer0.host":"jump0.example.test",
+        "jumpServer0.keyValue":"-----BEGIN fixture-skipped-not-a-secret",
+        "jumpServer0.password":"fixture-skipped-not-a-secret""#,
+        r#","jumpServer.count":0,"jumpServer0.enabled":true,"jumpServer0.host":"jump0.example.test",
+        "jumpServer0.keyValue":"-----BEGIN fixture-skipped-not-a-secret",
+        "jumpServer0.password":"fixture-skipped-not-a-secret""#,
+    ] {
+        let p = map(&ssh_with(props), None);
+        assert_eq!(jump_hosts(props), Ok(vec![]), "{props}");
+        assert!(
+            issue(&p, IssueKind::SecretRemoved, Some("jumpServer0.keyValue")),
+            "{props}"
+        );
+        assert!(
+            issue(&p, IssueKind::SecretRemoved, Some("jumpServer0.password")),
+            "{props}"
+        );
+        // A configured host that is not used is a warning, never only an info.
+        assert!(
+            p.connections[0]
+                .issues
+                .iter()
+                .any(|i| i.kind == IssueKind::Unsupported
+                    && i.severity == Severity::Warning
+                    && i.key.as_deref().is_some_and(|k| k.ends_with("jumpServer0"))),
+            "{props}"
+        );
+        let dump = format!("{p:?}");
+        assert!(!dump.contains("not-a-secret"), "{props}");
+        assert!(!dump.contains("jump0.example.test"), "{props}");
+    }
+    // Settings without a host: info only.
+    let p = map(
+        &ssh_with(r#","jumpServer0.enabled":false,"jumpServer0.port":"22""#),
+        None,
+    );
+    assert!(
+        p.connections[0]
+            .issues
+            .iter()
+            .any(|i| i.kind == IssueKind::Unsupported
+                && i.severity == Severity::Info
+                && i.key.as_deref().is_some_and(|k| k.ends_with("jumpServer0")))
     );
 }

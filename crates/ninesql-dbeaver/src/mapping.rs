@@ -281,7 +281,8 @@ pub struct SshHop {
 pub struct SshTunnel {
     /// Server that forwards to the database.
     pub server: SshHop,
-    /// Jump hosts (none found in the verified DBeaver formats yet).
+    /// Jump hosts, closest to NineSQL first (none found in the P0-E fixtures; key names and
+    /// order taken from DBeaver's source).
     pub jump_hosts: Vec<SshHop>,
 }
 
@@ -1527,6 +1528,12 @@ fn map_connection(
     // DBeaver writes `configuration."config-profile"` (and `"config-profile-source"`, e.g.
     // `global`: the profile may live outside this file), so any non-empty value under a key
     // containing `profile` disables, whether or not the file defines `network-profiles`.
+    // The same value test applies in every scope (connection, `configuration`, handler, handler
+    // properties): see `is_profile_reference`.
+    let profile_like = |key: &str| {
+        let norm = normalize_key(key);
+        norm.contains("profile") || (ctx.network_profiles && norm.starts_with("network"))
+    };
     let mut profile_keys: Vec<String> = Vec::new();
     let mut scopes: Vec<(String, &crate::model::Extra)> = vec![
         (String::new(), &def.extra),
@@ -1536,17 +1543,19 @@ fn map_connection(
         scopes.push((format!("configuration.handlers.{}", h.id), &h.extra));
         let props_prefix = format!("configuration.handlers.{}.properties", h.id);
         for (key, value) in &h.properties.entries {
-            if normalize_key(key).contains("profile") && !value.as_text().trim().is_empty() {
+            if profile_like(key) && is_profile_reference_scalar(value) {
+                profile_keys.push(join(&props_prefix, key));
+            }
+        }
+        for key in &h.properties.non_scalar {
+            if profile_like(key) && !h.properties.empty_non_scalar.contains(key) {
                 profile_keys.push(join(&props_prefix, key));
             }
         }
     }
     for (scope, extra) in scopes {
         for (key, value) in extra.iter() {
-            let norm = normalize_key(key);
-            let profile_like =
-                norm.contains("profile") || (ctx.network_profiles && norm.starts_with("network"));
-            if profile_like && !is_empty_json(value) {
+            if profile_like(key) && is_profile_reference(value) {
                 profile_keys.push(join(&scope, key));
             }
         }
@@ -1794,6 +1803,27 @@ fn is_empty_json(value: &serde_json::Value) -> bool {
         serde_json::Value::Array(a) => a.is_empty(),
         serde_json::Value::Object(m) => m.is_empty(),
         serde_json::Value::Bool(_) | serde_json::Value::Number(_) => false,
+    }
+}
+
+/// Whether the value of a profile-like key may reference a DBeaver network profile. Fail closed:
+/// only `null`, the empty string and an empty array or object do not. A blank string (`" "`)
+/// counts, because DBeaver does not trim the value it looks a profile up by.
+fn is_profile_reference(value: &serde_json::Value) -> bool {
+    match value {
+        serde_json::Value::Null => false,
+        serde_json::Value::String(s) => !s.is_empty(),
+        serde_json::Value::Array(a) => !a.is_empty(),
+        serde_json::Value::Object(m) => !m.is_empty(),
+        serde_json::Value::Bool(_) | serde_json::Value::Number(_) => true,
+    }
+}
+
+/// [`is_profile_reference`] for a scalar property value.
+fn is_profile_reference_scalar(value: &Scalar) -> bool {
+    match value {
+        Scalar::Text(s) => !s.is_empty(),
+        Scalar::Bool(_) | Scalar::Number(_) => true,
     }
 }
 
@@ -2102,6 +2132,7 @@ fn map_ssh(
         "PUBLIC_KEY" => {
             let key_path =
                 text_prop(props, "keyPath").ok_or("SSH public-key auth without a key path")?;
+            check_key_type(&key_path, join(&props_prefix, "keyPath"), st);
             let passphrase = match password {
                 Some(p) => Some(push_secret(
                     st,
@@ -2148,19 +2179,71 @@ fn map_ssh(
     })
 }
 
-/// Highest jump server index accepted (DBeaver offers up to 5).
-const MAX_JUMP_INDEX: usize = 31;
+/// DBeaver's `SSHConstants.MAX_JUMP_SERVERS`: the most jump servers its dialog creates, and the
+/// default of `jumpServer.count` when the key is absent (`SSHUtils.loadHostConfigurations`,
+/// DBeaver 24.3 and later; 22.x and 23.x read `jumpServer0` only).
+const MAX_JUMP_SERVERS: usize = 5;
 
 /// `keyValue` / `jumpServer<i>.keyValue`: an inline private key, a secret.
 fn is_inline_key(key: &str) -> bool {
     normalize_key(key).ends_with("keyvalue")
 }
 
+/// A jump server index as DBeaver writes it (`jumpServer` + Java `int` + `.`): `0`, or a
+/// non-zero digit followed by digits. `00`, `01`, `+0`, `-1` and the empty string are refused.
+fn parse_jump_index(index: &str) -> Option<usize> {
+    let canonical = index == "0"
+        || (index
+            .as_bytes()
+            .first()
+            .is_some_and(|b| (b'1'..=b'9').contains(b))
+            && index.bytes().all(|b| b.is_ascii_digit()));
+    if canonical { index.parse().ok() } else { None }
+}
+
+/// `jumpServer.count`: absent or blank means [`MAX_JUMP_SERVERS`] (DBeaver's default); a negative
+/// count means none. Anything that is not an integer fails (DBeaver would fall back to a default
+/// or truncate a fraction: NineSQL does not guess).
+fn parse_jump_count(value: Option<&Scalar>) -> Result<usize, &'static str> {
+    const ERR: &str = "unreadable SSH jump server count (`jumpServer.count`)";
+    let n: i64 = match value {
+        None => return Ok(MAX_JUMP_SERVERS),
+        Some(Scalar::Text(s)) if s.trim().is_empty() => return Ok(MAX_JUMP_SERVERS),
+        Some(Scalar::Text(s)) => s.parse().map_err(|_| ERR)?,
+        Some(Scalar::Number(n)) => n
+            .as_i64()
+            .or_else(|| n.as_u64().map(|_| i64::MAX))
+            .ok_or(ERR)?,
+        Some(Scalar::Bool(_)) => return Err(ERR),
+    };
+    Ok(usize::try_from(n.max(0)).unwrap_or(usize::MAX))
+}
+
+/// `jumpServer<i>.enabled`: absent means not enabled (DBeaver's `getBooleanProperty` default).
+/// A present value must be a boolean or the string `true` / `false` (any case, not trimmed);
+/// anything else fails rather than being read as `false`.
+fn parse_jump_enabled(value: Option<&Scalar>) -> Result<bool, &'static str> {
+    match value {
+        None => Ok(false),
+        Some(Scalar::Bool(b)) => Ok(*b),
+        Some(Scalar::Text(s)) if s.eq_ignore_ascii_case("true") => Ok(true),
+        Some(Scalar::Text(s)) if s.eq_ignore_ascii_case("false") => Ok(false),
+        Some(_) => Err("an SSH jump server `enabled` flag is not a boolean"),
+    }
+}
+
 /// DBeaver SSH jump servers: `jumpServer.count`, then `jumpServer<i>.enabled`, `.host`, `.port`,
-/// `.user`, `.authType`, `.keyPath`… They map to [`SshTunnel::jump_hosts`] in index order
-/// (assumed to be the ProxyJump order: to verify against a DBeaver-written workspace). Their
-/// saved secrets are not imported (storage format not verified): NineSQL asks for them.
-/// Anything unreadable fails the connection, so a jump hop is never skipped (I2).
+/// `.name` (the user name), `.authType`, `.keyPath`… Selection follows DBeaver's
+/// `SSHUtils.loadHostConfigurations`: indices `0..count`, stopping at the first one that is not
+/// enabled. Index 0 is the hop closest to NineSQL (DBeaver connects through jump #1, then #2…,
+/// then the SSH server), which is the [`SshTunnel::jump_hosts`] order. Their saved secrets are
+/// not imported (storage format not verified): NineSQL asks for them.
+///
+/// Fail closed (I2), the connection fails rather than losing a hop: unreadable settings, a
+/// non-canonical index, a non-boolean `enabled`, an enabled hop after a disabled or missing one
+/// (DBeaver would skip it silently), more than [`MAX_JUMP_SERVERS`] hops in the chain, and a hop
+/// without a valid host, port, user name or authentication type. Hops at an index at or past
+/// `jumpServer.count` are not used by DBeaver either: they are reported and not imported.
 fn map_jump_hosts(
     props: &Properties,
     props_prefix: &str,
@@ -2169,6 +2252,7 @@ fn map_jump_hosts(
     if props.non_scalar.iter().any(|k| k.starts_with("jumpServer")) {
         return Err("unreadable SSH jump server settings");
     }
+    let mut count = None;
     let mut servers: BTreeMap<usize, Vec<(&str, &Scalar)>> = BTreeMap::new();
     for (key, value) in &props.entries {
         let Some(rest) = key.strip_prefix("jumpServer") else {
@@ -2178,18 +2262,22 @@ fn map_jump_hosts(
             return Err("unreadable SSH jump server settings");
         };
         if index.is_empty() {
-            // `jumpServer.count`: the indices present are what counts.
-            if field != "count" {
+            if field == "count" {
+                count = Some(value);
+            } else {
                 coverage::report_key(Scope::SshProperties, props_prefix, key, &mut st.issues);
             }
             continue;
         }
-        let Some(i) = index.parse::<usize>().ok().filter(|i| *i <= MAX_JUMP_INDEX) else {
-            return Err("unreadable SSH jump server settings");
+        let Some(i) = parse_jump_index(index) else {
+            return Err("unreadable SSH jump server settings (index not written by DBeaver)");
         };
         servers.entry(i).or_default().push((field, value));
     }
+    let count = parse_jump_count(count)?;
     let mut hops = Vec::new();
+    // Whether every index before the current one was enabled (DBeaver's loop has not stopped).
+    let mut chain_open = true;
     for (i, fields) in servers {
         let get = |name: &str| fields.iter().find(|(f, _)| *f == name).map(|(_, v)| *v);
         let text = |name: &str| {
@@ -2198,16 +2286,32 @@ fn map_jump_hosts(
                 .filter(|v| !v.is_empty())
         };
         let hop_prefix = join(props_prefix, &format!("jumpServer{i}"));
-        let enabled = get("enabled").and_then(Scalar::as_bool);
-        let host = text("host");
-        let active = enabled == Some(true) || (enabled.is_none() && host.is_some());
-        if !active {
-            continue;
+        let enabled = parse_jump_enabled(get("enabled"))?;
+        if i >= count || i != hops.len() || !enabled {
+            // DBeaver's loop does not reach this hop (past the count, after a missing index) or
+            // stops at it (not enabled).
+            let past_count = i >= count;
+            if !past_count {
+                chain_open = false;
+            }
+            if past_count || !enabled {
+                report_skipped_hop(&fields, &hop_prefix, enabled, past_count, st);
+                continue;
+            }
+        }
+        if !chain_open {
+            return Err(
+                "an enabled SSH jump server follows a disabled or missing one (DBeaver would \
+                 skip it silently)",
+            );
+        }
+        if i >= MAX_JUMP_SERVERS {
+            return Err("more SSH jump servers than DBeaver supports (5)");
         }
         for (field, value) in &fields {
             let path = join(&hop_prefix, field);
             match *field {
-                "enabled" | "host" | "port" | "user" | "authType" | "keyPath" => {}
+                "enabled" | "host" | "port" | "name" | "authType" | "keyPath" => {}
                 f if is_inline_key(f) => st.issues.warn(
                     IssueKind::SecretRemoved,
                     Some(path),
@@ -2221,7 +2325,7 @@ fn map_jump_hosts(
                 f => coverage::report_key(Scope::SshProperties, &hop_prefix, f, &mut st.issues),
             }
         }
-        let host = host.ok_or("SSH jump server without a host")?;
+        let host = text("host").ok_or("SSH jump server without a host")?;
         if !is_valid_host(&host) {
             return Err("an SSH jump server host is not a valid host name or IP address");
         }
@@ -2232,7 +2336,8 @@ fn map_jump_hosts(
                 _ => return Err("an SSH jump server port is not valid"),
             },
         };
-        let username = text("user").ok_or("SSH jump server without a user name")?;
+        // DBeaver keeps a jump server's user name under `name` (`RegistryConstants.ATTR_NAME`).
+        let username = text("name").ok_or("SSH jump server without a user name")?;
         if !is_valid_short(&username) || username.starts_with('-') {
             return Err(
                 "an SSH jump server user name is too long, starts with `-` or has \
@@ -2247,12 +2352,15 @@ fn map_jump_hosts(
             "PASSWORD" => SshAuth::Password {
                 secret: SecretState::Prompt,
             },
-            "PUBLIC_KEY" => SshAuth::PublicKey {
-                key_path: PathBuf::from(
-                    text("keyPath").ok_or("SSH jump server public-key auth without a key path")?,
-                ),
-                passphrase: Some(SecretState::Prompt),
-            },
+            "PUBLIC_KEY" => {
+                let key_path =
+                    text("keyPath").ok_or("SSH jump server public-key auth without a key path")?;
+                check_key_type(&key_path, join(&hop_prefix, "keyPath"), st);
+                SshAuth::PublicKey {
+                    key_path: PathBuf::from(key_path),
+                    passphrase: Some(SecretState::Prompt),
+                }
+            }
             "AGENT" => SshAuth::Agent,
             _ => return Err("unknown SSH jump server authentication type"),
         };
@@ -2275,6 +2383,122 @@ fn map_jump_hosts(
         );
     }
     Ok(hops)
+}
+
+/// A jump server DBeaver does not use: reported, never imported. Its secret-like fields still
+/// get a `SecretRemoved` entry (their values are dropped like the others); a configured host
+/// gets a warning so the user knows a hop written in the file is not used.
+fn report_skipped_hop(
+    fields: &[(&str, &Scalar)],
+    hop_prefix: &str,
+    enabled: bool,
+    past_count: bool,
+    st: &mut ConnState,
+) {
+    for (field, value) in fields {
+        if is_inline_key(field) {
+            st.issues.warn(
+                IssueKind::SecretRemoved,
+                Some(join(hop_prefix, field)),
+                "an inline private key is never imported: save it to a file and set its path",
+            );
+        } else if *field != "enabled" && is_secret_like(field, &value.as_text()) {
+            st.issues.warn(
+                IssueKind::SecretRemoved,
+                Some(join(hop_prefix, field)),
+                "looks like a secret: removed, not imported",
+            );
+        }
+    }
+    let has_host = fields
+        .iter()
+        .any(|(f, v)| *f == "host" && !v.as_text().trim().is_empty());
+    let message = match (past_count, enabled, has_host) {
+        (true, true, _) => {
+            "enabled SSH jump server at or past `jumpServer.count`: DBeaver does not use it, so \
+             it is not imported"
+        }
+        (true, false, true) => {
+            "configured SSH jump host not used, as in DBeaver (at or past `jumpServer.count`, \
+             not enabled): not imported"
+        }
+        (false, _, true) => {
+            "configured SSH jump host not used, as in DBeaver (not enabled): not imported"
+        }
+        (_, _, false) => {
+            if fields.iter().all(|(f, _)| *f == "enabled") {
+                return;
+            }
+            st.issues.info(
+                IssueKind::Unsupported,
+                Some(hop_prefix.to_owned()),
+                "SSH jump server settings not used by DBeaver (not enabled or at or past \
+                 `jumpServer.count`): not imported",
+            );
+            return;
+        }
+    };
+    st.issues
+        .warn(IssueKind::Unsupported, Some(hop_prefix.to_owned()), message);
+}
+
+/// What the file name of an SSH private key says about its type. Key files are **never read**
+/// during import (I4 spirit, privacy), so this is a heuristic on the name only: a key named
+/// `id_ed25519` may still be RSA, and a key named `id_rsa` may not be.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum KeyNameHint {
+    /// `id_rsa*`, or a name with an `rsa` word (`deploy-rsa.pem`).
+    Rsa,
+    /// `id_ed25519*`, `id_ecdsa*`, or a name with an `ed25519` / `ecdsa` word.
+    NotRsa,
+    /// Nothing in the name.
+    Unknown,
+}
+
+fn key_name_hint(path: &str) -> KeyNameHint {
+    // Both separators: DBeaver workspaces may come from Windows.
+    let name = path
+        .rsplit(['/', '\\'])
+        .next()
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    let has_word = |w: &str| {
+        name.split(|c: char| !c.is_ascii_alphanumeric())
+            .any(|t| t == w)
+    };
+    if name.starts_with("id_rsa") || has_word("rsa") {
+        KeyNameHint::Rsa
+    } else if name.starts_with("id_ed25519")
+        || name.starts_with("id_ecdsa")
+        || has_word("ed25519")
+        || has_word("ecdsa")
+    {
+        KeyNameHint::NotRsa
+    } else {
+        KeyNameHint::Unknown
+    }
+}
+
+/// ADR-0016 §1.2: NineSQL refuses RSA private key files. Flags a key path whose name says RSA,
+/// or whose type cannot be told from the name. DBeaver stores no key type, so the name is the
+/// only hint available without reading the file. The message never contains the path.
+fn check_key_type(path: &str, key: String, st: &mut ConnState) {
+    match key_name_hint(path) {
+        KeyNameHint::NotRsa => {}
+        KeyNameHint::Rsa => st.issues.warn(
+            IssueKind::SshKeyType,
+            Some(key),
+            "RSA key files are not supported (ADR-0016); use an Ed25519/ECDSA key or the SSH \
+             agent",
+        ),
+        KeyNameHint::Unknown => st.issues.warn(
+            IssueKind::SshKeyType,
+            Some(key),
+            "the type of this key file is not checked on import (key files are never read): \
+             RSA key files are not supported (ADR-0016); if it is an RSA key, use an \
+             Ed25519/ECDSA key or the SSH agent",
+        ),
+    }
 }
 
 /// `remoteHost` / `remotePort`: the address the SSH server forwards to. NineSQL forwards to the
@@ -2748,5 +2972,56 @@ mod tests {
         assert!(is_valid_host("db.example.test"));
         assert!(!is_valid_host("user@db.example.test"));
         assert!(!is_valid_host(" "));
+    }
+
+    #[test]
+    fn jump_indices_counts_and_flags() {
+        for (index, expected) in [
+            ("0", Some(0)),
+            ("4", Some(4)),
+            ("10", Some(10)),
+            ("00", None),
+            ("01", None),
+            ("+0", None),
+            ("-1", None),
+            ("", None),
+            ("1 ", None),
+            ("٣", None),
+            ("99999999999999999999999999", None),
+        ] {
+            assert_eq!(parse_jump_index(index), expected, "{index:?}");
+        }
+        let text = |s: &str| Scalar::Text(s.to_owned());
+        assert_eq!(parse_jump_count(None), Ok(MAX_JUMP_SERVERS));
+        assert_eq!(parse_jump_count(Some(&text(" "))), Ok(MAX_JUMP_SERVERS));
+        assert_eq!(parse_jump_count(Some(&text("2"))), Ok(2));
+        assert_eq!(parse_jump_count(Some(&text("-2"))), Ok(0));
+        assert!(parse_jump_count(Some(&text("2.0"))).is_err());
+        assert!(parse_jump_count(Some(&Scalar::Bool(true))).is_err());
+        assert_eq!(parse_jump_enabled(None), Ok(false));
+        assert_eq!(parse_jump_enabled(Some(&text("TRUE"))), Ok(true));
+        assert_eq!(parse_jump_enabled(Some(&Scalar::Bool(false))), Ok(false));
+        assert!(parse_jump_enabled(Some(&text("on"))).is_err());
+    }
+
+    #[test]
+    fn key_name_hints() {
+        use KeyNameHint::{NotRsa, Rsa, Unknown};
+        for (path, hint) in [
+            ("~/.ssh/id_rsa", Rsa),
+            ("/k/id_rsa.old", Rsa),
+            ("/k/prod.RSA.key", Rsa),
+            (r"C:\k\id_rsa", Rsa),
+            ("/k/id_ed25519", NotRsa),
+            ("/k/id_ecdsa_sk", NotRsa),
+            ("/k/bastion-ed25519", NotRsa),
+            ("/k/rsa-to-ed25519", Rsa),
+            ("/rsa/key", Unknown),
+            ("/k/universal", Unknown),
+            ("/k/key.ppk", Unknown),
+            ("", Unknown),
+        ] {
+            assert_eq!(key_name_hint(path), hint, "{path}");
+        }
     }
 }
