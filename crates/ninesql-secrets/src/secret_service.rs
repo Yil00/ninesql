@@ -10,8 +10,12 @@
 //! (unmaintained advisories RUSTSEC-2026-0370/0371/0372) and keyring 4's store crates use
 //! zbus 5 / secret-service 5, flagged the same way. See the P0-D task report.
 //!
-//! Items go to the default collection with attributes `service = "ninesql"`, `secret_id`,
-//! `connection_id` and `kind`; lookups use `service` + `secret_id`.
+//! Items go to the default collection with attributes `xdg:schema = "org.ninesql.Secret"`,
+//! `service = "ninesql"`, `project`, `secret_id`, `connection_id` and `kind`. Lookups use
+//! `xdg:schema` + `service` + `project` + `secret_id`, so a project copied elsewhere (same
+//! connection ids) never reads or overwrites another project's secrets. Writing deletes any
+//! existing item for the id first, so a changed `connection_id` / `kind` cannot leave a stale
+//! duplicate behind.
 //!
 //! Calls block the current thread (zbus runs its own executor); run them on a blocking thread,
 //! never on the GPUI foreground.
@@ -28,22 +32,50 @@ use crate::error::SecretError;
 use crate::reference::{SecretId, StoreKind};
 use crate::store::{SecretMeta, SecretStore};
 
+const ATTR_SCHEMA: &str = "xdg:schema";
+/// Value of the `xdg:schema` attribute of NineSQL items.
+pub const SCHEMA: &str = "org.ninesql.Secret";
 const ATTR_SERVICE: &str = "service";
+const ATTR_PROJECT: &str = "project";
 const ATTR_SECRET_ID: &str = "secret_id";
 const ATTR_CONNECTION_ID: &str = "connection_id";
 const ATTR_KIND: &str = "kind";
 
-/// [`SecretStore`] backed by the freedesktop Secret Service.
-#[derive(Debug, Default, Clone, Copy)]
+/// [`SecretStore`] backed by the freedesktop Secret Service, scoped to one workspace project.
+#[derive(Debug, Clone)]
 pub struct SecretServiceStore {
-    _private: (),
+    project: String,
 }
 
 impl SecretServiceStore {
-    /// A handle on the session's Secret Service. Connects on each call.
+    /// A handle on the session's Secret Service for the items of `project` (the workspace
+    /// project name, not secret). Connects on each call.
     #[must_use]
-    pub const fn new() -> Self {
-        Self { _private: () }
+    pub fn new(project: impl Into<String>) -> Self {
+        Self {
+            project: project.into(),
+        }
+    }
+
+    fn lookup<'a>(&'a self, id: &'a SecretId) -> HashMap<&'a str, &'a str> {
+        HashMap::from([
+            (ATTR_SCHEMA, SCHEMA),
+            (ATTR_SERVICE, SERVICE),
+            (ATTR_PROJECT, self.project.as_str()),
+            (ATTR_SECRET_ID, id.as_str()),
+        ])
+    }
+
+    /// Every item stored under `id` in this project.
+    fn search<'a>(
+        &self,
+        ss: &'a SecretService<'a>,
+        id: &SecretId,
+    ) -> Result<Vec<Item<'a>>, SecretError> {
+        let found = ss.search_items(self.lookup(id)).map_err(map_error)?;
+        let mut items = found.unlocked;
+        items.extend(found.locked);
+        Ok(items)
     }
 
     fn connect<'a>() -> Result<SecretService<'a>, SecretError> {
@@ -51,20 +83,18 @@ impl SecretServiceStore {
     }
 
     /// The single item stored under `id`, if any.
-    fn find<'a>(ss: &'a SecretService<'a>, id: &SecretId) -> Result<Option<Item<'a>>, SecretError> {
-        let found = ss.search_items(lookup(id)).map_err(map_error)?;
-        let mut items = found.unlocked;
-        items.extend(found.locked);
+    fn find<'a>(
+        &self,
+        ss: &'a SecretService<'a>,
+        id: &SecretId,
+    ) -> Result<Option<Item<'a>>, SecretError> {
+        let mut items = self.search(ss, id)?;
         match items.len() {
             0 => Ok(None),
             1 => Ok(items.pop()),
             _ => Err(SecretError::Ambiguous(id.clone())),
         }
     }
-}
-
-fn lookup(id: &SecretId) -> HashMap<&str, &str> {
-    HashMap::from([(ATTR_SERVICE, SERVICE), (ATTR_SECRET_ID, id.as_str())])
 }
 
 impl SecretStore for SecretServiceStore {
@@ -74,7 +104,9 @@ impl SecretStore for SecretServiceStore {
 
     fn get(&self, id: &SecretId) -> Result<SecretString, SecretError> {
         let ss = Self::connect()?;
-        let item = Self::find(&ss, id)?.ok_or_else(|| SecretError::NotFound(id.clone()))?;
+        let item = self
+            .find(&ss, id)?
+            .ok_or_else(|| SecretError::NotFound(id.clone()))?;
         item.ensure_unlocked().map_err(map_error)?;
         let bytes = Zeroizing::new(item.get_secret().map_err(map_error)?);
         let text = std::str::from_utf8(&bytes).map_err(|_| SecretError::BadEncoding(id.clone()))?;
@@ -92,7 +124,11 @@ impl SecretStore for SecretServiceStore {
         let ss = Self::connect()?;
         let collection = ss.get_default_collection().map_err(map_error)?;
         collection.ensure_unlocked().map_err(map_error)?;
-        let mut attributes = lookup(id);
+        // Delete-before-create: never leave an older item with other attributes behind.
+        for old in self.search(&ss, id)? {
+            old.delete().map_err(map_error)?;
+        }
+        let mut attributes = self.lookup(id);
         attributes.insert(ATTR_CONNECTION_ID, meta.connection_id.as_str());
         attributes.insert(ATTR_KIND, meta.kind.as_str());
         collection
@@ -109,7 +145,7 @@ impl SecretStore for SecretServiceStore {
 
     fn delete(&self, id: &SecretId) -> Result<bool, SecretError> {
         let ss = Self::connect()?;
-        match Self::find(&ss, id)? {
+        match self.find(&ss, id)? {
             Some(item) => {
                 item.delete().map_err(map_error)?;
                 Ok(true)
@@ -187,10 +223,13 @@ mod tests {
     #[test]
     fn lookup_attributes() {
         let id = id();
-        let attrs = lookup(&id);
+        let store = SecretServiceStore::new("General");
+        let attrs = store.lookup(&id);
+        assert_eq!(attrs.get("xdg:schema"), Some(&"org.ninesql.Secret"));
         assert_eq!(attrs.get("service"), Some(&"ninesql"));
+        assert_eq!(attrs.get("project"), Some(&"General"));
         assert_eq!(attrs.get("secret_id"), Some(&"spike:password"));
-        assert_eq!(attrs.len(), 2);
+        assert_eq!(attrs.len(), 4);
     }
 
     /// Round trip against a real Secret Service. Ignored by default: run it on a desktop session
@@ -198,7 +237,7 @@ mod tests {
     #[test]
     #[ignore = "needs a session bus with a Secret Service (GNOME Keyring, KWallet, KeePassXC)"]
     fn round_trip_on_a_real_secret_service() {
-        let store = SecretServiceStore::new();
+        let store = SecretServiceStore::new("ninesql-spike-test");
         let id = SecretId::new("ninesql-spike-test:password").unwrap();
         let meta = SecretMeta {
             connection_id: "ninesql-spike-test".into(),
@@ -229,7 +268,7 @@ mod tests {
         {
             return;
         }
-        let err = SecretServiceStore::new().get(&id()).unwrap_err();
+        let err = SecretServiceStore::new("General").get(&id()).unwrap_err();
         assert!(matches!(err, SecretError::Unavailable { .. }), "{err:?}");
     }
 }
