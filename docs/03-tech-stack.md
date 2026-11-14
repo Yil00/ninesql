@@ -26,7 +26,7 @@ Confirmed by a driver task when marked so; the others are the initial plan.
 | Family | Crate |
 |---|---|
 | pg-wire (confirmed, P1-B) | `postgres-protocol` (message codec only) with `tokio` and `tokio-rustls`; SCRAM-SHA-256 and md5 implemented in the driver with `ring` and `md-5`. Not `tokio-postgres`: the driver needs `ParameterStatus` after every statement, full control of portals and cancel requests, and value cutting while rows are read ([docs/08](08-engine-capabilities.md#pgwire-postgresql-p1-b)) |
-| mysql-wire | `mysql_async` (rustls) |
+| mysql-wire (confirmed, P1-B) | No protocol crate: the client/server protocol (packets, handshake, text protocol) is implemented in the driver on top of `tokio` and `tokio-rustls`; `caching_sha2_password` and `mysql_native_password` scrambles with `ring`. Not `mysql_async`: it reads each row whole (no value cutting while rows are read), and its protocol crate `mysql_common` brings a large tree (compression, big-number and date crates) for features the driver does not use. The subset needed (one text-protocol statement per call, no prepared statements, no compression, no `LOAD DATA LOCAL`) is small, needs no new dependency and keeps control of `KILL QUERY` on a control connection, the access-mode read-back and the session's lexical modes ([docs/08](08-engine-capabilities.md#mysqlwire-mysql-and-mariadb-p1-b)) |
 | SQLite | `rusqlite` (bundled) |
 | DuckDB | `duckdb` (bundled) |
 | ClickHouse | `clickhouse` or HTTP via `reqwest` |
