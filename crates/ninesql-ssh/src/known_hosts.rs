@@ -21,9 +21,11 @@
 use std::fs::File;
 use std::io::{self, Read};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use data_encoding::BASE64;
 use hmac::{Hmac, KeyInit, Mac};
+use ninesql_storage::DirLock;
 use sha1::Sha1;
 
 use crate::error::SshError;
@@ -34,6 +36,10 @@ pub const MAX_KNOWN_HOSTS_SIZE: u64 = 16 * 1024 * 1024;
 
 /// Default SSH port: a host on this port is looked up as `host`, otherwise as `[host]:port`.
 pub const DEFAULT_SSH_PORT: u16 = 22;
+
+/// Name of the workspace lock file, in the same directory as NineSQL's `known_hosts`
+/// (`Paths::lock_file()` next to `Paths::known_hosts_file()`, both in `$XDG_DATA_HOME/ninesql`).
+const LOCK_FILE_NAME: &str = "ninesql.lock";
 
 /// Which file a `known_hosts` line comes from.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -503,15 +509,36 @@ impl KnownHosts {
         known_key_types(&self.files(), host, port)
     }
 
+    /// Takes the workspace lock that guards writes to NineSQL's file across processes
+    /// (ADR-0008 §3, review item L8): [`ninesql_storage::DirLock`] on [`LOCK_FILE_NAME`] next to
+    /// the file, which for `Paths::known_hosts_file()` is `Paths::lock_file()`.
+    ///
+    /// A process that already holds the workspace lock (the core keeps it for the whole
+    /// session) shares it: [`ninesql_storage::DirLock::acquire`] returns the held lock, so this
+    /// never deadlocks against its own process. Within one process, [`crate::KnownHostsStore`]
+    /// serializes writers. Never blocks: another NineSQL process holding the lock is an error.
+    fn lock_own(&self) -> Result<Arc<DirLock>, SshError> {
+        let dir = match self.own_path.parent() {
+            Some(d) if !d.as_os_str().is_empty() => d,
+            _ => Path::new("."),
+        };
+        ninesql_storage::fs::ensure_private_dir(dir)
+            .map_err(|e| SshError::KnownHosts(e.to_string()))?;
+        DirLock::acquire(&dir.join(LOCK_FILE_NAME)).map_err(|e| SshError::KnownHosts(e.to_string()))
+    }
+
     /// Adds a key for `host:port` to NineSQL's file after the user confirmed it (or under the
-    /// explicit accept-new policy). The file is re-read first so concurrent additions are kept,
-    /// then rewritten atomically with mode `0600`. Adding a key that is already present for the
+    /// explicit accept-new policy). The read-modify-write runs under the workspace lock
+    /// (`ninesql_storage::DirLock` on `Paths::lock_file()`, shared with the core if this process
+    /// already holds it), so two NineSQL processes cannot drop each other's additions; the file is re-read first so earlier additions are kept, then
+    /// rewritten atomically with mode `0600`. Adding a key that is already present for the
     /// host is a no-op. Refuses to add a key if the host has another supported key on file:
     /// a changed key must be removed explicitly first ([`KnownHosts::remove_host`], ADR-0011 §6).
     ///
     /// # Errors
-    /// [`SshError::KnownHosts`] on I/O errors, [`SshError::HostKeyChanged`] /
-    /// [`SshError::HostKeyRevoked`] if the key cannot be added.
+    /// [`SshError::KnownHosts`] on I/O errors or when another NineSQL process holds the
+    /// workspace lock, [`SshError::HostKeyChanged`] / [`SshError::HostKeyRevoked`] if the key
+    /// cannot be added.
     pub fn add(
         &mut self,
         host: &str,
@@ -520,12 +547,10 @@ impl KnownHosts {
         key_blob: &[u8],
     ) -> Result<(), SshError> {
         validate_host(host)?;
-        // TODO(P0-D review L8): take the workspace lock (DirLock, landing in ninesql-storage on
-        // another branch) around this read-modify-write, so two NineSQL processes cannot drop
-        // each other's additions. Within one process `KnownHostsStore` serializes writers.
         if blob_key_type(key_blob) != Some(key_type.as_bytes()) {
             return Err(SshError::InvalidHostKey);
         }
+        let _lock = self.lock_own()?;
         self.own = read_own(&self.own_path)?;
         match self.check(host, port, key_blob) {
             HostKeyStatus::Known { .. } => return Ok(()),
@@ -574,12 +599,14 @@ impl KnownHosts {
     /// Removes every plain (non-marker) line of NineSQL's file that names `host:port`, including
     /// hashed lines and lines that list other hosts too (the whole line goes, like
     /// `ssh-keygen -R`). The user's `~/.ssh/known_hosts` is never modified: a key on file there
-    /// must be removed by the user. Returns the number of lines removed.
+    /// must be removed by the user. Runs under the workspace lock, like [`KnownHosts::add`].
+    /// Returns the number of lines removed.
     ///
     /// # Errors
-    /// [`SshError::KnownHosts`] on I/O errors.
+    /// [`SshError::KnownHosts`] on I/O errors or when another NineSQL process holds the
+    /// workspace lock.
     pub fn remove_host(&mut self, host: &str, port: u16) -> Result<usize, SshError> {
-        // TODO(P0-D review L8): same cross-process lock as `add`.
+        let _lock = self.lock_own()?;
         let Some(text) = read_text(&self.own_path, true)? else {
             self.own = KnownHostsFile::default();
             return Ok(0);
@@ -971,6 +998,64 @@ mod tests {
             kh.check("db.example.test", 2222, &blob(K2)),
             HostKeyStatus::Known { .. }
         ));
+    }
+
+    #[test]
+    fn lock_file_is_the_workspace_lock() {
+        let xdg = ninesql_storage::XdgDirs::from_lookup(|k| {
+            (k == "HOME").then(|| std::ffi::OsString::from("/home/u"))
+        })
+        .unwrap();
+        let paths = ninesql_storage::Paths::new(&xdg);
+        assert_eq!(
+            paths.known_hosts_file().with_file_name(LOCK_FILE_NAME),
+            paths.lock_file()
+        );
+    }
+
+    #[test]
+    fn writes_are_guarded_by_the_workspace_lock() {
+        use std::fs::{File, OpenOptions};
+        let dir = tempfile::tempdir().unwrap();
+        let data = dir.path().join("ninesql");
+        let own = data.join("known_hosts");
+        let lock_path = data.join(LOCK_FILE_NAME);
+        let mut kh = KnownHosts::load(&own, None).unwrap();
+
+        // This process already holds the workspace lock (as the core does for the session):
+        // writes share it instead of deadlocking or failing.
+        ninesql_storage::fs::ensure_private_dir(&data).unwrap();
+        let held = DirLock::acquire(&lock_path).unwrap();
+        kh.add("a.example.test", 22, "ssh-ed25519", &blob(K1))
+            .unwrap();
+        assert_eq!(kh.remove_host("a.example.test", 22).unwrap(), 1);
+        drop(held);
+        // Released once the writes are done.
+        assert!(!ninesql_storage::lock::is_locked_elsewhere(&lock_path).unwrap());
+
+        // Another process (another open file description) holds the lock: the write is refused
+        // and the file is left untouched.
+        kh.add("b.example.test", 22, "ssh-ed25519", &blob(K1))
+            .unwrap();
+        let before = std::fs::read_to_string(&own).unwrap();
+        let other: File = OpenOptions::new().read(true).open(&lock_path).unwrap();
+        other.try_lock().unwrap();
+        let err = kh
+            .add("c.example.test", 22, "ssh-ed25519", &blob(K2))
+            .unwrap_err();
+        assert!(
+            matches!(&err, SshError::KnownHosts(m) if m.contains("locked")),
+            "{err:?}"
+        );
+        assert!(matches!(
+            kh.remove_host("b.example.test", 22),
+            Err(SshError::KnownHosts(_))
+        ));
+        assert_eq!(std::fs::read_to_string(&own).unwrap(), before);
+        drop(other);
+        kh.add("c.example.test", 22, "ssh-ed25519", &blob(K2))
+            .unwrap();
+        assert_eq!(std::fs::read_to_string(&own).unwrap().lines().count(), 2);
     }
 
     #[test]

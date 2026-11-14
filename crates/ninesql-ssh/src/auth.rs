@@ -13,6 +13,7 @@ use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use ninesql_storage::fs::current_uid;
 use russh::client::{AuthResult, Handle, Handler};
 use russh::keys::agent::AgentIdentity;
 use russh::keys::agent::client::AgentClient;
@@ -208,11 +209,6 @@ fn load_key(
             other.as_str().to_owned(),
         ))),
     }
-}
-
-/// Effective uid of this process (`geteuid`, which cannot fail; safe wrapper from `rustix`).
-fn current_uid() -> u32 {
-    rustix::process::geteuid().as_raw()
 }
 
 async fn authenticate_agent<H: Handler>(

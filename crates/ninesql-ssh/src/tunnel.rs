@@ -24,7 +24,7 @@ use std::net::{Ipv4Addr, SocketAddr};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use ninesql_driver_api::{Endpoint, TunnelInfo};
+use ninesql_driver_api::{Endpoint, SshHop, TunnelInfo};
 use russh::client::{self, ChannelOpenHandle, Handle, Handler, Msg, Session};
 use russh::keys::{Algorithm, EcdsaCurve, PublicKeyOrCertificate};
 use russh::{Channel, Disconnect, Preferred};
@@ -714,6 +714,32 @@ impl fmt::Debug for Tunnel {
     }
 }
 
+/// The route entry reported for one hop: its own policy, with `AcceptNew` reported as
+/// `Disabled` (ADR-0016, [`HostKeyPolicy::to_verification`]).
+fn route_hop(hop: &HopSpec) -> SshHop {
+    SshHop::new(
+        hop.host.clone(),
+        hop.port,
+        hop.host_key_policy.to_verification(),
+    )
+}
+
+/// The driver-facing description of an open tunnel: every hop with its own policy, so
+/// `ConnectParams::security_warnings` names each unverified hop
+/// (`SecurityWarning::SshHopHostKeyNotVerified`), plus the weakest-policy summary.
+fn tunnel_info(
+    ssh_host: String,
+    ssh_port: u16,
+    route: Vec<SshHop>,
+    weakest: HostKeyPolicy,
+) -> TunnelInfo {
+    let mut info = TunnelInfo::new(ssh_host, ssh_port).with_hops(route);
+    // Same value as the fold in `with_hops` (`to_verification` is monotonic); set from the
+    // policies themselves so the summary can never be stronger than the weakest hop.
+    info.host_key = info.host_key.weakest(weakest.to_verification());
+    info
+}
+
 impl Tunnel {
     /// Opens the tunnel: connects and authenticates every hop in order, then listens on
     /// `127.0.0.1:<ephemeral>`. Must run on a Tokio runtime (the driver runtime).
@@ -742,12 +768,14 @@ impl Tunnel {
         let (ssh_host, ssh_port) = (server.host.clone(), server.port);
 
         let mut sessions: Vec<Arc<SshHandle>> = Vec::with_capacity(jump_hosts.len() + 1);
+        let mut route: Vec<SshHop> = Vec::with_capacity(jump_hosts.len() + 1);
         for (index, hop) in jump_hosts
             .into_iter()
             .chain(std::iter::once(server))
             .enumerate()
         {
             weakest = weakest.weakest(hop.host_key_policy);
+            route.push(route_hop(&hop));
             let previous = sessions.last().cloned();
             let (session, auto_accepted) =
                 open_hop(index, hop, previous, &options, &known_hosts).await?;
@@ -764,9 +792,8 @@ impl Tunnel {
             .local_addr()
             .map_err(|e| SshError::Listener(e.to_string()))?;
 
-        let mut info = TunnelInfo::new(ssh_host, ssh_port);
-        info.jump_hosts = jump_count;
-        info.host_key = weakest.to_verification();
+        let info = tunnel_info(ssh_host, ssh_port, route, weakest);
+        debug_assert_eq!(info.jump_hosts, jump_count);
 
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
         let (state_tx, state_rx) = watch::channel(TunnelState::Running);
@@ -1158,6 +1185,57 @@ mod tests {
                 .validate()
                 .is_ok()
         );
+    }
+
+    #[test]
+    fn tunnel_info_reports_every_hop() {
+        use ninesql_driver_api::{
+            ConnectParams, EngineId, HostKeyVerification as V, SecurityWarning,
+        };
+        let spec = TunnelSpec::new(
+            hop("s").with_host_key_policy(HostKeyPolicy::Disabled),
+            "db",
+            5432,
+        )
+        .via(hop("j1"))
+        .via(hop("j2").with_host_key_policy(HostKeyPolicy::AcceptNew));
+        let hops: Vec<&HopSpec> = spec
+            .jump_hosts
+            .iter()
+            .chain(std::iter::once(&spec.server))
+            .collect();
+        let weakest = hops
+            .iter()
+            .fold(HostKeyPolicy::Strict, |w, h| w.weakest(h.host_key_policy));
+        let route = hops.iter().map(|h| route_hop(h)).collect();
+        let info = tunnel_info("s".into(), 22, route, weakest);
+        assert_eq!((info.ssh_host.as_str(), info.ssh_port), ("s", 22));
+        assert_eq!(info.jump_hosts, 2);
+        assert_eq!(info.host_key, V::Disabled);
+        let policies: Vec<_> = info.hops.iter().map(|h| h.host_key).collect();
+        let names: Vec<_> = info.hops.iter().map(|h| h.host.as_str()).collect();
+        assert_eq!(names, ["j1", "j2", "s"]);
+        // AcceptNew is reported as Disabled (ADR-0016).
+        assert_eq!(policies, [V::Strict, V::Disabled, V::Disabled]);
+
+        let mut params = ConnectParams::new(EngineId::POSTGRESQL, Endpoint::tcp("127.0.0.1", 5432));
+        params.tunnel = Some(info);
+        let w = params.security_warnings();
+        assert!(w.contains(&SecurityWarning::SshHostKeyNotVerified));
+        assert!(!w.contains(&SecurityWarning::SshHopHostKeyNotVerified { hop: 0 }));
+        assert!(w.contains(&SecurityWarning::SshHopHostKeyNotVerified { hop: 1 }));
+        assert!(w.contains(&SecurityWarning::SshHopHostKeyNotVerified { hop: 2 }));
+
+        // All strict: summary strict, no per-hop warning.
+        let info = tunnel_info(
+            "s".into(),
+            22,
+            vec![route_hop(&hop("s"))],
+            HostKeyPolicy::Strict,
+        );
+        assert_eq!(info.host_key, V::Strict);
+        assert_eq!(info.hops.len(), 1);
+        assert_eq!(info.jump_hosts, 0);
     }
 
     #[tokio::test]

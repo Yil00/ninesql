@@ -16,7 +16,9 @@ use std::path::Path;
 use std::process::Command;
 use std::time::{Duration, Instant};
 
-use ninesql_driver_api::{Endpoint, HostKeyVerification};
+use ninesql_driver_api::{
+    ConnectParams, Endpoint, EngineId, HostKeyVerification, SecurityWarning, TunnelInfo,
+};
 use ninesql_ssh::{
     Fingerprint, HopAuth, HopSpec, HostKeyPolicy, KnownHostsStore, SshError, SshWarningKind,
     Tunnel, TunnelOptions, TunnelSpec, TunnelState,
@@ -231,6 +233,20 @@ fn spec(c: &Creds, jump_policy: HostKeyPolicy, server_policy: HostKeyPolicy) -> 
         .with_options(options)
 }
 
+/// The driver API warnings a session behind this tunnel would carry.
+fn driver_warnings(info: &TunnelInfo) -> Vec<SecurityWarning> {
+    let mut params = ConnectParams::new(EngineId::POSTGRESQL, Endpoint::tcp("127.0.0.1", 5432));
+    params.tunnel = Some(info.clone());
+    params.security_warnings()
+}
+
+fn hop_policies(info: &TunnelInfo) -> Vec<(String, u16, HostKeyVerification)> {
+    info.hops
+        .iter()
+        .map(|h| (h.host.clone(), h.port, h.host_key))
+        .collect()
+}
+
 fn fp(key: &PublicKey) -> Fingerprint {
     Fingerprint::of_blob(&key.to_bytes().unwrap())
 }
@@ -373,6 +389,14 @@ fn tunnel_through_jump_host_to_postgres() {
         assert_eq!(tunnel.info().ssh_port, 2222);
         assert_eq!(tunnel.info().jump_hosts, 1);
         assert_eq!(tunnel.info().host_key, HostKeyVerification::Strict);
+        assert_eq!(
+            hop_policies(tunnel.info()),
+            vec![
+                ("127.0.0.1".to_owned(), jump_port, HostKeyVerification::Strict),
+                ("sshd".to_owned(), 2222, HostKeyVerification::Strict),
+            ]
+        );
+        assert!(driver_warnings(tunnel.info()).is_empty());
         assert!(tunnel.security_warnings().is_empty());
         assert_eq!(tunnel.state(), TunnelState::Running);
         let (a, b) = tokio::join!(postgres_answers(&endpoint), postgres_answers(&endpoint));
@@ -430,6 +454,11 @@ fn tunnel_through_jump_host_to_postgres() {
             .await
             .unwrap();
         assert_eq!(tunnel.info().host_key, HostKeyVerification::Disabled);
+        // Accept-new is reported per hop as not verified (ADR-0016).
+        let w = driver_warnings(tunnel.info());
+        assert!(w.contains(&SecurityWarning::SshHostKeyNotVerified));
+        assert!(w.contains(&SecurityWarning::SshHopHostKeyNotVerified { hop: 0 }));
+        assert!(w.contains(&SecurityWarning::SshHopHostKeyNotVerified { hop: 1 }));
         let auto: Vec<_> = tunnel
             .security_warnings()
             .iter()
@@ -455,8 +484,24 @@ fn tunnel_through_jump_host_to_postgres() {
             .iter()
             .all(|w| w.kind == SshWarningKind::HostKeyNotVerified));
         assert_eq!(tunnel.security_warnings().len(), 2);
+        assert_eq!(tunnel.info().host_key, HostKeyVerification::Disabled);
+        let w = driver_warnings(tunnel.info());
+        assert!(w.contains(&SecurityWarning::SshHopHostKeyNotVerified { hop: 0 }));
+        assert!(w.contains(&SecurityWarning::SshHopHostKeyNotVerified { hop: 1 }));
         drop(tunnel);
         assert!(!own3.exists());
+
+        // 7b. Only the jump host unverified: the per-hop warning names hop 0 only.
+        let tunnel = Tunnel::open(spec(&creds, HostKeyPolicy::Disabled, HostKeyPolicy::Strict), store.clone())
+            .await
+            .unwrap();
+        assert_eq!(tunnel.info().host_key, HostKeyVerification::Disabled);
+        assert_eq!(tunnel.info().jump_hosts, 1);
+        let w = driver_warnings(tunnel.info());
+        assert!(w.contains(&SecurityWarning::SshHostKeyNotVerified));
+        assert!(w.contains(&SecurityWarning::SshHopHostKeyNotVerified { hop: 0 }));
+        assert!(!w.contains(&SecurityWarning::SshHopHostKeyNotVerified { hop: 1 }));
+        drop(tunnel);
 
         // 8. The user's known_hosts is honored read-only.
         let user_kh = dir.path().join("user_known_hosts");

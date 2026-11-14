@@ -60,7 +60,6 @@ data-encoding = "2.3"
 hmac = "0.13"
 sha1 = "0.11"
 sha2 = "0.11"
-# Safe geteuid() for the private key owner check (already in the lockfile).
 # Tests only (key generation); same major as russh / ssh-key.
 rand = { version = "0.10", default-features = false, features = ["std", "thread_rng"] }
 
