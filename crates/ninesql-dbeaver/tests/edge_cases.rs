@@ -253,6 +253,64 @@ fn ssh_variants() {
 }
 
 #[test]
+fn benign_password_named_keys_are_checked_by_value_shape() {
+    let leaked = "fixture-pce-not-a-secret";
+    let secret_removed = |p: &ProjectImport, key: &str| {
+        p.connections[0]
+            .issues
+            .iter()
+            .any(|i| i.kind == IssueKind::SecretRemoved && i.key.as_deref() == Some(key))
+    };
+    let no_leak = |p: &ProjectImport| {
+        let c = only(p);
+        assert!(c.properties.values().all(|v| !v.contains(leaked)));
+        assert!(!format!("{p:?}").contains(leaked));
+    };
+    // Driver property: a misplaced password is removed, a charset name is not flagged.
+    let cfg = format!(
+        r#"{{"host":"db.example.test","properties":{{"passwordCharacterEncoding":"{leaked}"}}}}"#
+    );
+    let p = map(&one("mysql", "mysql8", &cfg), None);
+    assert!(secret_removed(
+        &p,
+        "configuration.properties.passwordCharacterEncoding"
+    ));
+    no_leak(&p);
+    let cfg = r#"{"host":"db.example.test","properties":{"passwordCharacterEncoding":"UTF-8"}}"#;
+    let p = map(&one("mysql", "mysql8", cfg), None);
+    assert!(!issue(&p, IssueKind::SecretRemoved, None));
+    // SSH tunnel and TLS handler properties.
+    let cfg = format!(
+        r#"{{"host":"db.example.test","handlers":{{"ssh_tunnel":{{"type":"TUNNEL","enabled":true,
+        "user":"nine_ssh","properties":{{"host":"bastion.example.test","authType":"AGENT",
+        "passwordCharacterEncoding":"{leaked}"}}}},
+        "postgre_ssl":{{"type":"CONFIG","enabled":true,"properties":{{"sslMode":"verify-full",
+        "passwordEncryption":"{leaked}"}}}}}}}}"#
+    );
+    let p = map(&one("postgresql", "postgres-jdbc", &cfg), None);
+    assert!(secret_removed(
+        &p,
+        "configuration.handlers.ssh_tunnel.properties.passwordCharacterEncoding"
+    ));
+    assert!(secret_removed(
+        &p,
+        "configuration.handlers.postgre_ssl.properties.passwordEncryption"
+    ));
+    no_leak(&p);
+    // Unknown key in `configuration`: the value is scrubbed from `extra`, the key still reported.
+    let cfg = format!(r#"{{"host":"db.example.test","passwordEncryption":"{leaked}"}}"#);
+    let ds = parse_data_sources(one("postgresql", "postgres-jdbc", &cfg).as_bytes())
+        .unwrap_or_else(|e| panic!("parse: {e}"));
+    assert_eq!(
+        ds.connections[0]
+            .configuration
+            .extra
+            .get("passwordEncryption"),
+        Some(&serde_json::Value::Null)
+    );
+}
+
+#[test]
 fn legacy_plaintext_secrets_are_moved_and_flagged() {
     let cfg =
         r#"{"host":"db.example.test","user":"nine_user","password":"fixture-legacy-not-a-secret"}"#;

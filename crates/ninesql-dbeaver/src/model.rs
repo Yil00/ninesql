@@ -10,15 +10,21 @@
 //!
 //! Secret hygiene (I1): plaintext passwords found in the file (legacy layouts, hand edits) are
 //! moved into [`SecretString`] at once. Keys of `extra` that look like secrets
-//! ([`ninesql_storage::hygiene::is_secret_like_key`]) have their string values zeroized and
-//! replaced by `null`: the key is still reported, the value is gone. `Debug` of [`Extra`] and
-//! [`Properties`] prints keys only.
+//! ([`ninesql_storage::hygiene::is_secret_like_key`], or a benign password-named key whose value
+//! does not have the expected shape, [`ninesql_storage::hygiene::is_secret_like_entry`]) have
+//! their values zeroized and replaced by `null`: the key is still reported, the value is gone.
+//! `Debug` of [`Extra`] and [`Properties`] prints keys only.
+//!
+//! Ordering is deterministic whatever `serde_json` features the workspace enables
+//! (`preserve_order` keeps file order in `serde_json::Map`): every object is walked in key order
+//! and [`Extra`] is a [`BTreeMap`].
 
 use std::borrow::Cow;
+use std::collections::BTreeMap;
 use std::fmt;
 
 use ninesql_secrets::SecretString;
-use ninesql_storage::hygiene::is_secret_like_key;
+use ninesql_storage::hygiene::{is_secret_like_entry, is_secret_like_key};
 use serde_json::{Map, Number, Value};
 use zeroize::Zeroize;
 
@@ -133,11 +139,14 @@ impl fmt::Debug for Scalar {
 ///
 /// Values under secret-like keys are zeroized and replaced by `null` when the map is built.
 #[derive(Clone, Default, PartialEq)]
-pub struct Extra(Map<String, Value>);
+pub struct Extra(BTreeMap<String, Value>);
 
 impl Extra {
-    fn new(mut map: Map<String, Value>) -> Self {
-        scrub_secret_like(&mut map);
+    fn new(map: Map<String, Value>) -> Self {
+        let mut map = sorted(map);
+        for (key, value) in &mut map {
+            scrub_entry(key, value);
+        }
         Self(map)
     }
 
@@ -185,15 +194,30 @@ impl Drop for Extra {
     }
 }
 
-/// Scrubs the value of every secret-like key, at any depth (the key itself is kept so the
-/// report can name it).
+/// The entries of a JSON object in key order, whatever `serde_json`'s `preserve_order` says.
+fn sorted(map: Map<String, Value>) -> BTreeMap<String, Value> {
+    map.into_iter().collect()
+}
+
+/// Whether a key / value pair looks like a secret: a secret-like key, or a benign
+/// password-named key (`passwordCharacterEncoding`…) whose string value has the wrong shape.
+fn is_secret_like(key: &str, value: &Value) -> bool {
+    is_secret_like_key(key) || matches!(value, Value::String(s) if is_secret_like_entry(key, s))
+}
+
+/// Scrubs `value` if the entry looks like a secret, else scrubs secret-like entries nested in
+/// it, at any depth (the key itself is kept so the report can name it).
+fn scrub_entry(key: &str, value: &mut Value) {
+    if is_secret_like(key, value) {
+        scrub(value);
+    } else {
+        scrub_secret_like_value(value);
+    }
+}
+
 fn scrub_secret_like(map: &mut Map<String, Value>) {
     for (key, value) in map.iter_mut() {
-        if is_secret_like_key(key) {
-            scrub(value);
-        } else {
-            scrub_secret_like_value(value);
-        }
+        scrub_entry(key, value);
     }
 }
 
@@ -228,7 +252,7 @@ pub struct Properties {
 impl Properties {
     fn from_map(map: Map<String, Value>) -> Self {
         let mut out = Self::default();
-        for (key, value) in map {
+        for (key, value) in sorted(map) {
             match Scalar::from_value(value) {
                 Ok(s) => out.entries.push((key, s)),
                 Err(mut v) => {
@@ -480,7 +504,7 @@ pub fn parse_data_sources(bytes: &[u8]) -> Result<DataSources, ParseError> {
     let mut top = Fields::new(map);
     let mut out = DataSources::default();
     if let Some(folders) = top.object("folders") {
-        for (key, value) in folders {
+        for (key, value) in sorted(folders) {
             match value {
                 Value::Object(m) => out.folders.push(folder(key, m)),
                 mut other => {
@@ -491,7 +515,7 @@ pub fn parse_data_sources(bytes: &[u8]) -> Result<DataSources, ParseError> {
         }
     }
     if let Some(connections) = top.object("connections") {
-        for (key, value) in connections {
+        for (key, value) in sorted(connections) {
             match value {
                 Value::Object(m) => out.connections.push(connection(key, m)),
                 mut other => {
@@ -502,7 +526,7 @@ pub fn parse_data_sources(bytes: &[u8]) -> Result<DataSources, ParseError> {
         }
     }
     if let Some(types) = top.object("connection-types") {
-        for (key, value) in types {
+        for (key, value) in sorted(types) {
             match value {
                 Value::Object(m) => out.connection_types.push(connection_type(key, m)),
                 mut other => {
@@ -565,7 +589,7 @@ fn configuration(map: Map<String, Value>) -> ConfigurationDef {
     let mut handlers = Vec::new();
     let mut invalid_handlers = Vec::new();
     if let Some(hs) = f.object("handlers") {
-        for (id, value) in hs {
+        for (id, value) in sorted(hs) {
             match value {
                 Value::Object(m) => handlers.push(handler(id, m)),
                 mut other => {
@@ -809,6 +833,52 @@ mod tests {
             future,
             Some(serde_json::json!({"a":[{"apiToken":null}],"b":"kept"}))
         );
+    }
+
+    #[test]
+    fn benign_password_keys_with_a_bad_shape_are_scrubbed() {
+        let ds = parse_data_sources(
+            br#"{"connections":{"c1":{"configuration":{"passwordCharacterEncoding":"fixture-pw",
+               "passwordEncryption":"scram-sha-256","nested":{"passwordCharacterEncoding":"x9"}}}}}"#,
+        )
+        .unwrap_or_default();
+        let extra = &ds.connections[0].configuration.extra;
+        assert_eq!(extra.get("passwordCharacterEncoding"), Some(&Value::Null));
+        assert_eq!(
+            extra.get("passwordEncryption"),
+            Some(&Value::from("scram-sha-256"))
+        );
+        assert_eq!(
+            extra.get("nested"),
+            Some(&serde_json::json!({"passwordCharacterEncoding": null}))
+        );
+    }
+
+    #[test]
+    fn order_is_by_key_whatever_the_file_order() {
+        // Keys deliberately out of order: with `serde_json/preserve_order` (enabled by other
+        // workspace crates) a `Map` keeps file order; the model must not.
+        let ds = parse_data_sources(
+            br#"{"z":1,"connections":{"c2":{"zz":1,"aa":2,"configuration":{"handlers":
+               {"h2":{},"h1":{}},"properties":{"b":"1","a":"2","c":[]}}},"c1":{}},
+               "folders":{"f2":{},"f1":{}},"connection-types":{"t2":{},"t1":{}},"a":2}"#,
+        )
+        .unwrap_or_default();
+        assert_eq!(ds.extra.keys().collect::<Vec<_>>(), ["a", "z"]);
+        let conns: Vec<_> = ds.connections.iter().map(|c| c.id.as_str()).collect();
+        assert_eq!(conns, ["c1", "c2"]);
+        let folders: Vec<_> = ds.folders.iter().map(|f| f.key.as_str()).collect();
+        assert_eq!(folders, ["f1", "f2"]);
+        let types: Vec<_> = ds.connection_types.iter().map(|t| t.id.as_str()).collect();
+        assert_eq!(types, ["t1", "t2"]);
+        let c2 = &ds.connections[1];
+        assert_eq!(c2.extra.keys().collect::<Vec<_>>(), ["aa", "zz"]);
+        let cfg = &c2.configuration;
+        let handlers: Vec<_> = cfg.handlers.iter().map(|h| h.id.as_str()).collect();
+        assert_eq!(handlers, ["h1", "h2"]);
+        let props: Vec<_> = cfg.properties.entries.iter().map(|(k, _)| k).collect();
+        assert_eq!(props, ["a", "b"]);
+        assert_eq!(cfg.properties.non_scalar, ["c"]);
     }
 
     #[test]

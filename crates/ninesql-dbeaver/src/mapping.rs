@@ -22,7 +22,7 @@ use std::path::PathBuf;
 
 use ninesql_driver_api::{EngineId, is_reserved_property};
 use ninesql_secrets::{ExposeSecret, SecretKind, SecretString};
-use ninesql_storage::hygiene::is_secret_like_key;
+use ninesql_storage::hygiene::{is_secret_like_entry, is_secret_like_key};
 
 use crate::coverage::{self, Scope, join};
 use crate::credentials::{
@@ -1808,6 +1808,13 @@ fn is_harmless_tls_handler(id: &str, kind: Option<&str>) -> bool {
             .any(|w| lower.contains(w))
 }
 
+/// Whether a property looks like it holds a secret: a secret-like key, or a benign
+/// password-named key (`passwordCharacterEncoding`…) whose value does not have the expected
+/// shape (a misplaced password).
+fn is_secret_like(key: &str, value: &str) -> bool {
+    is_secret_like_key(key) || is_secret_like_entry(key, value)
+}
+
 fn normalize_key(key: &str) -> String {
     key.chars()
         .filter(char::is_ascii_alphanumeric)
@@ -1848,7 +1855,7 @@ fn apply_property(prefix: &str, key: &str, value: &str, st: &mut ConnState) {
         }
         _ => {}
     }
-    if is_secret_like_key(key) {
+    if is_secret_like(key, value) {
         st.issues.warn(
             IssueKind::SecretRemoved,
             Some(path),
@@ -2007,7 +2014,7 @@ fn map_ssh(
         "remoteHost",
         "remotePort",
     ];
-    for (key, _) in &props.entries {
+    for (key, value) in &props.entries {
         if CONSUMED.contains(&key.as_str()) || key.starts_with("jumpServer") {
             continue;
         }
@@ -2019,7 +2026,7 @@ fn map_ssh(
             );
             continue;
         }
-        if is_secret_like_key(key) {
+        if is_secret_like(key, &value.as_text()) {
             st.issues.warn(
                 IssueKind::SecretRemoved,
                 Some(join(&props_prefix, key)),
@@ -2197,7 +2204,7 @@ fn map_jump_hosts(
         if !active {
             continue;
         }
-        for (field, _) in &fields {
+        for (field, value) in &fields {
             let path = join(&hop_prefix, field);
             match *field {
                 "enabled" | "host" | "port" | "user" | "authType" | "keyPath" => {}
@@ -2206,7 +2213,7 @@ fn map_jump_hosts(
                     Some(path),
                     "an inline private key is never imported: save it to a file and set its path",
                 ),
-                f if is_secret_like_key(f) => st.issues.warn(
+                f if is_secret_like(f, &value.as_text()) => st.issues.warn(
                     IssueKind::SecretRemoved,
                     Some(path),
                     "looks like a secret: removed, not imported",
@@ -2496,7 +2503,7 @@ fn tls_from_postgres_handler(h: &HandlerDef, prefix: &str, st: &mut ConnState) {
             "ssl.ca.cert" => set_path(&mut st.tls.ca_file, &text),
             "ssl.client.cert" => set_path(&mut st.tls.cert_file, &text),
             "ssl.client.key" => set_path(&mut st.tls.key_file, &text),
-            k if is_secret_like_key(k) => st.issues.warn(
+            k if is_secret_like(k, &text) => st.issues.warn(
                 IssueKind::SecretRemoved,
                 Some(path),
                 "looks like a secret: removed, not imported",
@@ -2543,7 +2550,7 @@ fn tls_from_mysql_handler(h: &HandlerDef, prefix: &str, st: &mut ConnState) {
                     );
                 }
             }
-            k if is_secret_like_key(k) => st.issues.warn(
+            k if is_secret_like(k, &text) => st.issues.warn(
                 IssueKind::SecretRemoved,
                 Some(path),
                 "looks like a secret: removed, not imported",
