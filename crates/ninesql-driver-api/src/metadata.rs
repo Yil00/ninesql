@@ -57,8 +57,16 @@ pub struct PageRequest {
     pub cursor: Option<String>,
     /// Maximum items in the page.
     pub limit: u32,
-    /// Optional name filter: a substring for SQL engines, a `MATCH` pattern for key-value
-    /// stores. Drivers apply it server-side where possible.
+    /// Optional name filter: a literal substring for SQL engines, a `MATCH` pattern for
+    /// key-value stores. Drivers apply it server-side where possible.
+    ///
+    /// The filter is **user input** (L5): drivers pass it as a bind parameter (or a separate
+    /// protocol argument, such as the `MATCH` argument of `SCAN`), never spliced into statement
+    /// text. For SQL engines it is a literal: wildcards are escaped with [`escape_like`] and the
+    /// query uses `LIKE ? ESCAPE '!'` (or the engine's equivalent), so `%` and `_` in a name
+    /// match only themselves. `!` is the recommended escape character: a backslash would itself
+    /// need escaping in the statement text under MySQL's default `sql_mode` and PostgreSQL with
+    /// `standard_conforming_strings = off`.
     pub filter: Option<String>,
 }
 
@@ -102,6 +110,33 @@ impl Default for PageRequest {
     fn default() -> Self {
         Self::first()
     }
+}
+
+/// Escapes `%`, `_` and `escape` itself in `filter` so a `LIKE` / `ILIKE` pattern built from
+/// it matches the text literally, and wraps it in `%…%` for a substring match. Bind the result
+/// and declare the same escape character (`LIKE ? ESCAPE '!'`; `!` is recommended, see
+/// [`PageRequest::filter`]). `escape` must not be `%` or `_`.
+///
+/// ```
+/// # use ninesql_driver_api::metadata::escape_like;
+/// assert_eq!(escape_like("a_b%c!d", '!'), "%a!_b!%c!!d%");
+/// ```
+#[must_use]
+pub fn escape_like(filter: &str, escape: char) -> String {
+    debug_assert!(
+        escape != '%' && escape != '_',
+        "the LIKE escape character cannot be a wildcard"
+    );
+    let mut out = String::with_capacity(filter.len() + 4);
+    out.push('%');
+    for c in filter.chars() {
+        if c == '%' || c == '_' || c == escape {
+            out.push(escape);
+        }
+        out.push(c);
+    }
+    out.push('%');
+    out
 }
 
 /// One page of results.
@@ -192,6 +227,13 @@ pub struct TableInfo {
 ///
 /// Calls are lazy (one level, one kind at a time) and paged. Dropping a returned future
 /// abandons the call; the core applies its own timeout around metadata calls.
+///
+/// When a driver serves metadata from a **separate connection** (so the navigator works while a
+/// query streams), that connection is opened with the session's exact security settings (L5):
+/// the same TLS configuration and verification (never a weaker mode), the same SSH route, the
+/// same read-only mechanism applied and verified before any query, and the same reserved
+/// property rules. Its queries bind every user-supplied value ([`PageRequest::filter`], object
+/// names) as parameters.
 #[async_trait::async_trait]
 pub trait Metadata: Send + Sync {
     /// Kinds that can be listed under an object of kind `parent` (`None` = server root), in

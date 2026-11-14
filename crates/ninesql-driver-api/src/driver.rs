@@ -50,10 +50,17 @@ pub trait Driver: Send + Sync {
     /// Opens a session.
     ///
     /// Contract:
-    /// - call [`check_properties`](crate::check_properties) first: driver properties never
-    ///   override TLS / verification, host / port, credentials, read-only / access mode,
-    ///   multi-statements, init SQL or lexical modes (reuse
-    ///   `conformance::assert_reserved_properties_rejected` in the integration tests);
+    /// - call [`Capabilities::check_properties`] (the global rule plus the engine's
+    ///   [`extra_reserved_properties`](Capabilities::extra_reserved_properties)) first: driver
+    ///   properties never override TLS / verification, host / port, credentials, read-only /
+    ///   access mode, multi-statements, init SQL or lexical modes (reuse
+    ///   `conformance::assert_reserved_properties_rejected` in the integration tests); every key
+    ///   the driver refuses is declared in `extra_reserved_properties`, so `ninesql-core`
+    ///   refuses it before saving the connection;
+    /// - take every connection setting from the typed fields of [`ConnectParams`] and pass them
+    ///   to the client as structured options: host, user and database may contain characters
+    ///   that matter in a DSN (`;`, `&`, `@`, spaces), so never format them into a connection
+    ///   string;
     /// - pass accepted properties to the client as separate typed options, **never** spliced into
     ///   a connection string or URL;
     /// - disable multi-statement support in the client (MySQL `CLIENT_MULTI_STATEMENTS` off);
@@ -72,8 +79,15 @@ pub trait Driver: Send + Sync {
     ///   (`SHOW default_transaction_read_only`);
     /// - run [`ConnectParams::init_statements`] after the read-only mechanism, so they cannot
     ///   lift it (they are subject to the same read-only refusal as user statements);
-    /// - drop every [`Secret`](crate::Secret) as soon as the handshake is done, unless the
-    ///   engine needs it for reconnects (documented per driver);
+    /// - drop every [`Secret`](crate::Secret) before returning, unless the driver declares
+    ///   [`Capabilities::retains_secret_after_connect`] (L5), in which case it keeps the
+    ///   `Secret` (zeroized on drop) only for its own reconnects and auxiliary authentications
+    ///   (cancel, metadata, keep-alive) and drops it with the session. A driver that does not
+    ///   retain it opens and authenticates every auxiliary connection it will need (for example
+    ///   a MySQL control connection for `KILL QUERY`) during `connect`; the declaration is
+    ///   listed per driver in `docs/08-engine-capabilities.md`;
+    /// - open any additional connection (metadata, cancel, keep-alive) with the same TLS
+    ///   settings, SSH route and read-only mechanism as the main one (see [`Metadata`]);
     /// - error messages are passed through
     ///   [`redact_connection_string`](crate::redact_connection_string) /
     ///   [`redact_secret`](crate::redact_secret) when the client may echo credentials.
@@ -81,7 +95,27 @@ pub trait Driver: Send + Sync {
 }
 
 /// A live connection with its transaction state. Owned by the core, used from one task at a
-/// time; [`Session::cancel_handle`] is the only part meant to be used concurrently.
+/// time; [`Session::cancel_handle`] and [`ResultStream::cancel_handle`] are the only parts
+/// meant to be used concurrently.
+///
+/// # Executions and cancellation (M6)
+/// Each [`execute`](Session::execute) call is one execution with an
+/// [`ExecutionId`](crate::ExecutionId) ([`ExecutionTracker`](crate::ExecutionTracker)):
+/// - the session is **busy** from `execute` until the server confirmed that the statement
+///   ended (last result message, error, or acknowledged cancel) and every cancel request sent
+///   for it has returned; meanwhile `execute` fails with [`DriverError::Busy`]. Dropping a
+///   [`ResultStream`] mid-result makes the driver close the cursor / drain the connection in
+///   the background; the session stays busy until that is confirmed, and a driver that cannot
+///   confirm it in bounded time closes the session ([`DriverError::Closed`]);
+/// - every cancel handle is **scoped to one execution**: once the execution ended it does
+///   nothing, so a late cancel (timeout, "Stop" clicked as the statement finished) never hits
+///   the next statement. Engines whose server-side cancel targets the connection rather than
+///   one statement (PostgreSQL cancel request, MySQL `KILL QUERY`, SQLite interrupt) rely on
+///   the busy rule above for this; engines with addressed cancel send the execution's own id
+///   (Trino query id, ClickHouse `query_id`, Elasticsearch task id, MongoDB `opId`);
+/// - drivers with [`CancelSupport::ServerSide`](crate::CancelSupport::ServerSide) return
+///   handles whose [`confirms_end`](CancelHandle::confirms_end) is `true` and end their raw
+///   stream when the server confirms the cancelled statement stopped.
 #[async_trait::async_trait]
 pub trait Session: Send + Sync {
     /// Exact capabilities for this engine and server version.
@@ -94,7 +128,8 @@ pub trait Session: Send + Sync {
     fn dialect(&self) -> Arc<dyn Dialect>;
 
     /// Metadata access. Drivers may serve it from a separate connection so the navigator keeps
-    /// working while a query streams.
+    /// working while a query streams; that connection applies the session's TLS settings, SSH
+    /// route and read-only mechanism (see [`Metadata`], L5).
     fn metadata(&self) -> Arc<dyn Metadata>;
 
     /// Executes one statement.
@@ -128,8 +163,14 @@ pub trait Session: Send + Sync {
     ///   `default_transaction_read_only`, MySQL session-state tracking of
     ///   `transaction_read_only`, or a read-back) and, if it changed, closes the session and
     ///   fails with [`DriverError::ReadOnly`]; later calls fail with [`DriverError::Closed`];
-    /// - fails with [`DriverError::Busy`] while a previous [`ResultStream`] of this session is
-    ///   still alive, unless the engine multiplexes;
+    /// - fails with [`DriverError::Busy`] while a previous execution of this session has not been
+    ///   confirmed ended (see [Executions and cancellation](Session#executions-and-cancellation-m6)),
+    ///   unless the engine multiplexes;
+    /// - builds the stream's cancel handle with
+    ///   [`ExecutionTracker::cancel_handle`](crate::ExecutionTracker::cancel_handle) and records
+    ///   the id with [`ResultStream::with_execution`];
+    /// - in tests, reuses `conformance::assert_stale_cancel_ignored` and
+    ///   `conformance::assert_batches_within_budget`;
     /// - fails with [`DriverError::Unsupported`] for a language or parameters not declared.
     async fn execute(
         &mut self,
@@ -137,11 +178,15 @@ pub trait Session: Send + Sync {
         options: ExecOptions,
     ) -> DriverResult<ResultStream>;
 
-    /// Handle that stops the running statement on the server, usable from another task while a
-    /// stream is consumed. [`ResultStream`] calls it on timeout and cancel.
+    /// Handle that stops, on the server, the execution running **when this method is called**
+    /// (a handle that does nothing when the session is idle), usable from another task while a
+    /// stream is consumed. Scoped to that execution: once it ended, the handle does nothing
+    /// (M6). Implementations return
+    /// [`ExecutionTracker::current_cancel_handle`](crate::ExecutionTracker::current_cancel_handle).
+    /// Prefer [`ResultStream::cancel_handle`], which names its execution explicitly.
     fn cancel_handle(&self) -> Arc<dyn CancelHandle>;
 
-    /// Stops the running statement (shortcut for `cancel_handle().cancel()`).
+    /// Stops the running execution, if any (shortcut for `cancel_handle().cancel()`).
     async fn cancel(&self) -> DriverResult<()> {
         self.cancel_handle().cancel().await
     }

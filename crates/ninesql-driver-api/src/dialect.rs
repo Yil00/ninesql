@@ -19,6 +19,21 @@
 //!   encoding change as [`StatementClass::ChangesAccessMode`].
 //!
 //! Drivers also send exactly one statement per protocol call (see [`ensure_single_statement`]).
+//!
+//! # Limits of the classifier (L4)
+//! The classifier sees statement text, not what the server will run. A call to a function with
+//! side effects is only recognised when the function is on a known list (`nextval`, `dblink_exec`,
+//! replication-slot, backup and statistics-reset functions, large-object writers…): **any other
+//! function, in particular user-defined functions and procedures called from a `SELECT`, is
+//! classified [`StatementClass::Read`]** even if it writes. Consequences:
+//! - read-only sessions stay safe: the engine-side mechanism (I3) rejects the write, and the
+//!   driver verifies the access mode after every statement for liftable mechanisms;
+//! - the production guard (ADR-0007 §3) does **not** ask for confirmation for such calls, and
+//!   on an engine declared [`ReadOnlyMechanism::ClientSideOnly`](crate::ReadOnlyMechanism::ClientSideOnly)
+//!   nothing stops them, which is why the UI recommends a read-only account there.
+//!
+//! PostgreSQL Unicode-escaped names (`U&"d\0061ta"`, `U&'…'`) are decoded before matching;
+//! a malformed escape or a `UESCAPE` clause makes the statement [`StatementClass::Unknown`].
 
 use crate::capabilities::ExplainFormat;
 use crate::error::{DriverError, DriverResult};
@@ -300,6 +315,10 @@ pub trait Dialect: Send + Sync {
 
     /// Classifies a statement (or a script: the riskiest statement wins). The default is a
     /// conservative keyword classifier; drivers with a real parser override it.
+    ///
+    /// Calls to functions with side effects that are not on the known list (user functions,
+    /// procedures called from a `SELECT`) classify as [`StatementClass::Read`]: see the
+    /// [module documentation](self#limits-of-the-classifier-l4).
     fn classify(&self, text: &str) -> StatementClass {
         classify_with_rules(text, self.lexical_rules())
     }
@@ -473,6 +492,21 @@ fn lex(text: &str, rules: LexicalRules) -> Lexed {
             let end = skip_quoted(bytes, i + 1, b'\'', true).min(bytes.len());
             push(&mut toks, TokKind::Str, i, end);
             i = end;
+        } else if matches!(b, b'u' | b'U')
+            && next == Some(b'&')
+            && matches!(bytes.get(i + 2), Some(b'\'' | b'"'))
+        {
+            // `U&"…"` / `U&'…'` (SQL standard, PostgreSQL): one token, decoded by `locate`.
+            // The quoted run is skipped exactly as without the prefix, so splitting is unchanged.
+            let q = bytes[i + 2];
+            let end = skip_quoted(bytes, i + 2, q, rules.backslash_escapes).min(bytes.len());
+            let kind = if q == b'\'' {
+                TokKind::Str
+            } else {
+                TokKind::Ident
+            };
+            push(&mut toks, kind, i, end);
+            i = end;
         } else if b == b'\'' || b == b'"' || rules.backtick_identifiers && b == b'`' {
             let backslash = rules.backslash_escapes && b != b'`';
             let end = skip_quoted(bytes, i, b, backslash).min(bytes.len());
@@ -600,8 +634,13 @@ pub fn classify_with_rules(text: &str, rules: LexicalRules) -> StatementClass {
         if stmt.is_empty() {
             continue;
         }
-        let items = locate(text, stmt);
-        let c = classify_items(&items);
+        let (items, opaque) = locate(text, stmt);
+        let c = if opaque {
+            // A name the classifier cannot decode could be anything.
+            StatementClass::Unknown
+        } else {
+            classify_items(&items)
+        };
         worst = Some(worst.map_or(c, |w| w.max(c)));
     }
     worst.unwrap_or(StatementClass::Read)
@@ -615,6 +654,69 @@ fn unquote_ident(raw: &str) -> String {
         .to_lowercase()
 }
 
+/// `U&"…"` / `U&'…'`: strips the prefix and the quotes, undoubles the quote and decodes
+/// `\XXXX`, `\+XXXXXX` and `\\` (surrogate pairs included). `None` when the token is
+/// unterminated or an escape is malformed.
+fn decode_unicode_escaped(raw: &str) -> Option<String> {
+    let body = raw.get(2..)?;
+    let q = body.chars().next()?;
+    if body.len() < 2 || !body.ends_with(q) {
+        return None;
+    }
+    let doubled: String = [q, q].iter().collect();
+    let inner = body[1..body.len() - 1].replace(&doubled, &q.to_string());
+    let mut out = String::with_capacity(inner.len());
+    let mut chars = inner.chars().peekable();
+    let mut pending_high: Option<u32> = None;
+    while let Some(c) = chars.next() {
+        if c != '\\' {
+            if pending_high.is_some() {
+                return None;
+            }
+            out.push(c);
+            continue;
+        }
+        let digits = match chars.peek() {
+            Some('\\') => {
+                chars.next();
+                if pending_high.is_some() {
+                    return None;
+                }
+                out.push('\\');
+                continue;
+            }
+            Some('+') => {
+                chars.next();
+                6
+            }
+            _ => 4,
+        };
+        let hex: String = chars.by_ref().take(digits).collect();
+        if hex.len() != digits || !hex.chars().all(|h| h.is_ascii_hexdigit()) {
+            return None;
+        }
+        let cp = u32::from_str_radix(&hex, 16).ok()?;
+        match (pending_high.take(), cp) {
+            (None, 0xD800..=0xDBFF) => pending_high = Some(cp),
+            (Some(high), 0xDC00..=0xDFFF) => {
+                out.push(char::from_u32(
+                    0x10000 + ((high - 0xD800) << 10) + (cp - 0xDC00),
+                )?);
+            }
+            (Some(_), _) => return None,
+            (None, _) => out.push(char::from_u32(cp)?),
+        }
+    }
+    if pending_high.is_some() {
+        return None;
+    }
+    Some(out)
+}
+
+fn has_unicode_prefix(raw: &str) -> bool {
+    raw.len() > 2 && raw.as_bytes()[1] == b'&' && matches!(raw.as_bytes()[0], b'u' | b'U')
+}
+
 fn unquote_str(raw: &str) -> String {
     let body = raw.strip_prefix(['e', 'E']).unwrap_or(raw);
     let inner = if body.len() >= 2 && body.starts_with('\'') && body.ends_with('\'') {
@@ -625,13 +727,34 @@ fn unquote_str(raw: &str) -> String {
     inner.to_lowercase()
 }
 
-fn locate(text: &str, toks: &[Tok]) -> Vec<Located> {
+/// Items of one statement, and whether a token could not be decoded (`opaque`).
+fn locate(text: &str, toks: &[Tok]) -> (Vec<Located>, bool) {
     let mut depth = 0u32;
+    let mut opaque = false;
     let mut out = Vec::with_capacity(toks.len());
     for t in toks {
         let raw = &text[t.start..t.end];
         let item = match t.kind {
-            TokKind::Word => Item::Word(raw.to_ascii_uppercase()),
+            TokKind::Word => {
+                if raw.eq_ignore_ascii_case("UESCAPE") {
+                    // A custom escape character for `U&` names: not decoded, fail closed.
+                    opaque = true;
+                }
+                Item::Word(raw.to_ascii_uppercase())
+            }
+            TokKind::Ident | TokKind::Str if has_unicode_prefix(raw) => {
+                if let Some(decoded) = decode_unicode_escaped(raw) {
+                    let lower = decoded.to_lowercase();
+                    if t.kind == TokKind::Ident {
+                        Item::Ident(lower)
+                    } else {
+                        Item::Str(lower)
+                    }
+                } else {
+                    opaque = true;
+                    Item::Punct(b'?')
+                }
+            }
             TokKind::Ident => Item::Ident(unquote_ident(raw)),
             TokKind::Str => Item::Str(unquote_str(raw)),
             TokKind::Other | TokKind::Semicolon => Item::Punct(raw.as_bytes()[0]),
@@ -647,29 +770,34 @@ fn locate(text: &str, toks: &[Tok]) -> Vec<Located> {
             depth += 1;
         }
     }
-    out
+    (out, opaque)
 }
 
 /// Functions that change the session's access mode.
 const ACCESS_MODE_FUNCTIONS: &[&str] = &["SET_CONFIG"];
 
 /// Functions with side effects a `SELECT` can call. Unknown = needs confirmation, refused in
-/// read-only sessions.
+/// read-only sessions. Not exhaustive: see the module's "Limits of the classifier".
 const SIDE_EFFECT_FUNCTIONS: &[&str] = &[
     "NEXTVAL",
     "SETVAL",
-    "DBLINK",
-    "DBLINK_EXEC",
-    "DBLINK_CONNECT",
-    "DBLINK_SEND_QUERY",
     "PG_TERMINATE_BACKEND",
     "PG_CANCEL_BACKEND",
     "PG_RELOAD_CONF",
     "PG_ROTATE_LOGFILE",
     "PG_PROMOTE",
     "PG_SWITCH_WAL",
-    "PG_CREATE_RESTORE_POINT",
     "PG_FILE_WRITE",
+    "PG_START_BACKUP",
+    "PG_STOP_BACKUP",
+    "PG_DROP_REPLICATION_SLOT",
+    "PG_REPLICATION_SLOT_ADVANCE",
+    "PG_LOGICAL_SLOT_GET_CHANGES",
+    "PG_LOGICAL_SLOT_GET_BINARY_CHANGES",
+    "PG_LOGICAL_EMIT_MESSAGE",
+    "PG_LOG_BACKEND_MEMORY_CONTEXTS",
+    "PG_IMPORT_SYSTEM_COLLATIONS",
+    "PG_STAT_STATEMENTS_RESET",
     "LO_IMPORT",
     "LO_EXPORT",
     "LO_UNLINK",
@@ -677,8 +805,30 @@ const SIDE_EFFECT_FUNCTIONS: &[&str] = &[
     "LO_CREATE",
     "LO_PUT",
     "LO_FROM_BYTEA",
+    "LO_TRUNCATE",
+    "LO_TRUNCATE64",
+    "LOWRITE",
     "LOAD_EXTENSION",
 ];
+
+/// Prefixes of function families with side effects (F2): replication slots and origins,
+/// statistics resets, backups, WAL replay control, `dblink*`, `pg_create_*` (restore points,
+/// replication slots) and `pg_copy_*_replication_slot`. A few read-only members
+/// (`pg_replication_origin_oid`…) are over-classified, which only asks for confirmation.
+const SIDE_EFFECT_PREFIXES: &[&str] = &[
+    "DBLINK",
+    "PG_CREATE_",
+    "PG_COPY_",
+    "PG_STAT_RESET",
+    "PG_BACKUP_",
+    "PG_WAL_REPLAY_",
+    "PG_REPLICATION_ORIGIN_",
+];
+
+fn is_side_effect_function(upper: &str) -> bool {
+    SIDE_EFFECT_FUNCTIONS.contains(&upper)
+        || SIDE_EFFECT_PREFIXES.iter().any(|p| upper.starts_with(p))
+}
 
 /// Settings `SET` / `RESET` may change without affecting access mode, privileges or the lexical
 /// rules. Everything else is [`StatementClass::ChangesAccessMode`].
@@ -777,7 +927,7 @@ fn classify_items(items: &[Located]) -> StatementClass {
         };
         if ACCESS_MODE_FUNCTIONS.contains(&f.as_str()) {
             worst = worst.max(StatementClass::ChangesAccessMode);
-        } else if SIDE_EFFECT_FUNCTIONS.contains(&f.as_str()) {
+        } else if is_side_effect_function(&f) {
             worst = worst.max(StatementClass::Unknown);
         }
     }
@@ -1430,6 +1580,108 @@ mod tests {
                 1,
             ),
             (pg, "SET TRANSACTION READ WRITE", C::ChangesAccessMode, 1),
+            // F1: Unicode-escaped names are decoded before matching.
+            (
+                pg,
+                "SELECT U&\"set\\005fconfig\"('default_transaction_read_only','off',false)",
+                C::ChangesAccessMode,
+                1,
+            ),
+            (
+                pg,
+                "SELECT u&\"\\0070g_terminate_backend\"(42)",
+                C::Unknown,
+                1,
+            ),
+            (
+                pg,
+                "SET U&\"default\\005ftransaction\\005fread\\005fonly\" = off",
+                C::ChangesAccessMode,
+                1,
+            ),
+            (pg, "SET U&\"search\\005fpath\" = app", C::Session, 1),
+            (
+                pg,
+                "SELECT U&\"!0073et_config\" UESCAPE '!'('a','b',false)",
+                C::Unknown,
+                1,
+            ),
+            (pg, "SELECT U&\"bad\\zzzz\"(1)", C::Unknown, 1),
+            (pg, "SELECT U&\"\\D83D\\DE00\" FROM t", C::Read, 1),
+            (pg, "SELECT U&\"\\D83D\" FROM t", C::Unknown, 1),
+            (pg, "SELECT U&'a;b'; DROP TABLE t", C::Destructive, 2),
+            (
+                pg,
+                "SET client_encoding TO U&'\\0053JIS'",
+                C::ChangesAccessMode,
+                1,
+            ),
+            (pg, "SET client_encoding TO U&'UTF8'", C::Session, 1),
+            // F2: more side-effect functions.
+            (
+                pg,
+                "SELECT pg_create_logical_replication_slot('s', 'pgoutput')",
+                C::Unknown,
+                1,
+            ),
+            (
+                pg,
+                "SELECT * FROM pg_create_physical_replication_slot('s')",
+                C::Unknown,
+                1,
+            ),
+            (pg, "SELECT pg_drop_replication_slot('s')", C::Unknown, 1),
+            (pg, "SELECT pg_stat_reset()", C::Unknown, 1),
+            (pg, "SELECT pg_stat_reset_shared('bgwriter')", C::Unknown, 1),
+            (pg, "SELECT pg_backup_start('x')", C::Unknown, 1),
+            (pg, "SELECT pg_backup_stop()", C::Unknown, 1),
+            (pg, "SELECT pg_wal_replay_pause()", C::Unknown, 1),
+            (pg, "SELECT pg_wal_replay_resume()", C::Unknown, 1),
+            (
+                pg,
+                "SELECT pg_logical_emit_message(true, 'p', 'x')",
+                C::Unknown,
+                1,
+            ),
+            (
+                pg,
+                "SELECT pg_replication_origin_create('o')",
+                C::Unknown,
+                1,
+            ),
+            (
+                pg,
+                "SELECT pg_replication_origin_session_setup('o')",
+                C::Unknown,
+                1,
+            ),
+            (pg, "SELECT dblink_open('c', 'select 1')", C::Unknown, 1),
+            (
+                pg,
+                "SELECT pg_copy_logical_replication_slot('a', 'b')",
+                C::Unknown,
+                1,
+            ),
+            (
+                pg,
+                "SELECT pg_replication_slot_advance('s', '0/0')",
+                C::Unknown,
+                1,
+            ),
+            (
+                pg,
+                "SELECT pg_logical_slot_get_changes('s', NULL, NULL)",
+                C::Unknown,
+                1,
+            ),
+            // The limit is documented: unknown user functions stay Read (L4).
+            (pg, "SELECT my_app_cleanup()", C::Read, 1),
+            (
+                pg,
+                "SELECT pg_logical_slot_peek_changes('s', NULL, NULL)",
+                C::Read,
+                1,
+            ),
             // M5: WHERE must be at the top level.
             (
                 pg,
@@ -1587,7 +1839,46 @@ mod tests {
         })
     }
 
+    #[test]
+    fn unicode_escapes_decode() {
+        assert_eq!(
+            decode_unicode_escaped("U&\"d\\0061t\\+000061\"").as_deref(),
+            Some("data")
+        );
+        assert_eq!(decode_unicode_escaped("u&'it''s'").as_deref(), Some("it's"));
+        assert_eq!(
+            decode_unicode_escaped("U&\"a\\\\b\"").as_deref(),
+            Some("a\\b")
+        );
+        assert_eq!(
+            decode_unicode_escaped("U&\"\\D83D\\DE00\"").as_deref(),
+            Some("\u{1F600}")
+        );
+        for bad in [
+            "U&\"\\12\"",
+            "U&\"\\+12\"",
+            "U&\"\\DE00\"",
+            "U&\"\\D83Dx\"",
+            "U&\"\\+110000\"",
+            "U&\"abc",
+            "U&\"",
+        ] {
+            assert_eq!(decode_unicode_escaped(bad), None, "{bad}");
+        }
+    }
+
     proptest! {
+        /// Any name, Unicode-escaped character by character, decodes back to itself.
+        #[test]
+        fn unicode_escaped_names_roundtrip(name in "\\PC{1,20}") {
+            let mut quoted = String::from("U&\"");
+            for c in name.chars() {
+                quoted.push_str(&format!("\\+{:06X}", u32::from(c)));
+            }
+            quoted.push('"');
+            prop_assert_eq!(decode_unicode_escaped(&quoted), Some(name));
+        }
+
         #[test]
         fn spans_are_ordered_and_on_char_boundaries(script in "\\PC{0,300}", rules in any_rules()) {
             let spans = split_with_rules(&script, rules);
