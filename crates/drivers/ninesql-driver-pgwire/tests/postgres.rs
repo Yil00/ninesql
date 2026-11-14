@@ -389,6 +389,56 @@ async fn read_only_refuses_writes_engine_side() {
         .unwrap();
 }
 
+/// Security review of mysqlwire (H1), checked on pgwire too: `SET TRANSACTION … READ WRITE`
+/// changes only the current transaction and leaves `default_transaction_read_only` on; its
+/// comma form is classified `Session` by the shared classifier. A write after it must still
+/// fail engine-side, in autocommit, in manual-commit mode and in an explicit transaction.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn one_shot_read_write_transaction_cannot_write() {
+    const ONE_SHOT: &str = "SET TRANSACTION ISOLATION LEVEL READ COMMITTED, READ WRITE";
+    let Some(dev) = dev() else { return };
+    fixtures(&dev).await;
+    let mut p = params(&dev);
+    p.read_only = true;
+    let mut s = PgWireDriver::new().connect(p).await.unwrap();
+    let count = |c: &Collected| scalar(c).unwrap();
+    let before = count(
+        &run(s.as_mut(), "SELECT count(*) FROM ninesql_test.written")
+            .await
+            .unwrap(),
+    );
+    for mode in ["autocommit", "manual", "explicit"] {
+        match mode {
+            "manual" => s.set_auto_commit(false).await.unwrap(),
+            "explicit" => {
+                s.set_auto_commit(true).await.unwrap();
+                s.begin().await.unwrap();
+            }
+            _ => {}
+        }
+        // Outside a transaction block PostgreSQL only warns; inside one it is accepted.
+        let _ = run(s.as_mut(), ONE_SHOT).await;
+        match run(s.as_mut(), "SELECT ninesql_test.write_one()").await {
+            Err(DriverError::ReadOnly(_)) => {}
+            other => panic!(
+                "{mode}: write after a one-shot READ WRITE: {:?}",
+                other.map(|_| ())
+            ),
+        }
+        if s.in_transaction() {
+            s.rollback().await.unwrap();
+        }
+        assert!(s.is_read_only());
+    }
+    s.set_auto_commit(true).await.unwrap();
+    let after = count(
+        &run(s.as_mut(), "SELECT count(*) FROM ninesql_test.written")
+            .await
+            .unwrap(),
+    );
+    assert_eq!(before, after, "rows were written");
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn access_mode_change_is_detected() {
     let Some(dev) = dev() else { return };

@@ -603,15 +603,30 @@ impl Actor {
                 }
             },
         };
-        if on {
-            Ok(())
-        } else {
+        if !on {
             self.close_session("read-only mode lifted");
-            Err(DriverError::ReadOnly(
+            return Err(DriverError::ReadOnly(
                 "a statement turned the session's read-only mode off; the session was closed"
                     .into(),
-            ))
+            ));
         }
+        // `SET TRANSACTION … READ WRITE` (also its comma form `SET TRANSACTION ISOLATION LEVEL
+        // READ COMMITTED, READ WRITE`, which the shared classifier sees as `Session`) makes the
+        // open transaction writable without touching `default_transaction_read_only`, so the
+        // check above cannot see it. Inside a transaction block, re-assert read-only for the
+        // transaction (always allowed: only going read-write is restricted).
+        if self.conn.txn_status == b'T'
+            && let Err(e) = self.internal("SET TRANSACTION READ ONLY", &[], 0).await
+        {
+            tracing::warn!(error = ?std::mem::discriminant(&e), "read-only re-assert failed");
+            self.close_session("read-only mode could not be re-asserted");
+            return Err(DriverError::Closed(
+                "the read-only mode could not be re-asserted after the statement; the \
+                     session was closed"
+                    .into(),
+            ));
+        }
+        Ok(())
     }
 
     /// Engine type name for `oid` (`ninesql.type` metadata).
