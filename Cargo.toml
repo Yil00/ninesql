@@ -1,7 +1,7 @@
 [workspace]
 resolver = "3"
-members = ["crates/*"]
-# Driver crates are added under crates/drivers/ from P1-B (ADR-0003) and listed here.
+members = ["crates/ninesql-*", "crates/drivers/*"]
+# Driver crates live under crates/drivers/, one per protocol family (ADR-0003).
 
 [workspace.package]
 version = "0.0.0"
@@ -72,6 +72,20 @@ async-trait = "0.1"
 futures-core = { version = "0.3", default-features = false, features = ["std"] }
 futures-util = { version = "0.3", default-features = false, features = ["std"] }
 tokio = { version = "1", default-features = false }
+
+# pgwire driver (P1-B, ADR-0003): the PostgreSQL message codec of rust-postgres (no client, no
+# OpenSSL), rustls with the `ring` provider only (ADR-0011, ADR-0016 §3), the platform trust store.
+postgres-protocol = "0.6.12"
+rustls = { version = "0.23.46", default-features = false, features = ["ring", "std", "tls12"] }
+tokio-rustls = { version = "0.26.6", default-features = false, features = ["ring", "tls12"] }
+rustls-native-certs = "0.8.5"
+rustls-pki-types = { version = "1.16", features = ["std"] }
+ring = "0.17.14"
+md-5 = "0.11"
+base64 = "0.22"
+stringprep = "0.1"
+fallible-iterator = "0.2"
+bytes = "1.11"
 
 # GPUI and gpui-component, pinned as one set from crates.io (ADR-0013, P0-A, docs/spikes/p0-a-gpui.md).
 # gpui-kit 0.9.1 = longbridge/gpui-component tag v0.9.1 (39ab849a93b5f15507b969164d49891db8d5b470);
