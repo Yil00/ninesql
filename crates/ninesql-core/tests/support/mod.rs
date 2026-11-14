@@ -2,6 +2,8 @@
 //! that records what the core passed to `connect` and can simulate misbehaviour.
 #![allow(dead_code, clippy::unwrap_used, clippy::expect_used)] // Tests may panic (AGENTS.md).
 
+pub mod sshd;
+
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -171,6 +173,15 @@ impl Session for WrapSession {
 
 /// A manager with `driver` registered, a keyring in memory and `known_hosts` under `dir`.
 pub fn manager(driver: Arc<dyn Driver>, dir: &Path) -> (SessionManager, Arc<MemoryStore>) {
+    manager_with(driver, dir, |_| {})
+}
+
+/// [`manager`], with the configuration adjusted by `tune`.
+pub fn manager_with(
+    driver: Arc<dyn Driver>,
+    dir: &Path,
+    tune: impl FnOnce(&mut ManagerConfig),
+) -> (SessionManager, Arc<MemoryStore>) {
     let mut registry = DriverRegistry::new();
     registry.register(driver);
     let keyring = Arc::new(MemoryStore::new(StoreKind::Keyring));
@@ -183,6 +194,7 @@ pub fn manager(driver: Arc<dyn Driver>, dir: &Path) -> (SessionManager, Arc<Memo
     config.workers = 2;
     config.connect_timeout = Duration::from_secs(5);
     config.busy_wait = Duration::from_millis(400);
+    tune(&mut config);
     (
         SessionManager::new(config, registry, stores).unwrap(),
         keyring,

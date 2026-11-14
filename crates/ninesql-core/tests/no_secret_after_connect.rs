@@ -4,6 +4,9 @@
 //! (ADR-0007 §6) while development query text does at `trace` level (proving the capture sees
 //! it).
 //!
+//! The SSH part runs against a real OpenSSH server in Docker and is skipped without Docker
+//! (AGENTS.md); the confirmed production `DROP` shows the executed path never logs the text.
+//!
 //! One test per process: the log capture is the global subscriber, so the runtime's worker
 //! threads are captured too.
 #![allow(clippy::unwrap_used, clippy::expect_used)] // Tests may panic (AGENTS.md).
@@ -18,8 +21,9 @@ use std::time::Duration;
 use ninesql_core::driver_api::Secret;
 use ninesql_core::driver_api::mock::MockDriver;
 use ninesql_core::{
-    Auth, ConnectionTypeId, ConnectionTypes, Connections, CoreError, ExecEvent, OpenOutcome,
-    OpenRequest, SecretSlot, SecretSource, SshAuth, SshHop, SshTunnel, Workspace,
+    Auth, ConnectionTypeId, ConnectionTypes, Connections, CoreError, ExecEvent, ExecuteRequest,
+    HostKeyPolicy, OpenOutcome, OpenRequest, SecretSlot, SecretSource, SshAuth, SshHop, SshTunnel,
+    Workspace,
 };
 use ninesql_secrets::{SecretStores, SecretString, StoreKind};
 use ninesql_storage::{Paths, ProjectName, XdgDirs};
@@ -56,6 +60,16 @@ impl tracing::Subscriber for Capture {
     }
     fn enter(&self, _: &tracing::span::Id) {}
     fn exit(&self, _: &tracing::span::Id) {}
+}
+
+fn rows_of(events: &[ExecEvent]) -> usize {
+    events
+        .iter()
+        .map(|e| match e {
+            ExecEvent::Item(ninesql_core::driver_api::ResultItem::Rows(b)) => b.num_rows(),
+            _ => 0,
+        })
+        .sum()
 }
 
 fn all_files(root: &Path) -> Vec<PathBuf> {
@@ -178,8 +192,19 @@ fn no_secret_in_workspace_files_or_logs_after_connect_flows() {
             matches!(terminal(&ev), ExecEvent::Finished { .. }),
             "{ev:?}"
         );
-        let ev = run(&h, &format!("DROP TABLE {PROD_MARKER}")).await;
-        assert!(matches!(terminal(&ev), ExecEvent::NeedsConfirmation(_)));
+        let drop_table = format!("DROP TABLE {PROD_MARKER}");
+        let ev = run(&h, &drop_table).await;
+        let ExecEvent::NeedsConfirmation(req) = terminal(&ev) else {
+            panic!("{ev:?}");
+        };
+        // The confirmed, executed path must not log the text either.
+        let ev = collect(h.execute(ExecuteRequest::sql(drop_table).confirmed(req.token))).await;
+        assert!(
+            matches!(terminal(&ev), ExecEvent::Finished { .. }),
+            "{ev:?}"
+        );
+        let ev = run(&h, &format!("SELECT error() AS {PROD_MARKER}")).await;
+        assert!(matches!(terminal(&ev), ExecEvent::Failed(_)), "{ev:?}");
         h.close().await.unwrap().unwrap();
 
         // SSH tunnel failure with a prompted SSH password.
@@ -190,13 +215,77 @@ fn no_secret_in_workspace_files_or_logs_after_connect_flows() {
         );
         assert!(matches!(open(&manager, req).await, Err(CoreError::Ssh(_))));
     });
+
+    // A real OpenSSH server (skipped without Docker): host key confirmation, a wrong prompted
+    // SSH password, then the right one saved in the keyring; `known_hosts` is written under
+    // the scanned directories.
+    let real_ssh_password = format!("Ssh-Real-Pa55-{}", uuid::Uuid::new_v4().simple());
+    let sshd = support::sshd::start(&real_ssh_password);
+    if let Some(sshd) = &sshd {
+        // The database login reuses the dev connection's saved password reference.
+        let db_auth = connections.get(dev_id).unwrap().auth.clone();
+        let mut prompted = support::sshd::connection(sshd.port, HostKeyPolicy::Strict);
+        prompted.auth = db_auth.clone();
+        let mut saved = support::sshd::connection(sshd.port, HostKeyPolicy::Strict);
+        saved.id = ninesql_core::ConnectionId::new_random();
+        let saved_id = ws
+            .create_connection(
+                &mut connections,
+                saved,
+                vec![(
+                    SecretSlot::SshServer,
+                    SecretString::from(real_ssh_password.clone()),
+                )],
+                StoreKind::Keyring,
+                &stores,
+            )
+            .unwrap();
+        let mut saved = connections.get(saved_id).unwrap().clone();
+        saved.auth = db_auth;
+        ui(async {
+            let out = open(&manager, OpenRequest::new(saved.clone(), &types))
+                .await
+                .unwrap();
+            let OpenOutcome::HostKeyNeedsConfirmation(confirm) = out else {
+                panic!("{out:?}");
+            };
+            manager
+                .trust_host_key(confirm.token)
+                .await
+                .unwrap()
+                .unwrap();
+            let wrong = OpenRequest::new(prompted, &types).with_secret(
+                SecretSlot::SshServer,
+                SecretString::from(SSH_PASSWORD.to_owned()),
+            );
+            assert!(matches!(
+                open(&manager, wrong).await,
+                Err(CoreError::Ssh(_))
+            ));
+            let h = open_ok(&manager, saved, &types).await;
+            assert_eq!(rows_of(&run(&h, "SELECT * FROM numbers(3)").await), 3);
+            h.close().await.unwrap().unwrap();
+        });
+    }
     manager.shutdown(Duration::from_secs(5));
     // Workspace saved again after the flows (as the UI would on exit).
     ws.save_connections(&connections).unwrap();
 
-    let secrets = [DB_PASSWORD, PROMPTED_PASSWORD, SSH_PASSWORD];
+    let secrets = [
+        DB_PASSWORD,
+        PROMPTED_PASSWORD,
+        SSH_PASSWORD,
+        real_ssh_password.as_str(),
+    ];
     let files = all_files(&root);
     assert!(files.iter().any(|f| f.ends_with("connections.json")));
+    if sshd.is_some() {
+        assert!(
+            files.iter().any(|f| f.ends_with("known_hosts")),
+            "{files:?}"
+        );
+    }
+    drop(sshd);
     for file in &files {
         let bytes = std::fs::read(file).unwrap();
         let text = String::from_utf8_lossy(&bytes);

@@ -25,6 +25,66 @@ use crate::connection::{
 use crate::connection_type::SafetyPolicy;
 use crate::error::{ConnectionError, CoreError};
 use crate::registry::api_engine;
+use crate::session::ConfirmReason;
+
+/// Whether a statement of `class` needs the user's confirmation under `policy` (ADR-0007 §1,
+/// §3): destructive, access-mode changing or unrecognised statements when the type confirms
+/// destructive statements (always for production), every write when it confirms writes.
+#[must_use]
+pub fn confirm_reason(policy: &SafetyPolicy, class: api::StatementClass) -> Option<ConfirmReason> {
+    if policy.confirm_destructive && class.needs_confirmation() {
+        Some(ConfirmReason::Destructive)
+    } else if policy.confirm_every_write && class.is_write() {
+        Some(ConfirmReason::Write)
+    } else {
+        None
+    }
+}
+
+/// An init SQL statement that needs the user's confirmation before the connection is opened.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct FlaggedInitStatement {
+    /// Index in [`Connection::init_sql`].
+    pub index: usize,
+    /// Classification by the engine's dialect ([`api::StatementClass::Unknown`] for an entry
+    /// holding several statements).
+    pub class: api::StatementClass,
+    /// Why it needs confirmation.
+    pub reason: ConfirmReason,
+}
+
+/// The init SQL entries that need confirmation under `policy` (ADR-0007): init SQL runs on
+/// every connect, after the read-only mechanism but outside the per-statement confirmation of
+/// the session, and DBeaver imports carry bootstrap queries into it. An entry that the dialect
+/// splits into several statements counts as unrecognised.
+#[must_use]
+pub fn init_sql_needing_confirmation(
+    connection: &Connection,
+    policy: &SafetyPolicy,
+    dialect: &dyn api::Dialect,
+) -> Vec<FlaggedInitStatement> {
+    if !policy.confirm_destructive && !policy.confirm_every_write {
+        return Vec::new();
+    }
+    connection
+        .init_sql
+        .iter()
+        .enumerate()
+        .filter_map(|(index, text)| {
+            let class = if dialect.split_statements(text).len() > 1 {
+                api::StatementClass::Unknown
+            } else {
+                dialect.classify(text)
+            };
+            confirm_reason(policy, class).map(|reason| FlaggedInitStatement {
+                index,
+                class,
+                reason,
+            })
+        })
+        .collect()
+}
 
 /// A credential the UI must ask for: a [`SecretSource::Prompt`] field (ADR-0005 §3, "ask every
 /// time"). The UI shows `label`, reads the value into a [`SecretString`] and opens the

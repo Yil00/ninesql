@@ -360,6 +360,11 @@ fn production_requires_a_confirmation_token_for_destructive_statements() {
         assert_eq!(req.reason, ConfirmReason::Destructive);
         assert!(req.production);
         assert_eq!(req.connection_name, "Mock");
+        assert_eq!(
+            req.statement, "DROP TABLE orders",
+            "the UI shows what will run"
+        );
+        assert_eq!(req.params, 0);
         let token = req.token;
 
         // The token is bound to the exact text.
@@ -751,4 +756,251 @@ fn closing_all_sessions_and_dropping_the_manager() {
     assert!(a.is_closed());
     // Dropping the last manager clone from a plain thread stops the runtime.
     drop(manager);
+}
+
+#[test]
+fn a_consumer_that_stops_reading_never_blocks_the_session() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (manager, _) = manager(Arc::new(MockDriver::new()), tmp.path());
+    let types = ConnectionTypes::default();
+    let big = || {
+        ExecuteRequest::sql("SELECT * FROM numbers(1000000)")
+            .with_budget(FetchBudget::default().with_batch_rows(10))
+    };
+    ui(async {
+        // Held but not read, then cancelled: the terminal event does not wait for a slot, and
+        // the queued command behind it is served.
+        let h = open_ok(&manager, mock_connection(ConnectionTypeId::dev()), &types).await;
+        let held = h.execute(big());
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let ping = h.ping();
+        held.cancel();
+        let pong = tokio::time::timeout(Duration::from_secs(5), ping)
+            .await
+            .expect("queued command not served");
+        assert!(pong.unwrap().is_ok());
+        let closed = tokio::time::timeout(Duration::from_secs(5), h.close())
+            .await
+            .expect("close blocked by a consumer that stopped reading");
+        assert!(closed.unwrap().is_ok());
+        let ev = collect(held).await;
+        assert!(
+            matches!(
+                terminal(&ev),
+                ExecEvent::Failed(CoreError::Driver(DriverError::Cancelled))
+            ),
+            "{ev:?}"
+        );
+
+        // Held, not read, not cancelled: close() cancels it and finishes.
+        let h = open_ok(&manager, mock_connection(ConnectionTypeId::dev()), &types).await;
+        let held = h.execute(big());
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let closed = tokio::time::timeout(Duration::from_secs(5), h.close())
+            .await
+            .expect("close blocked by a consumer that stopped reading");
+        assert!(closed.unwrap().is_ok());
+        assert!(matches!(
+            terminal(&collect(held).await),
+            ExecEvent::Failed(_)
+        ));
+    });
+    // Shutdown is not held up either.
+    let ui_manager = manager.clone();
+    let h = ui(open_ok(
+        &ui_manager,
+        mock_connection(ConnectionTypeId::dev()),
+        &types,
+    ));
+    let _held = h.execute(big());
+    std::thread::sleep(Duration::from_millis(200));
+    let start = std::time::Instant::now();
+    manager.shutdown(Duration::from_secs(10));
+    assert!(
+        start.elapsed() < Duration::from_secs(5),
+        "shutdown waited on the consumer"
+    );
+    while !h.is_closed() {
+        assert!(
+            start.elapsed() < Duration::from_secs(5),
+            "session not closed"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    drop(ui_manager);
+}
+
+#[test]
+fn init_sql_that_needs_confirmation_is_confirmed_before_connecting() {
+    let tmp = tempfile::tempdir().unwrap();
+    let wrap = Wrap::new(MockDriver::new());
+    let stats = wrap.mock.stats();
+    let (manager, _) = manager(Arc::new(wrap.clone()), tmp.path());
+    let types = ConnectionTypes::default();
+    let mut c = mock_connection(ConnectionTypeId::prod());
+    c.init_sql = vec![
+        "SELECT * FROM numbers(1)".into(),
+        "DROP TABLE scratch".into(),
+    ];
+    ui(async {
+        let out = open(&manager, OpenRequest::new(c.clone(), &types))
+            .await
+            .unwrap();
+        let OpenOutcome::InitSqlNeedsConfirmation(ic) = out else {
+            panic!("{out:?}");
+        };
+        assert_eq!(
+            ic.statements, c.init_sql,
+            "every statement, exactly as it will run"
+        );
+        assert_eq!(ic.flagged.len(), 1);
+        assert_eq!(ic.flagged[0].index, 1);
+        assert_eq!(ic.flagged[0].class, StatementClass::Destructive);
+        assert_eq!(ic.flagged[0].reason, ConfirmReason::Destructive);
+        assert!(ic.production);
+        assert_eq!((ic.connection, ic.connection_name.as_str()), (c.id, "Mock"));
+        assert_eq!(stats.connects(), 0, "nothing was dialled");
+
+        // Bound to the exact statements: a changed init SQL is refused, and the token is spent.
+        let mut changed = c.clone();
+        changed.init_sql[1] = "DROP TABLE everything".into();
+        let err = open(
+            &manager,
+            OpenRequest::new(changed, &types).with_init_sql_confirmation(ic.token),
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(err, CoreError::InvalidConfirmation));
+        let err = open(
+            &manager,
+            OpenRequest::new(c.clone(), &types).with_init_sql_confirmation(ic.token),
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(err, CoreError::InvalidConfirmation));
+
+        // Bound to the connection.
+        let OpenOutcome::InitSqlNeedsConfirmation(ic) =
+            open(&manager, OpenRequest::new(c.clone(), &types))
+                .await
+                .unwrap()
+        else {
+            panic!("no confirmation");
+        };
+        let mut twin = c.clone();
+        twin.id = ninesql_core::ConnectionId::new_random();
+        assert!(matches!(
+            open(
+                &manager,
+                OpenRequest::new(twin, &types).with_init_sql_confirmation(ic.token)
+            )
+            .await,
+            Err(CoreError::InvalidConfirmation)
+        ));
+
+        // Confirmed: opens, the driver gets both statements; the token is single-use.
+        let OpenOutcome::InitSqlNeedsConfirmation(ic) =
+            open(&manager, OpenRequest::new(c.clone(), &types))
+                .await
+                .unwrap()
+        else {
+            panic!("no confirmation");
+        };
+        let confirmed = OpenRequest::new(c.clone(), &types).with_init_sql_confirmation(ic.token);
+        let out = open(&manager, confirmed).await;
+        assert!(matches!(out, Ok(OpenOutcome::Opened(_))));
+        assert_eq!(wrap.last_seen().init_statements, 2);
+        assert!(matches!(
+            open(
+                &manager,
+                OpenRequest::new(c.clone(), &types).with_init_sql_confirmation(ic.token)
+            )
+            .await,
+            Err(CoreError::InvalidConfirmation)
+        ));
+
+        // A secret prompt in between does not spend the token.
+        let mut prompted = c.clone();
+        prompted.auth = Auth::Password {
+            username: "app".into(),
+            secret: SecretSource::Prompt,
+        };
+        let OpenOutcome::InitSqlNeedsConfirmation(ic) =
+            open(&manager, OpenRequest::new(prompted.clone(), &types))
+                .await
+                .unwrap()
+        else {
+            panic!("init SQL is confirmed before secrets are asked");
+        };
+        let out = open(
+            &manager,
+            OpenRequest::new(prompted.clone(), &types).with_init_sql_confirmation(ic.token),
+        )
+        .await
+        .unwrap();
+        assert!(matches!(out, OpenOutcome::NeedsSecrets(_)));
+        let req = OpenRequest::new(prompted, &types)
+            .with_init_sql_confirmation(ic.token)
+            .with_secret(SecretSlot::Auth, SecretString::from("pw".to_owned()));
+        assert!(matches!(
+            open(&manager, req).await,
+            Ok(OpenOutcome::Opened(_))
+        ));
+
+        // An entry with several statements counts as unrecognised.
+        let mut multi = c.clone();
+        multi.init_sql = vec!["SELECT 1; SELECT 2".into()];
+        let OpenOutcome::InitSqlNeedsConfirmation(ic) =
+            open(&manager, OpenRequest::new(multi, &types))
+                .await
+                .unwrap()
+        else {
+            panic!("no confirmation");
+        };
+        assert_eq!(ic.flagged[0].class, StatementClass::Unknown);
+
+        // Reads only on production, or anything on dev: no confirmation.
+        let mut reads = c.clone();
+        reads.init_sql = vec!["SELECT * FROM numbers(1)".into()];
+        assert!(matches!(
+            open(&manager, OpenRequest::new(reads, &types)).await,
+            Ok(OpenOutcome::Opened(_))
+        ));
+        let mut dev = c.clone();
+        dev.connection_type = ConnectionTypeId::dev();
+        assert!(matches!(
+            open(&manager, OpenRequest::new(dev, &types)).await,
+            Ok(OpenOutcome::Opened(_))
+        ));
+    });
+}
+
+#[test]
+fn core_events_are_bounded_and_drops_are_counted() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (manager, _) = manager_with(Arc::new(MockDriver::new()), tmp.path(), |c| {
+        c.event_queue = 2;
+    });
+    let types = ConnectionTypes::default();
+    ui(async {
+        // Nobody reads the events: opens and closes go on, extra events are dropped.
+        for _ in 0..3 {
+            let h = open_ok(&manager, mock_connection(ConnectionTypeId::dev()), &types).await;
+            h.close().await.unwrap().unwrap();
+        }
+    });
+    let start = std::time::Instant::now();
+    while manager.dropped_events() < 4 {
+        assert!(
+            start.elapsed() < Duration::from_secs(5),
+            "{}",
+            manager.dropped_events()
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let mut events = manager.take_events().unwrap();
+    assert!(matches!(
+        events.try_recv(),
+        Ok(CoreEvent::SessionOpened { .. })
+    ));
 }

@@ -12,7 +12,7 @@ pub mod runtime;
 pub mod session;
 pub mod workspace;
 
-pub use connect::SecretPrompt;
+pub use connect::{FlaggedInitStatement, SecretPrompt};
 pub use connection::{
     Auth, ClientCertificate, Connection, ConnectionId, Endpoint, EngineId, HostKeyPolicy, Origin,
     SecretSlot, SecretSource, SecurityWarning, SshAuth, SshHop, SshTunnel, TlsConfig, TlsMode,
@@ -23,8 +23,9 @@ pub use registry::DriverRegistry;
 pub use runtime::DriverRuntime;
 pub use session::{
     CloseReason, ConfirmReason, ConfirmationRequest, ConfirmationToken, CoreEvent, ExecEvent,
-    ExecuteRequest, Execution, KnownHostsFiles, ManagerConfig, Next, OpenOutcome, OpenRequest,
-    Reply, SessionHandle, SessionId, SessionInfo, SessionManager, SessionWarning, TransactionState,
+    ExecuteRequest, Execution, HostKeyConfirmation, HostKeyToken, InitSqlConfirmation,
+    InitSqlToken, KnownHostsFiles, ManagerConfig, Next, OpenOutcome, OpenRequest, Reply,
+    SessionHandle, SessionId, SessionInfo, SessionManager, SessionWarning, TransactionState,
 };
 pub use workspace::{
     ConnectionTypesFile, Connections, ConnectionsFile, LoadIssue, LoadedConnections, ProjectFile,

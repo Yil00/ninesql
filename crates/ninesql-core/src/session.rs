@@ -13,8 +13,13 @@
 //!   budget (I6).
 //! - [`Reply`] and [`Execution`] are executor-agnostic: GPUI awaits them on its own executor or
 //!   polls them with `try_take` / `try_next`.
-//! - Session-level events (opened, closed, tunnel lost) go to one [`CoreEvent`] channel
-//!   ([`SessionManager::take_events`]).
+//! - Session-level events (opened, closed, tunnel lost) go to one bounded [`CoreEvent`] channel
+//!   ([`SessionManager::take_events`]); when it is full, events are dropped and counted
+//!   ([`SessionManager::dropped_events`]), the runtime never waits on the UI.
+//! - An execution never blocks its session task on a consumer that stopped reading: every
+//!   event send gives up when the statement is cancelled or the [`Execution`] is dropped, and the
+//!   terminal event goes through a slot reserved when the statement starts. Closing a session
+//!   cancels its running statement, so [`SessionHandle::close`] always finishes.
 //!
 //! # Cancel and `Busy`
 //! [`Execution::cancel`] (or [`SessionHandle::cancel_current`]) sets the execution's
@@ -29,7 +34,15 @@
 //! connection whose type confirms destructive statements (always for production) or every
 //! write, a statement that needs it is not sent: the execution ends with
 //! [`ExecEvent::NeedsConfirmation`] and a single-use [`ConfirmationToken`] bound to the exact
-//! text and session. The UI shows the dialog and sends the statement again with the token.
+//! text, language and parameters, and to the session. The UI shows the dialog (with the text
+//! from [`ConfirmationRequest::statement`]) and sends the statement again with the token.
+//!
+//! Init SQL runs at every connect, outside the per-statement flow; when the type confirms
+//! destructive statements or writes, [`SessionManager::open`] classifies each init statement
+//! with the engine's dialect before anything is dialled and answers
+//! [`OpenOutcome::InitSqlNeedsConfirmation`] with a single-use [`InitSqlToken`] bound to the
+//! connection and its exact init statements. Saving such init SQL stays allowed (DBeaver
+//! imports carry bootstrap queries): it is confirmed when it would run, like any statement.
 //! Query text is logged only at `trace` level and never when the type forbids it (always for
 //! production).
 
@@ -70,6 +83,10 @@ const CONNECT_MARGIN: Duration = Duration::from_secs(5);
 const MAX_PENDING_CONFIRMATIONS: usize = 16;
 /// Lifetime of a confirmation token.
 const CONFIRMATION_TTL: Duration = Duration::from_secs(10 * 60);
+/// Init SQL and host key confirmations kept per manager.
+const MAX_PENDING_OPEN_CONFIRMATIONS: usize = 64;
+/// Default number of session-level events buffered for the UI before new ones are dropped.
+const CORE_EVENT_QUEUE: usize = 256;
 
 fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     // Critical sections are a few map operations without panics: the data stays consistent.
@@ -192,6 +209,8 @@ pub struct ManagerConfig {
     pub result_queue: usize,
     /// Commands queued per session.
     pub command_queue: usize,
+    /// Session-level events buffered for the UI before new ones are dropped and counted.
+    pub event_queue: usize,
     /// `known_hosts` files.
     pub known_hosts: KnownHostsFiles,
 }
@@ -212,6 +231,7 @@ impl ManagerConfig {
             busy_wait: ninesql_driver_api::SERVER_CANCEL_GRACE + Duration::from_secs(1),
             result_queue: 4,
             command_queue: 16,
+            event_queue: CORE_EVENT_QUEUE,
             known_hosts,
         }
     }
@@ -247,6 +267,19 @@ pub enum CloseReason {
     Lost(DriverError),
     /// The session task panicked; the application keeps running.
     Panicked,
+}
+
+impl CloseReason {
+    /// A short, stable name, safe to log at any level (no engine message).
+    #[must_use]
+    pub fn kind(&self) -> &'static str {
+        match self {
+            Self::Requested => "requested",
+            Self::TunnelLost => "tunnel-lost",
+            Self::Lost(e) => crate::error::driver_error_kind(e),
+            Self::Panicked => "panicked",
+        }
+    }
 }
 
 /// Session-level event, for the UI ([`SessionManager::take_events`]).
@@ -332,6 +365,7 @@ pub struct OpenRequest {
     connection: Connection,
     policy: SafetyPolicy,
     prompted: Vec<(SecretSlot, SecretString)>,
+    init_sql_confirmation: Option<InitSqlToken>,
 }
 
 impl fmt::Debug for OpenRequest {
@@ -343,6 +377,7 @@ impl fmt::Debug for OpenRequest {
                 "prompted",
                 &self.prompted.iter().map(|(s, _)| *s).collect::<Vec<_>>(),
             )
+            .field("init_sql_confirmed", &self.init_sql_confirmation.is_some())
             .finish()
     }
 }
@@ -356,7 +391,16 @@ impl OpenRequest {
             connection,
             policy,
             prompted: Vec::new(),
+            init_sql_confirmation: None,
         }
+    }
+
+    /// Attaches the user's confirmation of the connection's init SQL
+    /// ([`OpenOutcome::InitSqlNeedsConfirmation`]).
+    #[must_use]
+    pub fn with_init_sql_confirmation(mut self, token: InitSqlToken) -> Self {
+        self.init_sql_confirmation = Some(token);
+        self
     }
 
     /// Adds the answer to a [`SecretPrompt`]. The value stays in memory only until the connect
@@ -387,9 +431,62 @@ pub enum OpenOutcome {
     /// An SSH hop presented an unknown host key under the strict policy. Show the hop, the key
     /// type and the SHA-256 fingerprint (and, when `other_key_types` is not empty, that the host
     /// is known under another key type); if the user confirms, call
-    /// [`SessionManager::trust_host_key`] and open again (prompted secrets must be given again:
-    /// the core does not keep them while the user decides). No credential was sent to that hop.
-    HostKeyNeedsConfirmation(Box<UnknownHostKey>),
+    /// [`SessionManager::trust_host_key`] with the token and open again (prompted secrets must be
+    /// given again: the core does not keep them while the user decides). No credential was sent
+    /// to that hop.
+    HostKeyNeedsConfirmation(Box<HostKeyConfirmation>),
+    /// The connection's init SQL holds statements that need confirmation under its type
+    /// (ADR-0007). Show every statement (marking the flagged ones), the connection name and,
+    /// for production, the production color; if the user confirms, open again with
+    /// [`OpenRequest::with_init_sql_confirmation`]. Nothing reached a secret store or the
+    /// network.
+    InitSqlNeedsConfirmation(InitSqlConfirmation),
+}
+
+/// Single-use permission to record one SSH host key, issued with
+/// [`OpenOutcome::HostKeyNeedsConfirmation`]. The key itself stays in the core: the UI cannot
+/// get a different key trusted. Expires after ten minutes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct HostKeyToken(Uuid);
+
+/// An unknown SSH host key to show to the user.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct HostKeyConfirmation {
+    /// Token for [`SessionManager::trust_host_key`].
+    pub token: HostKeyToken,
+    /// The key as presented by the hop (what to show).
+    pub key: UnknownHostKey,
+}
+
+/// Single-use permission to run a connection's init SQL once, bound to the connection and its
+/// exact init statements. Expires after ten minutes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct InitSqlToken(Uuid);
+
+/// Init SQL waiting for the user's confirmation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct InitSqlConfirmation {
+    /// Token for [`OpenRequest::with_init_sql_confirmation`].
+    pub token: InitSqlToken,
+    /// Connection.
+    pub connection: ConnectionId,
+    /// Connection name.
+    pub connection_name: String,
+    /// The connection is typed production.
+    pub production: bool,
+    /// Every init statement, exactly as it will run, in order.
+    pub statements: Vec<String>,
+    /// The statements that need confirmation.
+    pub flagged: Vec<connect::FlaggedInitStatement>,
+}
+
+/// What an init SQL token is bound to.
+#[derive(PartialEq)]
+struct InitSqlKey {
+    connection: ConnectionId,
+    statements: Vec<String>,
 }
 
 struct Shared {
@@ -398,8 +495,11 @@ struct Shared {
     config: ManagerConfig,
     known_hosts: OnceCell<KnownHostsStore>,
     sessions: Mutex<HashMap<SessionId, SessionHandle>>,
-    events: mpsc::UnboundedSender<CoreEvent>,
+    events: mpsc::Sender<CoreEvent>,
+    dropped_events: AtomicU64,
     next_session: AtomicU64,
+    host_keys: Mutex<Pending<UnknownHostKey>>,
+    init_sql: Mutex<Pending<InitSqlKey>>,
 }
 
 impl Shared {
@@ -413,8 +513,11 @@ impl Shared {
     }
 
     fn emit(&self, event: CoreEvent) {
-        // No receiver (the UI did not take the channel, or dropped it): nothing to do.
-        let _ = self.events.send(event);
+        // Never waits on the UI. A full queue (the UI does not read it, or did not take it)
+        // drops the event and counts it; a dropped receiver is not an error.
+        if let Err(mpsc::error::TrySendError::Full(_)) = self.events.try_send(event) {
+            self.dropped_events.fetch_add(1, Ordering::Relaxed);
+        }
     }
 }
 
@@ -425,7 +528,7 @@ impl Shared {
 pub struct SessionManager {
     runtime: Arc<DriverRuntime>,
     shared: Arc<Shared>,
-    events_rx: Arc<Mutex<Option<mpsc::UnboundedReceiver<CoreEvent>>>>,
+    events_rx: Arc<Mutex<Option<mpsc::Receiver<CoreEvent>>>>,
 }
 
 impl fmt::Debug for SessionManager {
@@ -448,7 +551,7 @@ impl SessionManager {
         stores: SecretStores,
     ) -> Result<Self, CoreError> {
         let runtime = DriverRuntime::new(config.workers)?;
-        let (events, events_rx) = mpsc::unbounded_channel();
+        let (events, events_rx) = mpsc::channel(config.event_queue.max(1));
         Ok(Self {
             runtime: Arc::new(runtime),
             shared: Arc::new(Shared {
@@ -458,7 +561,10 @@ impl SessionManager {
                 known_hosts: OnceCell::new(),
                 sessions: Mutex::new(HashMap::new()),
                 events,
+                dropped_events: AtomicU64::new(0),
                 next_session: AtomicU64::new(1),
+                host_keys: Mutex::new(Pending::new(MAX_PENDING_OPEN_CONFIRMATIONS)),
+                init_sql: Mutex::new(Pending::new(MAX_PENDING_OPEN_CONFIRMATIONS)),
             }),
             events_rx: Arc::new(Mutex::new(Some(events_rx))),
         })
@@ -488,10 +594,18 @@ impl SessionManager {
         &self.runtime
     }
 
-    /// The session-level event channel. There is one receiver: the first call takes it.
+    /// The session-level event channel. There is one receiver: the first call takes it. The
+    /// channel is bounded: take it at startup and keep reading it; events that do not fit are
+    /// dropped and counted ([`Self::dropped_events`]).
     #[must_use]
-    pub fn take_events(&self) -> Option<mpsc::UnboundedReceiver<CoreEvent>> {
+    pub fn take_events(&self) -> Option<mpsc::Receiver<CoreEvent>> {
         lock(&self.events_rx).take()
+    }
+
+    /// Session-level events dropped because the channel was full.
+    #[must_use]
+    pub fn dropped_events(&self) -> u64 {
+        self.shared.dropped_events.load(Ordering::Relaxed)
     }
 
     /// Opens a session for a connection, on the runtime. Never blocks.
@@ -508,9 +622,20 @@ impl SessionManager {
         let shared = Arc::clone(&self.shared);
         self.runtime.spawn(async move {
             let id = request.connection.id;
+            let details = request.policy.log_query_text;
             let outcome = open_session(&shared, request).await;
             if let Err(e) = &outcome {
-                tracing::info!(connection = %id, error = %e, "connection failed");
+                // Engine and SSH messages may name hosts, users or objects: only the kind at
+                // info, the message at debug and never for production (ADR-0007 §6).
+                tracing::info!(
+                    connection = %id,
+                    error = e.kind(),
+                    code = ?e.engine_code(),
+                    "connection failed"
+                );
+                if details {
+                    tracing::debug!(connection = %id, error = %e, "connection failure details");
+                }
             }
             if let Err(Ok(OpenOutcome::Opened(handle))) = tx.send(outcome) {
                 tracing::debug!(session = %handle.id(), "open request abandoned; closing");
@@ -520,9 +645,16 @@ impl SessionManager {
         reply
     }
 
-    /// Records a host key the user confirmed (from [`OpenOutcome::HostKeyNeedsConfirmation`]) in
-    /// NineSQL's `known_hosts`. Call it only after the user saw and accepted the fingerprint.
-    pub fn trust_host_key(&self, key: UnknownHostKey) -> Reply<Result<(), CoreError>> {
+    /// Records the host key of a [`OpenOutcome::HostKeyNeedsConfirmation`] in NineSQL's
+    /// `known_hosts`. Call it only after the user saw and accepted the fingerprint. The token is
+    /// single-use; the key recorded is the one the core kept, never one supplied by the caller.
+    ///
+    /// # Errors
+    /// [`CoreError::InvalidConfirmation`] for an unknown, used or expired token.
+    pub fn trust_host_key(&self, token: HostKeyToken) -> Reply<Result<(), CoreError>> {
+        let Some(key) = lock(&self.shared.host_keys).take(token.0) else {
+            return Reply::ready(Err(CoreError::InvalidConfirmation));
+        };
         let (tx, reply) = Reply::channel();
         let shared = Arc::clone(&self.shared);
         self.runtime.spawn(async move {
@@ -592,6 +724,7 @@ async fn open_session(
         connection,
         policy,
         prompted,
+        init_sql_confirmation,
     } = request;
     if !connection.enabled {
         return Err(CoreError::ConnectionDisabled);
@@ -601,6 +734,47 @@ async fn open_session(
     let pre_caps = driver.capabilities(&engine, None)?;
     connection.validate_for_driver(&pre_caps)?;
     let target = connect::target(&connection)?;
+
+    // Init SQL that needs confirmation (ADR-0007): asked before anything touches a store or the
+    // network. A valid token is only checked here and consumed right before the driver connect,
+    // so a secret prompt or a host key confirmation in between does not ask again.
+    let init_key = {
+        let dialect = shared.registry.dialect(&connection.engine)?;
+        let flagged = connect::init_sql_needing_confirmation(&connection, &policy, &*dialect);
+        if flagged.is_empty() {
+            None
+        } else {
+            let key = InitSqlKey {
+                connection: connection.id,
+                statements: connection.init_sql.clone(),
+            };
+            let mut pending = lock(&shared.init_sql);
+            match init_sql_confirmation {
+                Some(token) if pending.matches(token.0, &key) => {}
+                Some(token) => {
+                    pending.take(token.0);
+                    return Err(CoreError::InvalidConfirmation);
+                }
+                None => {
+                    let token = InitSqlToken(pending.issue(key));
+                    tracing::debug!(
+                        connection = %connection.id,
+                        flagged = flagged.len(),
+                        "init SQL needs confirmation"
+                    );
+                    return Ok(OpenOutcome::InitSqlNeedsConfirmation(InitSqlConfirmation {
+                        token,
+                        connection: connection.id,
+                        connection_name: connection.name.clone(),
+                        production: policy.production,
+                        statements: connection.init_sql.clone(),
+                        flagged,
+                    }));
+                }
+            }
+            init_sql_confirmation.map(|t| (t, key))
+        }
+    };
 
     let supplied: Vec<SecretSlot> = prompted.iter().map(|(s, _)| *s).collect();
     let missing = connect::missing_prompts(&connection, &supplied);
@@ -625,13 +799,23 @@ async fn open_session(
         match Tunnel::open(spec, known_hosts).await {
             Ok(t) => tunnel = Some(t),
             Err(SshError::HostKeyNeedsConfirmation(key)) => {
-                return Ok(OpenOutcome::HostKeyNeedsConfirmation(key));
+                let token = HostKeyToken(lock(&shared.host_keys).issue((*key).clone()));
+                return Ok(OpenOutcome::HostKeyNeedsConfirmation(Box::new(
+                    HostKeyConfirmation { token, key: *key },
+                )));
             }
             Err(e) => return Err(e.into()),
         }
     }
 
-    let params = connect::connect_params(&connection, &policy, &mut bag, tunnel.as_ref(), timeout)?;
+    let params =
+        match connect::connect_params(&connection, &policy, &mut bag, tunnel.as_ref(), timeout) {
+            Ok(p) => p,
+            Err(e) => {
+                close_tunnel(tunnel).await;
+                return Err(e);
+            }
+        };
     // Every secret left the bag (into the params or the tunnel); drop it anyway, zeroized.
     drop(bag);
     let mut warnings: Vec<SessionWarning> = params
@@ -648,6 +832,14 @@ async fn open_session(
         );
     }
     let tunnel_info = params.tunnel.clone();
+
+    // The confirmed init SQL runs now: the token is spent.
+    if let Some((token, key)) = init_key
+        && !lock(&shared.init_sql).redeem(token.0, &key)
+    {
+        close_tunnel(tunnel).await;
+        return Err(CoreError::InvalidConfirmation);
+    }
 
     let connected = tokio::time::timeout(timeout + CONNECT_MARGIN, driver.connect(params)).await;
     let session = match connected {
@@ -694,7 +886,8 @@ async fn open_session(
             commands: cmd_tx,
             close: Mutex::new(Some(close_tx)),
             current: Mutex::new(None),
-            result_queue: shared.config.result_queue.max(1),
+            // One slot more than configured: the terminal event's reserved slot.
+            result_queue: shared.config.result_queue.max(1) + 1,
         }),
     };
     lock(&shared.sessions).insert(id, handle.clone());
@@ -703,19 +896,23 @@ async fn open_session(
         session: Some(session),
         tunnel,
         handle: handle.clone(),
-        confirmations: Confirmations::default(),
+        confirmations: Pending::new(MAX_PENDING_CONFIRMATIONS),
         busy_wait: shared.config.busy_wait,
     };
     let join = tokio::spawn(task.run(cmd_rx, close_rx));
     let supervisor = Arc::clone(shared);
     let connection_id = connection.id;
+    let details = policy.log_query_text;
     tokio::spawn(async move {
         let reason = join.await.unwrap_or_else(|e| {
             tracing::error!(session = %id, panicked = e.is_panic(), "session task failed");
             CloseReason::Panicked
         });
         lock(&supervisor.sessions).remove(&id);
-        tracing::info!(session = %id, reason = ?reason, "session closed");
+        tracing::info!(session = %id, reason = reason.kind(), "session closed");
+        if details && let CloseReason::Lost(e) = &reason {
+            tracing::debug!(session = %id, error = %e, "session lost");
+        }
         supervisor.emit(CoreEvent::SessionClosed {
             session: id,
             connection: connection_id,
@@ -740,8 +937,8 @@ async fn close_tunnel(tunnel: Option<Tunnel>) {
 // Session handle and executions
 
 /// Single-use permission to run one statement that needs confirmation, on one session
-/// ([`ExecEvent::NeedsConfirmation`]). Bound to the exact statement text; expires after ten
-/// minutes.
+/// ([`ExecEvent::NeedsConfirmation`]). Bound to the exact statement text, language and bind
+/// parameters; expires after ten minutes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct ConfirmationToken(Uuid);
 
@@ -756,14 +953,22 @@ pub enum ConfirmReason {
     Write,
 }
 
-/// A statement waiting for the user's confirmation. The UI shows the exact statement it sent,
-/// the connection name and, for production, the production color; then sends the statement
-/// again with [`ExecuteRequest::confirmed`].
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// A statement waiting for the user's confirmation. The UI shows [`Self::statement`] (exactly
+/// what will run), the connection name and, for production, the production color; then sends
+/// the same statement again with [`ExecuteRequest::confirmed`]. `Debug` shows the text length
+/// only.
+#[derive(Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct ConfirmationRequest {
     /// Token to send back with the same statement.
     pub token: ConfirmationToken,
+    /// The statement text the token is bound to.
+    pub statement: String,
+    /// Its language.
+    pub language: QueryLanguage,
+    /// Number of bind parameters the token is bound to (their values are never shown or
+    /// logged).
+    pub params: usize,
     /// Classification of the statement by the session's dialect.
     pub class: StatementClass,
     /// Why it needs confirmation.
@@ -772,6 +977,20 @@ pub struct ConfirmationRequest {
     pub connection_name: String,
     /// The connection is typed production.
     pub production: bool,
+}
+
+impl fmt::Debug for ConfirmationRequest {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ConfirmationRequest")
+            .field("token", &self.token)
+            .field("statement_len", &self.statement.len())
+            .field("language", &self.language)
+            .field("params", &self.params)
+            .field("class", &self.class)
+            .field("reason", &self.reason)
+            .field("production", &self.production)
+            .finish_non_exhaustive()
+    }
 }
 
 /// One statement to run. `Debug` shows the text length only.
@@ -1097,36 +1316,76 @@ impl SessionHandle {
 // ---------------------------------------------------------------------------------------------
 // Session task
 
-#[derive(Default)]
-struct Confirmations {
-    pending: HashMap<Uuid, (String, Instant)>,
+/// Single-use, expiring, bounded tokens for things the user confirmed.
+struct Pending<V> {
+    items: HashMap<Uuid, (V, Instant)>,
+    max: usize,
 }
 
-impl Confirmations {
-    fn issue(&mut self, text: &str) -> ConfirmationToken {
+impl<V> Pending<V> {
+    fn new(max: usize) -> Self {
+        Self {
+            items: HashMap::new(),
+            max: max.max(1),
+        }
+    }
+
+    fn issue(&mut self, value: V) -> Uuid {
         let now = Instant::now();
-        self.pending
+        self.items
             .retain(|_, (_, at)| now.duration_since(*at) < CONFIRMATION_TTL);
-        if self.pending.len() >= MAX_PENDING_CONFIRMATIONS
+        if self.items.len() >= self.max
             && let Some(oldest) = self
-                .pending
+                .items
                 .iter()
                 .min_by_key(|(_, (_, at))| *at)
                 .map(|(k, _)| *k)
         {
-            self.pending.remove(&oldest);
+            self.items.remove(&oldest);
         }
         let id = Uuid::new_v4();
-        self.pending.insert(id, (text.to_owned(), now));
-        ConfirmationToken(id)
+        self.items.insert(id, (value, now));
+        id
     }
 
-    /// Consumes a token: valid when it was issued by this session for exactly `text` and has not
-    /// expired. A token is removed even when the text does not match.
-    fn redeem(&mut self, token: ConfirmationToken, text: &str) -> bool {
-        match self.pending.remove(&token.0) {
-            Some((issued_for, at)) => issued_for == text && at.elapsed() < CONFIRMATION_TTL,
-            None => false,
+    /// Removes the token; its value when it has not expired.
+    fn take(&mut self, id: Uuid) -> Option<V> {
+        self.items
+            .remove(&id)
+            .filter(|(_, at)| at.elapsed() < CONFIRMATION_TTL)
+            .map(|(v, _)| v)
+    }
+}
+
+impl<V: PartialEq> Pending<V> {
+    /// Whether the token is valid for `value`, without consuming it.
+    fn matches(&self, id: Uuid, value: &V) -> bool {
+        self.items
+            .get(&id)
+            .is_some_and(|(v, at)| v == value && at.elapsed() < CONFIRMATION_TTL)
+    }
+
+    /// Consumes the token: valid when it was issued for exactly `value` and has not expired.
+    /// The token is removed even when the value does not match.
+    fn redeem(&mut self, id: Uuid, value: &V) -> bool {
+        self.take(id).is_some_and(|v| v == *value)
+    }
+}
+
+/// What a statement confirmation is bound to.
+#[derive(PartialEq)]
+struct StatementKey {
+    text: String,
+    language: QueryLanguage,
+    params: Vec<Param>,
+}
+
+impl StatementKey {
+    fn of(request: &ExecuteRequest) -> Self {
+        Self {
+            text: request.text.clone(),
+            language: request.language,
+            params: request.params.clone(),
         }
     }
 }
@@ -1135,7 +1394,7 @@ struct SessionTask {
     session: Option<Box<dyn Session>>,
     tunnel: Option<Tunnel>,
     handle: SessionHandle,
-    confirmations: Confirmations,
+    confirmations: Pending<StatementKey>,
     busy_wait: Duration,
 }
 
@@ -1230,7 +1489,8 @@ impl SessionTask {
                 cancel,
             } => {
                 *lock(&self.handle.inner.current) = Some(cancel.clone());
-                let flow = self.execute(request, &events, &cancel).await;
+                let mut out = Output::new(events, cancel.clone());
+                let flow = self.execute(request, &mut out, &cancel).await;
                 *lock(&self.handle.inner.current) = None;
                 flow
             }
@@ -1260,62 +1520,47 @@ impl SessionTask {
         }
     }
 
-    /// Whether `class` needs confirmation under the session's policy.
-    fn confirmation_reason(&self, class: StatementClass) -> Option<ConfirmReason> {
-        let policy = self.policy();
-        if policy.confirm_destructive && class.needs_confirmation() {
-            Some(ConfirmReason::Destructive)
-        } else if policy.confirm_every_write && class.is_write() {
-            Some(ConfirmReason::Write)
-        } else {
-            None
-        }
-    }
-
     async fn execute(
         &mut self,
         request: ExecuteRequest,
-        events: &mpsc::Sender<ExecEvent>,
+        out: &mut Output,
         cancel: &CancelToken,
     ) -> Flow {
         let id = self.id();
         // Cancelled (or its execution dropped) while it waited in the queue: never sent.
-        if cancel.is_cancelled() || events.is_closed() {
-            let _ = events
-                .send(ExecEvent::Failed(CoreError::Driver(DriverError::Cancelled)))
-                .await;
+        if cancel.is_cancelled() || out.consumer_gone() {
+            out.finish(ExecEvent::Failed(CoreError::Driver(DriverError::Cancelled)));
             return Flow::Continue;
         }
         let Some(session) = self.session.as_ref() else {
-            let _ = events
-                .send(ExecEvent::Failed(CoreError::SessionClosed))
-                .await;
+            out.finish(ExecEvent::Failed(CoreError::SessionClosed));
             return Flow::Continue;
         };
         let class = session.dialect().classify(&request.text);
-        if let Some(reason) = self.confirmation_reason(class) {
+        if let Some(reason) = connect::confirm_reason(self.policy(), class) {
+            let key = StatementKey::of(&request);
             let confirmed = request
                 .confirmation
-                .is_some_and(|t| self.confirmations.redeem(t, &request.text));
+                .is_some_and(|t| self.confirmations.redeem(t.0, &key));
             if !confirmed {
                 if request.confirmation.is_some() {
-                    let _ = events
-                        .send(ExecEvent::Failed(CoreError::InvalidConfirmation))
-                        .await;
+                    out.finish(ExecEvent::Failed(CoreError::InvalidConfirmation));
                     return Flow::Continue;
                 }
-                let token = self.confirmations.issue(&request.text);
+                let params = key.params.len();
+                let token = ConfirmationToken(self.confirmations.issue(key));
                 tracing::debug!(session = %id, class = ?class, "statement needs confirmation");
                 let info = self.handle.info();
-                let _ = events
-                    .send(ExecEvent::NeedsConfirmation(ConfirmationRequest {
-                        token,
-                        class,
-                        reason,
-                        connection_name: info.connection_name.clone(),
-                        production: info.policy.production,
-                    }))
-                    .await;
+                out.finish(ExecEvent::NeedsConfirmation(ConfirmationRequest {
+                    token,
+                    statement: request.text,
+                    language: request.language,
+                    params,
+                    class,
+                    reason,
+                    connection_name: info.connection_name.clone(),
+                    production: info.policy.production,
+                }));
                 return Flow::Continue;
             }
             tracing::info!(session = %id, class = ?class, "confirmed statement");
@@ -1345,31 +1590,25 @@ impl SessionTask {
         let mut waiting = false;
         let mut stream = loop {
             let Some(session) = self.session.as_mut() else {
-                let _ = events
-                    .send(ExecEvent::Failed(CoreError::SessionClosed))
-                    .await;
+                out.finish(ExecEvent::Failed(CoreError::SessionClosed));
                 return Flow::Continue;
             };
             match session.execute(statement.clone(), options.clone()).await {
                 Ok(stream) => break stream,
                 Err(DriverError::Busy) => {
                     if started.elapsed() >= self.busy_wait {
-                        let _ = events
-                            .send(ExecEvent::Failed(CoreError::StillCancelling))
-                            .await;
+                        out.finish(ExecEvent::Failed(CoreError::StillCancelling));
                         return Flow::Continue;
                     }
                     if !waiting {
                         waiting = true;
                         tracing::debug!(session = %id, "waiting for the previous cancel to be confirmed");
-                        let _ = events.send(ExecEvent::WaitingForPreviousCancel).await;
+                        out.send(ExecEvent::WaitingForPreviousCancel).await;
                     }
                     tokio::select! {
                         () = tokio::time::sleep(BUSY_RETRY) => {}
                         () = cancel.cancelled() => {
-                            let _ = events
-                                .send(ExecEvent::Failed(CoreError::Driver(DriverError::Cancelled)))
-                                .await;
+                            out.finish(ExecEvent::Failed(CoreError::Driver(DriverError::Cancelled)));
                             return Flow::Continue;
                         }
                     }
@@ -1380,47 +1619,34 @@ impl SessionTask {
                     } else {
                         Flow::Continue
                     };
-                    let _ = events.send(ExecEvent::Failed(e.into())).await;
+                    out.finish(ExecEvent::Failed(e.into()));
                     return flow;
                 }
             }
         };
 
-        if events
-            .send(ExecEvent::Started {
-                execution: stream.execution_id(),
-            })
-            .await
-            .is_err()
-        {
-            // The consumer is gone: stop the statement (server-side cancel, then drain).
+        let started = ExecEvent::Started {
+            execution: stream.execution_id(),
+        };
+        if !out.send(started).await {
+            // Cancelled, or the consumer is gone: stop the statement (server-side cancel); the
+            // loop below drains the stream to its end.
             cancel.cancel();
-            let _ = stream.next().await;
-            return Flow::Continue;
         }
         loop {
             match stream.next().await {
                 None => {
-                    let _ = events
-                        .send(ExecEvent::Finished {
-                            rows: stream.rows_delivered(),
-                            bytes: stream.bytes_delivered(),
-                        })
-                        .await;
+                    out.finish(ExecEvent::Finished {
+                        rows: stream.rows_delivered(),
+                        bytes: stream.bytes_delivered(),
+                    });
                     return Flow::Continue;
                 }
                 Some(Ok(item)) => {
-                    tokio::select! {
-                        sent = events.send(ExecEvent::Item(item)) => {
-                            if sent.is_err() {
-                                cancel.cancel();
-                                let _ = stream.next().await;
-                                return Flow::Continue;
-                            }
-                        }
-                        // The consumer stopped reading and cancelled: the item is dropped and
-                        // the next poll of the stream runs the cancel path.
-                        () = cancel.cancelled() => {}
+                    // Not delivered (cancelled, or the consumer stopped reading and dropped the
+                    // execution): the item is dropped and the next poll runs the cancel path.
+                    if !out.send(ExecEvent::Item(item)).await {
+                        cancel.cancel();
                     }
                 }
                 Some(Err(e)) => {
@@ -1429,9 +1655,59 @@ impl SessionTask {
                     } else {
                         Flow::Continue
                     };
-                    let _ = events.send(ExecEvent::Failed(e.into())).await;
+                    out.finish(ExecEvent::Failed(e.into()));
                     return flow;
                 }
+            }
+        }
+    }
+}
+
+/// Where the events of one execution go. A send never outlives the statement: it gives up when
+/// the statement is cancelled or the consumer is gone, and the terminal event uses a slot
+/// reserved before anything else is sent, so the session task never waits on a consumer that
+/// stopped reading, and `close`, a lost tunnel, queued commands and shutdown are always served.
+struct Output {
+    events: mpsc::Sender<ExecEvent>,
+    cancel: CancelToken,
+    terminal: Option<mpsc::OwnedPermit<ExecEvent>>,
+}
+
+impl Output {
+    fn new(events: mpsc::Sender<ExecEvent>, cancel: CancelToken) -> Self {
+        // The channel is fresh and has one slot more than the result queue: this succeeds
+        // unless the consumer is already gone.
+        let terminal = events.clone().try_reserve_owned().ok();
+        Self {
+            events,
+            cancel,
+            terminal,
+        }
+    }
+
+    fn consumer_gone(&self) -> bool {
+        self.events.is_closed()
+    }
+
+    /// A non-terminal event. `false` when it was not delivered: the statement was cancelled
+    /// while the queue was full, or the consumer is gone.
+    async fn send(&self, event: ExecEvent) -> bool {
+        tokio::select! {
+            biased;
+            sent = self.events.send(event) => sent.is_ok(),
+            () = self.cancel.cancelled() => false,
+            () = self.events.closed() => false,
+        }
+    }
+
+    /// The terminal event, through the reserved slot: never waits.
+    fn finish(&mut self, event: ExecEvent) {
+        match self.terminal.take() {
+            Some(permit) => {
+                let _ = permit.send(event);
+            }
+            None => {
+                let _ = self.events.try_send(event);
             }
         }
     }
@@ -1442,22 +1718,63 @@ impl SessionTask {
 mod tests {
     use super::*;
 
+    fn key(text: &str, params: Vec<Param>) -> StatementKey {
+        StatementKey::of(&ExecuteRequest::sql(text).with_params(params))
+    }
+
     #[test]
-    fn confirmation_tokens_are_single_use_and_bound_to_the_text() {
-        let mut c = Confirmations::default();
-        let t = c.issue("DROP TABLE a");
-        assert!(!c.redeem(t, "DROP TABLE b"));
+    fn confirmation_tokens_are_single_use_and_bound_to_the_statement() {
+        let mut c = Pending::new(MAX_PENDING_CONFIRMATIONS);
+        let t = c.issue(key("DROP TABLE a", vec![]));
+        assert!(!c.redeem(t, &key("DROP TABLE b", vec![])));
         assert!(
-            !c.redeem(t, "DROP TABLE a"),
+            !c.redeem(t, &key("DROP TABLE a", vec![])),
             "consumed by the failed attempt"
         );
-        let t = c.issue("DROP TABLE a");
-        assert!(c.redeem(t, "DROP TABLE a"));
-        assert!(!c.redeem(t, "DROP TABLE a"));
+        let t = c.issue(key("DROP TABLE a", vec![]));
+        assert!(
+            c.matches(t, &key("DROP TABLE a", vec![])),
+            "peek does not consume"
+        );
+        assert!(c.redeem(t, &key("DROP TABLE a", vec![])));
+        assert!(!c.redeem(t, &key("DROP TABLE a", vec![])));
+        // Bound to the parameters and the language too.
+        let t = c.issue(key("DELETE FROM a WHERE id = $1", vec![Param::Int(1)]));
+        assert!(!c.redeem(t, &key("DELETE FROM a WHERE id = $1", vec![Param::Int(2)])));
+        let t = c.issue(key("DROP TABLE a", vec![]));
+        let mut other = key("DROP TABLE a", vec![]);
+        other.language = QueryLanguage::Cypher;
+        assert!(!c.redeem(t, &other));
         for i in 0..(MAX_PENDING_CONFIRMATIONS * 2) {
-            c.issue(&format!("DROP TABLE t{i}"));
+            c.issue(key(&format!("DROP TABLE t{i}"), vec![]));
         }
-        assert!(c.pending.len() <= MAX_PENDING_CONFIRMATIONS);
+        assert!(c.items.len() <= MAX_PENDING_CONFIRMATIONS);
+        assert!(c.take(Uuid::new_v4()).is_none());
+    }
+
+    #[tokio::test]
+    async fn the_terminal_event_never_waits_for_the_consumer() {
+        let (tx, mut rx) = mpsc::channel(2);
+        let cancel = CancelToken::new();
+        let mut out = Output::new(tx, cancel.clone());
+        // One free slot besides the reserved one: the first send fits, the second would wait.
+        assert!(out.send(ExecEvent::WaitingForPreviousCancel).await);
+        let blocked = tokio::time::timeout(
+            Duration::from_millis(50),
+            out.send(ExecEvent::WaitingForPreviousCancel),
+        )
+        .await;
+        assert!(blocked.is_err(), "back-pressure while not cancelled");
+        cancel.cancel();
+        assert!(!out.send(ExecEvent::WaitingForPreviousCancel).await);
+        out.finish(ExecEvent::Failed(CoreError::StillCancelling));
+        drop(out);
+        assert!(matches!(
+            rx.recv().await,
+            Some(ExecEvent::WaitingForPreviousCancel)
+        ));
+        assert!(matches!(rx.recv().await, Some(ExecEvent::Failed(_))));
+        assert!(rx.recv().await.is_none());
     }
 
     #[tokio::test]
