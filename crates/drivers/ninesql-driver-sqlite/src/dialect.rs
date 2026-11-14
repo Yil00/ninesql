@@ -195,8 +195,8 @@ fn starts_with_with(view: &str) -> bool {
 /// `true` when a DML keyword is a whole token in code, as SQLite's tokenizer reads the raw
 /// text: a bare word bounded by non-identifier characters (`is_id_char`: so `updated_at` is
 /// not `UPDATE`), outside strings, quoted identifiers, variables and comments (so
-/// `SELECT 'delete'` is not a write). This is a second, independent tokenization: the shared
-/// lexer never sees it.
+/// `SELECT 'delete'` is not a write). It uses the same scanner as `lexer_view`, so it is
+/// independent of the shared lexer only, not of `lexer_view`.
 ///
 /// Incomplete text (an unterminated token or unbalanced parentheses: SQLite refuses it, so
 /// nothing would run) falls back to whole words anywhere in the raw text, strings and comments
