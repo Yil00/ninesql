@@ -7,7 +7,7 @@ NineSQL is an open-source (Apache 2.0) native database client for Debian and Ubu
 
 ## Where the project stands
 - **Current phase**: 0 – Foundations (see [docs/ROADMAP.md](docs/ROADMAP.md)), not started.
-- Done: repository bootstrap (documentation, ADR-0001 to ADR-0011, agent definitions, CI for format / lint / tests / licenses / links, empty crate skeleton that compiles without GPUI).
+- Done: repository bootstrap (documentation, ADR-0001 to ADR-0011, agent definitions, CI for format / lint / tests / licenses / links, empty crate skeleton that compiles without GPUI). Repository settings applied: `dev` is the default branch, `main` and `dev` are protected by rulesets (PR required, `CI result` required, no force-push), private vulnerability reporting is on.
 - Next: the GPUI spike (P0-A) and the driver API contract (P0-B) gate everything else. The dev environment (P0-C) can start in parallel.
 
 ## Invariants (non-negotiable)
