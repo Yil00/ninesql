@@ -20,3 +20,12 @@ ninesql-editor.workspace = true
 [[bin]]
 name = "ninesql"
 path = "src/main.rs"
+
+[dev-dependencies]
+gpui-kit = { workspace = true, features = ["component", "assets", "tree-sitter-sql"] }
+# Exact pins of the gpui-kit family (root Cargo.toml, ADR-0013): listed so `=0.9.1` constrains
+# resolution; gpui-kit itself only asks for "0.9.1" (caret).
+gpui-base.workspace = true
+gpui-component.workspace = true
+gpui-component-macros.workspace = true
+gpui-kit-assets.workspace = true

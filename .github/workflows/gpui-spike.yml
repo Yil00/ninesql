@@ -1,0 +1,65 @@
+name: GPUI spike
+
+# Builds and smoke-runs crates/ninesql-ui/examples/spike.rs (ROADMAP P0-A, ADR-0001) so a
+# GPUI / gpui-component bump that breaks the build or the first frame is caught.
+# The smoke run renders in software (Mesa lavapipe / llvmpipe under Xvfb): it checks that a
+# frame is drawn and the scripted benchmark completes, not performance.
+
+on:
+  push:
+    branches: [main, dev]
+    paths:
+      - Cargo.toml
+      - Cargo.lock
+      - crates/ninesql-ui/**
+      - .github/workflows/gpui-spike.yml
+  pull_request:
+    paths:
+      - Cargo.toml
+      - Cargo.lock
+      - crates/ninesql-ui/**
+      - .github/workflows/gpui-spike.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: gpui-spike-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  spike:
+    name: Build and smoke-run the GPUI spike (ubuntu-24.04)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - name: System packages (docs/10-supported-platforms.md, plus Xvfb and Mesa for the smoke run)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential pkg-config clang cmake libvulkan-dev libwayland-dev \
+            libxkbcommon-dev libxkbcommon-x11-dev libx11-xcb-dev libxcb1-dev \
+            libfontconfig-dev libfreetype-dev libzstd-dev libasound2-dev \
+            xvfb mesa-vulkan-drivers libvulkan1 fonts-dejavu-core
+      - name: Build the spike
+        run: cargo build --locked -p ninesql-ui --example spike
+      - name: Unit tests of the spike
+        run: cargo test --locked -p ninesql-ui --example spike
+      - name: Smoke run under Xvfb (software rendering)
+        run: |
+          Xvfb :99 -screen 0 1600x1000x24 &
+          sleep 2
+          DISPLAY=:99 NINESQL_SPIKE_AUTO=1 NINESQL_SPIKE_SCROLL_FRAMES=60 \
+            timeout 300 target/debug/examples/spike 2>&1 | tee spike.log
+          grep -q '^spike-metric first_frame_ms=' spike.log
+          grep -q '^spike-metric frames_scroll=' spike.log
+          grep -q '^spike-metric auto_done_ms=' spike.log

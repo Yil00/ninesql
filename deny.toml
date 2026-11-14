@@ -4,10 +4,24 @@
 
 [graph]
 all-features = true
+# Only the shipped targets (docs/10-supported-platforms.md): macOS / Windows / wasm-only crates of
+# the GPUI graph are not linked into a NineSQL binary (security review of P0-A, ADR-0013).
+targets = ["x86_64-unknown-linux-gnu", "aarch64-unknown-linux-gnu"]
 
 [advisories]
 # Advisories are checked in CI; an ignore needs a reason and a security-reviewer review.
-ignore = []
+ignore = [
+    # P0-A (GPUI pin, docs/spikes/p0-a-gpui.md): "unmaintained" notices on transitive
+    # dependencies of gpui-pre 0.3.12 / gpui-kit 0.9.1 with no maintained release to move to.
+    # None is a known vulnerability. Re-evaluate on every `chore(ui): bump gpui`.
+    { id = "RUSTSEC-2024-0384", reason = "instant: via gpui-base (time shim); no upgrade in the pinned GPUI pair" },
+    { id = "RUSTSEC-2024-0436", reason = "paste: proc-macro used at build time by gpui-component" },
+    { id = "RUSTSEC-2026-0206", reason = "rustybuzz: via usvg (SVG icons) in gpui-pre" },
+    { id = "RUSTSEC-2026-0192", reason = "ttf-parser: via fontdb / cosmic-text text stack of gpui-pre" },
+    { id = "RUSTSEC-2026-0371", reason = "zbus_names: D-Bus stack of gpui-pre-linux (portals, AT-SPI accessibility)" },
+    { id = "RUSTSEC-2026-0370", reason = "zvariant: D-Bus stack of gpui-pre-linux (portals, AT-SPI accessibility)" },
+    { id = "RUSTSEC-2026-0372", reason = "zvariant_derive: D-Bus stack of gpui-pre-linux (portals, AT-SPI accessibility)" },
+]
 
 [licenses]
 # Licenses compatible with distributing NineSQL under Apache-2.0 (ADR-0002, invariant I7).
@@ -47,14 +61,21 @@ deny = [
     # SSH through russh, not libssh2 (ADR-0011).
     { name = "ssh2", reason = "russh only (ADR-0011)" },
     { name = "libssh2-sys", reason = "russh only (ADR-0011)" },
+    # GPUI graph (ADR-0013): hot-patching, dev tooling, profilers, screen capture and an HTTP
+    # client must never be linked (I2: no network traffic except declared connections).
+    { name = "subsecond", reason = "hot-patching runtime, not in a release binary (ADR-0013)" },
+    { name = "dioxus-cli-config", reason = "dev tooling of hot-patching (ADR-0013)" },
+    { name = "dioxus-devtools-types", reason = "dev tooling of hot-patching (ADR-0013)" },
+    { name = "async-tungstenite", reason = "WebSocket client, I2 (ADR-0013)" },
+    { name = "tracy-client", reason = "profiler client opens a network listener, I2 (ADR-0013)" },
+    { name = "tracing-tracy", reason = "profiler client opens a network listener, I2 (ADR-0013)" },
+    { name = "scap", reason = "screen capture (ADR-0013)" },
+    { name = "gpui-pre-reqwest", reason = "HTTP client, I2: GPUI gets no HTTP client (ADR-0013)" },
 ]
 
 [sources]
 unknown-registry = "deny"
 unknown-git = "deny"
 allow-registry = ["https://github.com/rust-lang/crates.io-index"]
-# GPUI and gpui-component are git dependencies (ADR-0001).
-allow-git = [
-    "https://github.com/zed-industries/zed",
-    "https://github.com/longbridge/gpui-component",
-]
+# No git source is allowed: GPUI and gpui-component come from crates.io (ADR-0013).
+allow-git = []

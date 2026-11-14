@@ -27,7 +27,15 @@ jobs:
           toolchain: stable
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
-      # System packages for GPUI are added here by P0-A (docs/10-supported-platforms.md).
+      # System packages for GPUI (P0-A, docs/10-supported-platforms.md): the ninesql-ui spike
+      # example is built by clippy --all-targets and cargo test.
+      - name: System packages for GPUI
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential pkg-config clang cmake libvulkan-dev libwayland-dev \
+            libxkbcommon-dev libxkbcommon-x11-dev libx11-xcb-dev libxcb1-dev \
+            libfontconfig-dev libfreetype-dev libzstd-dev libasound2-dev
       - run: cargo fmt --all --check
       - run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
       - run: cargo test --workspace --locked
@@ -42,6 +50,15 @@ jobs:
         with:
           tool: cargo-deny@0.20.2
       - run: cargo deny --locked check
+      # ADR-0013 (security review of P0-A): GPUI must never get an HTTP client (I2), and
+      # GPUI's credential API must not be used: secrets go through ninesql-secrets (I1).
+      - name: Forbidden GPUI APIs under crates/
+        run: |
+          pattern='set_http_client|with_http_client|read_credentials|write_credentials|delete_credentials'
+          if git grep -nE "$pattern" -- crates/; then
+            echo "::error::Forbidden GPUI API used under crates/ (ADR-0013): $pattern"
+            exit 1
+          fi
 
   docs:
     name: Documentation links
