@@ -12,11 +12,15 @@
 
 use std::collections::HashMap;
 use std::fmt;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use ninesql_driver_api::{self as api, ConnectParams, PropertyValue, Secret};
-use ninesql_secrets::{ExposeSecret, SecretKind, SecretStores, SecretString};
+use ninesql_secrets::{
+    ExposeSecret, SecretError, SecretKind, SecretRef, SecretStores, SecretString, StoreKind,
+};
 use ninesql_ssh::{HopAuth, HopSpec, Tunnel, TunnelOptions, TunnelSpec};
+use tokio::sync::watch;
 
 use crate::connection::{
     Auth, ClientCertificate, Connection, Endpoint, SecretSlot, SecretSource, SshAuth, SshHop,
@@ -320,24 +324,198 @@ pub fn resolve_secrets(
 }
 
 /// Default time a connect waits for the saved secrets of one open (all store calls together)
-/// before giving up: long enough to type a keyring password in an unlock prompt, short enough
-/// that an ignored prompt does not leave the open hanging.
+/// before giving up: long enough for a slow keyring, short enough that an open does not hang.
 pub const DEFAULT_SECRET_TIMEOUT: Duration = Duration::from_secs(60);
 
-/// [`resolve_secrets`] for the async connect flow: each saved secret is read on the runtime's
-/// blocking pool, and all of them together get at most `timeout`.
+/// Most store reads allowed to run (or hang) at once on the blocking pool. Further reads of
+/// other secrets fail with [`SecretError::Unavailable`] until some end, so a store that stops
+/// answering cannot take every thread of the runtime's blocking pool.
+pub const MAX_PENDING_SECRET_READS: usize = 8;
+
+type ReadOutcome = Option<Result<SecretString, SecretError>>;
+
+/// Saved-secret reads of a [`crate::SessionManager`]: the stores, and the reads in flight.
 ///
-/// When the deadline passes (for example an unlock prompt the user ignores), or the blocking
-/// task panics, the field fails with [`ninesql_secrets::SecretError::Unavailable`]. The future
-/// is cancel-safe: dropping it stops waiting at once. A store call already running on a blocking
-/// thread cannot be interrupted: it ends with the store's own limits (the Secret Service method
-/// timeout, the prompt's end) and its value, if any, is dropped (zeroized) unused.
+/// Reads are **single-flight** per [`SecretRef`]: an open that needs a secret already being read
+/// (for example a retry after a timeout, while the first call still waits on the store) joins
+/// that read instead of starting another store call. At most [`MAX_PENDING_SECRET_READS`] reads
+/// run at once.
+#[derive(Clone)]
+pub struct SecretReads {
+    stores: SecretStores,
+    flights: Arc<Mutex<Flights>>,
+    max_pending: usize,
+}
+
+#[derive(Default)]
+struct Flights {
+    reads: HashMap<SecretRef, watch::Receiver<ReadOutcome>>,
+}
+
+impl fmt::Debug for SecretReads {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("SecretReads")
+            .field("stores", &self.stores)
+            .field("pending", &self.pending())
+            .finish()
+    }
+}
+
+/// Removes a read from the in-flight list when its blocking task ends, panic included.
+struct FlightGuard {
+    flights: Arc<Mutex<Flights>>,
+    key: SecretRef,
+}
+
+impl Drop for FlightGuard {
+    fn drop(&mut self) {
+        lock_flights(&self.flights).reads.remove(&self.key);
+    }
+}
+
+fn lock_flights(flights: &Mutex<Flights>) -> std::sync::MutexGuard<'_, Flights> {
+    flights
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// A copy of a read's outcome for one more waiter. Store errors carry no secret; variants added
+/// later are reported as a backend failure with the same message.
+fn copy_outcome(outcome: &Result<SecretString, SecretError>) -> Result<SecretString, SecretError> {
+    match outcome {
+        Ok(s) => Ok(SecretString::from(s.expose_secret().to_owned())),
+        Err(e) => Err(match e {
+            SecretError::NotFound(id) => SecretError::NotFound(id.clone()),
+            SecretError::StoreNotConfigured(k) => SecretError::StoreNotConfigured(*k),
+            SecretError::Locked(k) => SecretError::Locked(*k),
+            SecretError::Unavailable { store, detail } => SecretError::Unavailable {
+                store: *store,
+                detail: detail.clone(),
+            },
+            SecretError::BadEncoding(id) => SecretError::BadEncoding(id.clone()),
+            SecretError::Ambiguous(id) => SecretError::Ambiguous(id.clone()),
+            SecretError::Backend { store, detail } => SecretError::Backend {
+                store: *store,
+                detail: detail.clone(),
+            },
+            other => SecretError::Backend {
+                store: StoreKind::Keyring,
+                detail: other.to_string(),
+            },
+        }),
+    }
+}
+
+impl SecretReads {
+    /// Reads through `stores`, at most [`MAX_PENDING_SECRET_READS`] at once.
+    #[must_use]
+    pub fn new(stores: SecretStores) -> Self {
+        Self {
+            stores,
+            flights: Arc::default(),
+            max_pending: MAX_PENDING_SECRET_READS,
+        }
+    }
+
+    /// The stores.
+    #[must_use]
+    pub fn stores(&self) -> &SecretStores {
+        &self.stores
+    }
+
+    /// Reads running (or hanging) on the blocking pool now.
+    #[must_use]
+    pub fn pending(&self) -> usize {
+        lock_flights(&self.flights).reads.len()
+    }
+
+    /// Joins the read of `reference` in flight, or starts it. Must run inside the runtime.
+    fn flight(&self, reference: &SecretRef) -> Result<watch::Receiver<ReadOutcome>, SecretError> {
+        let mut flights = lock_flights(&self.flights);
+        if let Some(rx) = flights.reads.get(reference) {
+            return Ok(rx.clone());
+        }
+        if flights.reads.len() >= self.max_pending {
+            return Err(SecretError::Unavailable {
+                store: reference.store,
+                detail: "too many secret store calls are still waiting for an answer".into(),
+            });
+        }
+        let (tx, rx) = watch::channel(None);
+        flights.reads.insert(reference.clone(), rx.clone());
+        drop(flights);
+        let guard = FlightGuard {
+            flights: Arc::clone(&self.flights),
+            key: reference.clone(),
+        };
+        let stores = self.stores.clone();
+        let reference = reference.clone();
+        // Detached: when every waiter gave up, the call still ends on the store's own limits and
+        // its value is dropped (zeroized) with the channel.
+        drop(tokio::task::spawn_blocking(move || {
+            let _guard = guard;
+            let result = stores.resolve(&reference);
+            let _ = tx.send(Some(result));
+        }));
+        Ok(rx)
+    }
+
+    /// Reads one saved secret, waiting at most until `deadline`.
+    async fn read(
+        &self,
+        reference: &SecretRef,
+        deadline: tokio::time::Instant,
+        timeout: Duration,
+    ) -> Result<SecretString, SecretError> {
+        let store = reference.store;
+        let mut rx = self.flight(reference)?;
+        let wait = async {
+            loop {
+                if let Some(outcome) = rx.borrow_and_update().as_ref() {
+                    return Some(copy_outcome(outcome));
+                }
+                if rx.changed().await.is_err() {
+                    // The task ended: with a value sent just before, or by a panic.
+                    return rx.borrow().as_ref().map(copy_outcome);
+                }
+            }
+        };
+        match tokio::time::timeout_at(deadline, wait).await {
+            Ok(Some(result)) => result,
+            Ok(None) => {
+                tracing::warn!(store = %store, "secret store task failed");
+                Err(SecretError::Unavailable {
+                    store,
+                    detail: "the secret store task failed".into(),
+                })
+            }
+            Err(_) => {
+                tracing::info!(store = %store, "secret store did not answer in time");
+                Err(SecretError::Unavailable {
+                    store,
+                    detail: format!("no answer within {} s", timeout.as_secs()),
+                })
+            }
+        }
+    }
+}
+
+/// [`resolve_secrets`] for the async connect flow: saved secrets are read on the runtime's
+/// blocking pool through `reads` (single-flight per reference, bounded number of pending
+/// reads), and all of them together get at most `timeout`.
+///
+/// When the deadline passes, the blocking task panics or too many reads are pending, the field
+/// fails with [`SecretError::Unavailable`]. The future is cancel-safe: dropping it stops waiting
+/// at once. A store call already running on a blocking thread cannot be interrupted: it ends on
+/// the store's own limits (the Secret Service read path never waits on a prompt, and each of its
+/// D-Bus calls has a 25 s timeout) and its value, if nobody waits for it any more, is dropped
+/// (zeroized) unused. A later open of the same secret joins it while it runs.
 ///
 /// # Errors
 /// As [`resolve_secrets`].
 pub async fn resolve_secrets_bounded(
     connection: &Connection,
-    stores: &SecretStores,
+    reads: &SecretReads,
     prompted: Vec<(SecretSlot, SecretString)>,
     timeout: Duration,
 ) -> Result<SecretBag, CoreError> {
@@ -346,36 +524,10 @@ pub async fn resolve_secrets_bounded(
     let mut bag = SecretBag::default();
     for (slot, _, source) in credential_fields(connection) {
         let value = match source {
-            SecretSource::Stored(reference) => {
-                let store = reference.store;
-                let unavailable = |detail: String| CoreError::Secret {
-                    slot,
-                    source: ninesql_secrets::SecretError::Unavailable { store, detail },
-                };
-                let stores = stores.clone();
-                let reference = reference.clone();
-                let task = tokio::task::spawn_blocking(move || stores.resolve(&reference));
-                match tokio::time::timeout_at(deadline, task).await {
-                    Ok(Ok(result)) => {
-                        result.map_err(|source| CoreError::Secret { slot, source })?
-                    }
-                    Ok(Err(join)) => {
-                        tracing::warn!(
-                            store = %store,
-                            panicked = join.is_panic(),
-                            "secret store task failed"
-                        );
-                        return Err(unavailable("the secret store task failed".into()));
-                    }
-                    Err(_) => {
-                        tracing::info!(store = %store, "secret store did not answer in time");
-                        return Err(unavailable(format!(
-                            "no answer within {} s (an unlock prompt may be waiting)",
-                            timeout.as_secs()
-                        )));
-                    }
-                }
-            }
+            SecretSource::Stored(reference) => reads
+                .read(reference, deadline, timeout)
+                .await
+                .map_err(|source| CoreError::Secret { slot, source })?,
             SecretSource::Prompt => prompted
                 .remove(&slot)
                 .ok_or(ConnectionError::NoSuchSecretSlot(slot))?,

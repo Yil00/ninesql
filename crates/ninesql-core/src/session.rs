@@ -207,8 +207,7 @@ pub struct ManagerConfig {
     pub workers: usize,
     /// Connect timeout, per SSH hop and for the driver's connect.
     pub connect_timeout: Duration,
-    /// How long an open waits for its saved secrets (every store call together, an unlock
-    /// prompt included) before failing with [`SecretError::Unavailable`](ninesql_secrets::SecretError::Unavailable).
+    /// How long an open waits for its saved secrets (every store call together) before failing with [`SecretError::Unavailable`](ninesql_secrets::SecretError::Unavailable).
     /// Default: [`connect::DEFAULT_SECRET_TIMEOUT`] (60 s).
     pub secret_timeout: Duration,
     /// How long a statement waits for the previous, cancelled one to be confirmed ended before
@@ -502,7 +501,7 @@ struct InitSqlKey {
 
 struct Shared {
     registry: DriverRegistry,
-    stores: SecretStores,
+    reads: connect::SecretReads,
     config: ManagerConfig,
     known_hosts: OnceCell<KnownHostsStore>,
     sessions: Mutex<HashMap<SessionId, SessionHandle>>,
@@ -663,7 +662,7 @@ impl SessionManager {
             runtime: Arc::new(runtime),
             shared: Arc::new(Shared {
                 registry,
-                stores,
+                reads: connect::SecretReads::new(stores),
                 config,
                 known_hosts: OnceCell::new(),
                 sessions: Mutex::new(HashMap::new()),
@@ -730,11 +729,14 @@ impl SessionManager {
     /// read-only, auto-commit and production flags; a check that a read-only connection got a
     /// read-only session (I3). Secrets are dropped (zeroized) before the driver returns.
     ///
-    /// Saved secrets get at most [`ManagerConfig::secret_timeout`] (an ignored keyring unlock
-    /// prompt fails the open with [`SecretError::Unavailable`](ninesql_secrets::SecretError::Unavailable)).
+    /// Saved secrets get at most [`ManagerConfig::secret_timeout`] (a store that does not answer
+    /// fails the open with [`SecretError::Unavailable`](ninesql_secrets::SecretError::Unavailable));
+    /// reads are single-flight per secret and bounded in number ([`connect::SecretReads`]).
     /// If the [`Reply`] is dropped before the answer, the open is abandoned where it stands (no
     /// more waiting on a secret store, the tunnel or the driver; a tunnel already opened is shut
-    /// down), and a session opened meanwhile is closed.
+    /// down), and a session opened meanwhile is closed. Abandoning cannot recall what already
+    /// reached the server: an init statement the driver has already sent completes on the
+    /// server before the connection is dropped.
     pub fn open(&self, request: OpenRequest) -> Reply<Result<OpenOutcome, CoreError>> {
         let (mut tx, reply) = Reply::channel();
         let shared = Arc::clone(&self.shared);
@@ -912,7 +914,7 @@ async fn open_session(
     let connection = Arc::new(connection);
     let mut bag = connect::resolve_secrets_bounded(
         &connection,
-        &shared.stores,
+        &shared.reads,
         prompted,
         shared.config.secret_timeout,
     )

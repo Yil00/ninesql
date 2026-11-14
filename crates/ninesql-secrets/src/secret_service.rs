@@ -96,11 +96,16 @@
 //! call forever. Every connection this backend opens sets one ([`METHOD_TIMEOUT`], 25 s, the
 //! usual `dbus-daemon` reply timeout); a call that runs out is [`SecretError::Unavailable`]. The
 //! startup probe is bounded separately ([`PROBE_TIMEOUT`], 5 s, see [`crate::detect_secret_service`]).
-//! A call that has to wait for an unlock **prompt** waits for the prompt's `Completed` signal,
-//! which is not a method call: the user may take any time. The core should therefore run store
-//! calls with its own timeout or cancel path (for example `tokio::time::timeout` around
-//! `spawn_blocking`) and map a `JoinError` (a panic inside the client) to
-//! [`SecretError::Unavailable`].
+//! Prompts: `get` (the connect path) never runs one. It checks the item
+//! with `ensure_unlocked`, which reports a locked item as [`SecretError::Locked`] instead of
+//! asking to unlock it, so a read is a bounded series of method calls. `set` and `delete` also
+//! refuse a locked collection or item first, but a provider may still answer `CreateItem` or
+//! `Delete` with a prompt (KeePassXC asks to confirm deletions); the client then waits for the
+//! prompt's `Completed` signal, which is not a method call and has no timeout. Those calls run
+//! from explicit user actions (save, delete), never from a connect. Dismissing such a prompt when
+//! the core gives up needs prompt handling outside the client crate (a Phase 1 follow-up). The
+//! core runs every store call on its blocking pool with its own deadline, single-flight per
+//! secret, and maps a `JoinError` (a panic inside the client) to [`SecretError::Unavailable`].
 
 use std::collections::HashMap;
 use std::sync::mpsc;

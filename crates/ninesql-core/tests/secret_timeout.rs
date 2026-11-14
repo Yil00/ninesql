@@ -10,8 +10,8 @@ use std::time::{Duration, Instant};
 
 use ninesql_core::driver_api::mock::MockDriver;
 use ninesql_core::{
-    Auth, ConnectionTypeId, ConnectionTypes, CoreError, CoreEvent, Next, OpenRequest, SecretSlot,
-    SecretSource,
+    Auth, ConnectionTypeId, ConnectionTypes, CoreError, CoreEvent, HostKeyPolicy, Next,
+    OpenRequest, SecretSlot, SecretSource, SshAuth, SshHop, SshTunnel,
 };
 use ninesql_secrets::{
     SecretError, SecretId, SecretMeta, SecretRef, SecretStore, SecretStores, SecretString,
@@ -26,6 +26,8 @@ enum Mode {
     Hang,
     /// Panics inside the store (a client bug).
     Panic,
+    /// Answers after this long.
+    Delay(Duration),
 }
 
 struct SlowStore {
@@ -70,6 +72,7 @@ impl SecretStore for SlowStore {
         *self.calls.lock().unwrap() += 1;
         match self.mode {
             Mode::Panic => panic!("simulated failure inside the secret store client"),
+            Mode::Delay(d) => std::thread::sleep(d),
             Mode::Hang => {
                 let mut released = self.released.lock().unwrap();
                 while !*released {
@@ -91,15 +94,31 @@ impl SecretStore for SlowStore {
 }
 
 fn saved_password_connection() -> ninesql_core::Connection {
+    saved_password_connection_with("mock:auth")
+}
+
+fn saved_password_connection_with(id: &str) -> ninesql_core::Connection {
     let mut c = mock_connection(ConnectionTypeId::dev());
     c.auth = Auth::Password {
         username: "app".into(),
-        secret: SecretSource::Stored(SecretRef::new(
-            StoreKind::Keyring,
-            SecretId::new("mock:auth").unwrap(),
-        )),
+        secret: stored(id),
     };
     c
+}
+
+fn stored(id: &str) -> SecretSource {
+    SecretSource::Stored(SecretRef::new(
+        StoreKind::Keyring,
+        SecretId::new(id).unwrap(),
+    ))
+}
+
+async fn wait_until(what: &str, mut ok: impl FnMut() -> bool) {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !ok() {
+        assert!(Instant::now() < deadline, "timed out waiting: {what}");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
 }
 
 fn stores_with(store: Arc<SlowStore>) -> SecretStores {
@@ -136,7 +155,7 @@ fn an_unanswered_store_call_times_out_as_unavailable() {
                 source: SecretError::Unavailable { store, detail },
             } => {
                 assert_eq!(*store, StoreKind::Keyring);
-                assert!(detail.contains("unlock prompt"), "{detail}");
+                assert!(detail.contains("no answer within"), "{detail}");
             }
             other => panic!("{other:?}"),
         }
@@ -249,4 +268,195 @@ fn the_default_secret_timeout_is_sane() {
     );
     assert!(config.secret_timeout >= Duration::from_secs(30));
     assert!(config.secret_timeout <= Duration::from_secs(300));
+}
+
+#[test]
+fn opens_of_the_same_secret_join_the_read_in_flight() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mock = MockDriver::new();
+    let stats = mock.stats();
+    let store = SlowStore::new(Mode::Hang);
+    let manager = manager_with_stores(
+        Arc::new(mock),
+        tmp.path(),
+        stores_with(store.clone()),
+        |c| c.secret_timeout = Duration::from_millis(300),
+    );
+    let types = ConnectionTypes::default();
+    ui(async {
+        // Three opens (retries after a timeout) while the first store call still hangs.
+        for _ in 0..3 {
+            let err = open(
+                &manager,
+                OpenRequest::new(saved_password_connection(), &types),
+            )
+            .await
+            .unwrap_err();
+            assert!(matches!(
+                err,
+                CoreError::Secret {
+                    source: SecretError::Unavailable { .. },
+                    ..
+                }
+            ));
+        }
+        assert_eq!(store.calls(), 1, "one store call for the three opens");
+
+        // Joined by opens that wait long enough: one answer serves them all.
+        let replies: Vec<_> = (0..3)
+            .map(|_| {
+                let mut c = saved_password_connection();
+                c.id = ninesql_core::ConnectionId::new_random();
+                manager.open(OpenRequest::new(c, &types))
+            })
+            .collect();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        store.release();
+        for r in replies {
+            let _ = tokio::time::timeout(Duration::from_secs(10), r)
+                .await
+                .unwrap();
+        }
+    });
+    // The joined opens used the 300 ms deadline too, so some may have timed out; never a second
+    // store call while the first was in flight.
+    assert_eq!(store.calls(), 1);
+    assert!(stats.connects() <= 3);
+    manager.shutdown(Duration::from_secs(5));
+}
+
+#[test]
+fn joined_opens_get_the_value_once_the_store_answers() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mock = MockDriver::new();
+    let stats = mock.stats();
+    let store = SlowStore::new(Mode::Hang);
+    let manager = manager_with_stores(
+        Arc::new(mock),
+        tmp.path(),
+        stores_with(store.clone()),
+        |c| c.secret_timeout = Duration::from_secs(30),
+    );
+    let types = ConnectionTypes::default();
+    ui(async {
+        let replies: Vec<_> = (0..3)
+            .map(|_| manager.open(OpenRequest::new(saved_password_connection(), &types)))
+            .collect();
+        wait_until("first store call", || store.calls() == 1).await;
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        store.release();
+        for r in replies {
+            let outcome = tokio::time::timeout(Duration::from_secs(10), r)
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(
+                matches!(outcome, Ok(ninesql_core::OpenOutcome::Opened(_))),
+                "{outcome:?}"
+            );
+        }
+    });
+    assert_eq!(store.calls(), 1);
+    assert_eq!(stats.connects(), 3);
+    manager.shutdown(Duration::from_secs(5));
+}
+
+#[test]
+fn pending_store_reads_are_capped() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mock = MockDriver::new();
+    let store = SlowStore::new(Mode::Hang);
+    let manager = manager_with_stores(
+        Arc::new(mock),
+        tmp.path(),
+        stores_with(store.clone()),
+        |c| c.secret_timeout = Duration::from_secs(30),
+    );
+    let types = ConnectionTypes::default();
+    let max = u32::try_from(ninesql_core::connect::MAX_PENDING_SECRET_READS).unwrap();
+    ui(async {
+        let replies: Vec<_> = (0..max)
+            .map(|i| {
+                manager.open(OpenRequest::new(
+                    saved_password_connection_with(&format!("mock:auth-{i}")),
+                    &types,
+                ))
+            })
+            .collect();
+        wait_until("every read started", || store.calls() == max).await;
+        let started = Instant::now();
+        let err = open(
+            &manager,
+            OpenRequest::new(saved_password_connection_with("mock:one-more"), &types),
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "refused at once"
+        );
+        match err {
+            CoreError::Secret {
+                source: SecretError::Unavailable { detail, .. },
+                ..
+            } => assert!(detail.contains("too many"), "{detail}"),
+            other => panic!("{other:?}"),
+        }
+        assert_eq!(store.calls(), max, "no store call for the refused read");
+        store.release();
+        for r in replies {
+            let _ = tokio::time::timeout(Duration::from_secs(10), r)
+                .await
+                .unwrap();
+        }
+    });
+    manager.shutdown(Duration::from_secs(5));
+}
+
+#[test]
+fn several_fields_share_one_deadline() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mock = MockDriver::new();
+    let stats = mock.stats();
+    // Each read takes 250 ms: the first fits in the 400 ms deadline, the second does not.
+    let store = SlowStore::new(Mode::Delay(Duration::from_millis(250)));
+    let manager = manager_with_stores(
+        Arc::new(mock),
+        tmp.path(),
+        stores_with(store.clone()),
+        |c| c.secret_timeout = Duration::from_millis(400),
+    );
+    let types = ConnectionTypes::default();
+    let mut c = saved_password_connection();
+    let mut server = SshHop::new(
+        "127.0.0.1",
+        22,
+        "deploy",
+        SshAuth::Password {
+            secret: stored("mock:ssh"),
+        },
+    );
+    server.host_key_policy = HostKeyPolicy::Strict;
+    c.ssh = Some(SshTunnel {
+        server,
+        jump_hosts: vec![],
+    });
+    ui(async {
+        let err = open(&manager, OpenRequest::new(c, &types))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                CoreError::Secret {
+                    slot: SecretSlot::SshServer,
+                    source: SecretError::Unavailable { .. },
+                }
+            ),
+            "{err:?}"
+        );
+    });
+    assert_eq!(store.calls(), 2);
+    assert_eq!(stats.connects(), 0);
+    manager.shutdown(Duration::from_secs(5));
 }
