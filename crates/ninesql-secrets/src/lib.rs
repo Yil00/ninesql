@@ -31,7 +31,7 @@ pub use reference::{InvalidSecretId, SecretId, SecretKind, SecretRef, StoreKind}
 pub use registry::SecretStores;
 pub use secrecy::{ExposeSecret, SecretString};
 #[cfg(feature = "secret-service")]
-pub use secret_service::SecretServiceStore;
+pub use secret_service::{InvalidProjectId, SecretServiceStore};
 pub use store::{SecretMeta, SecretStore};
 
 /// Service name used for every item NineSQL writes to a secret store (ADR-0005).
