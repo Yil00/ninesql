@@ -562,7 +562,11 @@ fn redact_kv_pairs(text: &str) -> String {
             if quoted {
                 out.push_str(&text[last..=k]);
                 out.push_str("***");
-                out.push_str(&text[end - 1..end]);
+                // Only a real closing quote is kept: an unterminated value
+                // (`password='it''s`) must not leak its last character.
+                if bytes[end - 1] == bytes[k] {
+                    out.push_str(&text[end - 1..end]);
+                }
             } else {
                 out.push_str(&text[last..k]);
                 out.push_str("***");
@@ -686,6 +690,18 @@ mod tests {
             assert!(!r.contains("Pa55") && !r.contains("'word"), "{s} -> {r}");
             assert!(r.contains("***"), "{s} -> {r}");
         }
+        for s in ["password='it''s", "password=\"abc", "x password='a''b' y"] {
+            let r = redact_connection_string(s);
+            assert!(
+                !r.contains("it") && !r.contains("abc") && !r.contains("a''b"),
+                "{s} -> {r}"
+            );
+        }
+        assert_eq!(redact_connection_string("password='it''s"), "password='***");
+        assert_eq!(
+            redact_connection_string("password='a''b' y"),
+            "password='***' y"
+        );
         assert_eq!(
             redact_connection_string("NOAUTH Authentication required."),
             "NOAUTH Authentication required."

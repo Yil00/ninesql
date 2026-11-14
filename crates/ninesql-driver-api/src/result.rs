@@ -270,7 +270,8 @@ impl Truncation {
 }
 
 /// Maximum nesting depth of a [`Document`] (objects and arrays inside each other, the document
-/// itself at depth 1). Drivers stop decoding at this depth and replace deeper subtrees with
+/// itself at depth 1). Drivers enforce it **while decoding** (never build a deeper tree and cut
+/// it afterwards: the decoder's own recursion is the risk): they stop at this depth and replace deeper subtrees with
 /// [`DocValue::truncated`] of a [`DocValue::Other`] (`type_name` `"nested"`); [`ResultStream`]
 /// rejects deeper documents with [`DriverError::Protocol`]. The bound keeps the recursive
 /// `Drop`, `Clone` and `PartialEq` of documents far from the stack limit (L-8).
@@ -286,6 +287,36 @@ pub const MAX_DOCUMENT_DEPTH: usize = 100;
 pub struct Document {
     /// Fields in engine order.
     pub fields: Vec<(String, DocValue)>,
+}
+
+/// Iterative teardown (N-1): the values of a document are moved onto a heap stack and dropped
+/// one level at a time, so dropping a document never recurses, whatever its depth. Nested
+/// documents are emptied the same way before they are dropped. A deep chain of
+/// [`DocValue::Array`]s held **outside** any document still drops recursively: drivers keep
+/// values inside documents and enforce [`MAX_DOCUMENT_DEPTH`] while decoding.
+///
+/// Because `Document` implements `Drop`, its `fields` cannot be moved out by destructuring;
+/// use `std::mem::take(&mut doc.fields)`.
+impl Drop for Document {
+    fn drop(&mut self) {
+        if self.fields.is_empty() {
+            return;
+        }
+        let mut stack: Vec<DocValue> = std::mem::take(&mut self.fields)
+            .into_iter()
+            .map(|(_, v)| v)
+            .collect();
+        while let Some(v) = stack.pop() {
+            match v {
+                DocValue::Array(items) => stack.extend(items),
+                DocValue::Object(mut d) => {
+                    stack.extend(std::mem::take(&mut d.fields).into_iter().map(|(_, v)| v));
+                }
+                DocValue::Truncated { kept, .. } => stack.push(*kept),
+                _ => {}
+            }
+        }
+    }
 }
 
 impl From<Vec<(String, DocValue)>> for Document {
@@ -764,9 +795,9 @@ impl ResultStream {
                 Err(_) => request.await,
             }
         }
-        if tokio::time::timeout(SERVER_CANCEL_GRACE, self.cancel_state.wait_done())
+        if bounded(SERVER_CANCEL_GRACE, self.cancel_state.wait_done())
             .await
-            .is_err()
+            .is_none()
         {
             tracing::warn!("server-side cancel not acknowledged in time");
         }
@@ -783,7 +814,7 @@ impl ResultStream {
                         }
                     }
                 };
-                if tokio::time::timeout(remaining, drain).await.is_err() {
+                if bounded(remaining, drain).await.is_none() {
                     tracing::warn!(
                         "server did not confirm the end of the cancelled statement in time"
                     );
@@ -1041,11 +1072,21 @@ impl CancelState {
 }
 
 /// Sends the cancel request, bounded by [`SERVER_CANCEL_GRACE`], and records its end.
+/// `fut` bounded by `limit` when a Tokio runtime (with its timer) is current; awaited without
+/// a bound otherwise, so a stream polled outside a runtime never panics. `None` on timeout.
+async fn bounded<F: std::future::Future>(limit: Duration, fut: F) -> Option<F::Output> {
+    if tokio::runtime::Handle::try_current().is_ok() {
+        tokio::time::timeout(limit, fut).await.ok()
+    } else {
+        Some(fut.await)
+    }
+}
+
 async fn send_cancel(canceller: Arc<dyn CancelHandle>, state: Arc<CancelState>) {
-    match tokio::time::timeout(SERVER_CANCEL_GRACE, canceller.cancel()).await {
-        Ok(Ok(())) => {}
-        Ok(Err(e)) => tracing::warn!(error = %e, "server-side cancel failed"),
-        Err(_) => tracing::warn!("server-side cancel not acknowledged in time"),
+    match bounded(SERVER_CANCEL_GRACE, canceller.cancel()).await {
+        Some(Ok(())) => {}
+        Some(Err(e)) => tracing::warn!(error = %e, "server-side cancel failed"),
+        None => tracing::warn!("server-side cancel not acknowledged in time"),
     }
     state.done.store(true, Ordering::SeqCst);
     state.notify.notify_waiters();
@@ -1086,7 +1127,10 @@ enum Polled {
 
 async fn sleep_until_opt(deadline: Option<tokio::time::Instant>) {
     match deadline {
-        Some(d) => tokio::time::sleep_until(d).await,
-        None => std::future::pending::<()>().await,
+        // Without a runtime there is no timer: the deadline cannot be watched (N-2).
+        Some(d) if tokio::runtime::Handle::try_current().is_ok() => {
+            tokio::time::sleep_until(d).await;
+        }
+        _ => std::future::pending::<()>().await,
     }
 }

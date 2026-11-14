@@ -1427,3 +1427,51 @@ async fn tls_helper_needs_a_positive_control() {
     )
     .await;
 }
+
+/// N-1: dropping a very deep document never recurses (2 MiB thread, depth 200 000).
+#[test]
+fn deep_documents_drop_iteratively() {
+    use ninesql_driver_api::{DocValue, Document};
+    let handle = std::thread::Builder::new()
+        .stack_size(2 * 1024 * 1024)
+        .spawn(|| {
+            let mut v = DocValue::Int(1);
+            for i in 0..200_000 {
+                v = if i % 2 == 0 {
+                    DocValue::Array(vec![v])
+                } else {
+                    DocValue::Object(Document::new(vec![("k".into(), v)]))
+                };
+            }
+            let doc = Document::new(vec![("root".into(), v)]);
+            assert_eq!(doc.depth(), 200_001);
+            assert!(!doc.has_truncated_values());
+            assert!(doc.estimated_size() > 200_000);
+            drop(doc);
+        })
+        .unwrap();
+    handle.join().unwrap();
+}
+
+/// N-2: a stream polled outside a Tokio runtime neither panics nor loses the cancel.
+#[test]
+fn stream_polled_without_runtime_does_not_panic() {
+    struct InstantCancel(std::sync::atomic::AtomicU32);
+    #[async_trait::async_trait]
+    impl ninesql_driver_api::CancelHandle for InstantCancel {
+        async fn cancel(&self) -> ninesql_driver_api::DriverResult<()> {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(())
+        }
+    }
+    let c = std::sync::Arc::new(InstantCancel(std::sync::atomic::AtomicU32::new(0)));
+    let token = CancelToken::new();
+    let opts = ExecOptions::default()
+        .with_cancel(token.clone())
+        .with_timeout(Some(Duration::from_secs(1)));
+    let mut s = ResultStream::new(pending_raw(), &opts, c.clone());
+    token.cancel();
+    let r = futures_util::FutureExt::now_or_never(s.next()).expect("no runtime needed");
+    assert_eq!(r.unwrap().err(), Some(DriverError::Cancelled));
+    assert_eq!(c.0.load(std::sync::atomic::Ordering::SeqCst), 1);
+}
