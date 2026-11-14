@@ -16,6 +16,8 @@
 //! - [`Capabilities`]: plain data the UI reads to offer only what the engine supports (I8);
 //!   mirrored in `docs/08-engine-capabilities.md`.
 //! - [`DriverError`]: typed, user-presentable errors that never carry secrets or values.
+//!
+//! With the `mock` feature, `mock` provides an in-memory driver for UI and core tests.
 #![forbid(unsafe_code)]
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
 
@@ -24,6 +26,8 @@ pub mod dialect;
 pub mod driver;
 pub mod error;
 pub mod metadata;
+#[cfg(feature = "mock")]
+pub mod mock;
 pub mod params;
 pub mod result;
 pub mod secret;
