@@ -54,13 +54,22 @@ pub trait Driver: Send + Sync {
     ///   override TLS / verification, host / port, credentials, read-only / access mode,
     ///   multi-statements, init SQL or lexical modes (reuse
     ///   `conformance::assert_reserved_properties_rejected` in the integration tests);
+    /// - pass accepted properties to the client as separate typed options, **never** spliced into
+    ///   a connection string or URL;
     /// - disable multi-statement support in the client (MySQL `CLIENT_MULTI_STATEMENTS` off);
+    /// - connect with a UTF-8 client encoding and track the session's lexical modes
+    ///   (see the [`dialect`](crate::dialect) module);
     /// - honour [`ConnectParams::connect_timeout`] for the whole connect;
     /// - verify TLS according to [`TlsConfig`](crate::TlsConfig) with rustls; never fall back to
     ///   a weaker mode than requested;
     /// - when [`ConnectParams::read_only`] is set, apply the engine-side mechanism declared in
     ///   [`Capabilities::read_only`] **before** returning, verify it took effect where the engine
     ///   allows reading it back, and fail with [`DriverError::ReadOnly`] otherwise (I3);
+    /// - re-apply **and verify** the read-only mechanism on every driver-internal reconnect
+    ///   (pool refill, automatic reconnect after a network error) before the new connection
+    ///   runs any statement; PostgreSQL before 14 does not report
+    ///   `default_transaction_read_only` in `ParameterStatus`, so it needs a read-back
+    ///   (`SHOW default_transaction_read_only`);
     /// - run [`ConnectParams::init_statements`] after the read-only mechanism, so they cannot
     ///   lift it (they are subject to the same read-only refusal as user statements);
     /// - drop every [`Secret`](crate::Secret) as soon as the handshake is done, unless the

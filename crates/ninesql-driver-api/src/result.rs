@@ -53,7 +53,10 @@ pub const UPDATE_COUNT_BYTES: u64 = 16;
 pub enum ResultItem {
     /// Starts a result set.
     ResultSet(ResultSetHeader),
-    /// Rows of the current tabular result set; the schema equals the header's.
+    /// Rows of the current tabular result set. The batch schema equals the header's up to field
+    /// metadata: a batch may add [`TRUNCATED_VALUES_METADATA_KEY`] to a field. The grid treats
+    /// such a column as **non-editable** for that result (writing back a cut value would
+    /// destroy data).
     Rows(RecordBatch),
     /// Documents of the current document result set.
     Documents(Vec<Document>),
@@ -79,13 +82,35 @@ impl fmt::Debug for ResultItem {
     }
 }
 
-/// Header of one result set.
+/// Header of one result set. Build with [`ResultSetHeader::tabular`] /
+/// [`ResultSetHeader::documents`].
 #[derive(Clone, Debug, PartialEq)]
+#[non_exhaustive]
 pub struct ResultSetHeader {
     /// 0-based index of the result set within the statement.
     pub index: u32,
     /// What the result set contains.
     pub kind: ResultSetKind,
+}
+
+impl ResultSetHeader {
+    /// Header of a tabular result set.
+    #[must_use]
+    pub fn tabular(index: u32, schema: SchemaRef) -> Self {
+        Self {
+            index,
+            kind: ResultSetKind::Tabular(schema),
+        }
+    }
+
+    /// Header of a document result set.
+    #[must_use]
+    pub fn documents(index: u32) -> Self {
+        Self {
+            index,
+            kind: ResultSetKind::Documents,
+        }
+    }
 }
 
 /// Content of a result set.
@@ -114,7 +139,9 @@ pub enum NoticeSeverity {
 /// The message is **display-only**: it may quote data or statement text, so it is never written
 /// to logs (logs record the severity and code only) and never for production connections.
 /// Notices count against [`FetchBudget::max_bytes`](crate::FetchBudget::max_bytes).
+/// Build with [`Notice::new`].
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct Notice {
     /// Severity.
     pub severity: NoticeSeverity,
@@ -122,6 +149,25 @@ pub struct Notice {
     pub code: Option<String>,
     /// Message text.
     pub message: String,
+}
+
+impl Notice {
+    /// A notice without an engine code.
+    #[must_use]
+    pub fn new(severity: NoticeSeverity, message: impl Into<String>) -> Self {
+        Self {
+            severity,
+            code: None,
+            message: message.into(),
+        }
+    }
+
+    /// Adds the engine code.
+    #[must_use]
+    pub fn with_code(mut self, code: impl Into<String>) -> Self {
+        self.code = Some(code.into());
+        self
+    }
 }
 
 /// Why a result stopped early.
@@ -135,6 +181,7 @@ pub enum TruncationReason {
 
 /// Payload of [`ResultItem::Truncated`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[non_exhaustive]
 pub struct Truncation {
     /// Which limit was hit.
     pub reason: TruncationReason,

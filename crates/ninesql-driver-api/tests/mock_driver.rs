@@ -423,20 +423,14 @@ async fn query_errors_are_typed() {
 async fn auth_errors_never_echo_the_password() {
     let driver = MockDriver::new().with_password(Secret::new("right-pw".into()));
     let mut p = params();
-    p.auth = Auth::Password {
-        user: "nine".into(),
-        password: Some(Secret::new("Wrong-Pa55word".into())),
-    };
+    p.auth = Auth::password("nine", Some(Secret::new("Wrong-Pa55word".into())));
     let err = driver.connect(p).await.err().unwrap();
     assert!(matches!(err, DriverError::Auth(_)));
     assert!(!err.to_string().contains("Wrong-Pa55word"));
     assert!(!format!("{err:?}").contains("Wrong-Pa55word"));
 
     let mut p = params();
-    p.auth = Auth::Password {
-        user: "nine".into(),
-        password: Some(Secret::new("right-pw".into())),
-    };
+    p.auth = Auth::password("nine", Some(Secret::new("right-pw".into())));
     assert!(driver.connect(p).await.is_ok());
     assert_eq!(driver.stats().connects(), 1);
 }
@@ -469,11 +463,7 @@ async fn metadata_is_lazy_and_paged() {
             .list(
                 &public,
                 ObjectKind::Table,
-                PageRequest {
-                    cursor,
-                    limit: 20,
-                    filter: None,
-                },
+                PageRequest::first().with_cursor(cursor).with_limit(20),
             )
             .await
             .unwrap();
@@ -542,6 +532,12 @@ async fn conformance_suite_passes_on_the_mock() {
     conformance::assert_reserved_properties_rejected(&driver, &params()).await;
     conformance::assert_read_only_refuses_writes(&driver, params(), conformance::WRITES).await;
     conformance::assert_multiple_statements_refused(&driver, params()).await;
+    conformance::assert_access_mode_change_detected(
+        &driver,
+        params(),
+        "SELECT mock_lift_read_only()",
+    )
+    .await;
 }
 
 #[tokio::test]

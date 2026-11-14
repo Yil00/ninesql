@@ -12,6 +12,7 @@
 //!     conformance::assert_reserved_properties_rejected(&driver, &params).await;
 //!     conformance::assert_read_only_refuses_writes(&driver, &params, conformance::WRITES).await;
 //!     conformance::assert_multiple_statements_refused(&driver, &params).await;
+//!     conformance::assert_access_mode_change_detected(&driver, &params, LIFT_SQL).await;
 //! }
 //! ```
 
@@ -131,6 +132,42 @@ pub async fn assert_read_only_refuses_writes(
         );
     }
     assert!(session.is_read_only(), "session left read-only mode");
+}
+
+/// Opens a read-only session and runs `lift_sql`, an engine-specific statement that lifts the
+/// read-only mode while bypassing the classifier (the driver's test supplies it; for the mock:
+/// `SELECT mock_lift_read_only()`). Asserts that the driver detects the change (it fails with
+/// [`DriverError::ReadOnly`]) and closes the session (later calls fail with
+/// [`DriverError::Closed`]). Only meaningful for liftable mechanisms
+/// ([`ReadOnlyMechanism::is_liftable`](crate::ReadOnlyMechanism::is_liftable)).
+///
+/// # Panics
+/// When the change goes unnoticed or the session stays usable.
+pub async fn assert_access_mode_change_detected(
+    driver: &dyn Driver,
+    params: ConnectParams,
+    lift_sql: &str,
+) {
+    let mut p = params;
+    p.read_only = true;
+    let mut session = match driver.connect(p).await {
+        Ok(s) => s,
+        Err(e) => panic!("read-only connect failed: {e}"),
+    };
+    assert!(
+        session.capabilities().read_only.is_liftable(),
+        "the engine does not declare a liftable read-only mechanism"
+    );
+    let outcome = run(session.as_mut(), lift_sql).await;
+    assert!(
+        matches!(outcome, Err(DriverError::ReadOnly(_))),
+        "access-mode change was not detected: {outcome:?}"
+    );
+    let after = run(session.as_mut(), "SELECT 1").await;
+    assert!(
+        matches!(after, Err(DriverError::Closed(_))),
+        "session still usable after an access-mode change: {after:?}"
+    );
 }
 
 /// Asserts that a two-statement text is refused with [`DriverError::MultipleStatements`].

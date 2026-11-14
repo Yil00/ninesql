@@ -69,7 +69,10 @@ impl fmt::Debug for Param {
 /// `Debug` prints the language, the text length and the parameter types, never the text or the
 /// values: query text may be logged only at `trace` level and never for production connections,
 /// which is the caller's decision, not an accident of `{:?}`.
+///
+/// Build with [`Statement::sql`] / [`Statement::new`] and [`Statement::with_params`].
 #[derive(Clone, PartialEq)]
+#[non_exhaustive]
 pub struct Statement {
     /// Statement text (one statement; scripts are split by the [`Dialect`](crate::Dialect)).
     pub text: String,
@@ -81,6 +84,16 @@ pub struct Statement {
 }
 
 impl Statement {
+    /// A statement in `language`, without parameters.
+    #[must_use]
+    pub fn new(text: impl Into<String>, language: QueryLanguage) -> Self {
+        Self {
+            text: text.into(),
+            params: Vec::new(),
+            language,
+        }
+    }
+
     /// A SQL statement without parameters.
     #[must_use]
     pub fn sql(text: impl Into<String>) -> Self {

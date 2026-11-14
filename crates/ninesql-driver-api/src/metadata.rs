@@ -48,8 +48,10 @@ impl ObjectPath {
     }
 }
 
-/// Request for one page of a listing.
+/// Request for one page of a listing. Build with [`PageRequest::first`] and the `with_*`
+/// methods.
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct PageRequest {
     /// Opaque cursor from the previous [`Page::next_cursor`]; `None` for the first page.
     pub cursor: Option<String>,
@@ -72,6 +74,27 @@ impl PageRequest {
             limit: Self::DEFAULT_LIMIT,
             filter: None,
         }
+    }
+
+    /// Continues after `cursor`.
+    #[must_use]
+    pub fn with_cursor(mut self, cursor: Option<String>) -> Self {
+        self.cursor = cursor;
+        self
+    }
+
+    /// Sets the page size.
+    #[must_use]
+    pub fn with_limit(mut self, limit: u32) -> Self {
+        self.limit = limit;
+        self
+    }
+
+    /// Sets the name filter.
+    #[must_use]
+    pub fn with_filter(mut self, filter: Option<String>) -> Self {
+        self.filter = filter;
+        self
     }
 }
 
@@ -122,8 +145,9 @@ pub enum ObjectDetails {
     Table(TableInfo),
 }
 
-/// Column details.
+/// Column details. Build with [`ColumnInfo::new`].
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct ColumnInfo {
     /// 1-based position.
     pub ordinal: u32,
@@ -139,8 +163,24 @@ pub struct ColumnInfo {
     pub auto_generated: bool,
 }
 
-/// Table details.
+impl ColumnInfo {
+    /// A nullable, non-key column without default.
+    #[must_use]
+    pub fn new(ordinal: u32, data_type: impl Into<String>) -> Self {
+        Self {
+            ordinal,
+            data_type: data_type.into(),
+            nullable: true,
+            default: None,
+            primary_key: false,
+            auto_generated: false,
+        }
+    }
+}
+
+/// Table details. Build with `TableInfo::default()` and set fields.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct TableInfo {
     /// Row estimate from statistics, if cheap to get.
     pub estimated_rows: Option<u64>,

@@ -91,6 +91,7 @@ impl fmt::Display for EngineId {
 
 /// Where the engine lives.
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum Endpoint {
     /// A network server. When an SSH tunnel is used, this is the tunnel's local end
     /// (`127.0.0.1:<ephemeral>`), and [`TlsConfig::server_name`] carries the real host name.
@@ -111,13 +112,15 @@ pub enum Endpoint {
     InMemory,
 }
 
-/// How the session authenticates.
+/// How the session authenticates. Build with [`Auth::password`] / [`Auth::token`].
 #[derive(Debug, Default)]
+#[non_exhaustive]
 pub enum Auth {
     /// No authentication (or authentication by TLS client certificate only).
     #[default]
     None,
     /// User name and password. `password: None` means an empty password was explicitly chosen.
+    #[non_exhaustive]
     Password {
         /// Database user.
         user: String,
@@ -125,6 +128,7 @@ pub enum Auth {
         password: Option<Secret>,
     },
     /// Bearer / API token (InfluxDB, Elasticsearch, Trino…).
+    #[non_exhaustive]
     Token {
         /// Optional user name sent with the token.
         user: Option<String>,
@@ -156,8 +160,9 @@ impl TlsMode {
     }
 }
 
-/// Client certificate for mutual TLS (ADR-0011 §3).
+/// Client certificate for mutual TLS (ADR-0011 §3). Build with [`ClientCertificate::new`].
 #[derive(Debug)]
+#[non_exhaustive]
 pub struct ClientCertificate {
     /// PEM certificate (chain) file.
     pub cert_file: PathBuf,
@@ -165,6 +170,55 @@ pub struct ClientCertificate {
     pub key_file: PathBuf,
     /// Passphrase of the key, if encrypted; resolved from the secret store.
     pub key_passphrase: Option<Secret>,
+}
+
+impl Endpoint {
+    /// A network server.
+    #[must_use]
+    pub fn tcp(host: impl Into<String>, port: u16) -> Self {
+        Self::Tcp {
+            host: host.into(),
+            port,
+        }
+    }
+
+    /// An existing database file (not created when missing).
+    #[must_use]
+    pub fn file(path: impl Into<PathBuf>) -> Self {
+        Self::File {
+            path: path.into(),
+            create_if_missing: false,
+        }
+    }
+}
+
+impl Auth {
+    /// User name and password (`None` = explicitly empty password).
+    #[must_use]
+    pub fn password(user: impl Into<String>, password: Option<Secret>) -> Self {
+        Self::Password {
+            user: user.into(),
+            password,
+        }
+    }
+
+    /// Bearer / API token, with an optional user name.
+    #[must_use]
+    pub fn token(user: Option<String>, token: Secret) -> Self {
+        Self::Token { user, token }
+    }
+}
+
+impl ClientCertificate {
+    /// A client certificate whose key is not encrypted.
+    #[must_use]
+    pub fn new(cert_file: impl Into<PathBuf>, key_file: impl Into<PathBuf>) -> Self {
+        Self {
+            cert_file: cert_file.into(),
+            key_file: key_file.into(),
+            key_passphrase: None,
+        }
+    }
 }
 
 /// TLS settings for one connection. Drivers implement them with rustls only (ADR-0002).
@@ -186,6 +240,7 @@ pub struct TlsConfig {
 
 /// SSH host key policy (ADR-0011 §6). Defaults to [`HostKeyVerification::Strict`].
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+#[non_exhaustive]
 pub enum HostKeyVerification {
     /// Check `known_hosts`; unknown keys need user confirmation; changed keys block (default).
     #[default]
@@ -315,7 +370,18 @@ impl fmt::Debug for PropertyValue {
 }
 
 /// Normalized property keys (lower-case, ASCII alphanumerics only) that are always reserved.
+///
+/// Notes on some entries:
+/// - `allowpublickeyretrieval` (MySQL): lets the server send its RSA key unauthenticated, so a
+///   man in the middle on a non-TLS connection can obtain the password;
+/// - MongoDB `authSource` / `authMechanism` are reserved through the `auth` fragment until typed
+///   fields exist (fails closed).
 pub const RESERVED_PROPERTY_KEYS: &[&str] = &[
+    "uri",
+    "nodes",
+    "contactpoints",
+    "connectionstring",
+    "userid",
     "host",
     "hostaddr",
     "hostname",
@@ -345,6 +411,17 @@ pub const RESERVED_PROPERTY_KEYS: &[&str] = &[
 /// Fragments that make a normalized property key reserved wherever they appear: TLS and
 /// certificate verification, credentials, access mode, multi-statements, init SQL.
 pub const RESERVED_PROPERTY_FRAGMENTS: &[&str] = &[
+    "encrypt",
+    "secure",
+    "crypt",
+    "keystore",
+    "channelbinding",
+    "proxy",
+    "socks",
+    "host",
+    "url",
+    "reconnect",
+    "failover",
     "ssl",
     "tls",
     "cert",
@@ -377,7 +454,11 @@ fn normalize_property_key(key: &str) -> String {
 }
 
 /// `true` when `key` controls a security-relevant setting that only the typed
-/// [`ConnectParams`] fields may set (H3 of the P0-B security review).
+/// [`ConnectParams`] fields may set (H3 / N3 of the P0-B security review).
+///
+/// This is the **canonical** reserved-property rule: drivers apply it through
+/// [`check_properties`], and `ninesql-core` (connection dialog, DBeaver import) must reuse this
+/// function rather than keep its own list, so the UI and the drivers always agree.
 #[must_use]
 pub fn is_reserved_property(key: &str) -> bool {
     let k = normalize_property_key(key);
@@ -388,6 +469,10 @@ pub fn is_reserved_property(key: &str) -> bool {
 /// Rejects properties that would override TLS / verification, host / port, credentials,
 /// read-only / access mode, multi-statements, init SQL or lexical modes. `extra_reserved` adds
 /// engine-specific keys (compared after the same normalization).
+///
+/// Drivers pass accepted properties to the client library as separate typed options; they
+/// **never splice property values into a connection string or URL**, where a value could inject
+/// further keys (`x;sslmode=disable`, `a&useSSL=false`).
 ///
 /// Every driver calls it at the start of [`Driver::connect`](crate::Driver::connect) and reuses
 /// the conformance test of the `mock` feature (`conformance::assert_reserved_properties_rejected`).
@@ -636,6 +721,30 @@ mod tests {
             "tls.insecure",
             "sslrootcert",
             "authenticationPlugins",
+            "secure",
+            "encrypted",
+            "useEncryption",
+            "keystore",
+            "wire_crypt",
+            "channel_binding",
+            "hosts",
+            "alt_hosts",
+            "failoverHosts",
+            "loadBalanceHosts",
+            "contactPoints",
+            "nodes",
+            "url",
+            "uri",
+            "jdbcUrl",
+            "connectionString",
+            "proxy",
+            "http_proxy",
+            "socksProxyHost",
+            "autoReconnect",
+            "userid",
+            "allowPublicKeyRetrieval",
+            "authSource",
+            "authMechanism",
         ] {
             assert!(is_reserved_property(key), "{key}");
             let mut props = BTreeMap::new();
@@ -653,6 +762,8 @@ mod tests {
             "application_name".to_owned(),
             PropertyValue::Plain("x".into()),
         );
+        props.insert("tcpNoDelay".to_owned(), PropertyValue::Plain("true".into()));
+        props.insert("fetchSize".to_owned(), PropertyValue::Plain("100".into()));
         assert!(check_properties(&props, &[]).is_ok());
         assert!(check_properties(&props, &["connect_timeout"]).is_err());
     }
