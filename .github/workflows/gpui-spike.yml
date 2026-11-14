@@ -1,7 +1,8 @@
 name: GPUI spike
 
-# Builds and smoke-runs crates/ninesql-ui/examples/spike.rs (ROADMAP P0-A, ADR-0001) so a
-# GPUI / gpui-component bump that breaks the build or the first frame is caught.
+# Builds and smoke-runs crates/ninesql-ui/examples/spike.rs (ROADMAP P0-A, ADR-0001) and the
+# `ninesql` binary (P1-A shell) so a GPUI / gpui-component bump that breaks the build or the first
+# frame is caught.
 # The smoke run renders in software (Mesa lavapipe / llvmpipe under Xvfb): it checks that a
 # frame is drawn and the scripted benchmark completes, not performance.
 
@@ -49,7 +50,7 @@ jobs:
             build-essential pkg-config clang cmake libvulkan-dev libwayland-dev \
             libxkbcommon-dev libxkbcommon-x11-dev libx11-xcb-dev libxcb1-dev \
             libfontconfig-dev libfreetype-dev libzstd-dev libasound2-dev \
-            xvfb mesa-vulkan-drivers libvulkan1 fonts-dejavu-core
+            xvfb x11-utils mesa-vulkan-drivers libvulkan1 fonts-dejavu-core
       - name: Build the spike
         run: cargo build --locked -p ninesql-ui --example spike
       - name: Unit tests of the spike
@@ -63,3 +64,29 @@ jobs:
           grep -q '^spike-metric first_frame_ms=' spike.log
           grep -q '^spike-metric frames_scroll=' spike.log
           grep -q '^spike-metric auto_done_ms=' spike.log
+      - name: Build the ninesql binary
+        run: cargo build --locked -p ninesql-ui --bin ninesql
+      - name: Smoke run of ninesql under Xvfb (window mapped, still alive after 5 s)
+        run: |
+          Xvfb :98 -screen 0 1600x1000x24 &
+          sleep 2
+          export DISPLAY=:98
+          export XDG_CONFIG_HOME="$RUNNER_TEMP/xdg/config" XDG_DATA_HOME="$RUNNER_TEMP/xdg/data" \
+            XDG_STATE_HOME="$RUNNER_TEMP/xdg/state"
+          target/debug/ninesql > ninesql.log 2>&1 &
+          pid=$!
+          found=0
+          for _ in $(seq 1 90); do
+            if xwininfo -root -tree | grep -q 'NineSQL'; then found=1; break; fi
+            kill -0 "$pid" 2>/dev/null || break
+            sleep 1
+          done
+          sleep 5
+          alive=0
+          kill -0 "$pid" 2>/dev/null && alive=1
+          kill "$pid" 2>/dev/null || true
+          if [ "$found" != 1 ] || [ "$alive" != 1 ]; then
+            cat ninesql.log
+            echo "::error::ninesql did not map a window or exited (found=$found alive=$alive)"
+            exit 1
+          fi

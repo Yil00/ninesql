@@ -27,8 +27,9 @@ jobs:
           toolchain: stable
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
-      # System packages for GPUI (P0-A, docs/10-supported-platforms.md): the ninesql-ui spike
-      # example is built by clippy --all-targets and cargo test.
+      # System packages for GPUI (P0-A, docs/10-supported-platforms.md): GPUI is a normal
+      # dependency of ninesql-ui since P1-A (the `ninesql` binary); its TestAppContext tests run
+      # headless under cargo test.
       - name: System packages for GPUI
         run: |
           sudo apt-get update
