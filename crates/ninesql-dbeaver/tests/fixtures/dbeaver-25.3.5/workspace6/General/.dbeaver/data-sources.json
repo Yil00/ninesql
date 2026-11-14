@@ -1,0 +1,282 @@
+{
+	"folders": {
+		"Team A": {
+			"description": "Synthetic fixture folder"
+		},
+		"Team B": {},
+		"Analytics": {},
+		"Legacy": {},
+		"Production": {
+			"parent": "Team A"
+		}
+	},
+	"connections": {
+		"postgres-jdbc-1a1dae749e2-328d6a8f5123daf": {
+			"provider": "postgresql",
+			"driver": "postgres-jdbc",
+			"name": "pg-dev",
+			"save-password": true,
+			"folder": "Team A",
+			"configuration": {
+				"host": "pg-dev.example.invalid",
+				"port": "5432",
+				"database": "nine",
+				"configurationType": "MANUAL",
+				"type": "dev",
+				"closeIdleConnection": true,
+				"properties": {
+					"ApplicationName": "ninesql-fixture",
+					"connectTimeout": "7"
+				},
+				"bootstrap": {
+					"defaultSchema": "app",
+					"query": ["SET statement_timeout \u003d 30000"]
+				}
+			}
+		},
+		"postgres-jdbc-1a1dae74a02-636ad07b00a5dbfe": {
+			"provider": "postgresql",
+			"driver": "postgres-jdbc",
+			"name": "pg-prod-ssh",
+			"save-password": true,
+			"read-only": true,
+			"folder": "Team A/Production",
+			"configuration": {
+				"host": "pg-prod.example.invalid",
+				"port": "5432",
+				"database": "nine_prod",
+				"configurationType": "MANUAL",
+				"type": "prod",
+				"closeIdleConnection": true,
+				"handlers": {
+					"ssh_tunnel": {
+						"type": "TUNNEL",
+						"enabled": true,
+						"save-password": true,
+						"properties": {
+							"host": "bastion.example.invalid",
+							"port": "22",
+							"authType": "PASSWORD",
+							"implementation": "sshj"
+						}
+					}
+				}
+			}
+		},
+		"postgres-jdbc-1a1dae74a08-5b4a781004fce7de": {
+			"provider": "postgresql",
+			"driver": "postgres-jdbc",
+			"name": "pg-url-tls",
+			"folder": "Team B",
+			"configuration": {
+				"url": "jdbc:postgresql://pg-url.example.invalid:5433/nine_url?sslmode\u003dverify-full",
+				"configurationType": "MANUAL",
+				"type": "dev",
+				"closeIdleConnection": true,
+				"handlers": {
+					"postgre_ssl": {
+						"type": "CONFIG",
+						"enabled": true,
+						"save-password": false,
+						"properties": {
+							"sslMode": "verify-full",
+							"ssl.method": "CERTIFICATES",
+							"ssl.ca.cert": "/home/nine_user/certs/fixture-ca.pem",
+							"ssl.client.cert": "/home/nine_user/certs/fixture-client.pem",
+							"ssl.client.key": "/home/nine_user/certs/fixture-client.key"
+						}
+					}
+				}
+			}
+		},
+		"postgres-timescale-jdbc-1a1dae74a0c-75a2c9bb494dedde": {
+			"provider": "postgresql",
+			"driver": "postgres-timescale-jdbc",
+			"name": "timescale-metrics",
+			"save-password": true,
+			"folder": "Team B",
+			"configuration": {
+				"host": "tsdb.example.invalid",
+				"port": "5432",
+				"database": "metrics",
+				"configurationType": "MANUAL",
+				"type": "dev",
+				"closeIdleConnection": true
+			}
+		},
+		"mysql8-1a1dae74a10-6a68b590beb41b3b": {
+			"provider": "mysql",
+			"driver": "mysql8",
+			"name": "mysql-test",
+			"save-password": true,
+			"folder": "Team B",
+			"configuration": {
+				"host": "mysql.example.invalid",
+				"port": "3306",
+				"database": "nine",
+				"configurationType": "MANUAL",
+				"type": "test",
+				"closeIdleConnection": true,
+				"properties": {
+					"connectTimeout": "5000",
+					"useSSL": "true"
+				},
+				"bootstrap": {
+					"autocommit": false
+				}
+			}
+		},
+		"mariaDB-1a1dae74a1a-636c0ed7ea2627eb": {
+			"provider": "mysql",
+			"driver": "mariaDB",
+			"name": "mariadb-ssh-key",
+			"configuration": {
+				"host": "mariadb.example.invalid",
+				"port": "3306",
+				"database": "nine",
+				"configurationType": "MANUAL",
+				"type": "dev",
+				"closeIdleConnection": true,
+				"handlers": {
+					"ssh_tunnel": {
+						"type": "TUNNEL",
+						"enabled": true,
+						"save-password": true,
+						"properties": {
+							"host": "bastion.example.invalid",
+							"port": "2222",
+							"authType": "PUBLIC_KEY",
+							"keyPath": "/home/nine_user/.ssh/id_fixture_ed25519",
+							"implementation": "sshj"
+						}
+					},
+					"mysql_ssl": {
+						"type": "CONFIG",
+						"enabled": true,
+						"save-password": false,
+						"properties": {
+							"ssl.require": true,
+							"ssl.verify.server": false,
+							"ssl.public.key.retrieve": false,
+							"ssl.ca.cert": "/home/nine_user/certs/fixture-ca.pem"
+						}
+					}
+				}
+			}
+		},
+		"sqlite_jdbc-1a1dae74a1f-524049e36f42496c": {
+			"provider": "sqlite",
+			"driver": "sqlite_jdbc",
+			"name": "sqlite-local",
+			"description": "Local SQLite file (synthetic fixture)",
+			"save-password": true,
+			"configuration": {
+				"database": "/home/nine_user/data/fixture.sqlite",
+				"configurationType": "MANUAL",
+				"type": "dev",
+				"closeIdleConnection": true
+			}
+		},
+		"com_clickhouse-1a1dae74a22-44640105728d737f": {
+			"provider": "clickhouse",
+			"driver": "com_clickhouse",
+			"name": "clickhouse-analytics",
+			"save-password": true,
+			"folder": "Analytics",
+			"configuration": {
+				"host": "clickhouse.example.invalid",
+				"port": "8123",
+				"database": "default",
+				"configurationType": "MANUAL",
+				"type": "staging",
+				"closeIdleConnection": true
+			}
+		},
+		"oracle_thin-1a1dae74a27-405c7e4182eaa8f6": {
+			"provider": "oracle",
+			"driver": "oracle_thin",
+			"name": "oracle-legacy",
+			"save-password": true,
+			"folder": "Legacy",
+			"configuration": {
+				"host": "oracle.example.invalid",
+				"port": "1521",
+				"database": "ORCLPDB1",
+				"configurationType": "MANUAL",
+				"type": "dev",
+				"closeIdleConnection": true
+			}
+		},
+		"postgres-jdbc-1a1dae767c3-4ecf229b6947524d": {
+			"provider": "postgresql",
+			"driver": "postgres-jdbc",
+			"name": "roundtrip-marker",
+			"configuration": {
+				"host": "marker.example.invalid",
+				"port": "5432",
+				"database": "nine",
+				"configurationType": "MANUAL",
+				"type": "dev",
+				"closeIdleConnection": true
+			}
+		}
+	},
+	"connection-types": {
+		"dev": {
+			"name": "Development",
+			"color": "255,255,255",
+			"description": "Regular development database",
+			"auto-commit": true,
+			"confirm-execute": false,
+			"confirm-data-change": false,
+			"smart-commit": false,
+			"smart-commit-recover": true,
+			"auto-close-transactions": true,
+			"close-transactions-period": 1800,
+			"auto-close-connections": true,
+			"close-connections-period": 14400
+		},
+		"prod": {
+			"name": "Production",
+			"color": "org.jkiss.dbeaver.color.connectionType.prod.background",
+			"description": "Production database",
+			"auto-commit": false,
+			"confirm-execute": true,
+			"confirm-data-change": true,
+			"smart-commit": false,
+			"smart-commit-recover": false,
+			"auto-close-transactions": true,
+			"close-transactions-period": 600,
+			"auto-close-connections": true,
+			"close-connections-period": 3600
+		},
+		"test": {
+			"name": "Test",
+			"color": "org.jkiss.dbeaver.color.connectionType.qa.background",
+			"description": "Test (QA) database",
+			"auto-commit": true,
+			"confirm-execute": false,
+			"confirm-data-change": true,
+			"smart-commit": false,
+			"smart-commit-recover": true,
+			"auto-close-transactions": true,
+			"close-transactions-period": 900,
+			"auto-close-connections": true,
+			"close-connections-period": 7200
+		},
+		"staging": {
+			"name": "Staging",
+			"color": "0,128,128",
+			"description": "Custom connection type (synthetic fixture)",
+			"auto-commit": false,
+			"confirm-execute": true,
+			"confirm-data-change": true,
+			"smart-commit": false,
+			"smart-commit-recover": false,
+			"auto-close-transactions": false,
+			"close-transactions-period": 0,
+			"auto-close-connections": false,
+			"close-connections-period": 0
+		}
+	}
+}
