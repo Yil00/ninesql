@@ -9,8 +9,8 @@ pub mod properties;
 pub mod workspace;
 
 pub use connection::{
-    Auth, ClientCertificate, Connection, ConnectionId, Endpoint, EngineId, Origin, SecretSlot,
-    SecretSource, SecurityWarning, SshAuth, SshHop, SshTunnel, TlsConfig, TlsMode,
+    Auth, ClientCertificate, Connection, ConnectionId, Endpoint, EngineId, HostKeyPolicy, Origin,
+    SecretSlot, SecretSource, SecurityWarning, SshAuth, SshHop, SshTunnel, TlsConfig, TlsMode,
 };
 pub use connection_type::{Color, ConnectionType, ConnectionTypeId, ConnectionTypes, SafetyPolicy};
 pub use error::{ConnectionError, WorkspaceError};
