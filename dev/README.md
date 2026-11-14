@@ -93,4 +93,5 @@ When Docker works but Docker Hub rate-limits anonymous pulls, log in (`docker lo
 ## Rules
 - Official images, pinned by digest (`name:tag@sha256:…`), and every port bound to `127.0.0.1`. `ready.py check` enforces both and runs in CI.
 - To bump an image, change the tag and digest in both `compose.yaml` and `engines.json`. Use the multi-arch index digest from `docker buildx imagetools inspect <name:tag>`. Then run `ready.py check` and bring the profile up.
+- Dependabot proposes digest bumps weekly (`docker-compose` ecosystem on `/dev`, [`.github/dependabot.yml`](../.github/dependabot.yml)), but it only edits `compose.yaml`. Copy the new tag and digest to `engines.json` in the same PR: `python3 dev/ready.py check` (run by the dev-env workflow) fails while the two files disagree.
 - Fake data only. Never commit dumps, real hosts or real credentials.
