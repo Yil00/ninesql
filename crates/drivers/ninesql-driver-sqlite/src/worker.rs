@@ -309,6 +309,46 @@ pub(crate) fn resolve_path(path: &Path, create: bool) -> DriverResult<PathBuf> {
     }
 }
 
+/// `true` for a database file in WAL mode (header bytes 18 and 19 equal to 2) when neither its
+/// `-wal` nor its `-shm` file exists (not even as a dangling link).
+pub(crate) fn wal_without_sidecars(path: &Path) -> bool {
+    use std::io::Read;
+    let mut header = [0u8; 100];
+    let Ok(mut f) = std::fs::File::open(path) else {
+        return false;
+    };
+    if f.read_exact(&mut header).is_err()
+        || &header[..16] != b"SQLite format 3\0"
+        || header[18] != 2
+        || header[19] != 2
+    {
+        return false;
+    }
+    let sidecar = |suffix: &str| {
+        let mut p = path.as_os_str().to_owned();
+        p.push(suffix);
+        std::fs::symlink_metadata(PathBuf::from(p)).is_ok()
+    };
+    !sidecar("-wal") && !sidecar("-shm")
+}
+
+/// `file:<canonical path>?mode=ro&immutable=1`, every byte outside `[A-Za-z0-9/._~-]`
+/// percent-encoded, so no character of the path can add a URI parameter.
+pub(crate) fn immutable_uri(path: &Path) -> String {
+    use std::fmt::Write;
+    use std::os::unix::ffi::OsStrExt;
+    let mut uri = String::from("file:");
+    for &b in path.as_os_str().as_bytes() {
+        if b.is_ascii_alphanumeric() || matches!(b, b'/' | b'.' | b'_' | b'~' | b'-') {
+            uri.push(char::from(b));
+        } else {
+            let _ = write!(uri, "%{b:02X}");
+        }
+    }
+    uri.push_str("?mode=ro&immutable=1");
+    uri
+}
+
 /// The authorizer decision (pure, unit-tested).
 pub(crate) fn authorize(
     read_only: bool,
@@ -547,6 +587,8 @@ struct Worker {
     privileged: Arc<AtomicBool>,
     /// The user execution running now, read by the progress handler.
     current: Arc<Mutex<Option<Arc<ExecState>>>>,
+    /// Delivered with the first result of the session (an immutable WAL open).
+    startup_notice: std::cell::Cell<Option<Notice>>,
 }
 
 impl Worker {
@@ -564,21 +606,44 @@ impl Worker {
                 map_error(other, read_only)
             )),
         };
+        let mut startup_notice = None;
         let conn = match target {
             Target::File { path, create } => {
                 let real = resolve_path(path, *create && !read_only)?;
-                // Never `SQLITE_OPEN_URI`: the path is absolute, so it is never read as a
-                // `file:` URI even with the bundled build's `SQLITE_USE_URI`.
-                let mut flags = OpenFlags::SQLITE_OPEN_NO_MUTEX | OpenFlags::SQLITE_OPEN_NOFOLLOW;
-                if read_only {
-                    flags |= OpenFlags::SQLITE_OPEN_READ_ONLY;
+                if read_only && wal_without_sidecars(&real) {
+                    // A plain read-only open of a WAL database would create `-wal` and `-shm`
+                    // next to it (I4, review M1). With neither present no writer is active and
+                    // the file holds every committed page: open it immutable, through a URI the
+                    // driver builds from the canonical path (user text is never a URI).
+                    tracing::warn!("WAL database without -wal / -shm: opened immutable");
+                    startup_notice = Some(Notice::new(
+                        NoticeSeverity::Warning,
+                        "this WAL-mode database is opened immutable so that no -wal or -shm file \
+                         is created next to it: if another program writes to it while this \
+                         session is open, results may be stale or fail with SQLITE_CORRUPT \
+                         (the file itself is never modified)",
+                    ));
+                    let flags = OpenFlags::SQLITE_OPEN_READ_ONLY
+                        | OpenFlags::SQLITE_OPEN_URI
+                        | OpenFlags::SQLITE_OPEN_NO_MUTEX
+                        | OpenFlags::SQLITE_OPEN_NOFOLLOW;
+                    Connection::open_with_flags(immutable_uri(&real), flags)
+                        .map_err(|e| open_err(&e))?
                 } else {
-                    flags |= OpenFlags::SQLITE_OPEN_READ_WRITE;
-                    if *create {
-                        flags |= OpenFlags::SQLITE_OPEN_CREATE;
+                    // Never `SQLITE_OPEN_URI`: the path is absolute, so it is never read as a
+                    // `file:` URI even with the bundled build's `SQLITE_USE_URI`.
+                    let mut flags =
+                        OpenFlags::SQLITE_OPEN_NO_MUTEX | OpenFlags::SQLITE_OPEN_NOFOLLOW;
+                    if read_only {
+                        flags |= OpenFlags::SQLITE_OPEN_READ_ONLY;
+                    } else {
+                        flags |= OpenFlags::SQLITE_OPEN_READ_WRITE;
+                        if *create {
+                            flags |= OpenFlags::SQLITE_OPEN_CREATE;
+                        }
                     }
+                    Connection::open_with_flags(&real, flags).map_err(|e| open_err(&e))?
                 }
-                Connection::open_with_flags(&real, flags).map_err(|e| open_err(&e))?
             }
             Target::Memory => {
                 // A private in-memory database (never a shared cache); read-only sessions
@@ -600,6 +665,7 @@ impl Worker {
             epoch: Instant::now(),
             privileged: Arc::new(AtomicBool::new(false)),
             current: Arc::new(Mutex::new(None)),
+            startup_notice: std::cell::Cell::new(startup_notice),
         };
         worker.configure(options).map_err(|e| match e {
             DriverError::ReadOnly(m) => DriverError::ReadOnly(m),
@@ -1074,6 +1140,9 @@ impl Worker {
         let mut header = None;
         let mut warned = vec![false; ncols];
         let mut items: Vec<DriverResult<ResultItem>> = Vec::new();
+        if let Some(n) = self.startup_notice.take() {
+            items.push(Ok(ResultItem::Notice(n)));
+        }
         let max_value = budget.effective_max_value_bytes();
         loop {
             let mut batch: Vec<Vec<Val>> = Vec::new();
@@ -1700,6 +1769,18 @@ mod tests {
         );
         assert!(!params_supported(&[Param::Float(f64::NAN)]));
         assert!(params_supported(&[Param::Text("x".into()), Param::Null]));
+    }
+
+    #[test]
+    fn immutable_uris_are_encoded() {
+        assert_eq!(
+            immutable_uri(Path::new("/tmp/a b/x?mode=rw&vfs=y#%.db")),
+            "file:/tmp/a%20b/x%3Fmode%3Drw%26vfs%3Dy%23%25.db?mode=ro&immutable=1"
+        );
+        assert_eq!(
+            immutable_uri(Path::new("/d/é.db")),
+            "file:/d/%C3%A9.db?mode=ro&immutable=1"
+        );
     }
 
     #[test]

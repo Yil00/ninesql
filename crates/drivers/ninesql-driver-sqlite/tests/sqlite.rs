@@ -1234,3 +1234,47 @@ async fn dropping_stops_a_running_statement() {
     wait_writable(4);
     drop(stream);
 }
+
+/// Review M1 (I4): a read-only session on a WAL database creates no `-wal` / `-shm` file when
+/// none exists (immutable open, with a notice), and opens normally next to a live writer.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn wal_databases_leave_no_file_behind() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("wal db?x=1#.db");
+    {
+        let c = rusqlite::Connection::open(&db).unwrap();
+        let mode: String = c
+            .query_row("PRAGMA journal_mode = WAL", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(mode, "wal");
+        c.execute_batch("CREATE TABLE t (a INTEGER); INSERT INTO t VALUES (1), (2);")
+            .unwrap();
+    }
+    let before = files_in(dir.path());
+    assert_eq!(before.len(), 1, "the last connection removed -wal and -shm");
+    let mut s = connect(ro_params(&db)).await;
+    let o = run(s.as_mut(), "SELECT count(*) FROM t").await.unwrap();
+    assert_eq!(first_i64(&o), Some(2));
+    assert!(
+        matches!(o.items.first(), Some(ResultItem::Notice(n)) if n.message.contains("immutable"))
+    );
+    for sql in ["INSERT INTO t VALUES (3)", "PRAGMA journal_mode = DELETE"] {
+        assert!(matches!(
+            run(s.as_mut(), sql).await,
+            Err(DriverError::ReadOnly(_))
+        ));
+    }
+    let o = run(s.as_mut(), "SELECT count(*) FROM t").await.unwrap();
+    assert!(!o.items.iter().any(|i| matches!(i, ResultItem::Notice(_))));
+    assert_eq!(files_in(dir.path()), before, "a file changed or appeared");
+    s.close().await.unwrap();
+    assert_eq!(files_in(dir.path()), before, "a file changed or appeared");
+    // A live writer: -wal and -shm exist, the session opens normally and sees its commits.
+    let writer = rusqlite::Connection::open(&db).unwrap();
+    writer.execute("INSERT INTO t VALUES (3)", []).unwrap();
+    let mut s = connect(ro_params(&db)).await;
+    let o = run(s.as_mut(), "SELECT count(*) FROM t").await.unwrap();
+    assert_eq!(first_i64(&o), Some(3));
+    assert!(!o.items.iter().any(|i| matches!(i, ResultItem::Notice(_))));
+    s.close().await.unwrap();
+}
