@@ -1,6 +1,6 @@
 # Engine capabilities
 
-The human-readable mirror of each driver's `Capabilities` ([ADR-0004](adr/0004-driver-api-runtime-and-results.md)). The UI only offers what a driver declares (I8). **Nothing is implemented yet**: the tables below are the plan. A driver PR updates its row with what its integration tests prove.
+The human-readable mirror of each driver's `Capabilities` ([ADR-0004](adr/0004-driver-api-runtime-and-results.md)). The UI only offers what a driver declares (I8). The capability model exists (P0-B); **no driver is implemented yet**: the engine tables below are the plan. A driver PR updates its row with what its integration tests prove.
 
 Legend: ✅ supported · ◐ partial (see note) · ❌ not supported by the engine · 🗓 planned · — not applicable.
 
@@ -61,7 +61,7 @@ The mock driver (feature `mock` of `ninesql-driver-api`, engine id `mock`) decla
 | `cassandra` | Apache Cassandra | cassandra | 9042 | `cassandra` | heavy | v0.4 |
 | `neo4j` | Neo4j Community | neo4j | 7687 (Bolt) | `neo4j` | heavy | v0.4 |
 
-Ports in `dev/` are remapped to avoid clashes; [`dev/engines.json`](../dev/engines.json) is authoritative for host ports, pinned images and dev credentials. Image names, default ports and the InfluxDB 3 tag were verified in P0-C: every image above starts and loads the "nine" dataset ([dev/README.md](../dev/README.md)).
+Ports in `dev/` are remapped to avoid clashes; [`dev/engines.json`](../dev/engines.json) is authoritative for host ports, pinned images and dev credentials. Image names, default ports and the InfluxDB 3 tag were verified in P0-C: every image above started and loaded the "nine" dataset locally ([dev/README.md](../dev/README.md)), with two caveats: YugabyteDB and Elasticsearch reached ready only with a local disk override that is not committed, and the heavy profile was not re-run as a whole after the last Cassandra changes. The dev-environment CI job has not run yet ([ROADMAP](ROADMAP.md#phase-0-follow-ups)).
 
 ## Read-only mechanism (ADR-0007, I3)
 | Engine | Planned engine-side mechanism | Status |

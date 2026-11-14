@@ -25,6 +25,10 @@
    | `kind` | Slot kind |
 
    Slots: `auth` (database password or token), `ssh` (SSH password or key passphrase), `ssh-jump-N` (the same for jump host N), `tls-client-key` (TLS client key passphrase). The workspace secret reference of ADR-0005 point 3 carries the `secret_id`.
+
+   Reserved for later: `proxy` (proxy password, `SecretKind::ProxyPassword`; proxy support is F-CON-07, phase 8). No code writes this slot yet.
+
+   *Clarification added after P0-D (2026-11-14): the `proxy` slot name is reserved so that the proxy work does not invent another one. It does not change the decision; no other point of this ADR was edited.*
 5. The workspace **`rust-version` becomes 1.89** (root `Cargo.toml`). The toolchain stays `stable` (`rust-toolchain.toml` unchanged): 1.89 is the floor that contributors and anyone building from source must have, not the version CI builds with.
 
 ## Consequences
