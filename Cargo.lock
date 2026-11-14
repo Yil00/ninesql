@@ -4582,7 +4582,6 @@ dependencies = [
  "proptest",
  "rand 0.10.3",
  "russh",
- "rustix",
  "secrecy",
  "sha1",
  "sha2 0.11.0",
