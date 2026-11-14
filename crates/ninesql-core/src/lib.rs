@@ -2,18 +2,30 @@
 //! the UI (ADR-0004). ROADMAP: P0-D (connection model, workspace), P1-D, P3-C.
 #![forbid(unsafe_code)]
 
+pub mod connect;
 pub mod connection;
 pub mod connection_type;
 mod error;
 pub mod properties;
+pub mod registry;
+pub mod runtime;
+pub mod session;
 pub mod workspace;
 
+pub use connect::SecretPrompt;
 pub use connection::{
     Auth, ClientCertificate, Connection, ConnectionId, Endpoint, EngineId, HostKeyPolicy, Origin,
     SecretSlot, SecretSource, SecurityWarning, SshAuth, SshHop, SshTunnel, TlsConfig, TlsMode,
 };
 pub use connection_type::{Color, ConnectionType, ConnectionTypeId, ConnectionTypes, SafetyPolicy};
-pub use error::{ConnectionError, WorkspaceError};
+pub use error::{ConnectionError, CoreError, WorkspaceError};
+pub use registry::DriverRegistry;
+pub use runtime::DriverRuntime;
+pub use session::{
+    CloseReason, ConfirmReason, ConfirmationRequest, ConfirmationToken, CoreEvent, ExecEvent,
+    ExecuteRequest, Execution, KnownHostsFiles, ManagerConfig, Next, OpenOutcome, OpenRequest,
+    Reply, SessionHandle, SessionId, SessionInfo, SessionManager, SessionWarning, TransactionState,
+};
 pub use workspace::{
     ConnectionTypesFile, Connections, ConnectionsFile, LoadIssue, LoadedConnections, ProjectFile,
     ProjectId, Workspace,

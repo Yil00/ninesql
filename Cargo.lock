@@ -4490,6 +4490,7 @@ checksum = "650eef8c711430f1a879fdd01d4745a7deea475becfb90269c06775983bbf086"
 name = "ninesql-core"
 version = "0.0.0"
 dependencies = [
+ "async-trait",
  "ninesql-dbeaver",
  "ninesql-driver-api",
  "ninesql-secrets",
@@ -4502,6 +4503,7 @@ dependencies = [
  "serde_json",
  "tempfile",
  "thiserror 2.0.21",
+ "tokio",
  "tracing",
  "uuid",
  "zeroize",

@@ -93,3 +93,62 @@ pub enum WorkspaceError {
     #[error(transparent)]
     Secrets(#[from] ninesql_secrets::SecretError),
 }
+
+/// Error of the driver runtime, the connect flow and sessions (P1-D). User-presentable: no
+/// variant carries a secret, a parameter value, a result value or query text.
+#[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
+pub enum CoreError {
+    /// No registered driver serves this engine.
+    #[error("no driver is available for the engine `{0}`")]
+    NoDriver(String),
+    /// The connection is disabled and cannot be opened.
+    #[error("the connection is disabled")]
+    ConnectionDisabled,
+    /// The connection data is invalid, or uses a property the driver reserves.
+    #[error(transparent)]
+    InvalidConnection(#[from] ConnectionError),
+    /// The endpoint kind is not supported by the driver API yet.
+    #[error("{0}")]
+    UnsupportedEndpoint(&'static str),
+    /// A TCP endpoint without port, for an engine without a known default port.
+    #[error("the connection needs a port: the engine `{0}` has no default port")]
+    PortRequired(String),
+    /// A saved secret could not be read.
+    #[error("cannot read the saved secret for {slot:?}: {source}")]
+    Secret {
+        /// Credential field.
+        slot: SecretSlot,
+        /// What failed (never the value).
+        #[source]
+        source: ninesql_secrets::SecretError,
+    },
+    /// The SSH tunnel could not be opened.
+    #[error(transparent)]
+    Ssh(#[from] ninesql_ssh::SshError),
+    /// The driver failed.
+    #[error(transparent)]
+    Driver(#[from] ninesql_driver_api::DriverError),
+    /// The connect did not finish in time.
+    #[error("the connection timed out after {0:?}")]
+    ConnectTimeout(std::time::Duration),
+    /// The connection must be read-only but the session is not (I3): it was closed at once.
+    #[error(
+        "the connection must be read-only, but the driver did not report a read-only session; it was closed"
+    )]
+    ReadOnlyNotEnforced,
+    /// The previous statement was cancelled and the server has not confirmed its end yet.
+    #[error(
+        "the previous statement is still being cancelled; try again when the server confirms it stopped"
+    )]
+    StillCancelling,
+    /// A confirmation token that does not match this statement, this session, or was used.
+    #[error("the confirmation does not match this statement; confirm it again")]
+    InvalidConfirmation,
+    /// The session is closed or its task ended.
+    #[error("the session is closed")]
+    SessionClosed,
+    /// The driver runtime is shut down or failed to start.
+    #[error("driver runtime: {0}")]
+    Runtime(String),
+}
