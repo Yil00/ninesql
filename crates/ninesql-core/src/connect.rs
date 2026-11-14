@@ -381,7 +381,10 @@ fn lock_flights(flights: &Mutex<Flights>) -> std::sync::MutexGuard<'_, Flights> 
 
 /// A copy of a read's outcome for one more waiter. Store errors carry no secret; variants added
 /// later are reported as a backend failure with the same message.
-fn copy_outcome(outcome: &Result<SecretString, SecretError>) -> Result<SecretString, SecretError> {
+fn copy_outcome(
+    outcome: &Result<SecretString, SecretError>,
+    store: StoreKind,
+) -> Result<SecretString, SecretError> {
     match outcome {
         Ok(s) => Ok(SecretString::from(s.expose_secret().to_owned())),
         Err(e) => Err(match e {
@@ -399,7 +402,7 @@ fn copy_outcome(outcome: &Result<SecretString, SecretError>) -> Result<SecretStr
                 detail: detail.clone(),
             },
             other => SecretError::Backend {
-                store: StoreKind::Keyring,
+                store,
                 detail: other.to_string(),
             },
         }),
@@ -472,11 +475,11 @@ impl SecretReads {
         let wait = async {
             loop {
                 if let Some(outcome) = rx.borrow_and_update().as_ref() {
-                    return Some(copy_outcome(outcome));
+                    return Some(copy_outcome(outcome, store));
                 }
                 if rx.changed().await.is_err() {
                     // The task ended: with a value sent just before, or by a panic.
-                    return rx.borrow().as_ref().map(copy_outcome);
+                    return rx.borrow().as_ref().map(|o| copy_outcome(o, store));
                 }
             }
         };

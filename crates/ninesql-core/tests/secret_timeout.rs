@@ -68,8 +68,11 @@ impl SecretStore for SlowStore {
         StoreKind::Keyring
     }
 
-    fn get(&self, _id: &SecretId) -> Result<SecretString, SecretError> {
+    fn get(&self, id: &SecretId) -> Result<SecretString, SecretError> {
         *self.calls.lock().unwrap() += 1;
+        if id.as_str().ends_with(":fast") {
+            return Ok(SecretString::from("F4st-Answer".to_owned()));
+        }
         match self.mode {
             Mode::Panic => panic!("simulated failure inside the secret store client"),
             Mode::Delay(d) => std::thread::sleep(d),
@@ -458,5 +461,42 @@ fn several_fields_share_one_deadline() {
     });
     assert_eq!(store.calls(), 2);
     assert_eq!(stats.connects(), 0);
+    manager.shutdown(Duration::from_secs(5));
+}
+
+#[test]
+fn another_secret_resolves_while_one_hangs() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mock = MockDriver::new();
+    let stats = mock.stats();
+    let store = SlowStore::new(Mode::Hang);
+    let manager = manager_with_stores(
+        Arc::new(mock),
+        tmp.path(),
+        stores_with(store.clone()),
+        |c| c.secret_timeout = Duration::from_secs(30),
+    );
+    let types = ConnectionTypes::default();
+    ui(async {
+        let hanging = manager.open(OpenRequest::new(saved_password_connection(), &types));
+        wait_until("hanging read started", || store.calls() == 1).await;
+        // Below the cap, a different secret is read and the open completes meanwhile.
+        let outcome = open(
+            &manager,
+            OpenRequest::new(saved_password_connection_with("mock:fast"), &types),
+        )
+        .await
+        .unwrap();
+        assert!(
+            matches!(outcome, ninesql_core::OpenOutcome::Opened(_)),
+            "{outcome:?}"
+        );
+        assert_eq!(store.calls(), 2);
+        assert_eq!(stats.connects(), 1);
+        store.release();
+        let _ = tokio::time::timeout(Duration::from_secs(10), hanging)
+            .await
+            .unwrap();
+    });
     manager.shutdown(Duration::from_secs(5));
 }
