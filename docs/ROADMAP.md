@@ -71,6 +71,17 @@ Items deferred by the phase 0 security reviews and spikes. The deadline is when 
 
 **Exit criterion**: from a clean install, create a PostgreSQL connection over SSH with `verify-full` TLS, password in the keyring; connect; restart NineSQL; reconnect without retyping; `grep` finds no password under `$XDG_*/ninesql`. Same for MySQL, MariaDB and SQLite. A read-only session rejects a write engine-side.
 
+### Phase 1 follow-ups
+Items deferred by phase 1 decisions and reviews. The deadline is when the item must have landed.
+
+| Origin | Item | Must land |
+|---|---|---|
+| ADR-0016 | Enable RSA support (russh `rsa` feature) once a russh release depends on `rsa` ≥ 0.10.0 (RUSTSEC-2023-0071), with a `security-reviewer` review | When such a russh release exists; checked at each phase-end review |
+| ADR-0016 | Add a `HostKeyVerification::AcceptNew` variant to the driver API so `TunnelInfo` stops reporting `AcceptNew` as `Disabled` (frozen API: own reviewed PR) | Before P1-C exposes host-key policies |
+| ADR-0016 | Per-hop host-key policy field in the `ninesql-core` connection model (`SshHop`) | P1-D |
+| ADR-0015 | Consider `include-dev = true` in the `[licenses]` section of `deny.toml` so test-only crates are license-checked | P1 |
+| P1 review | SHA-pin the actions used in `.github/workflows/codeql.yml` | P1 |
+
 ## Phase 2 – DBeaver import
 *Objective: a DBeaver user switches in one click.*
 
