@@ -49,8 +49,19 @@ fn is_space(b: u8) -> bool {
 /// same length, with the same character boundaries at every token edge.
 #[must_use]
 pub fn lexer_view(text: &str) -> String {
+    scan(text, |_| {}).0
+}
+
+/// The scanner behind [`lexer_view`]; `on_word` receives every bare identifier or keyword token
+/// in code (never text inside strings, quoted or bracketed identifiers, variables or comments).
+/// The flag is `true` when the text is incomplete for SQLite: it ends inside an unterminated
+/// token (string, quoted or bracketed identifier, block comment, variable parentheses), or its
+/// parentheses in code do not balance.
+fn scan(text: &str, mut on_word: impl FnMut(&str)) -> (String, bool) {
     let src = text.as_bytes();
     let mut out = src.to_vec();
+    let mut unterminated = false;
+    let mut depth: i64 = 0;
     let mut i = 0;
     while i < src.len() {
         let c = src[i];
@@ -114,6 +125,8 @@ pub fn lexer_view(text: &str) -> String {
                         }
                         if i < src.len() && src[i] == b')' {
                             i += 1;
+                        } else {
+                            unterminated = true;
                         }
                         for b in &mut out[open..i] {
                             *b = b'_';
@@ -128,17 +141,36 @@ pub fn lexer_view(text: &str) -> String {
                 }
             }
             _ if c.is_ascii_alphanumeric() || c == b'_' || c >= 0x80 => {
+                let start = i;
                 while i < src.len()
                     && (is_id_char(src[i]) || (c.is_ascii_digit() && src[i] == b'.'))
                 {
                     i += 1;
                 }
+                if !c.is_ascii_digit() {
+                    // Token edges are ASCII or the text's ends: always char boundaries.
+                    if let Some(w) = text.get(start..i) {
+                        on_word(w);
+                    }
+                }
+            }
+            b'(' => {
+                depth += 1;
+                i += 1;
+            }
+            b')' => {
+                depth -= 1;
+                unterminated |= depth < 0;
+                i += 1;
             }
             _ => i += 1,
         }
     }
+    // An unterminated token runs to the end and steps past it.
+    unterminated |= i > src.len() || depth != 0;
     // Only whole tokens were rewritten with ASCII bytes; fall back to the original otherwise.
-    String::from_utf8(out).unwrap_or_else(|_| text.to_owned())
+    let view = String::from_utf8(out).unwrap_or_else(|_| text.to_owned());
+    (view, unterminated)
 }
 
 /// `true` when `text` starts (after blanks, comments and opening parentheses) with `WITH`.
@@ -160,12 +192,30 @@ fn starts_with_with(view: &str) -> bool {
         && !rest.as_bytes().get(4).copied().is_some_and(is_id_char)
 }
 
-/// `true` when a DML keyword appears anywhere in `text`, strings and comments included.
+/// `true` when a DML keyword is a whole token in code, as SQLite's tokenizer reads the raw
+/// text: a bare word bounded by non-identifier characters (`is_id_char`: so `updated_at` is
+/// not `UPDATE`), outside strings, quoted identifiers, variables and comments (so
+/// `SELECT 'delete'` is not a write). This is a second, independent tokenization: the shared
+/// lexer never sees it.
+///
+/// Incomplete text (an unterminated token or unbalanced parentheses: SQLite refuses it, so
+/// nothing would run) falls back to whole words anywhere in the raw text, strings and comments
+/// included.
 fn mentions_dml(text: &str) -> bool {
-    let upper = text.to_ascii_uppercase();
-    ["INSERT", "UPDATE", "DELETE", "REPLACE"]
-        .iter()
-        .any(|w| upper.contains(w))
+    let is_dml = |w: &str| {
+        ["INSERT", "UPDATE", "DELETE", "REPLACE"]
+            .iter()
+            .any(|k| w.eq_ignore_ascii_case(k))
+    };
+    let mut found = false;
+    let (_, unterminated) = scan(text, |w| found |= is_dml(w));
+    found
+        || (unterminated
+            && text
+                .split(|c: char| {
+                    !(c.is_ascii_alphanumeric() || c == '_' || c == '$' || !c.is_ascii())
+                })
+                .any(is_dml))
 }
 
 /// Pragmas that only read the schema, with an argument (`PRAGMA table_info(t)`) or as the
@@ -465,6 +515,44 @@ mod tests {
         }
     }
 
+    /// Re-review follow-up: the `WITH` safety net matches whole DML tokens in code only.
+    #[test]
+    fn with_safety_net_matches_whole_tokens_in_code() {
+        let d = SqliteDialect;
+        for sql in [
+            "WITH x AS (SELECT updated_at FROM t) SELECT * FROM x",
+            "WITH x AS (SELECT 1) SELECT 'delete' FROM x",
+            "WITH x AS (SELECT 1) SELECT \"insert\", [replace], $v FROM x -- delete",
+            "WITH x AS (SELECT inserted, deleted_by, x_update FROM t) SELECT * FROM x",
+        ] {
+            assert_eq!(d.classify(sql), StatementClass::Read, "{sql}");
+        }
+        assert!(mentions_dml("WITH x AS (SELECT 1) DeLeTe FROM t"));
+        assert!(mentions_dml(
+            "WITH x AS (SELECT $a(')) delete FROM t WHERE b <> '--'"
+        ));
+        assert!(!mentions_dml(
+            "SELECT 'update', updated FROM t /* insert */"
+        ));
+        // Unterminated text: whole words anywhere.
+        assert!(mentions_dml(
+            "WITH c AS (SELECT ') INSERT INTO t VALUES (1)"
+        ));
+        assert!(!mentions_dml("WITH c AS (SELECT ') SELECT updated_at"));
+        assert!(mentions_dml(
+            "WITH c AS (SELECT `) INSERT INTO t VALUES (1) `"
+        ));
+        assert!(!mentions_dml("WITH c AS (SELECT (1)) SELECT 'insert'"));
+    }
+
+    thread_local! {
+        static ORACLE: rusqlite::Connection = {
+            let c = rusqlite::Connection::open_in_memory().unwrap();
+            c.execute_batch("CREATE TABLE t (a, b)").unwrap();
+            c
+        };
+    }
+
     fn junk() -> impl Strategy<Value = String> {
         let frag = prop::sample::select(vec![
             "$a(", ":a(", "@a(", "#a(", "$a::b(", "'", "\"", "`", "[", "]", ")", "(", "--", "/*",
@@ -489,7 +577,19 @@ mod tests {
         ) {
             let sql = format!("WITH c AS (SELECT {j}) {dml} {tail}");
             let class = SqliteDialect.classify(&sql);
-            prop_assert!(class > StatementClass::Session, "{} -> {:?}", sql, class);
+            // SQLite is the oracle: junk can comment out or quote the DML, or leave the text
+            // incomplete, and then nothing writes. Whenever SQLite compiles a statement that
+            // writes, the classifier must not call it a read.
+            let writes = ORACLE.with(|c| match c.prepare(&sql) {
+                Ok(st) => !st.readonly(),
+                Err(_) => false,
+            });
+            if writes {
+                prop_assert!(class > StatementClass::Session, "{} -> {:?}", sql, class);
+            }
+            // Without junk the DML is always the main statement.
+            let clean = format!("WITH c AS (SELECT 1) {dml}");
+            prop_assert!(SqliteDialect.classify(&clean) > StatementClass::Session);
         }
 
         #[test]
