@@ -43,6 +43,9 @@ pub enum IssueKind {
     TlsConverted,
     /// The SSH host key is not trusted on import: the first connection asks (ADR-0011 §6).
     SshHostKeyToConfirm,
+    /// An SSH private key file is RSA by its name, or its type cannot be told without reading
+    /// it: NineSQL refuses RSA key files (ADR-0016 §1.2).
+    SshKeyType,
     /// Saved credentials could not be read or matched.
     Credentials,
     /// A data-sources file could not be read or parsed.
