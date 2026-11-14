@@ -28,6 +28,8 @@ rustix = { workspace = true, features = ["time"] }
 # Only to enable `aes/zeroize` (feature unification) for the AES-128 key schedule that
 # secret-service keeps in its cbc Encryptor / Decryptor.
 aes = { workspace = true, optional = true }
+# Session-bus connection with a method timeout for secret-service (same zbus 6).
+zbus = { workspace = true, optional = true }
 
 [features]
 default = []
@@ -37,7 +39,7 @@ memory-store = []
 # Freedesktop Secret Service backend (pure-Rust zbus 6 client, Rust crypto). Needs Rust >= 1.89.
 # Off by default until the review of secret-service 6.0.0-rc.1 (ROADMAP, P0-D review L5) and the
 # desktop round trip (ADR-0012) are closed.
-secret-service = ["dep:secret-service", "dep:aes"]
+secret-service = ["dep:secret-service", "dep:aes", "dep:zbus"]
 
 [dev-dependencies]
 serde_json.workspace = true

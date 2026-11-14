@@ -32,6 +32,10 @@
 //! - The Argon2 working memory (64 MiB by default) is allocated here, fallibly (an allocation
 //!   failure is [`VaultError::OutOfMemory`], not an abort), and zeroized after each derivation
 //!   (the `argon2` crate does not wipe the memory it allocates itself).
+//! - Upstream report items for `argon2` 0.6: besides not wiping its own block memory
+//!   (`fill_blocks`, worked around above), its final `blake2b_long` step leaves a 64-byte copy
+//!   whose first 32 bytes are the derived key in its own stack frame, which NineSQL cannot
+//!   reach to wipe.
 //! - Plaintext payload buffers are [`Zeroizing`] and allocated with their final capacity, so
 //!   encoding and in-place encryption never reallocate and leave a copy behind.
 //! - While unlocked, the key and the decrypted entries ([`SecretString`]) stay in memory;
@@ -870,7 +874,9 @@ fn derive_key(
         .try_reserve_exact(blocks)
         .map_err(|_| VaultError::OutOfMemory(kdf.m_cost_kib))?;
     memory.resize(blocks, Block::default());
-    // Allocated (zero) before the derivation writes into it: the key never sits on the stack.
+    // Allocated (zero) before the derivation writes into it: NineSQL's code never holds the key
+    // on the stack. Upstream caveat (argon2 0.6, to report): its final `blake2b_long` step
+    // leaves a 64-byte buffer whose first 32 bytes are the key in its own stack frame, unwiped.
     let mut key: Key = Box::new(Zeroizing::new([0u8; KEY_LEN]));
     argon
         .hash_password_into_with_memory(

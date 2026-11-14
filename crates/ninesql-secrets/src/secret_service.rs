@@ -90,8 +90,21 @@
 //!
 //! Calls block the current thread (zbus runs its own executor); run them on a blocking thread,
 //! never on the GPUI foreground.
+//!
+//! # Timeouts
+//! zbus 6 sets no method-call timeout by default, so a provider that never replies would block a
+//! call forever. Every connection this backend opens sets one ([`METHOD_TIMEOUT`], 25 s, the
+//! usual `dbus-daemon` reply timeout); a call that runs out is [`SecretError::Unavailable`]. The
+//! startup probe is bounded separately ([`PROBE_TIMEOUT`], 5 s, see [`crate::detect_secret_service`]).
+//! A call that has to wait for an unlock **prompt** waits for the prompt's `Completed` signal,
+//! which is not a method call: the user may take any time. The core should therefore run store
+//! calls with its own timeout or cancel path (for example `tokio::time::timeout` around
+//! `spawn_blocking`) and map a `JoinError` (a panic inside the client) to
+//! [`SecretError::Unavailable`].
 
 use std::collections::HashMap;
+use std::sync::mpsc;
+use std::time::Duration;
 
 use secrecy::{ExposeSecret, SecretString};
 use secret_service::EncryptionType;
@@ -112,6 +125,11 @@ const ATTR_PROJECT: &str = "project";
 const ATTR_SECRET_ID: &str = "secret_id";
 const ATTR_CONNECTION_ID: &str = "connection_id";
 const ATTR_KIND: &str = "kind";
+
+/// Timeout of each D-Bus method call to the Secret Service.
+pub const METHOD_TIMEOUT: Duration = Duration::from_secs(25);
+/// Longest wait for [`crate::detect_secret_service`].
+pub const PROBE_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// [`SecretStore`] backed by the freedesktop Secret Service, scoped to one workspace project.
 #[derive(Debug, Clone)]
@@ -156,8 +174,16 @@ impl SecretServiceStore {
         Ok(items)
     }
 
+    /// A session-bus connection with [`METHOD_TIMEOUT`] on every method call, then an encrypted
+    /// (Diffie-Hellman) Secret Service session on it.
     fn connect<'a>() -> Result<SecretService<'a>, SecretError> {
-        SecretService::connect(EncryptionType::Dh).map_err(map_error)
+        let conn = zbus::block_on(
+            zbus::connection::Builder::session()
+                .method_timeout(METHOD_TIMEOUT)
+                .build(),
+        )
+        .map_err(|e| map_error(e.into()))?;
+        SecretService::connect_with_existing(EncryptionType::Dh, conn).map_err(map_error)
     }
 
     /// The item to read under `id`: the only one, or among duplicates the single one that
@@ -200,26 +226,50 @@ impl SecretServiceStore {
 /// `default` collection alias. Transfers no secret and triggers no unlock prompt (but may
 /// D-Bus-activate a provider, see the module documentation).
 ///
-/// Runs on a thread of its own so that a panic inside `secret-service` (item 5 of the review)
-/// becomes `Unavailable` instead of unwinding into the caller.
+/// Runs on a thread of its own and waits at most [`PROBE_TIMEOUT`]: a panic inside
+/// `secret-service` (item 5 of the review) or a provider that does not answer in time becomes
+/// `Unavailable` instead of unwinding into, or blocking, the caller.
 pub(crate) fn probe() -> crate::backend::SecretServiceAvailability {
+    probe_with(probe_on_this_thread, PROBE_TIMEOUT)
+}
+
+/// Runs `probe` on a new thread and waits for it at most `timeout`. On timeout the thread is
+/// left detached (one per call; the core probes once per startup) and finishes or stays blocked
+/// on its own, holding no secret.
+fn probe_with<F>(probe: F, timeout: Duration) -> crate::backend::SecretServiceAvailability
+where
+    F: FnOnce() -> crate::backend::SecretServiceAvailability + Send + 'static,
+{
     use crate::backend::SecretServiceAvailability as A;
-    let joined = std::thread::Builder::new()
-        .name("ninesql-secret-service-probe".into())
-        .spawn(probe_on_this_thread)
-        .map_err(|e| {
-            tracing::warn!(error = %e, "could not start the Secret Service probe");
-            "could not start the Secret Service probe"
-        })
-        .and_then(|handle| {
-            handle.join().map_err(|_| {
-                tracing::warn!("the Secret Service probe panicked; using the encrypted vault");
-                "the Secret Service client failed unexpectedly"
-            })
-        });
-    joined.unwrap_or_else(|detail| A::Unavailable {
+    let unavailable = |detail: &str| A::Unavailable {
         detail: detail.to_owned(),
-    })
+    };
+    let (tx, rx) = mpsc::sync_channel(1);
+    let spawned = std::thread::Builder::new()
+        .name("ninesql-secret-service-probe".into())
+        .spawn(move || {
+            // The receiver is gone after a timeout: nothing left to report to.
+            let _ = tx.send(probe());
+        });
+    if let Err(e) = spawned {
+        tracing::warn!(error = %e, "could not start the Secret Service probe");
+        return unavailable("could not start the Secret Service probe");
+    }
+    match rx.recv_timeout(timeout) {
+        Ok(result) => result,
+        Err(mpsc::RecvTimeoutError::Timeout) => {
+            tracing::warn!(
+                timeout_s = timeout.as_secs_f32(),
+                "the Secret Service did not answer in time; using the encrypted vault"
+            );
+            unavailable("timed out")
+        }
+        Err(mpsc::RecvTimeoutError::Disconnected) => {
+            // The sender was dropped without a result: the probe panicked.
+            tracing::warn!("the Secret Service probe panicked; using the encrypted vault");
+            unavailable("the Secret Service client failed unexpectedly")
+        }
+    }
 }
 
 fn probe_on_this_thread() -> crate::backend::SecretServiceAvailability {
@@ -773,6 +823,30 @@ mod tests {
     /// Without any Secret Service provider the store reports itself unavailable instead of
     /// failing silently or panicking. Opt-in: run under `dbus-run-session` with
     /// `NINESQL_TEST_EXPECT_NO_SECRET_SERVICE=1`.
+    #[test]
+    fn probe_timeout_panic_and_success_paths() {
+        use crate::backend::SecretServiceAvailability as A;
+        let slow = probe_with(
+            || {
+                std::thread::sleep(Duration::from_secs(2));
+                A::Available
+            },
+            Duration::from_millis(50),
+        );
+        assert_eq!(
+            slow,
+            A::Unavailable {
+                detail: "timed out".into()
+            }
+        );
+        let panicked = probe_with(|| panic!("probe panics"), Duration::from_secs(5));
+        assert!(matches!(panicked, A::Unavailable { .. }), "{panicked:?}");
+        assert_eq!(
+            probe_with(|| A::Available, Duration::from_secs(5)),
+            A::Available
+        );
+    }
+
     #[test]
     fn reports_unavailable_without_provider() {
         if std::env::var_os("DBUS_SESSION_BUS_ADDRESS").is_none()

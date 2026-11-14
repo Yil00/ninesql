@@ -37,8 +37,10 @@ impl SecretServiceAvailability {
     }
 }
 
-/// Probes the session bus for a Secret Service provider (blocking; opens an encrypted session,
-/// reads the `default` collection alias, transfers no secret, triggers no prompt).
+/// Probes the session bus for a Secret Service provider (blocking for at most 5 s; opens an
+/// encrypted session, reads the `default` collection alias, transfers no secret, triggers no
+/// prompt). A provider that does not answer within 5 s, or a failure inside the client, is
+/// reported as `Unavailable`.
 #[must_use]
 pub fn detect_secret_service() -> SecretServiceAvailability {
     #[cfg(feature = "secret-service")]

@@ -46,6 +46,9 @@ toml = "0.8"
 uuid = { version = "1", features = ["v4", "serde"] }
 secrecy = "0.10"
 secret-service = { version = "=6.0.0-rc.1", default-features = false, features = ["rt-default", "crypto-rust"] }
+# Same zbus 6 as secret-service pulls in: only to build its session connection with a method
+# timeout (zbus 6 has none by default).
+zbus = { version = "6", default-features = false, features = ["default-rt", "proxy"] }
 # Encrypted vault (P1-D, ADR-0005 §2): RustCrypto crates only, versions aligned with the ones
 # russh already pulls in (argon2 0.6, chacha20 0.10, aead 0.6, getrandom 0.4).
 argon2 = { version = "0.6", default-features = false, features = ["alloc", "zeroize"] }
