@@ -35,7 +35,8 @@
 //!
 //! Deleting removes every item stored under the id in this project, duplicates included; it
 //! fails only if the default-collection item (the one reads use) could not be deleted, or if
-//! nothing could be deleted.
+//! nothing could be deleted. If the default collection cannot be looked up, every item is
+//! treated as non-default and deletion still proceeds.
 //!
 //! Calls block the current thread (zbus runs its own executor); run them on a blocking thread,
 //! never on the GPUI foreground.
@@ -254,13 +255,18 @@ impl SecretStore for SecretServiceStore {
         if items.is_empty() {
             return Ok(false);
         }
-        let in_default: Vec<String> = ss
-            .get_default_collection()
-            .and_then(|c| {
-                c.search_items(self.lookup(id))
-                    .map(|found| found.iter().map(|i| i.item_path.to_string()).collect())
-            })
-            .map_err(map_error)?;
+        // Without the default collection (no `default` alias, lookup failure) every item is
+        // treated as non-default and still deleted: a failed lookup must not keep secrets.
+        let in_default: Vec<String> = match ss.get_default_collection().and_then(|c| {
+            c.search_items(self.lookup(id))
+                .map(|found| found.iter().map(|i| i.item_path.to_string()).collect())
+        }) {
+            Ok(paths) => paths,
+            Err(e) => {
+                tracing::warn!(id = %id, error = %map_error(e), "cannot look up the default secret collection; deleting every item under the id");
+                Vec::new()
+            }
+        };
         let flagged: Vec<(&Item<'_>, bool)> = items
             .iter()
             .map(|item| (item, in_default.contains(&item.item_path.to_string())))

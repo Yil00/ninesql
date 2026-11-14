@@ -225,7 +225,7 @@ fn secret_pair(lower: &str) -> bool {
         }
         // Key: back over spaces and one closing quote, then key characters.
         let mut k = i;
-        while k > 0 && chars[k - 1] == ' ' {
+        while k > 0 && chars[k - 1].is_whitespace() {
             k -= 1;
         }
         if k > 0 && matches!(chars[k - 1], '"' | '\'') {
@@ -238,11 +238,15 @@ fn secret_pair(lower: &str) -> bool {
         let key: String = chars[k..key_end].iter().collect();
         // Value: over spaces and one opening quote, up to a delimiter.
         let mut v = i + 1;
-        while v < chars.len() && chars[v] == ' ' {
+        while v < chars.len() && chars[v].is_whitespace() {
             v += 1;
         }
         if v < chars.len() && matches!(chars[v], '"' | '\'') {
             v += 1;
+            // Inside quotes, leading whitespace is part of the value: skip it to reach the rest.
+            while v < chars.len() && chars[v].is_whitespace() {
+                v += 1;
+            }
         }
         let value: String = chars[v..]
             .iter()
@@ -507,6 +511,13 @@ mod tests {
             "x=1&client_secret=abc",
             // Fails closed like the key rule (the key `token_type` is refused as a property too).
             "token_type=bearer",
+            // Follow-up review N-2: any whitespace around the separator and inside quotes.
+            "password\t=x",
+            "api_key=\tabc",
+            "token\n: abc",
+            "password = \" Hunter2\"",
+            "secret\u{a0}=\u{a0}abc",
+            "Password\r\n=\r\nHunter2",
             // Oracle thin URL with credentials.
             "jdbc:oracle:thin:scott/tiger@db:1521/orcl",
         ] {
