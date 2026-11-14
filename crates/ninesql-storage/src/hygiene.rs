@@ -21,14 +21,31 @@ const SUSPICIOUS: &[&str] = &[
 /// Keys that suggest a secret only when they match exactly.
 const SUSPICIOUS_EXACT: &[&str] = &["pwd", "pass", "pin"];
 
+/// Known driver option keys that match the fragments above but never hold a secret (normalized).
+/// Checked before the heuristics so they are not reported, stripped or refused.
+pub const BENIGN_SECRET_LIKE_KEYS: &[&str] = &[
+    // MySQL Connector/J: charset used to encode the password.
+    "passwordcharacterencoding",
+    // PostgreSQL: password hashing method (server setting, also passed as an option).
+    "passwordencryption",
+];
+
+/// Normalizes a key: lower case, without `-`, `_`, `.` and spaces.
+#[must_use]
+pub fn normalize_key(key: &str) -> String {
+    key.chars()
+        .filter(|c| !matches!(c, '-' | '_' | '.' | ' '))
+        .flat_map(char::to_lowercase)
+        .collect()
+}
+
 /// Whether a key name looks like it would hold a secret.
 #[must_use]
 pub fn is_secret_like_key(key: &str) -> bool {
-    let norm: String = key
-        .chars()
-        .filter(|c| *c != '-' && *c != '_' && *c != '.')
-        .flat_map(char::to_lowercase)
-        .collect();
+    let norm = normalize_key(key);
+    if BENIGN_SECRET_LIKE_KEYS.contains(&norm.as_str()) {
+        return false;
+    }
     SUSPICIOUS_EXACT.contains(&norm.as_str()) || SUSPICIOUS.iter().any(|s| norm.contains(s))
 }
 
@@ -89,6 +106,22 @@ mod tests {
     use serde_json::json;
 
     use super::*;
+
+    #[test]
+    fn benign_keys_are_not_secret_like() {
+        for key in ["passwordCharacterEncoding", "password_encryption"] {
+            assert!(!is_secret_like_key(key), "{key}");
+        }
+        for key in [
+            "password",
+            "PASSWORD",
+            "sslpassword",
+            "clientSecret",
+            "api-token",
+        ] {
+            assert!(is_secret_like_key(key), "{key}");
+        }
+    }
 
     #[test]
     fn detects_secret_like_string_values_only() {
