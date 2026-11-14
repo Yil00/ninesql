@@ -55,8 +55,8 @@ pub trait Driver: Send + Sync {
     ///   properties never override TLS / verification, host / port, credentials, read-only /
     ///   access mode, multi-statements, init SQL or lexical modes (reuse
     ///   `conformance::assert_reserved_properties_rejected` in the integration tests); every key
-    ///   the driver refuses is declared in `extra_reserved_properties`, so `ninesql-core`
-    ///   refuses it before saving the connection;
+    ///   the driver refuses is declared in `extra_reserved_properties`, so `ninesql-core` can
+    ///   refuse it before saving the connection (planned with the first driver, P1-B);
     /// - take every connection setting from the typed fields of [`ConnectParams`] and pass them
     ///   to the client as structured options: host, user and database may contain characters
     ///   that matter in a DSN (`;`, `&`, `@`, spaces), so never format them into a connection
