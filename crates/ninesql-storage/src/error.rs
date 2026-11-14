@@ -14,7 +14,7 @@ pub enum StorageError {
     NoHome,
     /// A project name that cannot be used as a directory name.
     #[error(
-        "invalid project name: use 1 to 128 characters, no `/`, `\\`, control characters, leading `.` or trailing space or dot"
+        "invalid project name: use 1 to 128 characters without slashes, backslashes or control characters, not starting with a dot, not ending with a space or a dot"
     )]
     InvalidProjectName,
     /// An I/O failure on a path.
