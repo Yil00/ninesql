@@ -82,6 +82,15 @@ pub struct SqliteSession {
     pub(crate) current_exec: Mutex<Arc<ExecState>>,
 }
 
+/// A session dropped without `close` stops what its thread runs (review M2); the thread then
+/// rolls back and closes the connection once its command channel is gone.
+impl Drop for SqliteSession {
+    fn drop(&mut self) {
+        self.link.shared.closing.store(true, Ordering::SeqCst);
+        self.interrupt.interrupt();
+    }
+}
+
 impl std::fmt::Debug for SqliteSession {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("SqliteSession")
@@ -103,19 +112,41 @@ impl SqliteSession {
         demands: Sender<oneshot::Sender<Chunk>>,
         exec: Arc<ExecState>,
         shared: Arc<Shared>,
+        interrupt: Arc<InterruptHandle>,
     ) -> RawResultStream {
         struct State {
             demands: Option<Sender<oneshot::Sender<Chunk>>>,
             queue: VecDeque<DriverResult<ResultItem>>,
             exec: Arc<ExecState>,
             shared: Arc<Shared>,
+            interrupt: Arc<InterruptHandle>,
+        }
+        /// A stream dropped while its statement still runs stops it (review M2): a statement
+        /// that produces no row would otherwise run on, holding its lock.
+        impl Drop for State {
+            fn drop(&mut self) {
+                let ended = self
+                    .exec
+                    .ended
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner);
+                if !*ended {
+                    self.exec.cancelled.store(true, Ordering::SeqCst);
+                    self.interrupt.interrupt();
+                }
+            }
         }
         impl State {
             /// The thread stopped listening: the execution ended (a paused result closed,
             /// a cancel acknowledged) or the session was lost.
             fn ended(&mut self) -> Option<DriverResult<ResultItem>> {
                 self.demands = None;
-                if self.exec.ended.load(Ordering::SeqCst) {
+                if *self
+                    .exec
+                    .ended
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                {
                     self.exec
                         .end_error
                         .lock()
@@ -132,6 +163,7 @@ impl SqliteSession {
             queue: VecDeque::new(),
             exec,
             shared,
+            interrupt,
         };
         Box::pin(futures_util::stream::unfold(state, |mut st| async move {
             loop {
@@ -242,7 +274,12 @@ impl Session for SqliteSession {
             .tx
             .send(Command::Execute(Box::new(request)))
             .map_err(|_| shared.closed_error())?;
-        let raw = Self::raw_stream(demand_tx, exec, Arc::clone(shared));
+        let raw = Self::raw_stream(
+            demand_tx,
+            exec,
+            Arc::clone(shared),
+            Arc::clone(&self.interrupt),
+        );
         Ok(ResultStream::new(raw, &options, canceller).with_execution(id))
     }
 

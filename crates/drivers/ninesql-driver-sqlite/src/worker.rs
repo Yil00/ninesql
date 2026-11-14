@@ -130,8 +130,10 @@ impl Shared {
 #[derive(Debug, Default)]
 pub(crate) struct ExecState {
     pub(crate) cancelled: AtomicBool,
-    /// The thread ended the execution without a pending demand to answer.
-    pub(crate) ended: AtomicBool,
+    /// The thread ended the execution. A mutex rather than an atomic: a stream dropped
+    /// mid-execution interrupts the connection while holding it, so the interrupt can never
+    /// land after the thread moved on to the next execution (review M2).
+    pub(crate) ended: Mutex<bool>,
     /// Error to report to the stream when it asks again (a paused result that was closed).
     pub(crate) end_error: Mutex<Option<DriverError>>,
 }
@@ -543,6 +545,8 @@ struct Worker {
     epoch: Instant,
     /// The authorizer allows the driver's own pragmas while set (driver SQL only).
     privileged: Arc<AtomicBool>,
+    /// The user execution running now, read by the progress handler.
+    current: Arc<Mutex<Option<Arc<ExecState>>>>,
 }
 
 impl Worker {
@@ -595,6 +599,7 @@ impl Worker {
             deadline: Arc::new(AtomicU64::new(0)),
             epoch: Instant::now(),
             privileged: Arc::new(AtomicBool::new(false)),
+            current: Arc::new(Mutex::new(None)),
         };
         worker.configure(options).map_err(|e| match e {
             DriverError::ReadOnly(m) => DriverError::ReadOnly(m),
@@ -624,12 +629,22 @@ impl Worker {
         c.busy_timeout(options.busy_timeout).map_err(cfg)?;
         let deadline = Arc::clone(&self.deadline);
         let epoch = self.epoch;
+        let shared = Arc::clone(&self.shared);
+        let current = Arc::clone(&self.current);
         self.conn
             .progress_handler(
                 PROGRESS_OPS,
                 Some(move || {
+                    // A driver statement past its deadline, a closing session, or a cancelled
+                    // user statement (should an interrupt have been missed) stops here.
                     let d = deadline.load(Ordering::SeqCst);
-                    d != 0 && millis_since(epoch) >= d
+                    (d != 0 && millis_since(epoch) >= d)
+                        || shared.closing.load(Ordering::SeqCst)
+                        || current
+                            .lock()
+                            .unwrap_or_else(PoisonError::into_inner)
+                            .as_ref()
+                            .is_some_and(|e| e.cancelled.load(Ordering::SeqCst))
                 }),
             )
             .map_err(cfg)?;
@@ -843,7 +858,8 @@ impl Worker {
     /// the session when anything changed (fails closed). Also refreshes the transaction state.
     fn after_statement(&self) -> DriverResult<()> {
         self.refresh_tx();
-        if !self.shared.read_only {
+        if !self.shared.read_only || self.shared.closing.load(Ordering::SeqCst) {
+            // A closing session runs nothing more: no verification needed.
             return Ok(());
         }
         let outcome = self
@@ -919,6 +935,7 @@ impl Worker {
                 return;
             }
         };
+        *self.current.lock().unwrap_or_else(PoisonError::into_inner) = Some(Arc::clone(&exec));
         let outcome = if exec.cancelled.load(Ordering::SeqCst) {
             Err(Stop::Cancelled)
         } else {
@@ -937,6 +954,8 @@ impl Worker {
         reply: Option<oneshot::Sender<Chunk>>,
         outcome: Result<Vec<DriverResult<ResultItem>>, Stop>,
     ) {
+        // The statement is over: the progress handler must not stop the driver's own checks.
+        *self.current.lock().unwrap_or_else(PoisonError::into_inner) = None;
         let check = self.after_statement();
         let mut items = match outcome {
             Ok(items) => items,
@@ -977,7 +996,7 @@ impl Worker {
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner) = Some(e);
         }
-        exec.ended.store(true, Ordering::SeqCst);
+        *exec.ended.lock().unwrap_or_else(PoisonError::into_inner) = true;
         guard.complete();
         if let Some(r) = reply {
             let _ = r.send(Chunk { items, done: true });

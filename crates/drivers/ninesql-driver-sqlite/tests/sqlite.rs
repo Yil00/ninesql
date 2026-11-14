@@ -1169,3 +1169,68 @@ async fn closed_sessions_and_busy_rules() {
     assert!(matches!(r, Err(DriverError::Query { .. })), "{:?}", r.err());
     s.close().await.unwrap();
 }
+
+/// Review M2: a statement that produces no row is stopped when its stream, or its session, is
+/// dropped: the lock it holds is released within a bound.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn dropping_stops_a_running_statement() {
+    const ENDLESS: &str = "SELECT count(*) FROM big_events a, big_events b";
+    let dir = tempfile::tempdir().unwrap();
+    let db = nine_copy(dir.path());
+    let writer = rusqlite::Connection::open(&db).unwrap();
+    writer.busy_timeout(Duration::from_millis(50)).unwrap();
+    let can_write = |n: i64| {
+        writer
+            .execute(
+                "UPDATE nine_meta SET value = ?1 WHERE key = 'seed_version'",
+                [n],
+            )
+            .is_ok()
+    };
+    let wait_writable = |n: i64| {
+        let start = Instant::now();
+        while start.elapsed() < Duration::from_secs(5) {
+            if can_write(n) {
+                return start.elapsed();
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        panic!("the lock was not released after the drop");
+    };
+    let mut s = connect(ro_params(&db)).await;
+    // Dropped stream.
+    let mut stream = s
+        .execute(Statement::sql(ENDLESS), ExecOptions::default())
+        .await
+        .unwrap();
+    assert!(
+        tokio::time::timeout(Duration::from_millis(300), stream.next())
+            .await
+            .is_err(),
+        "the statement should still be running"
+    );
+    assert!(
+        !can_write(1),
+        "the running reader should hold its SHARED lock"
+    );
+    drop(stream);
+    wait_writable(2);
+    assert_eq!(
+        first_i64(&run_when_free(s.as_mut(), "SELECT 5").await.unwrap()),
+        Some(5)
+    );
+    // Dropped session (and then its stream).
+    let mut stream = s
+        .execute(Statement::sql(ENDLESS), ExecOptions::default())
+        .await
+        .unwrap();
+    assert!(
+        tokio::time::timeout(Duration::from_millis(300), stream.next())
+            .await
+            .is_err()
+    );
+    assert!(!can_write(3));
+    drop(s);
+    wait_writable(4);
+    drop(stream);
+}
