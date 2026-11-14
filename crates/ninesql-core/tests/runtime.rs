@@ -989,18 +989,100 @@ fn core_events_are_bounded_and_drops_are_counted() {
             h.close().await.unwrap().unwrap();
         }
     });
+    // Event queue of 2: Opened 1 and Closed 1 fit; Opened 2 and 3 are dropped and counted;
+    // Closed 2 and 3 are never dropped.
     let start = std::time::Instant::now();
-    while manager.dropped_events() < 4 {
-        assert!(
-            start.elapsed() < Duration::from_secs(5),
-            "{}",
-            manager.dropped_events()
-        );
+    while manager.dropped_events() < 2 {
+        assert!(start.elapsed() < Duration::from_secs(5));
         std::thread::sleep(Duration::from_millis(20));
     }
+    assert_eq!(manager.dropped_events(), 2);
     let mut events = manager.take_events().unwrap();
     assert!(matches!(
         events.try_recv(),
-        Ok(CoreEvent::SessionOpened { .. })
+        Next::Ready(CoreEvent::SessionOpened { .. })
     ));
+    let mut closed = std::collections::BTreeSet::new();
+    while closed.len() < 3 {
+        assert!(start.elapsed() < Duration::from_secs(5), "{closed:?}");
+        match events.try_recv() {
+            Next::Ready(CoreEvent::SessionClosed { session, .. }) => {
+                assert!(closed.insert(session));
+            }
+            Next::Ready(other) => panic!("{other:?}"),
+            Next::Pending => std::thread::sleep(Duration::from_millis(20)),
+            Next::Ended => panic!("ended"),
+        }
+    }
+    // The receiver also wakes up for a backlogged close.
+    ui(async {
+        let h = open_ok(&manager, mock_connection(ConnectionTypeId::dev()), &types).await;
+        assert!(matches!(
+            events.recv().await,
+            Some(CoreEvent::SessionOpened { .. })
+        ));
+        h.close().await.unwrap().unwrap();
+        let ev = tokio::time::timeout(Duration::from_secs(5), events.recv()).await;
+        assert!(
+            matches!(ev, Ok(Some(CoreEvent::SessionClosed { .. }))),
+            "{ev:?}"
+        );
+    });
+    assert_eq!(
+        manager.dropped_events(),
+        2,
+        "SessionClosed is never counted as dropped"
+    );
+}
+
+#[test]
+fn init_sql_that_changes_the_lexical_mode_or_follows_a_setting_is_confirmed() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (manager, _) = manager(Arc::new(MockDriver::new()), tmp.path());
+    let types = ConnectionTypes::default();
+    let flagged = |init: &[&str]| {
+        let mut c = mock_connection(ConnectionTypeId::prod());
+        c.init_sql = init.iter().map(|s| (*s).to_owned()).collect();
+        let out = ui(open(&manager, OpenRequest::new(c, &types))).unwrap();
+        match out {
+            OpenOutcome::InitSqlNeedsConfirmation(ic) => ic
+                .flagged
+                .iter()
+                .map(|f| (f.index, f.class))
+                .collect::<Vec<_>>(),
+            OpenOutcome::Opened(h) => {
+                let _ = ui(h.close());
+                Vec::new()
+            }
+            other => panic!("{other:?}"),
+        }
+    };
+    // Lexical mode changes are unrecognised.
+    for setting in [
+        "SET sql_mode = 'ANSI_QUOTES'",
+        "SET standard_conforming_strings = off",
+        "SET client_encoding TO 'SJIS'",
+        "SET NAMES 'gbk'",
+        "SET CHARACTER SET big5",
+    ] {
+        // Flagged: unrecognised, or already access-mode changing for the dialect.
+        let f = flagged(&[setting]);
+        assert!(
+            matches!(
+                f.as_slice(),
+                [(
+                    0,
+                    StatementClass::Unknown | StatementClass::ChangesAccessMode
+                )]
+            ),
+            "{setting}: {f:?}"
+        );
+    }
+    // A plain setting is fine on its own, but what follows it is unrecognised.
+    assert!(flagged(&["SET search_path TO app"]).is_empty());
+    assert_eq!(
+        flagged(&["SET search_path TO app", "SELECT * FROM numbers(1)"]),
+        [(1, StatementClass::Unknown)]
+    );
+    assert!(flagged(&["SELECT * FROM numbers(1)", "SELECT * FROM numbers(2)"]).is_empty());
 }

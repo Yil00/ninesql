@@ -16,6 +16,8 @@
 //! - Session-level events (opened, closed, tunnel lost) go to one bounded [`CoreEvent`] channel
 //!   ([`SessionManager::take_events`]); when it is full, events are dropped and counted
 //!   ([`SessionManager::dropped_events`]), the runtime never waits on the UI.
+//!   [`CoreEvent::SessionClosed`] is never dropped: it goes to a side list read by the same
+//!   [`CoreEvents`] receiver.
 //! - An execution never blocks its session task on a consumer that stopped reading: every
 //!   event send gives up when the statement is cancelled or the [`Execution`] is dropped, and the
 //!   terminal event goes through a slot reserved when the statement starts. Closing a session
@@ -87,6 +89,10 @@ const CONFIRMATION_TTL: Duration = Duration::from_secs(10 * 60);
 const MAX_PENDING_OPEN_CONFIRMATIONS: usize = 64;
 /// Default number of session-level events buffered for the UI before new ones are dropped.
 const CORE_EVENT_QUEUE: usize = 256;
+/// `SessionClosed` events kept aside when the event channel is full. One per session that ever
+/// closed while the UI was not reading; only beyond this many (a UI that never reads) is the
+/// oldest dropped and counted.
+const CLOSED_BACKLOG: usize = 4096;
 
 fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     // Critical sections are a few map operations without panics: the data stays consistent.
@@ -496,6 +502,7 @@ struct Shared {
     known_hosts: OnceCell<KnownHostsStore>,
     sessions: Mutex<HashMap<SessionId, SessionHandle>>,
     events: mpsc::Sender<CoreEvent>,
+    closed_backlog: Arc<Backlog>,
     dropped_events: AtomicU64,
     next_session: AtomicU64,
     host_keys: Mutex<Pending<UnknownHostKey>>,
@@ -515,9 +522,35 @@ impl Shared {
     fn emit(&self, event: CoreEvent) {
         // Never waits on the UI. A full queue (the UI does not read it, or did not take it)
         // drops the event and counts it; a dropped receiver is not an error.
-        if let Err(mpsc::error::TrySendError::Full(_)) = self.events.try_send(event) {
+        // `SessionClosed` is never dropped: when the channel is full (or a backlog exists, to
+        // keep closes in order) it goes to the side list, which the receiver also reads.
+        let event = match event {
+            closed @ CoreEvent::SessionClosed { .. } => {
+                let backlogged = !lock(&self.closed_backlog.events).is_empty();
+                if backlogged {
+                    closed
+                } else {
+                    match self.events.try_send(closed) {
+                        Ok(()) | Err(mpsc::error::TrySendError::Closed(_)) => return,
+                        Err(mpsc::error::TrySendError::Full(e)) => e,
+                    }
+                }
+            }
+            other => {
+                if let Err(mpsc::error::TrySendError::Full(_)) = self.events.try_send(other) {
+                    self.dropped_events.fetch_add(1, Ordering::Relaxed);
+                }
+                return;
+            }
+        };
+        let mut backlog = lock(&self.closed_backlog.events);
+        if backlog.len() >= CLOSED_BACKLOG {
+            backlog.pop_front();
             self.dropped_events.fetch_add(1, Ordering::Relaxed);
         }
+        backlog.push_back(event);
+        drop(backlog);
+        self.closed_backlog.notify.notify_one();
     }
 }
 
@@ -528,7 +561,71 @@ impl Shared {
 pub struct SessionManager {
     runtime: Arc<DriverRuntime>,
     shared: Arc<Shared>,
-    events_rx: Arc<Mutex<Option<mpsc::Receiver<CoreEvent>>>>,
+    events_rx: Arc<Mutex<Option<CoreEvents>>>,
+}
+
+/// `SessionClosed` events that did not fit the channel.
+#[derive(Default)]
+struct Backlog {
+    events: Mutex<std::collections::VecDeque<CoreEvent>>,
+    notify: tokio::sync::Notify,
+}
+
+/// The receiver of session-level events ([`SessionManager::take_events`]). Executor-agnostic:
+/// await [`CoreEvents::recv`] on any executor or poll [`CoreEvents::try_recv`].
+///
+/// The channel is bounded. Events that did not fit are dropped and counted
+/// ([`SessionManager::dropped_events`]), except [`CoreEvent::SessionClosed`], which is never
+/// dropped (it waits in a side list read after the events already queued). The UI must check
+/// `dropped_events()` after reading and, when it grew, resync its list of open sessions from
+/// [`SessionManager::sessions_of`] / [`SessionManager::session`].
+pub struct CoreEvents {
+    rx: mpsc::Receiver<CoreEvent>,
+    backlog: Arc<Backlog>,
+}
+
+impl fmt::Debug for CoreEvents {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("CoreEvents").finish_non_exhaustive()
+    }
+}
+
+impl CoreEvents {
+    fn pop_backlog(&self) -> Option<CoreEvent> {
+        lock(&self.backlog.events).pop_front()
+    }
+
+    /// Next event without waiting.
+    pub fn try_recv(&mut self) -> Next<CoreEvent> {
+        match self.rx.try_recv() {
+            Ok(e) => Next::Ready(e),
+            Err(mpsc::error::TryRecvError::Empty) => {
+                self.pop_backlog().map_or(Next::Pending, Next::Ready)
+            }
+            Err(mpsc::error::TryRecvError::Disconnected) => {
+                self.pop_backlog().map_or(Next::Ended, Next::Ready)
+            }
+        }
+    }
+
+    /// Next event; `None` once the manager is gone and everything was read.
+    pub async fn recv(&mut self) -> Option<CoreEvent> {
+        loop {
+            match self.try_recv() {
+                Next::Ready(e) => return Some(e),
+                Next::Ended => return None,
+                Next::Pending => {}
+            }
+            let backlog = Arc::clone(&self.backlog);
+            tokio::select! {
+                event = self.rx.recv() => {
+                    return event.or_else(|| self.pop_backlog());
+                }
+                // `notify_one` keeps a permit when nobody waits: no lost wake-up.
+                () = backlog.notify.notified() => {}
+            }
+        }
+    }
 }
 
 impl fmt::Debug for SessionManager {
@@ -552,6 +649,11 @@ impl SessionManager {
     ) -> Result<Self, CoreError> {
         let runtime = DriverRuntime::new(config.workers)?;
         let (events, events_rx) = mpsc::channel(config.event_queue.max(1));
+        let closed_backlog = Arc::new(Backlog::default());
+        let events_rx = CoreEvents {
+            rx: events_rx,
+            backlog: Arc::clone(&closed_backlog),
+        };
         Ok(Self {
             runtime: Arc::new(runtime),
             shared: Arc::new(Shared {
@@ -561,6 +663,7 @@ impl SessionManager {
                 known_hosts: OnceCell::new(),
                 sessions: Mutex::new(HashMap::new()),
                 events,
+                closed_backlog,
                 dropped_events: AtomicU64::new(0),
                 next_session: AtomicU64::new(1),
                 host_keys: Mutex::new(Pending::new(MAX_PENDING_OPEN_CONFIRMATIONS)),
@@ -596,13 +699,18 @@ impl SessionManager {
 
     /// The session-level event channel. There is one receiver: the first call takes it. The
     /// channel is bounded: take it at startup and keep reading it; events that do not fit are
-    /// dropped and counted ([`Self::dropped_events`]).
+    /// dropped and counted ([`Self::dropped_events`]), except
+    /// [`CoreEvent::SessionClosed`], which is never dropped. After reading, the UI must check
+    /// [`Self::dropped_events`] and, when it grew, resync its open sessions from
+    /// [`Self::sessions_of`].
     #[must_use]
-    pub fn take_events(&self) -> Option<mpsc::Receiver<CoreEvent>> {
+    pub fn take_events(&self) -> Option<CoreEvents> {
         lock(&self.events_rx).take()
     }
 
-    /// Session-level events dropped because the channel was full.
+    /// Session-level events dropped because the channel was full (never a
+    /// [`CoreEvent::SessionClosed`], unless more than 4096 of them waited unread). When it grows,
+    /// the UI resyncs its open sessions from [`Self::sessions_of`].
     #[must_use]
     pub fn dropped_events(&self) -> u64 {
         self.shared.dropped_events.load(Ordering::Relaxed)
@@ -626,7 +734,7 @@ impl SessionManager {
             let outcome = open_session(&shared, request).await;
             if let Err(e) = &outcome {
                 // Engine and SSH messages may name hosts, users or objects: only the kind at
-                // info, the message at debug and never for production (ADR-0007 §6).
+                // info, the message at trace and never for production (ADR-0007 §6).
                 tracing::info!(
                     connection = %id,
                     error = e.kind(),
@@ -634,7 +742,7 @@ impl SessionManager {
                     "connection failed"
                 );
                 if details {
-                    tracing::debug!(connection = %id, error = %e, "connection failure details");
+                    tracing::trace!(connection = %id, error = %e, "connection failure details");
                 }
             }
             if let Err(Ok(OpenOutcome::Opened(handle))) = tx.send(outcome) {
@@ -911,7 +1019,7 @@ async fn open_session(
         lock(&supervisor.sessions).remove(&id);
         tracing::info!(session = %id, reason = reason.kind(), "session closed");
         if details && let CloseReason::Lost(e) = &reason {
-            tracing::debug!(session = %id, error = %e, "session lost");
+            tracing::trace!(session = %id, error = %e, "session lost");
         }
         supervisor.emit(CoreEvent::SessionClosed {
             session: id,

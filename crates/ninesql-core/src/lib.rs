@@ -22,8 +22,8 @@ pub use error::{ConnectionError, CoreError, WorkspaceError};
 pub use registry::DriverRegistry;
 pub use runtime::DriverRuntime;
 pub use session::{
-    CloseReason, ConfirmReason, ConfirmationRequest, ConfirmationToken, CoreEvent, ExecEvent,
-    ExecuteRequest, Execution, HostKeyConfirmation, HostKeyToken, InitSqlConfirmation,
+    CloseReason, ConfirmReason, ConfirmationRequest, ConfirmationToken, CoreEvent, CoreEvents,
+    ExecEvent, ExecuteRequest, Execution, HostKeyConfirmation, HostKeyToken, InitSqlConfirmation,
     InitSqlToken, KnownHostsFiles, ManagerConfig, Next, OpenOutcome, OpenRequest, Reply,
     SessionHandle, SessionId, SessionInfo, SessionManager, SessionWarning, TransactionState,
 };

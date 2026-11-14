@@ -54,10 +54,40 @@ pub struct FlaggedInitStatement {
     pub reason: ConfirmReason,
 }
 
+/// Session settings that change how the following statements are lexed (quoting, escapes,
+/// encoding): after one of them, the client-side classifier may misread what comes next.
+const LEXICAL_SETTINGS: &[&str] = &[
+    "sql_mode",
+    "ansi_quotes",
+    "standard_conforming_strings",
+    "backslash_quote",
+    "escape_string_warning",
+    "client_encoding",
+    "encoding",
+    "names",
+    "character set",
+    "character_set",
+    "charset",
+    "quoted_identifier",
+];
+
+/// Whether a session statement may change the lexical mode of the session.
+fn changes_lexical_mode(text: &str) -> bool {
+    let lower = text.to_ascii_lowercase();
+    LEXICAL_SETTINGS.iter().any(|s| lower.contains(s))
+}
+
 /// The init SQL entries that need confirmation under `policy` (ADR-0007): init SQL runs on
 /// every connect, after the read-only mechanism but outside the per-statement confirmation of
-/// the session, and DBeaver imports carry bootstrap queries into it. An entry that the dialect
-/// splits into several statements counts as unrecognised.
+/// the session, and DBeaver imports carry bootstrap queries into it.
+///
+/// Counted as unrecognised ([`api::StatementClass::Unknown`], so flagged):
+/// - an entry that the dialect splits into several statements;
+/// - a session statement that may change the lexical mode (`sql_mode`, `ANSI_QUOTES`,
+///   `standard_conforming_strings`, `client_encoding`, `NAMES`, `CHARACTER SET`…), since the
+///   classifier lexes with the default rules;
+/// - every entry after the first session statement: once a setting ran, the classifier can no
+///   longer vouch for how the server reads what follows.
 #[must_use]
 pub fn init_sql_needing_confirmation(
     connection: &Connection,
@@ -67,23 +97,36 @@ pub fn init_sql_needing_confirmation(
     if !policy.confirm_destructive && !policy.confirm_every_write {
         return Vec::new();
     }
-    connection
-        .init_sql
-        .iter()
-        .enumerate()
-        .filter_map(|(index, text)| {
-            let class = if dialect.split_statements(text).len() > 1 {
-                api::StatementClass::Unknown
-            } else {
-                dialect.classify(text)
-            };
-            confirm_reason(policy, class).map(|reason| FlaggedInitStatement {
+    let mut after_setting = false;
+    let mut out = Vec::new();
+    for (index, text) in connection.init_sql.iter().enumerate() {
+        let class = if after_setting || dialect.split_statements(text).len() > 1 {
+            api::StatementClass::Unknown
+        } else {
+            match dialect.classify(text) {
+                api::StatementClass::Session if changes_lexical_mode(text) => {
+                    api::StatementClass::Unknown
+                }
+                c => c,
+            }
+        };
+        if matches!(
+            class,
+            api::StatementClass::Session
+                | api::StatementClass::ChangesAccessMode
+                | api::StatementClass::Unknown
+        ) {
+            after_setting = true;
+        }
+        if let Some(reason) = confirm_reason(policy, class) {
+            out.push(FlaggedInitStatement {
                 index,
                 class,
                 reason,
-            })
-        })
-        .collect()
+            });
+        }
+    }
+    out
 }
 
 /// A credential the UI must ask for: a [`SecretSource::Prompt`] field (ADR-0005 §3, "ask every
