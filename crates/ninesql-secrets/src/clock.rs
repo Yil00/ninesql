@@ -7,9 +7,11 @@
 //!
 //! Suspend still pauses the timer that calls [`crate::Vault::lock_if_idle`] and
 //! [`crate::SessionSecretCache::purge_expired`]: the deadline is applied at the first check after
-//! resume (every vault and cache access checks it too). The core should additionally lock the
-//! vault and clear the cache on logind's `PrepareForSleep(true)` and on the session `Lock` signal
-//! so nothing is unlocked when the machine wakes up.
+//! resume (every vault and cache access checks it too). The application should additionally lock
+//! the vault and clear the cache on logind's `PrepareForSleep(true)` and on the session `Lock`
+//! signal, so nothing is unlocked when the machine wakes up: register both in a
+//! [`crate::LockHooks`] and, with the `secret-service` feature, start a
+//! `DesktopLockWatcher` on it ([`crate::lock_events`]).
 
 use std::fmt;
 use std::sync::Arc;

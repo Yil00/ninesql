@@ -48,9 +48,9 @@
 //! ([`Vault::set_idle_timeout`], enforced at every access and by [`Vault::lock_if_idle`], which the
 //! core calls from a timer) lock it again. Idle time is measured on `CLOCK_BOOTTIME`, so time
 //! spent suspended counts: a vault left unlocked before an overnight suspend is locked at the
-//! first check after resume. The core should also call [`Vault::lock`] on logind's
-//! `PrepareForSleep(true)` and on the session `Lock` signal, so the vault is already locked when
-//! the machine wakes up. [`Vault::change_master_password`] re-encrypts
+//! first check after resume. [`Vault`] is also a [`crate::LockHook`]: registered in a
+//! [`crate::LockHooks`], it is locked on logind's `PrepareForSleep(true)` and on the session
+//! `Lock` signal ([`crate::lock_events`]), so it is already locked when the machine wakes up. [`Vault::change_master_password`] re-encrypts
 //! atomically under a new salt. Failed attempts are slowed down by [`UnlockBackoff`].
 //!
 //! Reading never writes: a wrong password, a damaged, truncated or newer file is reported with a

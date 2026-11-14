@@ -1,6 +1,7 @@
 //! Secrets: secret references, the [`SecretStore`] trait, the encrypted [`Vault`], the
 //! Secret Service backend (feature `secret-service`), backend selection, the "ask every time"
-//! [`SessionSecretCache`] and an in-memory test store (ADR-0005, invariant I1). ROADMAP: P0-D,
+//! [`SessionSecretCache`], locking on sleep / session lock ([`lock_events`]) and an in-memory test
+//! store (ADR-0005, invariant I1). ROADMAP: P0-D,
 //! P1-D.
 //!
 //! **Security review required for every change to this crate.**
@@ -22,6 +23,9 @@
 pub mod backend;
 mod clock;
 mod error;
+pub mod lock_events;
+#[cfg(feature = "secret-service")]
+mod lock_signals;
 #[cfg(any(test, feature = "memory-store"))]
 mod memory;
 mod project;
@@ -35,6 +39,9 @@ pub mod vault;
 
 pub use backend::{SecretServiceAvailability, detect_secret_service};
 pub use error::SecretError;
+pub use lock_events::{LockHook, LockHooks, LockTrigger};
+#[cfg(feature = "secret-service")]
+pub use lock_signals::{DesktopLockWatcher, LockWatchError, WATCHER_SETUP_TIMEOUT};
 #[cfg(any(test, feature = "memory-store"))]
 pub use memory::MemoryStore;
 pub use project::InvalidProjectId;
