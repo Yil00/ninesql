@@ -1,0 +1,58 @@
+{
+  "schema_version": 2,
+  "connections": [
+    {
+      "id": "7f1e2d3c-4b5a-4968-8776-655443322a06",
+      "name": "Reporting over two hops",
+      "engine": "postgresql",
+      "endpoint": {
+        "kind": "tcp",
+        "host": "reporting.internal.example.test",
+        "port": 5432,
+        "database": "reports"
+      },
+      "auth": {
+        "method": "password",
+        "username": "reader",
+        "secret": {
+          "source": "prompt"
+        }
+      },
+      "ssh": {
+        "host": "bastion.example.test",
+        "port": 22,
+        "username": "deploy",
+        "auth": {
+          "method": "agent"
+        },
+        "jump_hosts": [
+          {
+            "host": "lab-edge.example.test",
+            "port": 2222,
+            "username": "jump",
+            "auth": {
+              "method": "agent"
+            },
+            "host_key_policy": "accept-new"
+          },
+          {
+            "host": "lab-inner.example.test",
+            "port": 22,
+            "username": "jump",
+            "auth": {
+              "method": "agent"
+            },
+            "host_key_policy": "disabled"
+          }
+        ]
+      },
+      "tls": {
+        "mode": "verify-full"
+      },
+      "connection_type": "test",
+      "origin": {
+        "kind": "native"
+      }
+    }
+  ]
+}

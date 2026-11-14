@@ -8,8 +8,9 @@
 //!   and removed by [`Connection::sanitize`] on load.
 //! - **I5**: TLS defaults to [`TlsMode::VerifyFull`], also when the `tls` key is absent from the
 //!   file; any weaker mode is an explicit value and is reported by
-//!   [`Connection::security_warnings`]. SSH host key checking cannot be turned off: there is no
-//!   field for it (ADR-0011 §6).
+//!   [`Connection::security_warnings`]. SSH host keys are checked strictly by default on every
+//!   hop; a weaker per-hop [`HostKeyPolicy`] is an explicit value, also reported by
+//!   [`Connection::security_warnings`] (ADR-0011 §6 as amended by ADR-0016 §2).
 //! - **I3**: every connection names its [`ConnectionTypeId`] explicitly (no default), and its
 //!   effective read-only mode comes from the type unless overridden.
 //!
@@ -249,10 +250,58 @@ pub enum SshAuth {
     },
 }
 
+/// Host key policy of one SSH hop (ADR-0016 §2). Defaults to [`HostKeyPolicy::Strict`], also
+/// when the key is absent from the file.
+///
+/// Anything but `Strict` is an explicit, per-connection, per-hop downgrade, always reported by
+/// [`Connection::security_warnings`] (I5). Neither weaker policy is ever a default, and the
+/// DBeaver import never sets one.
+#[derive(
+    Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize,
+)]
+#[serde(rename_all = "kebab-case")]
+pub enum HostKeyPolicy {
+    /// Known key: accepted. Unknown key: the user confirms its fingerprint. Changed or revoked
+    /// key: the connection is blocked. The default.
+    #[default]
+    Strict,
+    /// Unknown keys are recorded in NineSQL's `known_hosts` without asking (trust on first use);
+    /// changed and revoked keys still block, and a host known only under another key type still
+    /// needs confirmation.
+    AcceptNew,
+    /// The host key is not checked (revoked keys are still refused): no protection against a
+    /// man in the middle on this hop.
+    Disabled,
+}
+
+impl HostKeyPolicy {
+    /// `true` for anything weaker than [`HostKeyPolicy::Strict`].
+    #[must_use]
+    pub const fn is_downgrade(self) -> bool {
+        !matches!(self, Self::Strict)
+    }
+
+    /// The `ninesql-ssh` policy.
+    #[must_use]
+    pub const fn to_ssh(self) -> ninesql_ssh::HostKeyPolicy {
+        match self {
+            Self::Strict => ninesql_ssh::HostKeyPolicy::Strict,
+            Self::AcceptNew => ninesql_ssh::HostKeyPolicy::AcceptNew,
+            Self::Disabled => ninesql_ssh::HostKeyPolicy::Disabled,
+        }
+    }
+}
+
+fn is_strict(policy: &HostKeyPolicy) -> bool {
+    !policy.is_downgrade()
+}
+
 /// One SSH server: the tunnel endpoint or a jump host.
 ///
-/// There is deliberately no option to skip host key verification: unknown keys are confirmed by
-/// the user, changed keys block the connection (ADR-0011 §6, I5).
+/// Host keys are verified on every hop (ADR-0011 §6, I5): under the default
+/// [`HostKeyPolicy::Strict`], unknown keys are confirmed by the user and changed keys block the
+/// connection. A hop may carry an explicit weaker policy ([`HostKeyPolicy::AcceptNew`],
+/// [`HostKeyPolicy::Disabled`]) per ADR-0016 §2; it is always reported as a security warning.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SshHop {
     /// SSH server host.
@@ -264,6 +313,36 @@ pub struct SshHop {
     pub username: String,
     /// Authentication.
     pub auth: SshAuth,
+    /// Host key policy of this hop; strict when absent (ADR-0016).
+    #[serde(default, skip_serializing_if = "is_strict")]
+    pub host_key_policy: HostKeyPolicy,
+}
+
+impl SshHop {
+    /// A hop with the strict host key policy.
+    #[must_use]
+    pub fn new(
+        host: impl Into<String>,
+        port: u16,
+        username: impl Into<String>,
+        auth: SshAuth,
+    ) -> Self {
+        Self {
+            host: host.into(),
+            port,
+            username: username.into(),
+            auth,
+            host_key_policy: HostKeyPolicy::Strict,
+        }
+    }
+}
+
+impl SshTunnel {
+    /// Every hop in connection order: jump hosts first, the tunnel server last (the hop indices
+    /// of `ninesql-ssh` errors and warnings).
+    pub fn hops(&self) -> impl Iterator<Item = &SshHop> {
+        self.jump_hosts.iter().chain(std::iter::once(&self.server))
+    }
 }
 
 /// SSH tunnel: local port forwarding through `jump_hosts` (in order) then `server` (ADR-0011 §5).
@@ -339,6 +418,7 @@ pub enum Origin {
 
 /// A weakened security setting, shown on the connection and its tabs (ADR-0011 §2, I5).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum SecurityWarning {
     /// TLS is off: traffic is readable on the network.
     TlsDisabled,
@@ -346,6 +426,17 @@ pub enum SecurityWarning {
     TlsCertificateNotVerified,
     /// Certificate verified, host name not verified.
     TlsHostnameNotVerified,
+    /// Unknown SSH host keys of this hop are accepted without confirmation (ADR-0016). `hop`
+    /// counts jump hosts first, the tunnel server last.
+    SshAcceptNewHostKeys {
+        /// Hop index.
+        hop: usize,
+    },
+    /// The SSH host key of this hop is not verified (ADR-0016).
+    SshHostKeyNotVerified {
+        /// Hop index.
+        hop: usize,
+    },
 }
 
 impl fmt::Display for SecurityWarning {
@@ -356,6 +447,12 @@ impl fmt::Display for SecurityWarning {
                 "the server certificate is not verified: the connection can be intercepted"
             }
             Self::TlsHostnameNotVerified => "the server host name is not verified",
+            Self::SshAcceptNewHostKeys { .. } => {
+                "unknown SSH host keys are accepted without confirmation on an SSH hop"
+            }
+            Self::SshHostKeyNotVerified { .. } => {
+                "the SSH host key of an SSH hop is not verified: the tunnel can be intercepted"
+            }
         })
     }
 }
@@ -582,15 +679,29 @@ impl Connection {
     /// Weakened security settings of this connection, for the warning badge (I5).
     #[must_use]
     pub fn security_warnings(&self) -> Vec<SecurityWarning> {
-        if !self.endpoint.is_network() {
-            return Vec::new();
+        let mut out = Vec::new();
+        if self.endpoint.is_network() {
+            match self.tls.mode {
+                TlsMode::Disable => out.push(SecurityWarning::TlsDisabled),
+                TlsMode::Require => out.push(SecurityWarning::TlsCertificateNotVerified),
+                TlsMode::VerifyCa => out.push(SecurityWarning::TlsHostnameNotVerified),
+                TlsMode::VerifyFull => {}
+            }
         }
-        match self.tls.mode {
-            TlsMode::Disable => vec![SecurityWarning::TlsDisabled],
-            TlsMode::Require => vec![SecurityWarning::TlsCertificateNotVerified],
-            TlsMode::VerifyCa => vec![SecurityWarning::TlsHostnameNotVerified],
-            TlsMode::VerifyFull => Vec::new(),
+        if let Some(ssh) = &self.ssh {
+            for (hop, h) in ssh.hops().enumerate() {
+                match h.host_key_policy {
+                    HostKeyPolicy::Strict => {}
+                    HostKeyPolicy::AcceptNew => {
+                        out.push(SecurityWarning::SshAcceptNewHostKeys { hop });
+                    }
+                    HostKeyPolicy::Disabled => {
+                        out.push(SecurityWarning::SshHostKeyNotVerified { hop });
+                    }
+                }
+            }
         }
+        out
     }
 
     /// Effective safety rules of this connection: its type resolved through

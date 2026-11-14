@@ -7,6 +7,7 @@ loading it through the migration chain.
 | File | Document | Schema |
 |------|----------|--------|
 | `connections/v1.json` | `connections.json` | 1 |
+| `connections/v2.json` | `connections.json` | 2 (adds the per-hop SSH `host_key_policy`, ADR-0016) |
 | `connection-types/v1.json` | `connection-types.json` | 1 |
 | `project/v1.json` | `project.json` | 1 (current: 2, adds `id`) |
 

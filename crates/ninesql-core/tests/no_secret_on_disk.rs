@@ -10,7 +10,7 @@ use std::sync::{Arc, Mutex};
 
 use ninesql_core::{
     Auth, ClientCertificate, Connection, ConnectionTypeId, ConnectionTypes, Connections, Endpoint,
-    EngineId, SecretSlot, SecretSource, SshAuth, SshHop, SshTunnel, Workspace,
+    EngineId, HostKeyPolicy, SecretSlot, SecretSource, SshAuth, SshHop, SshTunnel, Workspace,
 };
 use ninesql_secrets::{ExposeSecret, MemoryStore, SecretStores, SecretString, StoreKind};
 use ninesql_storage::{Paths, ProjectName, XdgDirs};
@@ -133,6 +133,7 @@ fn full_connection() -> Connection {
             auth: SshAuth::Password {
                 secret: SecretSource::Prompt,
             },
+            host_key_policy: HostKeyPolicy::Strict,
         },
         jump_hosts: vec![SshHop {
             host: "edge.example.test".into(),
@@ -142,6 +143,7 @@ fn full_connection() -> Connection {
                 key_path: "/home/u/.ssh/id_ed25519".into(),
                 passphrase: None,
             },
+            host_key_policy: HostKeyPolicy::Strict,
         }],
     });
     c.tls.client_certificate = Some(ClientCertificate {

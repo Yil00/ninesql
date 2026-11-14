@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 
 use ninesql_core::{
     Auth, ConnectionTypeId, ConnectionTypes, ConnectionTypesFile, ConnectionsFile, Endpoint,
-    Origin, SecretSource, SecurityWarning, SshAuth, TlsMode,
+    HostKeyPolicy, Origin, SecretSource, SecurityWarning, SshAuth, TlsMode,
 };
 use ninesql_secrets::{SecretKind, StoreKind};
 use ninesql_storage::document;
@@ -87,11 +87,69 @@ fn connections_v1_fixture_loads_with_every_field() {
 
 #[test]
 fn connections_v1_round_trip_is_stable() {
+    // Version 1 → 2 changes nothing but the version: a hop without `host_key_policy` is strict.
     let path = fixture("connections/v1.json");
-    let original: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    let mut original: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    original["schema_version"] = Value::from(2);
     let file = decode_connections("connections/v1.json");
     let encoded: Value = serde_json::from_slice(&document::encode(&file).unwrap()).unwrap();
     assert_eq!(encoded, original);
+    let ssh = file.connections[0].ssh.as_ref().unwrap();
+    assert!(
+        ssh.hops()
+            .all(|h| h.host_key_policy == HostKeyPolicy::Strict)
+    );
+}
+
+#[test]
+fn connections_v2_fixture_keeps_per_hop_host_key_policies() {
+    let path = fixture("connections/v2.json");
+    let original: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    let file = decode_connections("connections/v2.json");
+    let c = &file.connections[0];
+    c.validate().unwrap();
+    let ssh = c.ssh.as_ref().unwrap();
+    let policies: Vec<_> = ssh.hops().map(|h| h.host_key_policy).collect();
+    assert_eq!(
+        policies,
+        [
+            HostKeyPolicy::AcceptNew,
+            HostKeyPolicy::Disabled,
+            HostKeyPolicy::Strict
+        ]
+    );
+    assert_eq!(
+        c.security_warnings(),
+        [
+            SecurityWarning::SshAcceptNewHostKeys { hop: 0 },
+            SecurityWarning::SshHostKeyNotVerified { hop: 1 }
+        ]
+    );
+    let encoded: Value = serde_json::from_slice(&document::encode(&file).unwrap()).unwrap();
+    assert_eq!(encoded, original, "strict is not written, downgrades are");
+}
+
+#[test]
+fn a_host_key_policy_in_a_v1_file_is_ignored() {
+    // Only a NineSQL that knows the field writes a downgrade; a hand-edited v1 file stays strict.
+    let json = br#"{ "schema_version": 1, "connections": [ {
+        "id": "0b0c6c0e-6f0a-4d4e-9c47-1f1e0f3a9a99", "name": "n", "engine": "postgresql",
+        "endpoint": { "kind": "tcp", "host": "h" }, "auth": { "method": "none" },
+        "connection_type": "dev",
+        "ssh": { "host": "b", "username": "u", "auth": { "method": "agent" },
+                 "host_key_policy": "disabled",
+                 "jump_hosts": [ { "host": "j", "username": "u", "auth": { "method": "agent" },
+                                   "host_key_policy": "accept-new" } ] }
+    } ] }"#;
+    let file = document::decode::<ConnectionsFile>(Path::new("mem"), json)
+        .unwrap()
+        .document;
+    let ssh = file.connections[0].ssh.as_ref().unwrap();
+    assert!(
+        ssh.hops()
+            .all(|h| h.host_key_policy == HostKeyPolicy::Strict)
+    );
+    assert!(file.connections[0].security_warnings().is_empty());
 }
 
 #[test]

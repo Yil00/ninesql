@@ -2,7 +2,7 @@
 //!
 //! On-disk documents:
 //! - `project.json`: [`ProjectFile`] (`schema_version` 2)
-//! - `connections.json`: [`ConnectionsFile`] (`schema_version` 1)
+//! - `connections.json`: [`ConnectionsFile`] (`schema_version` 2)
 //! - `connection-types.json`: [`ConnectionTypesFile`] (`schema_version` 1)
 //!
 //! Secrets given to [`Workspace::create_connection`] go to the secret store; only their
@@ -120,11 +120,13 @@ pub struct ConnectionsFile {
 impl Document for ConnectionsFile {
     const NAME: &'static str = "connections";
     const FORMAT: Format = Format::Json;
-    /// Version 1 is the first published schema; its fixture is
-    /// `tests/fixtures/connections/v1.json`. A bump adds a [`Migration`] here.
-    const SCHEMA_VERSION: u32 = 1;
+    /// Schema history: version 1 is the first published schema (fixture
+    /// `tests/fixtures/connections/v1.json`); version 2 adds the optional per-hop
+    /// `host_key_policy` of SSH hops (ADR-0016), strict when absent. A bump adds a [`Migration`]
+    /// here.
+    const SCHEMA_VERSION: u32 = 2;
     fn migrations() -> &'static [Migration] {
-        &[]
+        CONNECTIONS_MIGRATIONS
     }
 
     /// Applies the rules of [`Connection::sanitize`] to the raw file (any schema version): every
@@ -165,6 +167,36 @@ impl Document for ConnectionsFile {
         }
     }
 }
+
+/// `connections.json` 1 → 2: SSH hops gain `host_key_policy`. Version 1 files have no such key,
+/// and an absent key means strict, which is exactly the version 1 behavior: nothing to rewrite.
+/// Any `host_key_policy` key already present in a version 1 file (hand edit) is removed, so a
+/// downgrade can only come from a file written by a NineSQL that knows the field.
+fn connections_v1_to_v2(doc: &mut Value) -> Result<(), String> {
+    let Some(connections) = doc.get_mut("connections").and_then(Value::as_array_mut) else {
+        return Ok(());
+    };
+    for connection in connections {
+        let Some(ssh) = connection.get_mut("ssh").and_then(Value::as_object_mut) else {
+            continue;
+        };
+        ssh.remove("host_key_policy");
+        if let Some(jumps) = ssh.get_mut("jump_hosts").and_then(Value::as_array_mut) {
+            for jump in jumps {
+                if let Some(jump) = jump.as_object_mut() {
+                    jump.remove("host_key_policy");
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+const CONNECTIONS_MIGRATIONS: &[Migration] = &[Migration {
+    from: 1,
+    description: "add the per-hop SSH host key policy (strict when absent)",
+    apply: connections_v1_to_v2,
+}];
 
 /// `connection-types.json`: built-in types as customized plus user-defined types.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]

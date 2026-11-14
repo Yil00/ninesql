@@ -6,8 +6,8 @@ use std::path::Path;
 
 use ninesql_core::{
     Auth, ClientCertificate, Connection, ConnectionError, ConnectionId, ConnectionType,
-    ConnectionTypeId, ConnectionTypes, ConnectionsFile, Endpoint, EngineId, Origin, SecretSlot,
-    SecretSource, SecurityWarning, SshAuth, SshHop, SshTunnel, TlsConfig, TlsMode,
+    ConnectionTypeId, ConnectionTypes, ConnectionsFile, Endpoint, EngineId, HostKeyPolicy, Origin,
+    SecretSlot, SecretSource, SecurityWarning, SshAuth, SshHop, SshTunnel, TlsConfig, TlsMode,
 };
 use ninesql_secrets::{SecretId, SecretKind, SecretRef, StoreKind};
 use ninesql_storage::document;
@@ -131,6 +131,7 @@ fn validation_rejects_bad_fields() {
                         port: 0,
                         username: "u".into(),
                         auth: SshAuth::Agent,
+                        host_key_policy: HostKeyPolicy::Strict,
                     },
                     jump_hosts: vec![],
                 })
@@ -185,6 +186,7 @@ fn set_secret_ref_matches_slots() {
             port: 22,
             username: "u".into(),
             auth: SshAuth::Agent,
+            host_key_policy: HostKeyPolicy::Strict,
         },
         jump_hosts: vec![],
     });
@@ -372,12 +374,24 @@ fn ssh_auth() -> impl Strategy<Value = SshAuth> {
 }
 
 fn hop() -> impl Strategy<Value = SshHop> {
-    (host(), 1u16.., text(), ssh_auth()).prop_map(|(host, port, username, auth)| SshHop {
-        host,
-        port,
-        username,
-        auth,
-    })
+    (
+        host(),
+        1u16..,
+        text(),
+        ssh_auth(),
+        prop_oneof![
+            Just(HostKeyPolicy::Strict),
+            Just(HostKeyPolicy::AcceptNew),
+            Just(HostKeyPolicy::Disabled),
+        ],
+    )
+        .prop_map(|(host, port, username, auth, host_key_policy)| SshHop {
+            host,
+            port,
+            username,
+            auth,
+            host_key_policy,
+        })
 }
 
 fn tls() -> impl Strategy<Value = TlsConfig> {

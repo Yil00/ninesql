@@ -12,6 +12,12 @@ publish.workspace = true
 [lints]
 workspace = true
 
+[features]
+default = []
+# Registers nothing by itself: exposes `ninesql_driver_api::mock` (the in-memory mock driver) to
+# UI and core tests. Never enabled in release builds.
+mock = ["ninesql-driver-api/mock"]
+
 [dependencies]
 ninesql-driver-api.workspace = true
 ninesql-storage.workspace = true
@@ -26,8 +32,12 @@ tracing.workspace = true
 uuid.workspace = true
 secrecy.workspace = true
 zeroize.workspace = true
+# Driver runtime (ADR-0004): one multi-thread runtime owned by the core, channels to the UI.
+tokio = { workspace = true, features = ["rt", "rt-multi-thread", "sync", "time", "macros"] }
 
 [dev-dependencies]
+ninesql-driver-api = { workspace = true, features = ["mock"] }
+async-trait.workspace = true
 ninesql-secrets = { workspace = true, features = ["memory-store"] }
 proptest.workspace = true
 tempfile.workspace = true
