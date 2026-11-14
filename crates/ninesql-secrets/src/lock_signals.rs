@@ -14,9 +14,13 @@
 //!   applications started in an `app-*.scope` outside the session). Without a session, only sleep
 //!   is watched ([`DesktopLockWatcher::watches_session_lock`]).
 //!
-//! Every subscription is restricted to signals sent by the owner of `org.freedesktop.login1`
-//! (the bus checks the sender); member, interface and path are checked again on receipt.
-//! On the bus the watcher only calls logind: the session lookup and `Inhibit`.
+//! Every subscription is restricted to signals sent by the owner of `org.freedesktop.login1`.
+//! Since a signal sent to this connection by name bypasses match rules, each signal is also
+//! checked on receipt: no destination header, sender equal to the logind name's current unique
+//! owner (`GetNameOwner` at setup, followed through `NameOwnerChanged`), then member, interface
+//! and path.
+//! On the bus the watcher only calls logind (the session lookup and `Inhibit`) and the bus
+//! itself (`GetNameOwner` for the logind name).
 //!
 //! Fail closed: a panicking hook is logged and the watcher goes on; when the bus connection is
 //! lost, the hook is called once with [`LockTrigger::Requested`] and the watcher stops
@@ -125,6 +129,9 @@ pub struct DesktopLockWatcher {
     stop: Arc<Stop>,
     status: Arc<Status>,
     session_watched: bool,
+    /// The watcher connection's unique bus name (tests send unicast signals to it).
+    #[cfg_attr(not(test), allow(dead_code))]
+    unique_name: String,
 }
 
 impl std::fmt::Debug for DesktopLockWatcher {
@@ -199,10 +206,11 @@ impl DesktopLockWatcher {
             })
             .map_err(|e| LockWatchError::Bus(format!("cannot start the watcher thread: {e}")))?;
         match ready_rx.recv_timeout(setup_timeout) {
-            Ok(Ok(session_watched)) => Ok(Self {
+            Ok(Ok((session_watched, unique_name))) => Ok(Self {
                 stop,
                 status,
                 session_watched,
+                unique_name,
             }),
             Ok(Err(e)) => Err(e),
             Err(mpsc::RecvTimeoutError::Timeout) => {
@@ -292,6 +300,8 @@ async fn own_session(conn: &Connection) -> Option<String> {
 }
 
 /// Takes a logind delay inhibitor for sleep. `None` when logind refuses it (no logind, policy).
+// zbus receives the fd without `MSG_CMSG_CLOEXEC`; NineSQL spawns no child process, so it
+// cannot leak into one (upstream note, review N5).
 async fn take_sleep_delay(conn: &Connection) -> Option<OwnedFd> {
     let reply = conn
         .call_method(
@@ -334,20 +344,66 @@ fn signal_rule(
 }
 
 /// What a received signal means.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum Event {
     SleepStarting,
     Resumed,
     SessionLocked,
+    /// `org.freedesktop.login1` has a new owner (unique name), or none.
+    LogindOwner(Option<String>),
 }
 
-/// What a received signal asks for (second check after the bus-side match rules).
-fn classify(msg: &Message, session_path: Option<&str>) -> Option<Event> {
+const BUS: &str = "org.freedesktop.DBus";
+
+/// The `NameOwnerChanged` rule for the logind name (sent by the bus itself).
+fn owner_rule() -> Result<MatchRule<'static>, zbus::Error> {
+    MatchRule::builder()
+        .msg_type(MessageType::Signal)
+        .sender(BUS)
+        .interface(BUS)
+        .member("NameOwnerChanged")
+        .path("/org/freedesktop/DBus")
+        .arg(0, LOGIND)
+        .build()
+        .map(|r| r.to_owned())
+}
+
+/// The unique name owning `org.freedesktop.login1` now, if any.
+async fn logind_owner(conn: &Connection) -> Option<String> {
+    let reply = conn
+        .call_method(
+            Some(BUS),
+            "/org/freedesktop/DBus",
+            Some(BUS),
+            "GetNameOwner",
+            &(LOGIND,),
+        )
+        .await
+        .inspect_err(|e| tracing::info!(error = %e, "logind is not on the bus"))
+        .ok()?;
+    reply.body().deserialize::<String>().ok()
+}
+
+/// What a received signal asks for. The bus-side match rules are not enough: a signal sent to
+/// this connection by name (a destination header) is delivered whatever the rules say, and the
+/// client-side rule check cannot resolve well-known sender names. So every signal is checked
+/// here: no destination, and sent by the bus itself (owner changes of the logind name) or by
+/// the current unique-name owner of `org.freedesktop.login1`.
+fn classify(msg: &Message, session_path: Option<&str>, owner: Option<&str>) -> Option<Event> {
     let header = msg.header();
-    if header.message_type() != MessageType::Signal {
+    if header.message_type() != MessageType::Signal || header.destination().is_some() {
         return None;
     }
+    let sender = header.sender()?.as_str();
     let interface = header.interface()?.as_str();
+    let member = header.member()?.as_str();
+    if sender == BUS && interface == BUS && member == "NameOwnerChanged" {
+        let (name, _old, new): (String, String, String) = msg.body().deserialize().ok()?;
+        return (name == LOGIND).then(|| Event::LogindOwner((!new.is_empty()).then_some(new)));
+    }
+    if Some(sender) != owner {
+        return None;
+    }
     let member = header.member()?.as_str();
     let path = header.path()?.as_str();
     match (interface, member) {
@@ -398,7 +454,7 @@ async fn watch(
     hook: Arc<dyn LockHook>,
     stop: Arc<Stop>,
     status: Arc<Status>,
-    ready: mpsc::Sender<Result<bool, LockWatchError>>,
+    ready: mpsc::Sender<Result<(bool, String), LockWatchError>>,
 ) {
     let setup = async {
         let conn = connect(target).await?;
@@ -422,17 +478,25 @@ async fn watch(
                 .map(|r| r.to_owned());
             streams.push(subscribe(&conn, props).await?);
         }
+        // Subscribed before the lookup, so an owner change in between is not missed.
+        streams.push(subscribe(&conn, owner_rule()).await?);
+        let owner = logind_owner(&conn).await;
         let inhibitor = take_sleep_delay(&conn).await;
-        Ok::<_, LockWatchError>((conn, session_path, streams, inhibitor))
+        let unique = conn
+            .unique_name()
+            .map(|n| n.as_str().to_owned())
+            .unwrap_or_default();
+        Ok::<_, LockWatchError>((conn, session_path, streams, owner, inhibitor, unique))
     };
-    let (conn, session_path, mut streams, mut inhibitor) = match until_stopped(&stop, setup).await {
-        None => return,
-        Some(Ok(v)) => v,
-        Some(Err(e)) => {
-            let _ = ready.send(Err(e));
-            return;
-        }
-    };
+    let (conn, session_path, mut streams, mut owner, mut inhibitor, unique) =
+        match until_stopped(&stop, setup).await {
+            None => return,
+            Some(Ok(v)) => v,
+            Some(Err(e)) => {
+                let _ = ready.send(Err(e));
+                return;
+            }
+        };
     if session_path.is_none() {
         tracing::info!("no logind session found: only sleep locks the secrets");
     }
@@ -440,47 +504,67 @@ async fn watch(
     status
         .sleep_delay
         .store(inhibitor.is_some(), Ordering::SeqCst);
-    if ready.send(Ok(session_path.is_some())).is_err() {
+    if ready.send(Ok((session_path.is_some(), unique))).is_err() {
         // `start` gave up waiting.
         return;
     }
+    // The `Inhibit` call after a resume runs alongside the streams, so signals are handled
+    // while logind answers.
+    let mut retake: Option<Pin<Box<dyn Future<Output = Option<OwnedFd>> + Send>>> = None;
     loop {
         let next = poll_fn(|cx| {
             if stop.poll_stopped(cx) {
-                return Poll::Ready(None);
+                return Poll::Ready(Next::Stopped);
+            }
+            if let Some(f) = retake.as_mut()
+                && let Poll::Ready(fd) = f.as_mut().poll(cx)
+            {
+                return Poll::Ready(Next::Inhibitor(fd));
             }
             for s in &mut streams {
                 if let Poll::Ready(m) = Pin::new(s).poll_next(cx) {
-                    return Poll::Ready(Some(m));
+                    return Poll::Ready(Next::Message(m));
                 }
             }
             Poll::Pending
         })
         .await;
         match next {
-            None => break,
-            Some(Some(Ok(msg))) => match classify(&msg, session_path.as_deref()) {
-                Some(Event::SleepStarting) => {
-                    run_hook(&*hook, LockTrigger::Sleep);
-                    // Secrets are gone: let the suspend go on.
-                    inhibitor = None;
-                    status.sleep_delay.store(false, Ordering::SeqCst);
-                }
-                Some(Event::Resumed) => {
-                    if inhibitor.is_none() {
-                        inhibitor = until_stopped(&stop, take_sleep_delay(&conn))
-                            .await
-                            .flatten();
-                        status
-                            .sleep_delay
-                            .store(inhibitor.is_some(), Ordering::SeqCst);
+            Next::Stopped => break,
+            Next::Inhibitor(fd) => {
+                retake = None;
+                inhibitor = fd;
+                status
+                    .sleep_delay
+                    .store(inhibitor.is_some(), Ordering::SeqCst);
+            }
+            Next::Message(Some(Ok(msg))) => {
+                match classify(&msg, session_path.as_deref(), owner.as_deref()) {
+                    Some(Event::SleepStarting) => {
+                        run_hook(&*hook, LockTrigger::Sleep);
+                        // Secrets are gone: let the suspend go on.
+                        retake = None;
+                        inhibitor = None;
+                        status.sleep_delay.store(false, Ordering::SeqCst);
                     }
+                    Some(Event::Resumed) => {
+                        if inhibitor.is_none() && retake.is_none() {
+                            let c = conn.clone();
+                            retake = Some(Box::pin(async move { take_sleep_delay(&c).await }));
+                        }
+                    }
+                    Some(Event::SessionLocked) => run_hook(&*hook, LockTrigger::SessionLock),
+                    Some(Event::LogindOwner(new)) => {
+                        tracing::info!(present = new.is_some(), "logind owner changed");
+                        owner = new;
+                    }
+                    None => {}
                 }
-                Some(Event::SessionLocked) => run_hook(&*hook, LockTrigger::SessionLock),
-                None => {}
-            },
-            Some(Some(Err(e))) => tracing::debug!(error = %e, "bad message on the system bus"),
-            Some(None) => {
+            }
+            Next::Message(Some(Err(e))) => {
+                tracing::debug!(error = %e, "bad message on the system bus");
+            }
+            Next::Message(None) => {
                 tracing::warn!(
                     "system bus connection lost: locking secrets; sleep and lock no longer watched"
                 );
@@ -490,6 +574,13 @@ async fn watch(
         }
     }
     drop(inhibitor);
+}
+
+/// What woke the watcher loop.
+enum Next {
+    Stopped,
+    Inhibitor(Option<OwnedFd>),
+    Message(Option<zbus::Result<Message>>),
 }
 
 #[cfg(test)]
@@ -743,6 +834,90 @@ mod tests {
         logind.emit(LOGIND_PATH, MANAGER, "PrepareForSleep", Some(true));
         std::thread::sleep(Duration::from_millis(300));
         assert_eq!(recorder.got().len(), 2);
+    }
+
+    #[test]
+    fn a_unicast_forged_signal_is_ignored_and_the_delay_kept() {
+        let Some(bus) = private_bus() else {
+            eprintln!("dbus-daemon not available: skipped");
+            return;
+        };
+        let logind = FakeLogind::start(&bus.address);
+        let recorder = Arc::new(Recorder::default());
+        let w = watcher(
+            &bus,
+            SessionChoice::Path(OUR_SESSION.into()),
+            recorder.clone(),
+        );
+        assert!(w.holds_sleep_delay());
+        assert!(!w.unique_name.is_empty());
+        // Sent to the watcher by name: the bus delivers it whatever the match rules say.
+        let forger = connect_to(&bus.address);
+        let to = Some(w.unique_name.as_str());
+        zbus::block_on(async {
+            forger
+                .emit_signal(to, LOGIND_PATH, MANAGER, "PrepareForSleep", &(true,))
+                .await
+                .unwrap();
+            forger
+                .emit_signal(to, OUR_SESSION, SESSION, "Lock", &())
+                .await
+                .unwrap();
+            // A forged owner change, then a broadcast that would match the forger.
+            forger
+                .emit_signal(
+                    to,
+                    "/org/freedesktop/DBus",
+                    BUS,
+                    "NameOwnerChanged",
+                    &(LOGIND, "", forger.unique_name().unwrap().as_str()),
+                )
+                .await
+                .unwrap();
+        });
+        emit_on(&forger, LOGIND_PATH, MANAGER, "PrepareForSleep", Some(true));
+        // The real logind signal sent from the same name owner, unicast, is refused too.
+        zbus::block_on(
+            logind
+                .conn
+                .emit_signal(to, OUR_SESSION, SESSION, "Lock", &()),
+        )
+        .unwrap();
+        std::thread::sleep(Duration::from_millis(400));
+        assert!(recorder.got().is_empty(), "{:?}", recorder.got());
+        assert!(w.holds_sleep_delay());
+        assert!(!logind.inhibitor_released(0));
+        // The genuine broadcast still works.
+        logind.emit(OUR_SESSION, SESSION, "Lock", None);
+        assert_eq!(recorder.wait_for(1), [LockTrigger::SessionLock]);
+    }
+
+    #[test]
+    fn a_new_logind_owner_is_followed() {
+        let Some(bus) = private_bus() else {
+            eprintln!("dbus-daemon not available: skipped");
+            return;
+        };
+        let first = FakeLogind::start(&bus.address);
+        let recorder = Arc::new(Recorder::default());
+        let w = watcher(
+            &bus,
+            SessionChoice::Path(OUR_SESSION.into()),
+            recorder.clone(),
+        );
+        // logind restarts: the old owner leaves, a new connection takes the name.
+        zbus::block_on(first.conn.release_name(LOGIND)).unwrap();
+        let second = FakeLogind::start(&bus.address);
+        std::thread::sleep(Duration::from_millis(200));
+        first.emit(OUR_SESSION, SESSION, "Lock", None);
+        std::thread::sleep(Duration::from_millis(300));
+        assert!(
+            recorder.got().is_empty(),
+            "the old owner is not trusted any more"
+        );
+        second.emit(OUR_SESSION, SESSION, "Lock", None);
+        assert_eq!(recorder.wait_for(1), [LockTrigger::SessionLock]);
+        drop(w);
     }
 
     #[test]
