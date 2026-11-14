@@ -10,6 +10,7 @@
 //! ui_font_size = 14               # pixels, 8 to 32
 //! mono_font_family = "JetBrains Mono"
 //! mono_font_size = 13
+//! zoom = 0                        # pixels added to both sizes by the zoom actions, -8 to 16
 //!
 //! [keybindings]
 //! "ninesql::NewEditorTab" = "ctrl-n"              # replaces the defaults
@@ -21,10 +22,27 @@
 //! and sections are ignored; every invalid value or binding is reported as a [`Diagnostic`]
 //! (shown in the status bar) and replaced by its default, never fatal. A file without
 //! `schema_version` is read as version 1; a newer version is not read at all and the file is
-//! left untouched (ADR-0008 §2: no silent downgrade). NineSQL does not write this file yet.
+//! left untouched (ADR-0008 §2: no silent downgrade).
+//!
+//! Changes made from the UI (theme, fonts, zoom, key bindings) are written back by
+//! [`crate::persist`], which edits only the keys that changed and keeps comments, formatting and
+//! unknown keys. NineSQL never writes a file it could not read: a newer `schema_version`, invalid
+//! TOML or UTF-8, an unreadable file or a refused symbolic link block saving (see
+//! [`SettingsState::save_blocked`]) and the problem is listed with the others.
+//!
+//! # Symbolic links
+//! Dotfile managers often make `settings.toml` a symbolic link. NineSQL follows it only if the
+//! final target (every link resolved) is a regular file owned by the current effective user
+//! ([`ninesql_core::storage::fs::current_uid`]); it then reads and writes that target, so the link
+//! itself stays in place (the atomic write renames a temp file next to the target, and the target
+//! ends up with mode 0600). A link to a file owned by someone else (for example a root-owned file
+//! in `/nix/store`), to something that is not a regular file, or a dangling link is refused with
+//! a diagnostic: defaults are used and nothing is written. See [`resolve_settings_file`].
 //!
 //! Diagnostics name keys and key bindings, never other string values from the file.
 
+use std::io;
+use std::os::unix::fs::MetadataExt as _;
 use std::path::{Path, PathBuf};
 
 use gpui_kit::Global;
@@ -41,6 +59,8 @@ pub const SETTINGS_SCHEMA_VERSION: i64 = 1;
 const MAX_SETTINGS_BYTES: u64 = 1024 * 1024;
 /// Allowed font sizes, in pixels.
 pub const FONT_SIZE_RANGE: std::ops::RangeInclusive<f32> = 8.0..=32.0;
+/// Allowed zoom offsets, in pixels.
+pub const ZOOM_RANGE: std::ops::RangeInclusive<f32> = -8.0..=16.0;
 
 /// One problem found in settings.toml.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -91,6 +111,8 @@ pub struct Appearance {
     pub mono_font_family: Option<String>,
     /// Editor font size in pixels; `None` keeps the theme default.
     pub mono_font_size: Option<f32>,
+    /// Pixels added to both font sizes by the zoom actions.
+    pub zoom: f32,
 }
 
 /// The parsed settings.
@@ -111,6 +133,10 @@ pub struct SettingsState {
     pub settings: Settings,
     /// Problems, in file order.
     pub diagnostics: Vec<Diagnostic>,
+    /// Why changes made from the UI are not written to the file, if they are not. Set when the
+    /// file could not be read as this build's settings: NineSQL never overwrites what it could
+    /// not read.
+    pub save_blocked: Option<Diagnostic>,
 }
 
 impl Global for SettingsState {}
@@ -118,6 +144,12 @@ impl Global for SettingsState {}
 /// Parses settings text. Never fails: problems are returned next to the settings in effect.
 #[must_use]
 pub fn parse(text: &str) -> (Settings, Vec<Diagnostic>) {
+    let (settings, diags, _) = parse_full(text);
+    (settings, diags)
+}
+
+/// [`parse`], and whether the text must not be overwritten (invalid TOML, newer schema).
+fn parse_full(text: &str) -> (Settings, Vec<Diagnostic>, Option<Diagnostic>) {
     let mut diags = Vec::new();
     let mut settings = Settings::default();
     let table: Table = match text.parse() {
@@ -132,7 +164,11 @@ pub fn parse(text: &str) -> (Settings, Vec<Diagnostic>) {
                 }
                 None => "settings.toml is not valid TOML: defaults are used".to_owned(),
             }));
-            return (settings, diags);
+            return (
+                settings,
+                diags,
+                Some(not_saved("settings.toml is not valid TOML")),
+            );
         }
     };
 
@@ -144,7 +180,11 @@ pub fn parse(text: &str) -> (Settings, Vec<Diagnostic>) {
                 "settings.toml has schema_version {v}, newer than this NineSQL reads \
                  ({SETTINGS_SCHEMA_VERSION}): the file is ignored and left untouched"
             )));
-            return (settings, diags);
+            return (
+                settings,
+                diags,
+                Some(not_saved("settings.toml was written by a newer NineSQL")),
+            );
         }
         Some(_) => diags.push(Diagnostic::new(format!(
             "{SCHEMA_VERSION_KEY} must be {SETTINGS_SCHEMA_VERSION}: read as version {SETTINGS_SCHEMA_VERSION}"
@@ -161,7 +201,14 @@ pub fn parse(text: &str) -> (Settings, Vec<Diagnostic>) {
         Some(Value::Table(t)) => settings.keybindings = parse_keybindings(t, &mut diags),
         Some(_) => diags.push(Diagnostic::new("[keybindings] must be a table")),
     }
-    (settings, diags)
+    (settings, diags, None)
+}
+
+/// The "changes are not saved" diagnostic for `why`.
+fn not_saved(why: &str) -> Diagnostic {
+    Diagnostic::new(format!(
+        "{why}: changes made in NineSQL are not saved to settings.toml"
+    ))
 }
 
 fn parse_appearance(t: &Table, diags: &mut Vec<Diagnostic>) -> Appearance {
@@ -180,6 +227,18 @@ fn parse_appearance(t: &Table, diags: &mut Vec<Diagnostic>) -> Appearance {
     out.mono_font_family = font_family(t, "mono_font_family", diags);
     out.ui_font_size = font_size(t, "ui_font_size", diags);
     out.mono_font_size = font_size(t, "mono_font_size", diags);
+    if let Some(v) = t.get("zoom") {
+        #[allow(clippy::cast_precision_loss, clippy::cast_possible_truncation)]
+        match v {
+            Value::Integer(i) if ZOOM_RANGE.contains(&(*i as f32)) => out.zoom = *i as f32,
+            Value::Float(f) if ZOOM_RANGE.contains(&(*f as f32)) => out.zoom = *f as f32,
+            _ => diags.push(Diagnostic::new(format!(
+                "[appearance] zoom must be a number from {} to {}: 0 is used",
+                ZOOM_RANGE.start(),
+                ZOOM_RANGE.end()
+            ))),
+        }
+    }
     out
 }
 
@@ -260,28 +319,107 @@ fn parse_keybindings(t: &Table, diags: &mut Vec<Diagnostic>) -> BindingOverrides
     out
 }
 
-/// Reads settings from `path`. A missing file gives defaults without a problem.
+/// The file to read and write for the configured settings location `path`, under the
+/// symbolic link rule of the module documentation:
+///
+/// - a missing file or a regular file: `path` itself;
+/// - a symbolic link whose final target is a regular file owned by the current effective user:
+///   that target (canonical path, no link left in it);
+/// - anything else (a link to a file owned by someone else or to a non-regular file, a dangling
+///   link, a directory or a device in place of the file): refused.
+///
+/// # Errors
+/// A diagnostic for the status bar; the caller uses defaults and writes nothing.
+pub fn resolve_settings_file(path: &Path) -> Result<PathBuf, Diagnostic> {
+    let meta = match std::fs::symlink_metadata(path) {
+        Ok(meta) => meta,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(path.to_path_buf()),
+        Err(e) => {
+            return Err(Diagnostic::new(format!(
+                "settings.toml cannot be read ({e}): defaults are used"
+            )));
+        }
+    };
+    if meta.file_type().is_file() {
+        return Ok(path.to_path_buf());
+    }
+    if !meta.file_type().is_symlink() {
+        return Err(Diagnostic::new(
+            "settings.toml is not a regular file: defaults are used",
+        ));
+    }
+    let target = match std::fs::canonicalize(path) {
+        Ok(target) => target,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {
+            return Err(Diagnostic::new(
+                "settings.toml is a symbolic link to a missing file: defaults are used",
+            ));
+        }
+        Err(e) => {
+            return Err(Diagnostic::new(format!(
+                "settings.toml is a symbolic link that cannot be followed ({e}): defaults are used"
+            )));
+        }
+    };
+    let meta = std::fs::symlink_metadata(&target).map_err(|e| {
+        Diagnostic::new(format!(
+            "settings.toml is a symbolic link that cannot be followed ({e}): defaults are used"
+        ))
+    })?;
+    if !meta.file_type().is_file() {
+        return Err(Diagnostic::new(
+            "settings.toml is a symbolic link to something that is not a regular file: \
+             defaults are used",
+        ));
+    }
+    let me = ninesql_core::storage::fs::current_uid();
+    if meta.uid() != me {
+        return Err(Diagnostic::new(format!(
+            "settings.toml is a symbolic link to a file owned by another user (uid {}): \
+             defaults are used",
+            meta.uid()
+        )));
+    }
+    tracing::debug!(link = %path.display(), target = %target.display(), "following the settings.toml symbolic link");
+    Ok(target)
+}
+
+/// Reads settings from `path` (the configured location; a symbolic link is followed under the
+/// rule of [`resolve_settings_file`]). A missing file gives defaults without a problem.
 #[must_use]
 pub fn load(path: &Path) -> SettingsState {
     let mut state = SettingsState {
         path: Some(path.to_path_buf()),
         ..SettingsState::default()
     };
-    match ninesql_core::storage::fs::read_limited(path, MAX_SETTINGS_BYTES) {
-        Ok(None) => {}
-        Ok(Some(bytes)) => match String::from_utf8(bytes) {
-            Ok(text) => {
-                let (settings, diagnostics) = parse(&text);
-                state.settings = settings;
-                state.diagnostics = diagnostics;
+    match resolve_settings_file(path) {
+        Err(problem) => {
+            state.save_blocked = Some(not_saved("settings.toml was not read"));
+            state.diagnostics.push(problem);
+        }
+        Ok(file) => match ninesql_core::storage::fs::read_limited(&file, MAX_SETTINGS_BYTES) {
+            Ok(None) => {}
+            Ok(Some(bytes)) => match String::from_utf8(bytes) {
+                Ok(text) => {
+                    let (settings, diagnostics, blocked) = parse_full(&text);
+                    state.settings = settings;
+                    state.diagnostics = diagnostics;
+                    state.save_blocked = blocked;
+                }
+                Err(_) => {
+                    state.diagnostics.push(Diagnostic::new(
+                        "settings.toml is not valid UTF-8: defaults are used",
+                    ));
+                    state.save_blocked = Some(not_saved("settings.toml is not valid UTF-8"));
+                }
+            },
+            Err(err) => {
+                state.diagnostics.push(Diagnostic::new(format!(
+                    "settings.toml cannot be read ({err}): defaults are used"
+                )));
+                state.save_blocked = Some(not_saved("settings.toml was not read"));
             }
-            Err(_) => state.diagnostics.push(Diagnostic::new(
-                "settings.toml is not valid UTF-8: defaults are used",
-            )),
         },
-        Err(err) => state.diagnostics.push(Diagnostic::new(format!(
-            "settings.toml cannot be read ({err}): defaults are used"
-        ))),
     }
     for d in &state.diagnostics {
         tracing::warn!(problem = %d, "settings.toml");
@@ -289,24 +427,37 @@ pub fn load(path: &Path) -> SettingsState {
     state
 }
 
+/// Reads settings from the location of `paths` (ADR-0008).
+#[must_use]
+pub fn load_from_paths(paths: &Paths) -> SettingsState {
+    load(&paths.settings_file())
+}
+
 /// Reads settings from the XDG location (ADR-0008).
 #[must_use]
 pub fn load_from_env() -> SettingsState {
     match Paths::from_env() {
-        Ok(paths) => load(&paths.settings_file()),
+        Ok(paths) => load_from_paths(&paths),
         Err(err) => SettingsState {
             path: None,
             settings: Settings::default(),
             diagnostics: vec![Diagnostic::new(format!(
                 "no settings location ({err}): defaults are used"
             ))],
+            save_blocked: Some(not_saved("no settings location")),
         },
     }
 }
 
+/// The largest settings file NineSQL reads, in bytes.
+#[must_use]
+pub const fn max_settings_bytes() -> u64 {
+    MAX_SETTINGS_BYTES
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{ThemePreference, load, parse};
+    use super::{ThemePreference, load, parse, resolve_settings_file};
 
     #[test]
     fn empty_text_gives_defaults() {
@@ -450,5 +601,109 @@ ui_font_family = ""
         assert!(state.diagnostics.is_empty(), "{:?}", state.diagnostics);
         assert_eq!(state.settings.appearance.theme, ThemePreference::Dark);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn temp_dir() -> tempfile::TempDir {
+        match tempfile::tempdir() {
+            Ok(dir) => dir,
+            Err(e) => panic!("no temp dir: {e}"),
+        }
+    }
+
+    #[test]
+    fn owned_symlink_is_followed() {
+        let dir = temp_dir();
+        let target = dir.path().join("dotfiles-settings.toml");
+        assert!(std::fs::write(&target, "[appearance]\ntheme = \"dark\"\n").is_ok());
+        let link = dir.path().join("settings.toml");
+        assert!(std::os::unix::fs::symlink(&target, &link).is_ok());
+        let resolved = resolve_settings_file(&link);
+        assert_eq!(resolved.ok(), std::fs::canonicalize(&target).ok());
+        let state = load(&link);
+        assert!(state.diagnostics.is_empty(), "{:?}", state.diagnostics);
+        assert!(state.save_blocked.is_none());
+        assert_eq!(state.settings.appearance.theme, ThemePreference::Dark);
+        // A chain of links is followed to its final target.
+        let link2 = dir.path().join("settings2.toml");
+        assert!(std::os::unix::fs::symlink(&link, &link2).is_ok());
+        assert_eq!(
+            load(&link2).settings.appearance.theme,
+            ThemePreference::Dark
+        );
+    }
+
+    #[test]
+    fn symlink_to_a_foreign_file_is_refused() {
+        let dir = temp_dir();
+        let target = if ninesql_core::storage::fs::current_uid() == 0 {
+            // Running as root (containers): hand a file to `nobody`.
+            let target = dir.path().join("foreign.toml");
+            assert!(std::fs::write(&target, "[appearance]\ntheme = \"dark\"\n").is_ok());
+            assert!(std::os::unix::fs::chown(&target, Some(65534), Some(65534)).is_ok());
+            target
+        } else {
+            // Any root-owned regular file.
+            std::path::PathBuf::from("/etc/passwd")
+        };
+        let link = dir.path().join("settings.toml");
+        assert!(std::os::unix::fs::symlink(&target, &link).is_ok());
+        let state = load(&link);
+        assert_eq!(state.settings, super::Settings::default());
+        assert!(state.save_blocked.is_some());
+        assert!(
+            state.diagnostics[0]
+                .message()
+                .contains("owned by another user"),
+            "{:?}",
+            state.diagnostics
+        );
+        // Saving refuses too, and the link is untouched.
+        let saved = crate::persist::save_blocking(
+            &link,
+            &[crate::persist::SettingsChange::Theme(
+                ThemePreference::Light,
+            )],
+        );
+        assert!(saved.is_err());
+        assert!(std::fs::symlink_metadata(&link).is_ok_and(|m| m.file_type().is_symlink()));
+    }
+
+    #[test]
+    fn dangling_symlink_and_non_files_are_refused() {
+        let dir = temp_dir();
+        let link = dir.path().join("settings.toml");
+        assert!(std::os::unix::fs::symlink(dir.path().join("missing.toml"), &link).is_ok());
+        let state = load(&link);
+        assert!(state.save_blocked.is_some());
+        assert!(
+            state.diagnostics[0].message().contains("missing file"),
+            "{:?}",
+            state.diagnostics
+        );
+        let saved =
+            crate::persist::save_blocking(&link, &[crate::persist::SettingsChange::Zoom(1.0)]);
+        assert!(saved.is_err());
+        assert!(
+            !dir.path().join("missing.toml").exists(),
+            "nothing is created through the link"
+        );
+
+        // A link to a directory, and a directory in place of the file.
+        let link_dir = dir.path().join("to-dir.toml");
+        assert!(std::os::unix::fs::symlink(dir.path(), &link_dir).is_ok());
+        assert!(resolve_settings_file(&link_dir).is_err());
+        let as_dir = dir.path().join("dir.toml");
+        assert!(std::fs::create_dir(&as_dir).is_ok());
+        assert!(resolve_settings_file(&as_dir).is_err());
+    }
+
+    #[test]
+    fn zoom_is_read_and_checked() {
+        let (settings, diags) = parse("[appearance]\nzoom = -2\n");
+        assert!(diags.is_empty(), "{diags:?}");
+        assert_eq!(settings.appearance.zoom, -2.0);
+        let (settings, diags) = parse("[appearance]\nzoom = 40\n");
+        assert_eq!(diags.len(), 1);
+        assert_eq!(settings.appearance.zoom, 0.0);
     }
 }

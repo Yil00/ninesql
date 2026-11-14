@@ -34,6 +34,8 @@ pub fn init(mut settings: SettingsState, cx: &mut App) {
     }
     settings.diagnostics.extend(problems);
     cx.set_global(settings);
+    // Changes still waiting for the debounce timer are written when NineSQL quits.
+    cx.on_app_quit(crate::persist::flush_on_quit).detach();
 
     cx.on_action(|_: &Quit, cx| cx.quit());
     cx.on_action(|_: &NewWindow, cx| {

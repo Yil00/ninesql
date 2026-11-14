@@ -4625,7 +4625,9 @@ dependencies = [
  "ninesql-core",
  "ninesql-editor",
  "ninesql-grid",
+ "tempfile",
  "toml 0.8.23",
+ "toml_edit 0.22.27",
  "tracing",
  "xim-ctext",
 ]
