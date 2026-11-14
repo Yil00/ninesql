@@ -37,6 +37,8 @@ allow = [
     "Unicode-3.0",
     "CC0-1.0",
     "MPL-2.0",
+    # ADR-0015: BSD Zero Clause, no conditions (enum-iterator, enum-iterator-derive via gpui-component)
+    "0BSD",
 ]
 confidence-threshold = 0.9
 unused-allowed-license = "allow"
