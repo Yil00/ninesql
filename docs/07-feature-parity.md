@@ -24,7 +24,7 @@ Parity means the user can do the same job, not that the UI is a copy: NineSQL ma
 | F-CON-02 | Folders and drag-and-drop organization | CE | 1 | planned | verified (`Manage-Connections`, `Database-Navigator`) |
 | F-CON-03 | Connection types (Dev / Test / Prod, custom) with color, auto-commit default, smart commit, confirmation of SQL execution and of data changes, auto-close of idle transactions and connections | CE | 1 | planned | corrected: read-only is not a connection-type setting in DBeaver (it is per connection, F-CON-11); smart commit and auto-close added (`Connection-Types`) |
 | F-CON-04 | Saved passwords in a secure store; "ask every time" mode | CE / PRO (OS secure storage) | 1 | planned | corrected: CE saves credentials in a locally encrypted file (`credentials-config.json`); keeping them in secure storage is PRO (`Security`, `Admin-Manage-Connections`) |
-| F-CON-05 | SSH tunnel: password, private key, agent; jump hosts; shared tunnels, keep-alive | CE | 1 | planned | verified (`SSH-Configuration`) |
+| F-CON-05 | SSH tunnel: password, private key, agent; jump hosts; shared tunnels, keep-alive | CE | 1 | partial: `ninesql-ssh` (P1-D, wave 1) has tunnels with password, Ed25519 / ECDSA key files, agent, jump hosts, keep-alive and per-hop host-key policies; RSA key files are refused (ADR-0016), no proxy in front of the first hop, shared tunnels not done; not reachable from the core or the UI yet | verified (`SSH-Configuration`) |
 | F-CON-06 | TLS: modes, CA, client certificates | CE / PRO (certificate management UI) | 1 | planned | corrected: TLS settings are CE; the certificate (truststore) manager is PRO (`SSL-Configuration`, `Managing-Truststore-Settings`) |
 | F-CON-07 | SOCKS / HTTP proxy | CE / PRO (automatic proxy detection) | 8 | planned | corrected: DBeaver's per-connection proxy is SOCKS; its HTTP proxy is global (driver downloads); automatic detection is PRO (`Proxy-configuration`) |
 | F-CON-08 | Driver / connection properties (engine-specific options) | CE | 1 | planned | verified (`Create-Connection`) |
@@ -33,7 +33,7 @@ Parity means the user can do the same job, not that the UI is a copy: NineSQL ma
 | F-CON-11 | Read-only connection | CE | 1 | planned | verified; DBeaver also offers finer restrictions: data edit, structure edit, script execution, data import (`Managing-security-restrictions-for-database-connection`) |
 | F-CON-12 | Connect by URL / connection string | CE | 1 | planned | verified (`Create-Connection`, release notes 25.2.1) |
 | F-CON-13 | Multiple projects | CE | 10 | planned | verified (`Projects`) |
-| F-CON-14 | Import connections from DBeaver (connections, folders, types, SSH, TLS, passwords, scripts) | — | 2 | planned | verified: NineSQL-specific |
+| F-CON-14 | Import connections from DBeaver (connections, folders, types, SSH, TLS, passwords, scripts) | — | 2 | partial: the read-only parser and mapping landed (P2-A, [docs/06](06-dbeaver-interop.md)); the import flow (P2-B), persistence and secret move (P2-C) and scripts are open | verified: NineSQL-specific |
 | F-CON-15 | Export connections to DBeaver format (no passwords) | — | 5 | planned | verified: NineSQL-specific |
 | F-CON-16 | Open a local database file (SQLite / DuckDB) directly; local engine detection (sockets) | CE (file open only) | 10 | planned | corrected: DBeaver opens SQLite / DuckDB files from the File menu (release notes 25.3.4); automatic detection of local engines has no DBeaver equivalent |
 | F-CON-17 | Network profiles: reusable SSH / proxy settings shared by several connections, global or per project | CE | 10 | planned | added (`Network-profiles`, release notes 26.1.3) |
@@ -148,9 +148,9 @@ Parity means the user can do the same job, not that the UI is a copy: NineSQL ma
 ## Workspace and UX (`WS`)
 | Id | Feature | Edition | Phase | Status | Audit |
 |---|---|---|---|---|---|
-| F-WS-01 | Tabs, split panes, dockable panels, multiple windows | CE | 1 | planned | verified (`Application-Window-Overview`) |
-| F-WS-02 | Command palette and configurable key bindings | CE | 1 | planned | corrected: was `—`; DBeaver CE has "Find actions" (Ctrl+3) and configurable key bindings (`Shortcuts`) |
-| F-WS-03 | Light / dark themes, font settings, HiDPI and fractional scaling on Wayland | CE | 1 | planned | verified (`User-Interface-Themes`; release notes 26.1.2, 26.2.2) |
+| F-WS-01 | Tabs, split panes, dockable panels, multiple windows | CE | 1 | partial: tabs, splits, status bar, multiple windows and a resizable, hideable navigator dock landed (P1-A); panels cannot be moved to another dock position yet | verified (`Application-Window-Overview`) |
+| F-WS-02 | Command palette and configurable key bindings | CE | 1 | done (P1-A): 19 actions, each with a default binding and a palette entry; overrides in `settings.toml`, read at startup only | corrected: was `—`; DBeaver CE has "Find actions" (Ctrl+3) and configurable key bindings (`Shortcuts`) |
+| F-WS-03 | Light / dark themes, font settings, HiDPI and fractional scaling on Wayland | CE | 1 | partial: light / dark / system themes, fonts and zoom landed (P1-A); fractional scaling relies on GPUI's scale factor and is not checked on a real display yet; settings are not saved from the UI yet | verified (`User-Interface-Themes`; release notes 26.1.2, 26.2.2) |
 | F-WS-04 | Preferences UI (global and per connection) | CE | 3 | planned | verified (`Admin-Manage-Preferences`) |
 | F-WS-05 | Bookmarks on objects and scripts | CE | 10 | planned | verified (`Bookmarks`) |
 | F-WS-06 | Session restore (open tabs and scripts after restart) | CE? | 3 | planned | unverified: not documented |
