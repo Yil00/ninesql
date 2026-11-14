@@ -13,3 +13,25 @@ publish.workspace = true
 workspace = true
 
 [dependencies]
+ninesql-driver-api.workspace = true
+ninesql-storage.workspace = true
+# Pure-Rust SSH (ADR-0011 §5). `ring` is the crypto provider (no OpenSSL, no aws-lc C build);
+# `flate2` (compression) is off: no decompression of untrusted data is needed for a tunnel.
+russh = { workspace = true }
+data-encoding = { workspace = true }
+libc.workspace = true
+rustix.workspace = true
+hmac = { workspace = true }
+sha1 = { workspace = true }
+sha2 = { workspace = true }
+secrecy.workspace = true
+thiserror.workspace = true
+tokio = { workspace = true, features = ["net", "rt", "sync", "time", "io-util", "macros"] }
+tracing.workspace = true
+zeroize.workspace = true
+
+[dev-dependencies]
+proptest.workspace = true
+rand.workspace = true
+tempfile.workspace = true
+tokio = { workspace = true, features = ["net", "rt", "rt-multi-thread", "sync", "time", "io-util", "macros", "process"] }
