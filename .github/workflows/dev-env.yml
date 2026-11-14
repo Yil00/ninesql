@@ -1,0 +1,112 @@
+name: Dev environment
+
+# Brings up each profile of dev/compose.yaml and checks that every engine is
+# healthy and seeded (ADR-0009). The heavy profile runs nightly, on demand, and
+# on pull requests that touch its seeds or drivers.
+
+on:
+  pull_request:
+    paths:
+      - "dev/**"
+      - ".github/workflows/dev-env.yml"
+      - "crates/drivers/**"
+  push:
+    branches: [main, dev]
+    paths:
+      - "dev/**"
+      - ".github/workflows/dev-env.yml"
+  schedule:
+    - cron: "17 3 * * *"
+  workflow_dispatch:
+    inputs:
+      profile:
+        description: "Profile to run (core, sql, nosql, heavy or all)"
+        required: true
+        default: all
+        type: choice
+        options: [core, sql, nosql, heavy, all]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: dev-env-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  check:
+    name: engines.json matches compose.yaml
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - run: python3 dev/ready.py check
+
+  profile:
+    name: Profile ${{ matrix.profile }}
+    needs: check
+    if: >-
+      github.event_name != 'workflow_dispatch' ||
+      inputs.profile == 'all' || inputs.profile == matrix.profile
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        profile: [core, sql, nosql]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Free disk space for the images
+        if: matrix.profile == 'sql'
+        run: sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+      - name: Pull images
+        run: timeout 1200 docker compose -f dev/compose.yaml --profile ${{ matrix.profile }} pull --quiet
+      - name: Start and wait for readiness
+        run: python3 dev/ready.py up ${{ matrix.profile }} --timeout 1200
+      - name: Show state
+        if: always()
+        run: docker compose -f dev/compose.yaml --profile all ps --all
+      - name: Stop
+        if: always()
+        run: python3 dev/ready.py down
+
+  heavy:
+    name: Profile heavy
+    needs: check
+    if: >-
+      github.event_name == 'schedule' || github.event_name == 'pull_request' ||
+      (github.event_name == 'workflow_dispatch' && (inputs.profile == 'all' || inputs.profile == 'heavy'))
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+      - name: Decide whether this pull request needs the heavy profile
+        id: scope
+        env:
+          EVENT: ${{ github.event_name }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: |
+          run=true
+          if [ "$EVENT" = "pull_request" ]; then
+            if git diff --name-only "$BASE_SHA" HEAD | grep -qE '^(dev/compose\.yaml|dev/engines\.json|dev/ready\.py|dev/seed/(search|cassandra|neo4j)/|\.github/workflows/dev-env\.yml|crates/drivers/ninesql-driver-(search|cassandra|neo4j)/)'; then
+              run=true
+            else
+              run=false
+            fi
+          fi
+          echo "run=$run" >> "$GITHUB_OUTPUT"
+          echo "heavy profile needed: $run"
+      - name: Pull images
+        if: steps.scope.outputs.run == 'true'
+        run: timeout 1200 docker compose -f dev/compose.yaml --profile heavy pull --quiet
+      - name: Start and wait for readiness
+        if: steps.scope.outputs.run == 'true'
+        run: python3 dev/ready.py up heavy --timeout 1500
+      - name: Show state
+        if: always() && steps.scope.outputs.run == 'true'
+        run: docker compose -f dev/compose.yaml --profile all ps --all
+      - name: Stop
+        if: always() && steps.scope.outputs.run == 'true'
+        run: python3 dev/ready.py down
