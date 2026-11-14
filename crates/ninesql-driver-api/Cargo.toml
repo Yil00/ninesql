@@ -12,4 +12,24 @@ publish.workspace = true
 [lints]
 workspace = true
 
+[features]
+default = []
+# In-memory mock driver for UI and core tests. Never enabled in release builds.
+mock = []
+
 [dependencies]
+arrow-array.workspace = true
+arrow-schema.workspace = true
+async-trait.workspace = true
+futures-core.workspace = true
+futures-util.workspace = true
+thiserror.workspace = true
+tokio = { workspace = true, features = ["sync", "time", "macros"] }
+tracing.workspace = true
+zeroize.workspace = true
+
+[dev-dependencies]
+proptest.workspace = true
+tokio = { workspace = true, features = ["rt", "rt-multi-thread", "macros", "time", "test-util"] }
+# Enables the `mock` feature for this crate's own integration tests.
+ninesql-driver-api = { path = ".", features = ["mock"] }

@@ -33,19 +33,29 @@ ninesql-dbeaver = { path = "crates/ninesql-dbeaver" }
 ninesql-grid = { path = "crates/ninesql-grid" }
 ninesql-editor = { path = "crates/ninesql-editor" }
 
+# Shared by several crates
+thiserror = "2"
+tracing = "0.1"
+zeroize = { version = "1", features = ["std"] }
+proptest = "1"
+
 # Storage, connection model and secrets (P0-D)
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 toml = "0.8"
-thiserror = "2"
-tracing = "0.1"
 uuid = { version = "1", features = ["v4", "serde"] }
 secrecy = "0.10"
-zeroize = "1"
 secret-service = { version = "=6.0.0-rc.1", default-features = false, features = ["rt-default", "crypto-rust"] }
-proptest = "1"
 tempfile = "3"
 libc = "0.2"
+
+# Driver API (ADR-0004): Arrow sub-crates only, async contract.
+arrow-array = { version = "57", default-features = false }
+arrow-schema = { version = "57", default-features = false }
+async-trait = "0.1"
+futures-core = { version = "0.3", default-features = false, features = ["std"] }
+futures-util = { version = "0.3", default-features = false, features = ["std"] }
+tokio = { version = "1", default-features = false }
 
 # GPUI and gpui-component are pinned to one git revision pair in P0-A (ADR-0001), e.g.:
 # gpui = { git = "https://github.com/zed-industries/zed", rev = "<sha>" }
