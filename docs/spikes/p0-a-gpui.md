@@ -9,18 +9,29 @@
 | Component | Pin | Notes |
 |---|---|---|
 | `gpui-kit` (facade: GPUI + `gpui-base` + `gpui-component` + assets + platform) | `=0.9.1` on crates.io | Same source as `longbridge/gpui-component` tag `v0.9.1`, commit `39ab849a93b5f15507b969164d49891db8d5b470` |
-| `gpui-component` | `0.9.1` (through `gpui-kit`) | Apache-2.0 |
-| GPUI | `gpui-pre =0.3.12` (exact pin made by `gpui-kit`) | crates.io snapshot of `zed-industries/zed@d2a4fb6`, Apache-2.0 |
+| `gpui-base`, `gpui-component`, `gpui-component-macros`, `gpui-kit-assets` | `=0.9.1`, each pinned in the workspace and a direct dev-dependency of `ninesql-ui` | `gpui-kit` asks for its siblings with caret ranges (`"0.9.1"`); the direct exact requirements are what hold resolution on 0.9.1. Apache-2.0 |
+| GPUI | `gpui-pre =0.3.12` (exact pin made by `gpui-kit` and `gpui-component`) | crates.io snapshot of `zed-industries/zed@d2a4fb6`, Apache-2.0 |
 
-Why crates.io and not a `zed-industries/zed` git revision: since its 0.8 line, `gpui-component` no longer depends on Zed's git repository; it depends on the `gpui-pre-*` crates, exact-pinned snapshots of Zed's GPUI crates. A git pin of `zed` would produce a second, incompatible `gpui` crate next to the one `gpui-component` uses. ADR-0001 §3 allows the switch to crates.io releases without a new ADR. Two follow-ups for the security review:
-- The `gpui-pre-*` crates are published by the `gpui-component` maintainer, not by the `zed-industries` crates.io team (who publish `gpui` 0.2.x, too old for `gpui-component`). Supply-chain trust moves from "Zed's git repository" to "a third-party snapshot of it"; Cargo.lock checksums pin the exact bytes.
-- The two `allow-git` entries in `deny.toml` are now unused (cargo-deny warns `unmatched-source`, not an error); they are kept in case a later bump goes back to git.
+### Decision: GPUI from crates.io (ADR-0013)
+The decision is recorded in **ADR-0013** (written on its own branch). In short: since its 0.8 line, `gpui-component` no longer depends on Zed's git repository; it depends on the `gpui-pre-*` crates, exact-pinned snapshots of Zed's GPUI crates. A git pin of `zed` would produce a second, incompatible `gpui` crate next to the one `gpui-component` uses. The `gpui-pre-*` and `gpui-kit` crates are published by the `gpui-component` maintainer, not by the `zed-industries` crates.io team, so ADR-0013 asks for: exact pins, Cargo.lock checksums, a snapshot check on every bump ([`scripts/verify-gpui-snapshot.sh`](../../scripts/verify-gpui-snapshot.sh)), bans on the dangerous parts of the graph, and a CI grep against GPUI's HTTP client and credential APIs.
 
-Dependency graph: about 670 crates for `ninesql-ui` with the spike on Linux (810 in `Cargo.lock` across all targets). `cargo deny --locked check`: licenses, bans and sources pass unchanged (no Zed GPL crate: `editor`, `language`, `project`, `workspace` are absent). Advisories needed:
-- `cargo update` of `time` (0.3.45 to 0.3.47, RUSTSEC-2026-0009) and `zbus_xml` (5.1.0 to 5.2.1, drops `quick-xml` 0.38: RUSTSEC-2026-0194 / -0195). Both require Rust 1.87 / 1.88, above the workspace `rust-version = "1.85"`; GPUI itself uses let-chains (Rust 1.88), so the workspace MSRV should move to at least 1.88.
-- Eight "unmaintained" notices with no maintained release in the pinned pair, ignored one by one with a reason in `deny.toml` (`instant`, `paste`, `rustls-pemfile` (wasm only), `rustybuzz`, `ttf-parser`, `zbus_names`, `zvariant`, `zvariant_derive`). No known vulnerability is ignored.
+### Supply-chain controls (security review of P0-A)
+- `deny.toml`: the graph is limited to `x86_64-unknown-linux-gnu` and `aarch64-unknown-linux-gnu`; no git source is allowed (`allow-git = []`); banned: `subsecond`, `dioxus-cli-config`, `dioxus-devtools-types`, `async-tungstenite`, `tracy-client`, `tracing-tracy`, `scap`, `gpui-pre-reqwest` (all checked absent from the Linux graph).
+- CI (`ci.yml`, `deny` job): fails if `set_http_client`, `with_http_client`, `read_credentials`, `write_credentials` or `delete_credentials` appear under `crates/`.
+- Advisories: `cargo update` of `time` (0.3.45 to 0.3.47, RUSTSEC-2026-0009) and `zbus_xml` (5.1.0 to 5.2.1, drops `quick-xml` 0.38: RUSTSEC-2026-0194 / -0195); both need Rust 1.87 / 1.88, above the workspace `rust-version = "1.85"` (GPUI itself uses let-chains, Rust 1.88; the MSRV bump lands from another branch). Seven "unmaintained" notices with no maintained release in the pinned set are ignored one by one with a reason (`instant`, `paste`, `rustybuzz`, `ttf-parser`, `zbus_names`, `zvariant`, `zvariant_derive`); the `rustls-pemfile` ignore went away with the Linux-only graph. No known vulnerability is ignored.
+- Licenses and bans: no Zed GPL crate (`editor`, `language`, `project`, `workspace` are absent). About 670 crates for `ninesql-ui` with the spike on Linux.
 
-Network (I2): GPUI links `gpui-pre-http-client` (a trait used for remote images); no HTTP client implementation is linked on Linux (`gpui-pre-reqwest` is only pulled for the wasm asset loader). D-Bus is used for XDG portals, notifications and AT-SPI; no network traffic was observed or expected.
+### Snapshot verification (run on 2026-11-14)
+`scripts/verify-gpui-snapshot.sh` checks every `gpui-pre*` and `gpui-kit` family crate in Cargo.lock: archive checksum against Cargo.lock, then a file-by-file diff against its source (`package.metadata.gpui-pre.zed-rev` for `gpui-pre-*`, tag `v0.9.1` for the `gpui-kit` family, the crates.io `zed-reqwest 0.12.15-zed` for `gpui-pre-reqwest`), ignoring `Cargo.toml`, `Cargo.toml.orig`, `.cargo_vcs_info.json`. Result: **all 26 crates match their sources**. Every changed file carries a `// Modified for gpui-pre` marker:
+- `gpui-pre`: `src/action.rs` (`actions!` derive paths made crate-relative).
+- `gpui-pre-macros`: `src/gpui_macros.rs` and the added `src/gpui_pre_facade_paths.rs` (macros resolve `gpui` through a facade).
+- `gpui-pre-wgpu`: `wgpu_atlas.rs`, `wgpu_context.rs`, `wgpu_renderer.rs` (device queues and sRGB detection adapted to `wgpu` 30.0.1).
+- `gpui-pre-apple`: `build.rs` reads the GPUI sources vendored under `vendor/gpui`; the five vendored files are identical to `crates/gpui/src` at `d2a4fb6`.
+- `gpui-pre-derive-refineable` lives at `crates/refineable/derive_refineable` in Zed; the `gpui-kit` family and `gpui-pre-reqwest` have no changed file (`gpui-component`'s README is the repository README, as its manifest declares).
+
+crates.io owner of all 26 crates: `huacnlee` (single owner, no team). That single-owner fact is the residual risk ADR-0013 accepts; re-run the script on every bump.
+
+Network (I2): GPUI links `gpui-pre-http-client` (a trait used for remote images); no HTTP client implementation is linked on Linux (`gpui-pre-reqwest` is wasm-only and now banned). D-Bus is used for XDG portals, notifications and AT-SPI; no network traffic was observed or expected.
 
 ## Build
 - System packages: the list in [docs/10-supported-platforms.md](../10-supported-platforms.md) builds on Ubuntu 24.04. The binary links only `libxcb`, `libxcb-xkb`, `libxkbcommon`, `libxkbcommon-x11` (Vulkan, Wayland, fontconfig are loaded at run time, FreeType is built from source), so the strictly needed `-dev` packages are `pkg-config`, `libxkbcommon-dev`, `libxkbcommon-x11-dev`, `libxcb1-dev`; the rest of the list can be trimmed after a CI run confirms it.
@@ -79,7 +90,7 @@ To reproduce on a real GPU, from the repository root: `crates/ninesql-ui/example
 
 ## Follow-ups
 1. Run `spike-measure.sh` on a real GPU (Wayland and X11) and record the numbers in the PR (ROADMAP acceptance).
-2. File upstream issues: `xim-ctext` / `zed-xim` panic on Latin-1 / CJK compound text; GPUI panic without `wl_seat`.
-3. Raise the workspace `rust-version` to 1.88 (GPUI let-chains; `time` 0.3.47).
+2. **P1 work: fix the X11 IME crash.** Patch `xim-ctext` (decode unescaped COMPOUND_TEXT as Latin-1, support the GB2312 / KSC escapes or fail softly) and `zed-xim` (no `expect` on decoding), carry the patch with `[patch.crates-io]` from a path or crates.io release that passes ADR-0013's rules, and file the upstream issues. Also report GPUI's panic without `wl_seat`.
+3. Workspace `rust-version`: raised from another branch (GPUI let-chains; `time` 0.3.47 needs 1.88).
 4. Trim `docs/10-supported-platforms.md` build packages after a green CI run; add `libvulkan1` + `mesa-vulkan-drivers` as run-time dependencies of the `.deb`.
 5. Ubuntu 22.04 and Debian 12: not tested here (the sandbox is Ubuntu 24.04). Check that the binary builds and that `wgpu` finds a Vulkan adapter with their Mesa versions before keeping them as targets.
