@@ -16,7 +16,8 @@ pub enum HostKeyPolicy {
     #[default]
     Strict,
     /// Like `Strict`, but an unknown key is accepted without asking and recorded in NineSQL's
-    /// `known_hosts` (OpenSSH `StrictHostKeyChecking=accept-new`). Changed keys still block.
+    /// `known_hosts` (OpenSSH `StrictHostKeyChecking=accept-new`). Changed keys still block, and
+    /// a host already known under another (unsupported) key type still needs confirmation.
     /// Explicit per-connection choice, reported as a security warning.
     AcceptNew,
     /// The host key is not checked (except `@revoked` keys, still refused). Explicit
@@ -80,6 +81,12 @@ pub enum HostKeyDecision {
 }
 
 /// Pure policy decision; no I/O.
+///
+/// [`HostKeyDecision::NeedsConfirmation`] is also returned under [`HostKeyPolicy::AcceptNew`]
+/// when the host is on file only under key types NineSQL cannot negotiate
+/// (`HostKeyStatus::Unknown` with a non-empty `other_key_types`). In that case the UI must say
+/// that **this host is known under another key type** ([`crate::UnknownHostKey::other_key_types`])
+/// before offering to trust the new key.
 #[must_use]
 pub fn decide(policy: HostKeyPolicy, status: &HostKeyStatus) -> HostKeyDecision {
     match (status, policy) {
@@ -87,6 +94,13 @@ pub fn decide(policy: HostKeyPolicy, status: &HostKeyStatus) -> HostKeyDecision 
         (_, HostKeyPolicy::Disabled) => HostKeyDecision::AcceptUnverified,
         (HostKeyStatus::Known { .. }, _) => HostKeyDecision::Accept,
         (HostKeyStatus::Changed { .. }, _) => HostKeyDecision::RejectChanged,
+        // A host already on file under another (unsupported) key type is not "new": accepting
+        // a fresh key silently would let a man-in-the-middle downgrade it. Ask the user.
+        (HostKeyStatus::Unknown { other_key_types }, HostKeyPolicy::AcceptNew)
+            if !other_key_types.is_empty() =>
+        {
+            HostKeyDecision::NeedsConfirmation
+        }
         (HostKeyStatus::Unknown { .. }, HostKeyPolicy::AcceptNew) => {
             HostKeyDecision::AcceptAndRecord
         }
@@ -165,6 +179,21 @@ mod tests {
                 D::RejectRevoked,
                 D::AcceptAndRecord
             ]
+        );
+    }
+
+    #[test]
+    fn accept_new_asks_when_host_known_under_other_key_type() {
+        let s = HostKeyStatus::Unknown {
+            other_key_types: vec!["ssh-rsa".to_owned()],
+        };
+        assert_eq!(
+            decide(HostKeyPolicy::AcceptNew, &s),
+            HostKeyDecision::NeedsConfirmation
+        );
+        assert_eq!(
+            decide(HostKeyPolicy::Strict, &s),
+            HostKeyDecision::NeedsConfirmation
         );
     }
 

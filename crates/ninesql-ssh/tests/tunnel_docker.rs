@@ -310,6 +310,7 @@ fn tunnel_through_jump_host_to_postgres() {
         ],
         true,
     );
+    let jump_rsa_line = lab.exec("jump", "cat /config/ssh_host_keys/ssh_host_rsa_key.pub");
     lab.wait_log(
         "db",
         "database system is ready to accept connections",
@@ -468,11 +469,43 @@ fn tunnel_through_jump_host_to_postgres() {
         let store4 = KnownHostsStore::load(dir.path().join("empty-own"), Some(user_kh.clone()))
             .await
             .unwrap();
-        let tunnel = Tunnel::open(spec(&creds, HostKeyPolicy::Strict, HostKeyPolicy::Strict), store4)
+        let tunnel = Tunnel::open(spec(&creds, HostKeyPolicy::Strict, HostKeyPolicy::Strict), store4.clone())
             .await
             .unwrap();
         assert_eq!(std::fs::read_to_string(&user_kh).unwrap(), user_text);
         assert!(!dir.path().join("empty-own").exists());
+
+        // 8b. A key revoked in the user's file after the store was loaded is seen at the next
+        // open (the files are re-read per open).
+        let revoked_kh = dir.path().join("revoked_user_known_hosts");
+        std::fs::write(&revoked_kh, &user_text).unwrap();
+        let store5 = KnownHostsStore::load(dir.path().join("own5"), Some(revoked_kh.clone()))
+            .await
+            .unwrap();
+        std::fs::write(
+            &revoked_kh,
+            format!("{user_text}@revoked * {}\n", jump_key.to_openssh().unwrap()),
+        )
+        .unwrap();
+        let err = Tunnel::open(spec(&creds, HostKeyPolicy::Strict, HostKeyPolicy::Strict), store5)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, SshError::HostKeyRevoked { hop: Some(0), .. }), "{err:?}");
+
+        // 8c. Accept-new never silently accepts a host already known under another key type
+        // (here the jump host's real RSA key, which NineSQL does not negotiate).
+        let rsa_kh = dir.path().join("rsa_user_known_hosts");
+        let rsa_key = jump_rsa_line.split_whitespace().take(2).collect::<Vec<_>>().join(" ");
+        std::fs::write(&rsa_kh, format!("[127.0.0.1]:{jump_port} {rsa_key}\n")).unwrap();
+        let own6 = dir.path().join("own6").join("known_hosts");
+        let store6 = KnownHostsStore::load(own6.clone(), Some(rsa_kh)).await.unwrap();
+        let err = Tunnel::open(spec(&creds, HostKeyPolicy::AcceptNew, HostKeyPolicy::AcceptNew), store6)
+            .await
+            .unwrap_err();
+        let unknown = err.unknown_host_key().unwrap_or_else(|| panic!("{err:?}"));
+        assert_eq!(unknown.hop, 0);
+        assert_eq!(unknown.other_key_types, vec!["ssh-rsa".to_owned()]);
+        assert!(!own6.exists(), "nothing may be recorded without confirmation");
 
         // 9. Losing the jump host ends the tunnel (keepalive / connection loss).
         docker(&["kill", &lab.name("jump")]).unwrap();

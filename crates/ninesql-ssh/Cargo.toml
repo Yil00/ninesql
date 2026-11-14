@@ -19,6 +19,7 @@ ninesql-storage.workspace = true
 # `flate2` (compression) is off: no decompression of untrusted data is needed for a tunnel.
 russh = { workspace = true }
 data-encoding = { workspace = true }
+libc.workspace = true
 hmac = { workspace = true }
 sha1 = { workspace = true }
 sha2 = { workspace = true }

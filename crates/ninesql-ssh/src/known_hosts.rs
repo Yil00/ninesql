@@ -520,6 +520,9 @@ impl KnownHosts {
         key_blob: &[u8],
     ) -> Result<(), SshError> {
         validate_host(host)?;
+        // TODO(P0-D review L8): take the workspace lock (DirLock, landing in ninesql-storage on
+        // another branch) around this read-modify-write, so two NineSQL processes cannot drop
+        // each other's additions. Within one process `KnownHostsStore` serializes writers.
         if blob_key_type(key_blob) != Some(key_type.as_bytes()) {
             return Err(SshError::InvalidHostKey);
         }
@@ -576,6 +579,7 @@ impl KnownHosts {
     /// # Errors
     /// [`SshError::KnownHosts`] on I/O errors.
     pub fn remove_host(&mut self, host: &str, port: u16) -> Result<usize, SshError> {
+        // TODO(P0-D review L8): same cross-process lock as `add`.
         let Some(text) = read_text(&self.own_path, true)? else {
             self.own = KnownHostsFile::default();
             return Ok(0);
@@ -610,14 +614,18 @@ impl KnownHosts {
     }
 }
 
-/// Host names written to the file must not be able to inject patterns or extra fields.
-fn validate_host(host: &str) -> Result<(), SshError> {
-    let ok = !host.is_empty()
+/// Host names (or IP addresses) accepted for SSH hops and written to the file: they cannot
+/// inject patterns, extra fields or control characters.
+pub(crate) fn is_valid_host(host: &str) -> bool {
+    !host.is_empty()
         && host.len() <= 255
         && host
             .chars()
-            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_' | ':'));
-    if ok {
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_' | ':'))
+}
+
+fn validate_host(host: &str) -> Result<(), SshError> {
+    if is_valid_host(host) {
         Ok(())
     } else {
         Err(SshError::InvalidHost)

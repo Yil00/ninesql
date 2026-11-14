@@ -13,6 +13,10 @@
 //!
 //! Everything runs on the Tokio runtime given by the caller (the driver runtime, ADR-0004); no
 //! call blocks a thread: file I/O goes through `spawn_blocking`.
+//!
+//! Known gap: russh 0.65.1 calls `check_server_key` only at the initial key exchange, so a
+//! host key presented at a later re-key is not checked against `known_hosts` by this crate
+//! (russh still verifies the re-key exchange signature). Tracked for the next russh update.
 
 use std::borrow::Cow;
 use std::fmt;
@@ -32,8 +36,12 @@ use tokio::task::{JoinHandle, JoinSet};
 use crate::auth::{HopAuth, HopRef, authenticate};
 use crate::error::{SshError, UnknownHostKey};
 use crate::fingerprint::Fingerprint;
-use crate::known_hosts::{DEFAULT_SSH_PORT, HostKeyStatus, KnownHosts};
+use crate::known_hosts::{DEFAULT_SSH_PORT, HostKeyStatus, KnownHosts, is_valid_host};
 use crate::policy::{HostKeyDecision, HostKeyPolicy, decide};
+
+/// First and largest pause after a failed `accept()` on the local listener.
+const ACCEPT_BACKOFF_MIN: Duration = Duration::from_millis(100);
+const ACCEPT_BACKOFF_MAX: Duration = Duration::from_secs(1);
 
 /// Most jump hosts accepted before the tunnel server.
 pub const MAX_JUMP_HOSTS: usize = 8;
@@ -170,14 +178,22 @@ impl TunnelSpec {
                 "the database host and port are required",
             ));
         }
+        if !is_valid_host(&self.target_host) {
+            return Err(SshError::InvalidHost);
+        }
         for h in self.jump_hosts.iter().chain(std::iter::once(&self.server)) {
             if h.host.is_empty() || h.port == 0 {
                 return Err(SshError::InvalidSpec(
                     "every SSH hop needs a host and a port",
                 ));
             }
-            if h.username.is_empty() {
-                return Err(SshError::InvalidSpec("every SSH hop needs a user name"));
+            if !is_valid_host(&h.host) {
+                return Err(SshError::InvalidHost);
+            }
+            if h.username.is_empty() || h.username.chars().any(char::is_control) {
+                return Err(SshError::InvalidSpec(
+                    "every SSH hop needs a valid user name",
+                ));
             }
         }
         if self.options.connect_timeout.is_zero() || self.options.max_forwarded_connections == 0 {
@@ -234,8 +250,15 @@ impl SshSecurityWarning {
 
 /// Shared, cheaply clonable access to the `known_hosts` files. File I/O runs on Tokio's
 /// blocking pool.
+///
+/// Two locks: `state` guards the in-memory copy and is only ever held for in-memory work (the
+/// host key check of a handshake takes it from a Tokio worker), `io` serializes file
+/// reads / writes within this process and is only taken on the blocking pool.
 #[derive(Clone)]
-pub struct KnownHostsStore(Arc<Mutex<KnownHosts>>);
+pub struct KnownHostsStore {
+    state: Arc<Mutex<KnownHosts>>,
+    io: Arc<Mutex<()>>,
+}
 
 impl fmt::Debug for KnownHostsStore {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -243,11 +266,18 @@ impl fmt::Debug for KnownHostsStore {
     }
 }
 
+fn poisoned<T>(_: T) -> SshError {
+    SshError::Internal("known_hosts lock poisoned")
+}
+
 impl KnownHostsStore {
     /// Wraps already loaded files.
     #[must_use]
     pub fn new(known_hosts: KnownHosts) -> Self {
-        Self(Arc::new(Mutex::new(known_hosts)))
+        Self {
+            state: Arc::new(Mutex::new(known_hosts)),
+            io: Arc::new(Mutex::new(())),
+        }
     }
 
     /// Loads NineSQL's file and, optionally, the user's read-only file (see [`KnownHosts::load`]).
@@ -266,11 +296,31 @@ impl KnownHostsStore {
     }
 
     fn with<T>(&self, f: impl FnOnce(&mut KnownHosts) -> T) -> Result<T, SshError> {
-        let mut guard = self
-            .0
-            .lock()
-            .map_err(|_| SshError::Internal("known_hosts lock poisoned"))?;
+        let mut guard = self.state.lock().map_err(poisoned)?;
         Ok(f(&mut guard))
+    }
+
+    /// Re-reads both files from disk, so keys added or `@revoked` since the last load (by the
+    /// user in `~/.ssh/known_hosts`, or by another NineSQL process) are seen. Called by
+    /// [`Tunnel::open`] before connecting.
+    ///
+    /// # Errors
+    /// See [`KnownHosts::load`].
+    pub async fn refresh(&self) -> Result<(), SshError> {
+        let (own, user) = self.with(|kh| {
+            (
+                kh.own_path().to_path_buf(),
+                kh.user_path().map(std::path::Path::to_path_buf),
+            )
+        })?;
+        let io = Arc::clone(&self.io);
+        let fresh = tokio::task::spawn_blocking(move || {
+            let _io = io.lock().map_err(poisoned)?;
+            KnownHosts::load(&own, user.as_deref())
+        })
+        .await
+        .map_err(|_| SshError::Internal("known_hosts loading task failed"))??;
+        self.with(|kh| *kh = fresh)
     }
 
     /// In-memory lookup (no I/O).
@@ -300,6 +350,26 @@ impl KnownHostsStore {
         .await
     }
 
+    /// Runs a file-modifying operation on a copy, outside the state lock, then publishes the
+    /// result.
+    async fn modify<T: Send + 'static>(
+        &self,
+        op: impl FnOnce(&mut KnownHosts) -> Result<T, SshError> + Send + 'static,
+    ) -> Result<T, SshError> {
+        let state = Arc::clone(&self.state);
+        let io = Arc::clone(&self.io);
+        tokio::task::spawn_blocking(move || {
+            let _io = io.lock().map_err(poisoned)?;
+            let mut copy = state.lock().map_err(poisoned)?.clone();
+            let out = op(&mut copy);
+            // Publish even on error: the operation re-read NineSQL's file, which is fresher.
+            *state.lock().map_err(poisoned)? = copy;
+            out
+        })
+        .await
+        .map_err(|_| SshError::Internal("known_hosts task failed"))?
+    }
+
     async fn add(
         &self,
         host: String,
@@ -307,15 +377,8 @@ impl KnownHostsStore {
         key_type: String,
         key_blob: Vec<u8>,
     ) -> Result<(), SshError> {
-        let inner = Arc::clone(&self.0);
-        tokio::task::spawn_blocking(move || {
-            inner
-                .lock()
-                .map_err(|_| SshError::Internal("known_hosts lock poisoned"))?
-                .add(&host, port, &key_type, &key_blob)
-        })
-        .await
-        .map_err(|_| SshError::Internal("known_hosts task failed"))?
+        self.modify(move |kh| kh.add(&host, port, &key_type, &key_blob))
+            .await
     }
 
     /// Removes NineSQL's entries for a host (the explicit step required after a changed key).
@@ -323,15 +386,7 @@ impl KnownHostsStore {
     /// # Errors
     /// See [`KnownHosts::remove_host`].
     pub async fn remove_host(&self, host: String, port: u16) -> Result<usize, SshError> {
-        let inner = Arc::clone(&self.0);
-        tokio::task::spawn_blocking(move || {
-            inner
-                .lock()
-                .map_err(|_| SshError::Internal("known_hosts lock poisoned"))?
-                .remove_host(&host, port)
-        })
-        .await
-        .map_err(|_| SshError::Internal("known_hosts task failed"))?
+        self.modify(move |kh| kh.remove_host(&host, port)).await
     }
 }
 
@@ -427,8 +482,6 @@ struct HopHandler {
     port: u16,
     policy: HostKeyPolicy,
     store: KnownHostsStore,
-    /// Key accepted at the first key exchange: re-keys must present the same one.
-    accepted: Option<Vec<u8>>,
     outcome: Arc<Mutex<Option<HostKeyOutcome>>>,
 }
 
@@ -452,14 +505,6 @@ impl HopHandler {
             self.set_outcome(HostKeyOutcome::Rejected(SshError::InvalidHostKey));
             return false;
         };
-        if let Some(accepted) = &self.accepted {
-            // Re-key: the server must keep the key it proved at the first exchange.
-            let same = *accepted == blob;
-            if !same {
-                tracing::warn!(hop = self.hop, host = %self.host, "SSH host key changed during re-key");
-            }
-            return same;
-        }
         let key_type = key.algorithm().as_str().to_owned();
         let fingerprint = Fingerprint::of_blob(&blob);
         let status = match self.store.check(&self.host, self.port, &blob) {
@@ -527,9 +572,6 @@ impl HopHandler {
             _ => HostKeyOutcome::Rejected(SshError::Internal("inconsistent host key decision")),
         };
         let ok = matches!(outcome, HostKeyOutcome::Accepted { .. });
-        if ok {
-            self.accepted = Some(blob);
-        }
         self.set_outcome(outcome);
         ok
     }
@@ -681,6 +723,7 @@ impl Tunnel {
     /// authentication errors, each naming the hop.
     pub async fn open(spec: TunnelSpec, known_hosts: KnownHostsStore) -> Result<Self, SshError> {
         spec.validate()?;
+        known_hosts.refresh().await?;
         let mut warnings = spec.security_warnings();
         let TunnelSpec {
             jump_hosts,
@@ -728,7 +771,7 @@ impl Tunnel {
             sessions,
             target_host,
             target_port,
-            options.max_forwarded_connections,
+            options.clone(),
             shutdown_rx,
             state_tx,
         ));
@@ -845,7 +888,6 @@ async fn open_hop(
             port,
             policy: host_key_policy,
             store: known_hosts.clone(),
-            accepted: None,
             outcome: Arc::clone(&outcome),
         };
         let connect_err = |detail: String| SshError::Connect {
@@ -933,11 +975,15 @@ async fn serve(
     sessions: Vec<Arc<SshHandle>>,
     target_host: String,
     target_port: u16,
-    max_connections: usize,
+    options: TunnelOptions,
     mut shutdown: watch::Receiver<bool>,
     state: watch::Sender<TunnelState>,
 ) {
+    let max_connections = options.max_forwarded_connections;
+    let connect_timeout = options.connect_timeout;
     let mut conns = JoinSet::new();
+    // Backoff on repeated accept errors (EMFILE…), so the loop does not spin.
+    let mut accept_backoff = ACCEPT_BACKOFF_MIN;
     let mut health = tokio::time::interval(Duration::from_millis(500));
     health.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let Some(last) = sessions.last().cloned() else {
@@ -959,9 +1005,14 @@ async fn serve(
             }
             accepted = listener.accept() => {
                 let (socket, peer) = match accepted {
-                    Ok(a) => a,
+                    Ok(a) => {
+                        accept_backoff = ACCEPT_BACKOFF_MIN;
+                        a
+                    }
                     Err(e) => {
                         tracing::debug!(error = %e, "tunnel accept failed");
+                        tokio::time::sleep(accept_backoff).await;
+                        accept_backoff = (accept_backoff * 2).min(ACCEPT_BACKOFF_MAX);
                         continue;
                     }
                 };
@@ -974,7 +1025,7 @@ async fn serve(
                 }
                 let last = Arc::clone(&last);
                 let host = target_host.clone();
-                conns.spawn(forward(socket, peer, last, host, target_port));
+                conns.spawn(forward(socket, peer, last, host, target_port, connect_timeout));
             }
             Some(_) = conns.join_next(), if !conns.is_empty() => {}
         }
@@ -998,15 +1049,19 @@ async fn forward(
     last: Arc<SshHandle>,
     host: String,
     port: u16,
+    connect_timeout: Duration,
 ) {
     let _ = socket.set_nodelay(true);
-    let channel = match last
-        .channel_open_direct_tcpip(host, u32::from(port), "127.0.0.1", u32::from(peer.port()))
-        .await
-    {
-        Ok(c) => c,
-        Err(e) => {
+    let open =
+        last.channel_open_direct_tcpip(host, u32::from(port), "127.0.0.1", u32::from(peer.port()));
+    let channel = match tokio::time::timeout(connect_timeout, open).await {
+        Ok(Ok(c)) => c,
+        Ok(Err(e)) => {
             tracing::warn!(error = %e, "the SSH server refused to forward to the database endpoint");
+            return;
+        }
+        Err(_) => {
+            tracing::warn!("the SSH server did not open the forwarding channel in time");
             return;
         }
     };
@@ -1084,6 +1139,21 @@ mod tests {
         assert!(spec.validate().is_err());
         let spec = TunnelSpec::new(hop(""), "db", 1);
         assert!(spec.validate().is_err());
+        for bad in ["a b", "h,x", "*", "|1|x", "h\nx"] {
+            assert!(matches!(
+                TunnelSpec::new(hop(bad), "db", 1).validate(),
+                Err(SshError::InvalidHost)
+            ));
+            assert!(matches!(
+                TunnelSpec::new(hop("s"), bad, 1).validate(),
+                Err(SshError::InvalidHost)
+            ));
+        }
+        assert!(
+            TunnelSpec::new(hop("::1"), "db_1.example.test", 1)
+                .validate()
+                .is_ok()
+        );
     }
 
     #[tokio::test]

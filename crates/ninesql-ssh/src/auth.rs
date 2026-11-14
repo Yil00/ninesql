@@ -3,13 +3,13 @@
 //!
 //! Secrets (I1) arrive as [`SecretString`] (zeroized on drop, redacted `Debug`) and are moved
 //! into the authentication step, which drops them as soon as it returns. The key file is read
-//! into a zeroized buffer; the decoded private key zeroizes itself on drop (`ssh-key`).
-//! Limitation: `russh` copies a password into its own `String` for the duration of the request
-//! and does not zeroize that copy.
+//! into a zeroized buffer sized up front (no reallocation leaves copies behind); the decoded
+//! private key zeroizes itself on drop (`ssh-key`). `russh` 0.65.1 copies a password into its
+//! own request (`auth::Method::Password`), which it zeroizes on drop.
 
 use std::fmt;
 use std::io::Read;
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -163,8 +163,16 @@ fn load_key(
         path: path.to_path_buf(),
         reason,
     };
-    let meta =
-        std::fs::metadata(path).map_err(|e| err(KeyFileError::Unreadable(e.kind().to_string())))?;
+    let unreadable = |e: std::io::Error| err(KeyFileError::Unreadable(e.kind().to_string()));
+    // Open first, then check the open descriptor (no gap between the check and the read).
+    // Non-blocking open: a FIFO planted at the path cannot hang the blocking pool. Symbolic
+    // links are followed, like OpenSSH.
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NONBLOCK | libc::O_CLOEXEC)
+        .open(path)
+        .map_err(unreadable)?;
+    let meta = file.metadata().map_err(unreadable)?;
     if !meta.is_file() || meta.len() > MAX_KEY_FILE_SIZE {
         return Err(err(KeyFileError::NotAKeyFile));
     }
@@ -172,11 +180,22 @@ fn load_key(
     if mode & 0o077 != 0 {
         return Err(err(KeyFileError::PermissionsTooOpen(mode)));
     }
-    let mut text = Zeroizing::new(String::new());
-    std::fs::File::open(path)
-        .and_then(|f| f.take(MAX_KEY_FILE_SIZE).read_to_string(&mut text))
-        .map_err(|e| err(KeyFileError::Unreadable(e.kind().to_string())))?;
-    let key = russh::keys::decode_secret_key(&text, passphrase.as_ref().map(|p| p.expose_secret()))
+    match current_uid() {
+        Some(uid) if meta.uid() != uid && meta.uid() != 0 => {
+            return Err(err(KeyFileError::WrongOwner));
+        }
+        Some(_) => {}
+        None => tracing::warn!("cannot determine the current user; key file owner not checked"),
+    }
+    let len = usize::try_from(meta.len()).map_err(|_| err(KeyFileError::NotAKeyFile))?;
+    // Capacity for the whole file plus one byte, and reads capped at the size seen by fstat:
+    // the buffer never reallocates, so no unzeroized copy of the key is left on the heap.
+    let mut bytes = Zeroizing::new(Vec::with_capacity(len + 1));
+    file.take(meta.len())
+        .read_to_end(&mut bytes)
+        .map_err(unreadable)?;
+    let text = std::str::from_utf8(&bytes).map_err(|_| err(KeyFileError::Undecodable))?;
+    let key = russh::keys::decode_secret_key(text, passphrase.as_ref().map(|p| p.expose_secret()))
         .map_err(|e| match e {
             russh::keys::Error::KeyIsEncrypted => err(KeyFileError::PassphraseRequired),
             _ => err(KeyFileError::Undecodable),
@@ -192,6 +211,11 @@ fn load_key(
             other.as_str().to_owned(),
         ))),
     }
+}
+
+/// Effective uid of this process, from the owner of `/proc/self` (no `unsafe` libc call).
+fn current_uid() -> Option<u32> {
+    std::fs::metadata("/proc/self").ok().map(|m| m.uid())
 }
 
 async fn authenticate_agent<H: Handler>(
@@ -322,6 +346,14 @@ mod tests {
                 ..
             })
         ));
+    }
+
+    #[test]
+    fn current_uid_matches_owned_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("f");
+        std::fs::write(&p, "x").unwrap();
+        assert_eq!(current_uid(), Some(std::fs::metadata(&p).unwrap().uid()));
     }
 
     #[test]

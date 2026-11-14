@@ -4390,6 +4390,7 @@ version = "0.0.0"
 dependencies = [
  "data-encoding",
  "hmac 0.13.0",
+ "libc",
  "ninesql-driver-api",
  "ninesql-storage",
  "proptest",

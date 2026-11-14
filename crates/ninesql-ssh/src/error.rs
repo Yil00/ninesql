@@ -29,7 +29,8 @@ pub struct UnknownHostKey {
     /// Public key blob (wire encoding), written to `known_hosts` if the user confirms.
     pub key_blob: Vec<u8>,
     /// Key types known for this host that NineSQL cannot negotiate (for example `ssh-rsa`):
-    /// when not empty the UI should say that the host is known under another key type.
+    /// when not empty the UI **must** say that this host is known under another key type
+    /// (also under the accept-new policy, which then asks instead of accepting).
     pub other_key_types: Vec<String>,
 }
 
@@ -192,6 +193,10 @@ pub enum KeyFileError {
     /// Group or others can read the file (OpenSSH refuses such keys too).
     #[error("permissions {0:o} are too open; run `chmod 600` on the key")]
     PermissionsTooOpen(u32),
+    /// The file belongs to another user (only the current user or root are accepted, like
+    /// OpenSSH).
+    #[error("the file belongs to another user")]
+    WrongOwner,
     /// Not a regular file, or larger than the limit.
     #[error("not a regular key file of reasonable size")]
     NotAKeyFile,
