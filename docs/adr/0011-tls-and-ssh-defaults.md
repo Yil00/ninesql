@@ -1,6 +1,6 @@
 # ADR-0011: TLS and SSH defaults
 
-- **Status**: Accepted
+- **Status**: Accepted. Partially amended by [ADR-0016](0016-ssh-rsa-and-host-key-policies.md) for Decision §5–§7 (RSA keys disabled for now, opt-in `AcceptNew` / `Disabled` host-key policies) and a clarification of §4 (TLS of imported DBeaver connections).
 - **Date**: 2026-11-14
 
 ## Context
