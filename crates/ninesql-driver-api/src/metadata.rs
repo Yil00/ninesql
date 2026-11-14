@@ -63,8 +63,10 @@ pub struct PageRequest {
     /// The filter is **user input** (L5): drivers pass it as a bind parameter (or a separate
     /// protocol argument, such as the `MATCH` argument of `SCAN`), never spliced into statement
     /// text. For SQL engines it is a literal: wildcards are escaped with [`escape_like`] and the
-    /// query uses `LIKE ? ESCAPE '\'` (or the engine's equivalent), so `%` and `_` in a name
-    /// match only themselves.
+    /// query uses `LIKE ? ESCAPE '!'` (or the engine's equivalent), so `%` and `_` in a name
+    /// match only themselves. `!` is the recommended escape character: a backslash would itself
+    /// need escaping in the statement text under MySQL's default `sql_mode` and PostgreSQL with
+    /// `standard_conforming_strings = off`.
     pub filter: Option<String>,
 }
 
@@ -112,14 +114,19 @@ impl Default for PageRequest {
 
 /// Escapes `%`, `_` and `escape` itself in `filter` so a `LIKE` / `ILIKE` pattern built from
 /// it matches the text literally, and wraps it in `%…%` for a substring match. Bind the result
-/// and declare the same escape character (`LIKE ? ESCAPE '\'`).
+/// and declare the same escape character (`LIKE ? ESCAPE '!'`; `!` is recommended, see
+/// [`PageRequest::filter`]). `escape` must not be `%` or `_`.
 ///
 /// ```
 /// # use ninesql_driver_api::metadata::escape_like;
-/// assert_eq!(escape_like("a_b%c\\d", '\\'), "%a\\_b\\%c\\\\d%");
+/// assert_eq!(escape_like("a_b%c!d", '!'), "%a!_b!%c!!d%");
 /// ```
 #[must_use]
 pub fn escape_like(filter: &str, escape: char) -> String {
+    debug_assert!(
+        escape != '%' && escape != '_',
+        "the LIKE escape character cannot be a wildcard"
+    );
     let mut out = String::with_capacity(filter.len() + 4);
     out.push('%');
     for c in filter.chars() {

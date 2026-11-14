@@ -771,12 +771,21 @@ async fn new_conformance_helpers_pass_on_the_mock() {
     assert_eq!(report.rows, 100);
     assert!(report.batches > 1 && report.truncated_values, "{report:?}");
 
-    let mut p = ConnectParams::new(
-        MOCK_ENGINE,
-        Endpoint::tcp(ninesql_driver_api::mock::MOCK_SELF_SIGNED_HOST, 5432),
-    );
-    p.auth = Auth::password("nine", Some(Secret::new("self-signed-pw".into())));
-    conformance::assert_verify_full_rejects_untrusted_certificate(&driver, p).await;
+    let tls_params = || {
+        let mut p = ConnectParams::new(
+            MOCK_ENGINE,
+            Endpoint::tcp(ninesql_driver_api::mock::MOCK_SELF_SIGNED_HOST, 5432),
+        );
+        p.auth = Auth::password("nine", Some(Secret::new("self-signed-pw".into())));
+        p
+    };
+    conformance::assert_verify_full_rejects_untrusted_certificate(
+        &driver,
+        &tls_params,
+        std::path::Path::new("/dev-certs/mock-ca.pem"),
+        "wrong.example.test",
+    )
+    .await;
 }
 
 #[test]
@@ -1163,7 +1172,7 @@ async fn extra_reserved_properties_are_exposed_and_enforced() {
     );
     assert!(caps.is_reserved_property("Mock-Backdoor"));
     assert!(!ninesql_driver_api::is_reserved_property("mock_backdoor"));
-    assert!(!caps.retains_secret_for_reconnect);
+    assert!(!caps.retains_secret_after_connect);
     let mut p = params();
     p.properties.insert(
         "mockBackdoor".into(),
@@ -1172,4 +1181,249 @@ async fn extra_reserved_properties_are_exposed_and_enforced() {
     let err = driver.connect(p).await.err().unwrap();
     assert!(matches!(err, DriverError::InvalidParams(_)));
     assert!(!err.to_string().contains("open-sesame"));
+}
+
+// ---------------------------------------------------------------------------------------------
+// Security review of the follow-ups (M-1, M-3, L-2, L-4, L-5, L-8)
+
+struct SlowCancel {
+    started: std::sync::atomic::AtomicU32,
+    done: std::sync::atomic::AtomicU32,
+}
+
+impl SlowCancel {
+    fn new() -> std::sync::Arc<Self> {
+        std::sync::Arc::new(Self {
+            started: std::sync::atomic::AtomicU32::new(0),
+            done: std::sync::atomic::AtomicU32::new(0),
+        })
+    }
+    fn counts(&self) -> (u32, u32) {
+        use std::sync::atomic::Ordering::SeqCst;
+        (self.started.load(SeqCst), self.done.load(SeqCst))
+    }
+}
+
+#[async_trait::async_trait]
+impl ninesql_driver_api::CancelHandle for SlowCancel {
+    async fn cancel(&self) -> ninesql_driver_api::DriverResult<()> {
+        use std::sync::atomic::Ordering::SeqCst;
+        self.started.fetch_add(1, SeqCst);
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        self.done.fetch_add(1, SeqCst);
+        Ok(())
+    }
+    fn confirms_end(&self) -> bool {
+        true
+    }
+}
+
+fn pending_raw() -> ninesql_driver_api::RawResultStream {
+    Box::pin(futures_util::stream::pending())
+}
+
+/// M-1: a `next()` dropped while the cancel request is in flight does not lose the request,
+/// and the retry does not send a second one.
+#[tokio::test(start_paused = true)]
+async fn dropped_abort_still_delivers_the_cancel_once() {
+    let c = SlowCancel::new();
+    let token = CancelToken::new();
+    let opts = ExecOptions::default().with_cancel(token.clone());
+    let mut s = ResultStream::new(pending_raw(), &opts, c.clone());
+    token.cancel();
+    assert!(
+        tokio::time::timeout(Duration::from_millis(50), s.next())
+            .await
+            .is_err()
+    );
+    assert_eq!(c.counts(), (1, 0));
+    let r = s.next().await;
+    assert_eq!(r.unwrap().err(), Some(DriverError::Cancelled));
+    assert_eq!(c.counts(), (1, 1), "the cancel was lost or sent twice");
+
+    // Same on the timeout path, with the consumer polling: dropped once, then retried.
+    let c = SlowCancel::new();
+    let opts = ExecOptions::default().with_timeout(Some(Duration::from_secs(1)));
+    let mut s = ResultStream::new(pending_raw(), &opts, c.clone());
+    let _ = tokio::time::timeout(Duration::from_millis(1050), s.next()).await;
+    let r = s.next().await;
+    assert_eq!(
+        r.unwrap().err(),
+        Some(DriverError::Timeout(Duration::from_secs(1)))
+    );
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    assert_eq!(c.counts(), (1, 1));
+}
+
+/// M-1: the watchdog and the poll path share one cancel request.
+#[tokio::test(start_paused = true)]
+async fn watchdog_and_poll_send_one_cancel() {
+    let c = SlowCancel::new();
+    let opts = ExecOptions::default().with_timeout(Some(Duration::from_secs(1)));
+    let mut s = ResultStream::new(pending_raw(), &opts, c.clone());
+    tokio::time::sleep(Duration::from_millis(1100)).await;
+    assert_eq!(c.counts(), (1, 0), "watchdog request in flight");
+    let r = s.next().await;
+    assert_eq!(
+        r.unwrap().err(),
+        Some(DriverError::Timeout(Duration::from_secs(1)))
+    );
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    assert_eq!(c.counts(), (1, 1));
+}
+
+/// L-4: outside a runtime there is no watchdog (and no panic).
+#[test]
+fn stream_without_runtime_has_no_watchdog() {
+    let c = SlowCancel::new();
+    let opts = ExecOptions::default().with_timeout(Some(Duration::from_secs(1)));
+    drop(ResultStream::new(pending_raw(), &opts, c.clone()));
+    assert_eq!(c.counts(), (0, 0));
+}
+
+/// M-6 / reviewer case: a late confirmation for an old execution never frees the next one.
+#[test]
+fn late_confirmation_does_not_free_the_next_execution() {
+    let t = ninesql_driver_api::ExecutionTracker::new();
+    let a = t.begin().unwrap();
+    let a_id = a.id();
+    drop(a);
+    t.confirm_ended(a_id);
+    let b = t.begin().unwrap();
+    t.confirm_ended(a_id);
+    assert!(t.is_busy());
+    b.complete();
+    assert!(!t.is_busy());
+}
+
+/// M-3: after the watchdog fired on a paused (idle) cursor, the next poll closes the cursor
+/// instead of fetching more rows.
+#[tokio::test(start_paused = true)]
+async fn idle_cursor_is_closed_not_fetched_after_cancel() {
+    let driver = MockDriver::new();
+    let stats = driver.stats();
+    let mut s = connect(&driver).await;
+    let options = ExecOptions::default()
+        .with_timeout(Some(Duration::from_secs(5)))
+        .with_budget(FetchBudget::default().with_batch_rows(10));
+    let mut stream = s
+        .execute(
+            Statement::sql("SELECT * FROM slow_numbers(100000, 100)"),
+            options,
+        )
+        .await
+        .unwrap();
+    let _header = stream.next().await.unwrap().unwrap();
+    let _first = stream.next().await.unwrap().unwrap();
+    let fetched = stats.rows_generated();
+    tokio::time::sleep(Duration::from_secs(6)).await;
+    assert_eq!(stats.server_cancels(), 1);
+    assert_eq!(
+        stream.next().await.unwrap().err(),
+        Some(DriverError::Timeout(Duration::from_secs(5)))
+    );
+    assert_eq!(stats.cursors_closed_on_cancel(), 1);
+    assert_eq!(
+        stats.rows_generated(),
+        fetched,
+        "the drain fetched more rows"
+    );
+    drop(stream);
+    assert!(
+        s.execute(
+            Statement::sql("SELECT * FROM numbers(1)"),
+            ExecOptions::default()
+        )
+        .await
+        .is_ok()
+    );
+}
+
+/// L-5: empty batches cost budget.
+#[tokio::test]
+async fn empty_batches_count_against_the_budget() {
+    let empty = label_batch(0, 0);
+    let mut items = vec![Ok(header_of(&empty))];
+    items.extend((0..100_000).map(|_| Ok(ResultItem::Rows(empty.clone()))));
+    let opts = ExecOptions::default().with_budget(FetchBudget::default().with_max_bytes(10_000));
+    let mut stream = ResultStream::from_items(items, &opts);
+    let (_, items, err) = drain(&mut stream).await;
+    assert!(err.is_none());
+    assert!(items.len() < 200, "{} items delivered", items.len());
+    assert!(matches!(items.last(), Some(ResultItem::Truncated(_))));
+}
+
+/// L-8: nesting is capped; the walks are iterative.
+#[tokio::test]
+async fn deep_documents_are_rejected() {
+    use ninesql_driver_api::{DocValue, Document, MAX_DOCUMENT_DEPTH, ResultSetHeader};
+    fn nested(depth: usize) -> Document {
+        let mut v = DocValue::truncated(DocValue::Int(1), None);
+        for _ in 1..depth {
+            v = DocValue::Array(vec![v]);
+        }
+        Document::new(vec![("a".into(), v)])
+    }
+    let ok = nested(MAX_DOCUMENT_DEPTH);
+    assert_eq!(ok.depth(), MAX_DOCUMENT_DEPTH);
+    assert!(ok.has_truncated_values());
+    let deep = nested(1000);
+    assert_eq!(deep.depth(), 1000);
+    assert!(deep.estimated_size() > 1000);
+    for (doc, accepted) in [(ok, true), (deep, false)] {
+        let items = vec![
+            Ok(ResultItem::ResultSet(ResultSetHeader::documents(0))),
+            Ok(ResultItem::Documents(vec![doc])),
+        ];
+        let mut stream = ResultStream::from_items(items, &ExecOptions::default());
+        let (_, _, err) = drain(&mut stream).await;
+        assert_eq!(err.is_none(), accepted, "{err:?}");
+        if !accepted {
+            assert!(matches!(err, Some(DriverError::Protocol(_))));
+        }
+    }
+}
+
+/// L-2: a driver whose server does not speak TLS cannot pass the TLS helper.
+#[tokio::test]
+#[should_panic(expected = "positive control")]
+async fn tls_helper_needs_a_positive_control() {
+    struct NoTls(MockDriver);
+    #[async_trait::async_trait]
+    impl Driver for NoTls {
+        fn family(&self) -> &'static str {
+            "no-tls"
+        }
+        fn engines(&self) -> &[ninesql_driver_api::EngineId] {
+            self.0.engines()
+        }
+        fn capabilities(
+            &self,
+            e: &ninesql_driver_api::EngineId,
+            v: Option<&str>,
+        ) -> ninesql_driver_api::DriverResult<Capabilities> {
+            self.0.capabilities(e, v)
+        }
+        fn dialect(
+            &self,
+            e: &ninesql_driver_api::EngineId,
+        ) -> ninesql_driver_api::DriverResult<std::sync::Arc<dyn ninesql_driver_api::Dialect>>
+        {
+            self.0.dialect(e)
+        }
+        async fn connect(
+            &self,
+            _p: ConnectParams,
+        ) -> ninesql_driver_api::DriverResult<Box<dyn Session>> {
+            Err(DriverError::Tls("server does not support TLS".into()))
+        }
+    }
+    let params = || ConnectParams::new(MOCK_ENGINE, Endpoint::tcp("plain.example.test", 5432));
+    conformance::assert_verify_full_rejects_untrusted_certificate(
+        &NoTls(MockDriver::new()),
+        &params,
+        std::path::Path::new("/dev-certs/mock-ca.pem"),
+        "wrong.example.test",
+    )
+    .await;
 }

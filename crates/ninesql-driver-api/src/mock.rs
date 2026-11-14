@@ -27,10 +27,14 @@
 //! server-side cancels, connects) so tests can prove that streaming stops at the budget and that
 //! cancel reaches the "server".
 //!
-//! Cancellation behaves like PostgreSQL (M6): the simulated server's cancel targets "whatever
-//! the session runs", the session uses an [`ExecutionTracker`] so handles are scoped to one
-//! execution, and a cancelled stream ends only when the simulated server notices the cancel
-//! (at its next batch): until then the session is busy. The mock declares
+//! Cancellation behaves like PostgreSQL (M6): the cancel targets "whatever the session runs",
+//! the session uses an [`ExecutionTracker`] so handles are scoped to one execution, and a
+//! cancelled stream ends only when the end is confirmed: until then the session is busy. The
+//! simulated server only works while the stream is polled, so, like a PostgreSQL backend
+//! waiting on a suspended portal, it cannot act on a cancel while idle. The cancel handle
+//! therefore also sets the driver-local flag of the "Idle cursors" rule
+//! ([`crate::result`]): a batch already being fetched finishes and then stops; an idle cursor
+//! is closed on the next poll without fetching ([`MockStats::cursors_closed_on_cancel`]). The mock declares
 //! [`MOCK_RESERVED_PROPERTY`] as an extra reserved property key and does not retain the secret
 //! after connect.
 
@@ -73,10 +77,15 @@ static MOCK_ENGINES: [EngineId; 1] = [MOCK_ENGINE];
 /// [`Capabilities::extra_reserved_properties`].
 pub const MOCK_RESERVED_PROPERTY: &str = "mock_backdoor";
 
-/// Host name the mock treats as a TLS endpoint with a self-signed certificate: connecting to it
-/// over TCP with `verify-ca` / `verify-full` and no extra CA file fails with
-/// [`DriverError::Tls`] (for `conformance::assert_verify_full_rejects_untrusted_certificate`).
+/// Host name the mock treats as a TLS endpoint whose certificate is signed by a private CA:
+/// with `verify-ca` / `verify-full` it connects only when the CA file is named
+/// [`MOCK_TRUSTED_CA_FILE`], and `verify-full` also requires `server_name` (if set) to be this
+/// host; failures are [`DriverError::Tls`] (for
+/// `conformance::assert_verify_full_rejects_untrusted_certificate`).
 pub const MOCK_SELF_SIGNED_HOST: &str = "self-signed.mock.invalid";
+
+/// File name of the CA the mock's TLS endpoint trusts (never read: only the name is checked).
+pub const MOCK_TRUSTED_CA_FILE: &str = "mock-ca.pem";
 
 /// Number of tables listed in the mock `public` schema (enough to exercise paging).
 pub const MOCK_TABLE_COUNT: usize = 50;
@@ -88,6 +97,7 @@ pub struct MockStats {
     server_cancels: AtomicU64,
     connects: AtomicU64,
     server_rejected_writes: AtomicU64,
+    cursors_closed_on_cancel: AtomicU64,
 }
 
 impl MockStats {
@@ -114,6 +124,12 @@ impl MockStats {
     #[must_use]
     pub fn server_rejected_writes(&self) -> u64 {
         self.server_rejected_writes.load(Ordering::SeqCst)
+    }
+
+    /// Cursors closed by the raw stream because a cancel flagged it (idle-cursor rule).
+    #[must_use]
+    pub fn cursors_closed_on_cancel(&self) -> u64 {
+        self.cursors_closed_on_cancel.load(Ordering::SeqCst)
     }
 }
 
@@ -158,7 +174,7 @@ pub fn full_capabilities() -> Capabilities {
         tls: BTreeSet::new(),
         parameters: true,
         extra_reserved_properties: BTreeSet::from([MOCK_RESERVED_PROPERTY.to_owned()]),
-        retains_secret_for_reconnect: false,
+        retains_secret_after_connect: false,
     }
 }
 
@@ -217,6 +233,37 @@ impl MockDriver {
         Arc::clone(&self.stats)
     }
 
+    /// TLS of the simulated [`MOCK_SELF_SIGNED_HOST`]: a certificate for that name, signed by
+    /// a CA trusted only through a CA file named [`MOCK_TRUSTED_CA_FILE`].
+    fn simulate_tls(params: &ConnectParams) -> DriverResult<()> {
+        let mode = params.tls.mode;
+        if !matches!(mode, TlsMode::VerifyCa | TlsMode::VerifyFull) {
+            return Ok(());
+        }
+        let trusted = params
+            .tls
+            .ca_file
+            .as_deref()
+            .and_then(std::path::Path::file_name)
+            .is_some_and(|n| n == MOCK_TRUSTED_CA_FILE);
+        if !trusted {
+            return Err(DriverError::Tls(
+                "invalid peer certificate: UnknownIssuer".into(),
+            ));
+        }
+        let name = params
+            .tls
+            .server_name
+            .as_deref()
+            .unwrap_or(MOCK_SELF_SIGNED_HOST);
+        if mode == TlsMode::VerifyFull && name != MOCK_SELF_SIGNED_HOST {
+            return Err(DriverError::Tls(
+                "invalid peer certificate: NotValidForName".into(),
+            ));
+        }
+        Ok(())
+    }
+
     fn check_engine(engine: &EngineId) -> DriverResult<()> {
         if *engine == MOCK_ENGINE {
             Ok(())
@@ -259,12 +306,8 @@ impl Driver for MockDriver {
         self.capabilities.check_properties(&params.properties)?;
         if let Endpoint::Tcp { host, .. } = &params.endpoint
             && host == MOCK_SELF_SIGNED_HOST
-            && matches!(params.tls.mode, TlsMode::VerifyCa | TlsMode::VerifyFull)
-            && params.tls.ca_file.is_none()
         {
-            return Err(DriverError::Tls(
-                "invalid peer certificate: UnknownIssuer (self-signed)".into(),
-            ));
+            Self::simulate_tls(&params)?;
         }
         if let Some(expected) = &self.password {
             match &params.auth {
@@ -532,11 +575,20 @@ impl MockSession {
                 if next >= total {
                     return None;
                 }
+                // Idle cursor flagged by a cancel: close it instead of fetching (the server
+                // would ignore the cancel while idle).
+                if cancelled.load(Ordering::SeqCst) {
+                    stats
+                        .cursors_closed_on_cancel
+                        .fetch_add(1, Ordering::SeqCst);
+                    return Some((Err(server_cancelled()), (total, guard)));
+                }
                 if let Some(d) = delay {
                     tokio::time::sleep(d).await;
                 }
-                // The simulated server notices a cancel between batches and confirms the end
-                // with an error; the stream then ends and the guard frees the session.
+                // A cancel that arrived while this batch was being fetched: the server stops
+                // at the end of the batch and confirms with an error; the stream then ends and
+                // the guard frees the session.
                 if cancelled.load(Ordering::SeqCst) {
                     return Some((Err(server_cancelled()), (total, guard)));
                 }
@@ -579,6 +631,9 @@ impl MockSession {
                     return None;
                 }
                 if cancelled.load(Ordering::SeqCst) {
+                    stats
+                        .cursors_closed_on_cancel
+                        .fetch_add(1, Ordering::SeqCst);
                     return Some((Err(server_cancelled()), (total, guard)));
                 }
                 let mut limiter = BatchLimiter::new(&budget);

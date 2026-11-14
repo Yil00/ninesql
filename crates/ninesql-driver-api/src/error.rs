@@ -106,8 +106,12 @@ pub fn redact_secret(message: &str, secret: &Secret) -> String {
 /// - the credential after an `Authorization: Bearer|Basic|Token …` scheme;
 /// - SQL forms: `PASSWORD '…'`, `IDENTIFIED BY '…'`, `IDENTIFIED WITH plugin BY '…'`,
 ///   `IDENTIFIED BY PASSWORD '…'`, `SET PASSWORD = PASSWORD('…')`;
-/// - command-line forms: `-p secret`, `-psecret`, `--password secret` (`-p` is also the port
-///   flag of some tools: masking a port is accepted over-redaction).
+/// - SQL literal forms inside those: doubled quotes (`'it''s'`), `N'…'`, `E'…'`, `U&'…'`,
+///   PostgreSQL dollar quotes (`$$…$$`, `$tag$…$tag$`), with the literal on the next line;
+/// - Redis forms: `AUTH [user] password`, `CONFIG SET requirepass|masterauth value`;
+/// - command-line forms: `-p secret`, `-psecret`, `-a secret` (`redis-cli`), `--password
+///   secret` (`-p` is also the port flag of some tools: masking a port is accepted
+///   over-redaction).
 ///
 /// Redaction is best effort over free text: it never replaces passing structured parameters
 /// and never makes it acceptable to log a statement or an error that may carry a secret.
@@ -117,6 +121,7 @@ pub fn redact_connection_string(text: &str) -> String {
     let text = redact_bare_userinfo(&text);
     let text = redact_sql_forms(&text);
     let text = redact_kv_pairs(&text);
+    let text = redact_redis_forms(&text);
     redact_cli_flags(&text)
 }
 
@@ -164,21 +169,101 @@ fn eq_word(bytes: &[u8], start: usize, end: usize, word: &str) -> bool {
 /// Masks the quoted literal starting at `k` (after optional blanks, an optional `(` and an
 /// optional one-letter prefix such as `N` / `E`). Returns `(open_quote, close_end)`.
 fn literal_at(bytes: &[u8], k: usize) -> Option<(usize, usize)> {
-    let mut k = skip_blanks(bytes, k);
+    let mut k = skip_ws(bytes, k);
     if bytes.get(k) == Some(&b'(') {
-        k = skip_blanks(bytes, k + 1);
+        k = skip_ws(bytes, k + 1);
     }
-    if bytes
-        .get(k)
-        .is_some_and(|b| matches!(b, b'N' | b'n' | b'E' | b'e' | b'B' | b'b'))
-        && matches!(bytes.get(k + 1), Some(b'\'' | b'"'))
-    {
-        k += 1;
-    }
+    k += literal_prefix_len(bytes, k);
     match bytes.get(k) {
         Some(b'\'' | b'"') => Some((k, value_end(bytes, k))),
+        Some(b'$') => dollar_end(bytes, k).map(|end| (k, end)),
         _ => None,
     }
+}
+
+/// Length of a literal prefix at `k` that is directly followed by a quote: `N`, `E`, `B`
+/// (`N'…'`, `E'…'`) or `U&` (`U&'…'`); 0 otherwise.
+fn literal_prefix_len(bytes: &[u8], k: usize) -> usize {
+    let quote_at = |i: usize| matches!(bytes.get(i), Some(b'\'' | b'"'));
+    match bytes.get(k) {
+        Some(b'N' | b'n' | b'E' | b'e' | b'B' | b'b') if quote_at(k + 1) => 1,
+        Some(b'U' | b'u') if bytes.get(k + 1) == Some(&b'&') && quote_at(k + 2) => 2,
+        _ => 0,
+    }
+}
+
+/// End (exclusive) of a PostgreSQL dollar-quoted literal (`$$…$$`, `$tag$…$tag$`) starting at
+/// `k`, or `None` when no dollar tag starts there. An unterminated literal runs to the end.
+fn dollar_end(bytes: &[u8], k: usize) -> Option<usize> {
+    if bytes.get(k) != Some(&b'$') {
+        return None;
+    }
+    let mut t = k + 1;
+    while t < bytes.len() && (bytes[t].is_ascii_alphanumeric() || bytes[t] == b'_') {
+        t += 1;
+    }
+    if bytes.get(t) != Some(&b'$') || bytes.get(k + 1).is_some_and(u8::is_ascii_digit) {
+        return None;
+    }
+    let tag = &bytes[k..=t];
+    let body = t + 1;
+    let close = bytes[body..]
+        .windows(tag.len())
+        .position(|w| w == tag)
+        .map_or(bytes.len(), |p| body + p + tag.len());
+    Some(close)
+}
+
+fn skip_ws(bytes: &[u8], mut k: usize) -> usize {
+    while k < bytes.len() && bytes[k].is_ascii_whitespace() {
+        k += 1;
+    }
+    k
+}
+
+/// Redis forms: `AUTH [user] password` (upper-case `AUTH`, or any case at the start of a
+/// line) and `CONFIG SET requirepass|masterauth value`; the CLI `-a password` is handled with
+/// the other flags.
+fn redact_redis_forms(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    for (n, line) in text.split('\n').enumerate() {
+        if n > 0 {
+            out.push('\n');
+        }
+        let mut tokens: Vec<&str> = Vec::new();
+        let mut masked: Vec<bool> = Vec::new();
+        let mut seps: Vec<&str> = Vec::new();
+        let mut rest = line;
+        loop {
+            let start = rest
+                .find(|c: char| !c.is_whitespace())
+                .unwrap_or(rest.len());
+            seps.push(&rest[..start]);
+            rest = &rest[start..];
+            if rest.is_empty() {
+                break;
+            }
+            let end = rest.find(char::is_whitespace).unwrap_or(rest.len());
+            tokens.push(&rest[..end]);
+            masked.push(false);
+            rest = &rest[end..];
+        }
+        for (i, t) in tokens.iter().enumerate() {
+            let auth = *t == "AUTH" || (i == 0 && t.eq_ignore_ascii_case("auth"));
+            let config =
+                t.eq_ignore_ascii_case("requirepass") || t.eq_ignore_ascii_case("masterauth");
+            let count = if auth { 2 } else { usize::from(config) };
+            for m in masked.iter_mut().skip(i + 1).take(count) {
+                *m = true;
+            }
+        }
+        for (i, t) in tokens.iter().enumerate() {
+            out.push_str(seps[i]);
+            out.push_str(if masked[i] { "***" } else { t });
+        }
+        out.push_str(seps.last().copied().unwrap_or(""));
+    }
+    out
 }
 
 /// SQL forms that carry a password literal: `PASSWORD '…'`, `PASSWORD('…')`,
@@ -283,13 +368,15 @@ fn redact_cli_flags(text: &str) -> String {
             j += 1;
         }
         let flag = &text[i..j];
-        let value = if flag == "-p" || flag == "--password" || flag == "--pass" {
+        let value = if matches!(flag, "-p" | "-a" | "--password" | "--pass") {
             let k = skip_blanks(bytes, j);
             let mut e = k;
             while e < bytes.len() && !bytes[e].is_ascii_whitespace() {
                 e += 1;
             }
-            (e > k && !text[k..e].starts_with('-')).then_some((k, e))
+            // A value starting with `-` may still be the password: mask it (over-redaction of
+            // a following flag is harmless).
+            (e > k).then_some((k, e))
         } else if flag.len() > 2 && flag.starts_with("-p") && !flag.starts_with("-p=") {
             Some((i + 2, j))
         } else {
@@ -336,6 +423,8 @@ fn redact_userinfo(text: &str) -> String {
 
 const SECRET_KEY_FRAGMENTS: &[&str] = &[
     "password",
+    "requirepass",
+    "masterauth",
     "passwd",
     "secret",
     "token",
@@ -370,14 +459,24 @@ fn value_end(bytes: &[u8], k: usize) -> usize {
     match bytes.get(k) {
         Some(&q) if q == b'"' || q == b'\'' => {
             let mut j = k + 1;
-            while j < bytes.len() && bytes[j] != q {
+            while j < bytes.len() {
                 if bytes[j] == b'\\' {
-                    j += 1;
+                    j += 2;
+                    continue;
+                }
+                if bytes[j] == q {
+                    // A doubled quote (`'it''s'`) is part of the value.
+                    if bytes.get(j + 1) == Some(&q) {
+                        j += 2;
+                        continue;
+                    }
+                    break;
                 }
                 j += 1;
             }
             (j + 1).min(bytes.len())
         }
+        Some(b'$') if dollar_end(bytes, k).is_some() => dollar_end(bytes, k).unwrap_or(k),
         _ => {
             let mut j = k;
             while j < bytes.len() && !is_value_end(bytes[j]) {
@@ -435,14 +534,11 @@ fn redact_kv_pairs(text: &str) -> String {
         }
         k = skip_blanks(bytes, k);
         // `N'…'` / `E'…'` (SQL Server, PostgreSQL): the literal starts at the quote.
-        if bytes
-            .get(k)
-            .is_some_and(|b| matches!(b, b'N' | b'n' | b'E' | b'e' | b'B' | b'b'))
-            && matches!(bytes.get(k + 1), Some(b'\'' | b'"'))
-        {
-            out.push_str(&text[last..=k]);
-            last = k + 1;
-            k += 1;
+        let prefix = literal_prefix_len(bytes, k);
+        if prefix > 0 {
+            out.push_str(&text[last..k + prefix]);
+            last = k + prefix;
+            k += prefix;
         }
         let mut end = value_end(bytes, k);
         // `PASSWORD('…')`: a function call whose argument is the secret.
@@ -569,6 +665,31 @@ mod tests {
             redact_connection_string("nine:secret@db.example.test"),
             "nine:***@db.example.test"
         );
+        // L-1 of the driver API review.
+        for s in [
+            "CREATE ROLE r PASSWORD 'it''s Pa55word'",
+            "CREATE ROLE r PASSWORD $$Pa55word$$",
+            "CREATE ROLE r PASSWORD $pw$Pa55'word$pw$",
+            "CREATE ROLE r PASSWORD U&'Pa55word'",
+            "CREATE ROLE r PASSWORD\n  'Pa55word'",
+            "CREATE USER u IDENTIFIED BY\n'Pa55word'",
+            "password='it''s Pa55word'",
+            "AUTH Pa55word",
+            "auth default Pa55word",
+            "ERR in AUTH nine Pa55word",
+            "CONFIG SET requirepass Pa55word",
+            "config set masterauth Pa55word",
+            "requirepass=Pa55word",
+            "redis-cli -h db -a Pa55word ping",
+        ] {
+            let r = redact_connection_string(s);
+            assert!(!r.contains("Pa55") && !r.contains("'word"), "{s} -> {r}");
+            assert!(r.contains("***"), "{s} -> {r}");
+        }
+        assert_eq!(
+            redact_connection_string("NOAUTH Authentication required."),
+            "NOAUTH Authentication required."
+        );
         // Not secrets: `user@host:port`, emails, times, plain prose.
         for s in [
             "connect to nine@db.example.test:5432 refused",
@@ -670,11 +791,17 @@ mod tests {
         #[test]
         fn sql_form_passwords_never_survive(
             pw in "[A-Za-z0-9!$%*+.~#@-]{6,24}",
-            form in 0usize..6,
+            form in 0usize..12,
             quote in prop::sample::select(vec!['\'', '"']),
         ) {
             let s = match form {
                 0 => format!("CREATE ROLE r LOGIN PASSWORD {quote}{pw}{quote}"),
+                6 => format!("CREATE ROLE r PASSWORD {quote}a{quote}{quote}{pw}{quote}"),
+                7 => format!("CREATE ROLE r PASSWORD $q${pw}$q$"),
+                8 => format!("ALTER ROLE r PASSWORD\n U&{quote}{pw}{quote}"),
+                9 => format!("AUTH nine {pw}"),
+                10 => format!("CONFIG SET requirepass {pw}"),
+                11 => format!("redis-cli -a {pw} ping"),
                 1 => format!("CREATE USER u IDENTIFIED BY {quote}{pw}{quote}"),
                 2 => format!("ALTER USER u IDENTIFIED WITH mysql_native_password BY {quote}{pw}{quote}"),
                 3 => format!("SET PASSWORD = PASSWORD({quote}{pw}{quote})"),

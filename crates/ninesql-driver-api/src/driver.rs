@@ -79,10 +79,13 @@ pub trait Driver: Send + Sync {
     ///   (`SHOW default_transaction_read_only`);
     /// - run [`ConnectParams::init_statements`] after the read-only mechanism, so they cannot
     ///   lift it (they are subject to the same read-only refusal as user statements);
-    /// - drop every [`Secret`](crate::Secret) as soon as the handshake is done, unless the
-    ///   driver declares [`Capabilities::retains_secret_for_reconnect`] (L5), in which case it
-    ///   keeps the `Secret` (zeroized on drop) only for its own reconnects and drops it with the
-    ///   session; the declaration is listed per driver in `docs/08-engine-capabilities.md`;
+    /// - drop every [`Secret`](crate::Secret) before returning, unless the driver declares
+    ///   [`Capabilities::retains_secret_after_connect`] (L5), in which case it keeps the
+    ///   `Secret` (zeroized on drop) only for its own reconnects and auxiliary authentications
+    ///   (cancel, metadata, keep-alive) and drops it with the session. A driver that does not
+    ///   retain it opens and authenticates every auxiliary connection it will need (for example
+    ///   a MySQL control connection for `KILL QUERY`) during `connect`; the declaration is
+    ///   listed per driver in `docs/08-engine-capabilities.md`;
     /// - open any additional connection (metadata, cancel, keep-alive) with the same TLS
     ///   settings, SSH route and read-only mechanism as the main one (see [`Metadata`]);
     /// - error messages are passed through

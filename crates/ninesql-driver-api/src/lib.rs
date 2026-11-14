@@ -60,9 +60,9 @@ pub use params::{
     check_properties, is_reserved_property,
 };
 pub use result::{
-    CancelHandle, DocValue, Document, ENGINE_TYPE_METADATA_KEY, NoServerCancel, Notice,
-    NoticeSeverity, RawResultStream, ResultItem, ResultSetHeader, ResultSetKind, ResultStream,
-    SERVER_CANCEL_GRACE, TRUNCATED_VALUES_METADATA_KEY, Truncation, TruncationReason,
+    CancelHandle, DocValue, Document, ENGINE_TYPE_METADATA_KEY, MAX_DOCUMENT_DEPTH, NoServerCancel,
+    Notice, NoticeSeverity, RawResultStream, ResultItem, ResultSetHeader, ResultSetKind,
+    ResultStream, SERVER_CANCEL_GRACE, TRUNCATED_VALUES_METADATA_KEY, Truncation, TruncationReason,
 };
 pub use secret::Secret;
 pub use statement::{

@@ -19,12 +19,15 @@
 //!     conformance::assert_identifier_quoting(
 //!         &driver, dev_params(..), conformance::ALIAS_TEMPLATE, conformance::IDENTIFIER_SAMPLES,
 //!     ).await;
-//!     // Parameters pointing at the self-signed TLS endpoint of the driver's dev service.
-//!     conformance::assert_verify_full_rejects_untrusted_certificate(&driver, self_signed(..)).await;
+//!     // The TLS endpoint of the driver's dev service, its test CA and a name it does not cover.
+//!     conformance::assert_verify_full_rejects_untrusted_certificate(
+//!         &driver, &|| tls_params(..), Path::new("dev/tls/ca.pem"), "wrong.example.test",
+//!     ).await;
 //! }
 //! ```
 
 use std::collections::BTreeMap;
+use std::path::Path;
 
 use arrow_array::Array;
 use arrow_array::cast::AsArray;
@@ -238,46 +241,98 @@ pub async fn assert_multiple_statements_refused(driver: &dyn Driver, params: Con
     );
 }
 
-/// Connects with `params` forced to `verify-full` and without its extra CA file, then with
-/// `verify-ca`, and asserts both fail with [`DriverError::Tls`] and do not echo the password.
+/// TLS verification conformance (I5). `make_params` builds fresh parameters (credentials
+/// included) for an endpoint whose certificate is **not** trusted by the platform store but is
+/// signed by `trusted_ca` for the endpoint's real host name (for example the TLS-enabled
+/// `dev/compose.yaml` service of the engine with its test CA). `mismatched_server_name` is a
+/// name the certificate does not cover. The helper asserts:
+/// 1. positive control: `verify-full` with `trusted_ca` connects, which proves the endpoint
+///    really speaks TLS (so a "server does not support TLS" error cannot pass as a rejection);
+/// 2. without `trusted_ca`, `verify-full` and `verify-ca` both fail with [`DriverError::Tls`];
+/// 3. with `trusted_ca` but `server_name = mismatched_server_name`, `verify-ca` connects and
+///    `verify-full` fails with [`DriverError::Tls`] (host name checked only by `verify-full`);
 ///
-/// `params` is supplied by the driver's test and points at an endpoint that presents a
-/// **self-signed** certificate (or one signed by a CA that is not in the platform trust store),
-/// for example the TLS-enabled `dev/compose.yaml` service of the engine.
+/// and that no TLS error echoes the password or token.
 ///
 /// # Panics
-/// When the connection succeeds or fails with another error.
+/// When a check fails.
 pub async fn assert_verify_full_rejects_untrusted_certificate(
     driver: &dyn Driver,
-    params: ConnectParams,
+    make_params: &(dyn Fn() -> ConnectParams + Sync),
+    trusted_ca: &Path,
+    mismatched_server_name: &str,
 ) {
-    let password = match &params.auth {
-        Auth::Password {
-            password: Some(p), ..
-        } => Some(Secret::new(p.expose().to_owned())),
-        Auth::Token { token, .. } => Some(Secret::new(token.expose().to_owned())),
-        _ => None,
+    let secret = {
+        let p = make_params();
+        match &p.auth {
+            Auth::Password {
+                password: Some(pw), ..
+            } => Some(Secret::new(pw.expose().to_owned())),
+            Auth::Token { token, .. } => Some(Secret::new(token.expose().to_owned())),
+            _ => None,
+        }
     };
-    let mut verify_ca = clone_params(&params);
-    verify_ca.tls.mode = TlsMode::VerifyCa;
-    verify_ca.tls.ca_file = None;
-    let mut verify_full = params;
-    verify_full.tls.mode = TlsMode::VerifyFull;
-    verify_full.tls.ca_file = None;
-    for p in [verify_full, verify_ca] {
-        let mode = p.tls.mode;
-        match driver.connect(p).await {
+    let with = |mode: TlsMode, ca: Option<&Path>, server_name: Option<&str>| {
+        let mut p = make_params();
+        p.tls.mode = mode;
+        p.tls.ca_file = ca.map(Path::to_path_buf);
+        if let Some(name) = server_name {
+            p.tls.server_name = Some(name.to_owned());
+        }
+        p
+    };
+    let expect_tls_error =
+        |case: &str, outcome: Result<Box<dyn Session>, DriverError>| match outcome {
             Err(DriverError::Tls(msg)) => {
-                if let Some(pw) = &password
-                    && !pw.is_empty()
+                if let Some(s) = &secret
+                    && !s.is_empty()
                 {
-                    assert!(!msg.contains(pw.expose()), "TLS error echoes the password");
+                    assert!(
+                        !msg.contains(s.expose()),
+                        "{case}: TLS error echoes the secret"
+                    );
                 }
             }
-            Err(other) => panic!("{mode:?}: expected a TLS error, got {other:?}"),
-            Ok(_) => panic!("{mode:?} accepted an untrusted certificate"),
+            Err(other) => panic!("{case}: expected a TLS error, got {other:?}"),
+            Ok(_) => panic!("{case}: an untrusted or mismatched certificate was accepted"),
+        };
+    // 1. Positive control.
+    match driver
+        .connect(with(TlsMode::VerifyFull, Some(trusted_ca), None))
+        .await
+    {
+        Ok(session) => {
+            let _ = session.close().await;
         }
+        Err(e) => panic!("positive control: verify-full with the trusted CA failed: {e}"),
     }
+    // 2. Untrusted issuer.
+    for mode in [TlsMode::VerifyFull, TlsMode::VerifyCa] {
+        let outcome = driver.connect(with(mode, None, None)).await;
+        expect_tls_error(&format!("{mode:?} without the CA"), outcome);
+    }
+    // 3. Host name mismatch.
+    match driver
+        .connect(with(
+            TlsMode::VerifyCa,
+            Some(trusted_ca),
+            Some(mismatched_server_name),
+        ))
+        .await
+    {
+        Ok(session) => {
+            let _ = session.close().await;
+        }
+        Err(e) => panic!("verify-ca must not check the host name: {e}"),
+    }
+    let outcome = driver
+        .connect(with(
+            TlsMode::VerifyFull,
+            Some(trusted_ca),
+            Some(mismatched_server_name),
+        ))
+        .await;
+    expect_tls_error("verify-full with a mismatched host name", outcome);
 }
 
 /// Bytes a batch may exceed `2 × max_batch_bytes + max_row_bytes` by (Arrow buffer alignment,
@@ -470,6 +525,14 @@ pub const IDENTIFIER_SAMPLES: &[&str] = &[
     "a/*b*/c",
     "ünïcødé",
     "\"\"",
+    "a\\b",
+    "a$b",
+    "$1",
+    "$$",
+    "a\nb",
+    "]",
+    "[x]",
+    "1abc",
 ];
 
 /// Template for [`assert_identifier_quoting`]: `{ident}` is replaced by the quoted name.

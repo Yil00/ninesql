@@ -37,6 +37,17 @@
 //! [`ExecutionGuard`](crate::ExecutionGuard) lives in the raw stream, so the session stays busy
 //! until the server confirmed that the cancelled statement ended.
 //!
+//! **Idle cursors.** Some engines ignore a cancel while the backend waits for the client
+//! (PostgreSQL: a portal suspended between `Execute` calls is not "running", so a cancel
+//! request does nothing, and the open portal keeps its snapshot and locks). For such engines
+//! the driver's cancel handle also sets a **driver-local flag** read by the raw stream: on its
+//! next poll (the drain above, or the consumer's next poll after the watchdog fired), the raw
+//! stream does not fetch more rows but closes the cursor (`Close` + `Sync`, or `ROLLBACK` of the
+//! driver's implicit transaction), waits for the server's acknowledgement, confirms the end and
+//! ends. pgwire should also set `idle_in_transaction_session_timeout` (a server-side bound for a
+//! consumer that never polls again), and its integration tests pause a cursor, let the deadline
+//! pass, and check that the locks it held are released.
+//!
 //! # Integrity checks (L3)
 //! The stream fails with [`DriverError::Protocol`] when a driver breaks the grammar: `Rows`
 //! without a tabular header or with a schema that differs from the header's beyond field
@@ -54,7 +65,7 @@ use arrow_data::transform::{Capacities, MutableArrayData};
 use arrow_schema::{Schema, SchemaRef};
 use futures_core::Stream;
 use futures_util::StreamExt;
-use tokio::sync::oneshot;
+use tokio::sync::{Notify, oneshot};
 
 use crate::error::{DriverError, DriverResult};
 use crate::execution::ExecutionId;
@@ -258,10 +269,18 @@ impl Truncation {
     }
 }
 
+/// Maximum nesting depth of a [`Document`] (objects and arrays inside each other, the document
+/// itself at depth 1). Drivers stop decoding at this depth and replace deeper subtrees with
+/// [`DocValue::truncated`] of a [`DocValue::Other`] (`type_name` `"nested"`); [`ResultStream`]
+/// rejects deeper documents with [`DriverError::Protocol`]. The bound keeps the recursive
+/// `Drop`, `Clone` and `PartialEq` of documents far from the stack limit (L-8).
+pub const MAX_DOCUMENT_DEPTH: usize = 100;
+
 /// An ordered document (MongoDB document, Redis hash, Elasticsearch hit, Neo4j node…).
 ///
 /// `Debug` prints the field count only (result values are never logged). Build with
-/// [`Document::new`] or `Document::from(fields)`.
+/// [`Document::new`] or `Document::from(fields)`. Nesting is bounded by
+/// [`MAX_DOCUMENT_DEPTH`].
 #[derive(Clone, Default, PartialEq)]
 #[non_exhaustive]
 pub struct Document {
@@ -284,21 +303,68 @@ impl Document {
 
     /// `true` when any value, at any depth, is [`DocValue::Truncated`]. The document viewer
     /// then treats the document as **non-editable** (writing back a cut value destroys data).
+    /// Iterative: safe on any depth.
     #[must_use]
     pub fn has_truncated_values(&self) -> bool {
-        self.fields.iter().any(|(_, v)| v.has_truncated_values())
+        any_truncated(self.fields.iter().map(|(_, v)| v).collect())
     }
 
-    /// Estimated heap size in bytes, used for the memory budget.
+    /// Nesting depth (1 for a flat document). Iterative: safe on any depth.
+    #[must_use]
+    pub fn depth(&self) -> usize {
+        let mut max = 1;
+        let mut stack: Vec<(&DocValue, usize)> = self.fields.iter().map(|(_, v)| (v, 1)).collect();
+        while let Some((v, d)) = stack.pop() {
+            max = max.max(d);
+            match v {
+                DocValue::Array(a) => stack.extend(a.iter().map(|x| (x, d + 1))),
+                DocValue::Object(o) => stack.extend(o.fields.iter().map(|(_, x)| (x, d + 1))),
+                DocValue::Truncated { kept, .. } => stack.push((kept, d)),
+                _ => {}
+            }
+        }
+        max
+    }
+
+    /// Estimated heap size in bytes, used for the memory budget. Iterative: safe on any depth.
     #[must_use]
     pub fn estimated_size(&self) -> u64 {
-        let own = (self.fields.capacity() * std::mem::size_of::<(String, DocValue)>()) as u64;
-        own + self
-            .fields
-            .iter()
-            .map(|(k, v)| k.capacity() as u64 + v.estimated_heap_size())
-            .sum::<u64>()
+        let mut total = 0u64;
+        let mut docs: Vec<&Document> = vec![self];
+        let mut values: Vec<&DocValue> = Vec::new();
+        loop {
+            if let Some(d) = docs.pop() {
+                total += (d.fields.capacity() * std::mem::size_of::<(String, DocValue)>()) as u64;
+                for (k, v) in &d.fields {
+                    total += k.capacity() as u64;
+                    values.push(v);
+                }
+            } else if let Some(v) = values.pop() {
+                total += v.own_heap_size();
+                match v {
+                    DocValue::Array(a) => values.extend(a.iter()),
+                    DocValue::Object(o) => docs.push(o),
+                    DocValue::Truncated { kept, .. } => values.push(kept),
+                    _ => {}
+                }
+            } else {
+                return total;
+            }
+        }
     }
+}
+
+/// Iterative search for a [`DocValue::Truncated`] below `stack`.
+fn any_truncated(mut stack: Vec<&DocValue>) -> bool {
+    while let Some(v) = stack.pop() {
+        match v {
+            DocValue::Truncated { .. } => return true,
+            DocValue::Array(a) => stack.extend(a.iter()),
+            DocValue::Object(d) => stack.extend(d.fields.iter().map(|(_, v)| v)),
+            _ => {}
+        }
+    }
+    false
 }
 
 impl fmt::Debug for Document {
@@ -367,30 +433,25 @@ impl DocValue {
         }
     }
 
-    /// `true` for [`DocValue::Truncated`] or a container holding one.
+    /// `true` for [`DocValue::Truncated`] or a container holding one. Iterative.
     #[must_use]
     pub fn has_truncated_values(&self) -> bool {
         match self {
             Self::Truncated { .. } => true,
-            Self::Array(a) => a.iter().any(Self::has_truncated_values),
-            Self::Object(d) => d.has_truncated_values(),
+            Self::Array(_) | Self::Object(_) => any_truncated(vec![self]),
             _ => false,
         }
     }
 
-    fn estimated_heap_size(&self) -> u64 {
+    /// Heap bytes owned directly by this value (children excluded).
+    fn own_heap_size(&self) -> u64 {
         match self {
             Self::Decimal(s) | Self::String(s) => s.capacity() as u64,
             Self::Bytes(b) => b.capacity() as u64,
-            Self::Array(a) => {
-                (a.capacity() * std::mem::size_of::<DocValue>()) as u64
-                    + a.iter().map(Self::estimated_heap_size).sum::<u64>()
-            }
-            Self::Object(d) => d.estimated_size(),
+            Self::Array(a) => (a.capacity() * std::mem::size_of::<DocValue>()) as u64,
+            Self::Object(_) => 0,
             Self::Other { type_name, text } => (type_name.capacity() + text.capacity()) as u64,
-            Self::Truncated { kept, .. } => {
-                std::mem::size_of::<DocValue>() as u64 + kept.estimated_heap_size()
-            }
+            Self::Truncated { .. } => std::mem::size_of::<DocValue>() as u64,
             Self::Null
             | Self::Bool(_)
             | Self::Int(_)
@@ -448,6 +509,10 @@ pub trait CancelHandle: Send + Sync {
     /// raw stream, bounded by [`SERVER_CANCEL_GRACE`], instead of dropping it at once, so the
     /// session stays busy until that confirmation. Default `false` (dropped at once): drivers
     /// with [`CancelSupport::ServerSide`](crate::CancelSupport::ServerSide) override it.
+    ///
+    /// Where the engine ignores a cancel while the cursor is idle (PostgreSQL suspended
+    /// portal), `cancel` also flags the raw stream so its next poll closes the cursor and
+    /// confirms the end instead of fetching more rows (see the module's "Idle cursors").
     fn confirms_end(&self) -> bool {
         false
     }
@@ -507,7 +572,7 @@ pub struct ResultStream {
     cancel: CancelToken,
     canceller: Arc<dyn CancelHandle>,
     /// Set by whoever calls the server-side cancel first (watchdog or poll path).
-    cancel_claimed: Arc<AtomicBool>,
+    cancel_state: Arc<CancelState>,
     /// Dropping it stops the watchdog task.
     watchdog: Option<oneshot::Sender<()>>,
     execution: Option<ExecutionId>,
@@ -551,9 +616,9 @@ impl ResultStream {
         canceller: Arc<dyn CancelHandle>,
     ) -> Self {
         let deadline = options.timeout.map(|t| tokio::time::Instant::now() + t);
-        let cancel_claimed = Arc::new(AtomicBool::new(false));
+        let cancel_state = Arc::new(CancelState::default());
         let watchdog = deadline
-            .and_then(|d| spawn_watchdog(d, Arc::clone(&canceller), Arc::clone(&cancel_claimed)));
+            .and_then(|d| spawn_watchdog(d, Arc::clone(&canceller), Arc::clone(&cancel_state)));
         Self {
             inner: Some(raw),
             budget: options.budget,
@@ -561,7 +626,7 @@ impl ResultStream {
             deadline,
             cancel: options.cancel.clone(),
             canceller,
-            cancel_claimed,
+            cancel_state,
             watchdog,
             execution: None,
             current: None,
@@ -687,12 +752,23 @@ impl ResultStream {
             "result stream aborted, requesting server-side cancel"
         );
         let started = tokio::time::Instant::now();
-        if !self.cancel_claimed.swap(true, Ordering::SeqCst) {
-            match tokio::time::timeout(SERVER_CANCEL_GRACE, self.canceller.cancel()).await {
-                Ok(Ok(())) => {}
-                Ok(Err(e)) => tracing::warn!(error = %e, "server-side cancel failed"),
-                Err(_) => tracing::warn!("server-side cancel not acknowledged in time"),
+        // The cancel request runs as a detached task: if the caller drops this future (a
+        // `select!` or `timeout` around `next()`), the request still reaches the server, and a
+        // retry waits for that same request instead of sending a second one or none (M-1).
+        if !self.cancel_state.claimed.swap(true, Ordering::SeqCst) {
+            let request = send_cancel(Arc::clone(&self.canceller), Arc::clone(&self.cancel_state));
+            match tokio::runtime::Handle::try_current() {
+                Ok(handle) => {
+                    handle.spawn(request);
+                }
+                Err(_) => request.await,
             }
+        }
+        if tokio::time::timeout(SERVER_CANCEL_GRACE, self.cancel_state.wait_done())
+            .await
+            .is_err()
+        {
+            tracing::warn!("server-side cancel not acknowledged in time");
         }
         // Wait for the server to confirm the end of the statement: the driver ends its raw
         // stream then, and its execution guard frees the session. Nothing was sent if the raw
@@ -783,6 +859,11 @@ impl ResultStream {
                         "documents received outside a document result set".into(),
                     ));
                 }
+                if docs.iter().any(|d| d.depth() > MAX_DOCUMENT_DEPTH) {
+                    return Err(DriverError::Protocol(format!(
+                        "a document is nested deeper than {MAX_DOCUMENT_DEPTH} levels"
+                    )));
+                }
                 self.account_documents(docs)
             }
             ResultItem::Notice(n) => {
@@ -801,10 +882,11 @@ impl ResultStream {
 
     fn account_rows(&mut self, batch: RecordBatch) -> ResultItem {
         let n = batch.num_rows();
+        let size = (batch.get_array_memory_size() as u64).max(EMPTY_BATCH_BYTES);
         if n == 0 {
-            return ResultItem::Rows(batch);
+            // Empty batches still cost something: a driver cannot stream them for free (L-5).
+            return self.account_small(size, ResultItem::Rows(batch));
         }
-        let size = batch.get_array_memory_size() as u64;
         let (mut keep, reason) = self.fit(n as u64, size);
         if keep == n as u64 {
             self.rows += keep;
@@ -933,24 +1015,62 @@ fn compact_prefix(batch: &RecordBatch, len: usize) -> Option<RecordBatch> {
     RecordBatch::try_new_with_options(batch.schema(), columns, &options).ok()
 }
 
+/// Minimum bytes counted for a batch (an empty batch included).
+pub const EMPTY_BATCH_BYTES: u64 = 64;
+
+/// The one server-side cancel request of a stream, shared by the poll path and the watchdog.
+#[derive(Default)]
+struct CancelState {
+    /// Whoever sets it first sends the request.
+    claimed: AtomicBool,
+    /// The request returned (or gave up after [`SERVER_CANCEL_GRACE`]).
+    done: AtomicBool,
+    notify: Notify,
+}
+
+impl CancelState {
+    async fn wait_done(&self) {
+        loop {
+            let notified = self.notify.notified();
+            if self.done.load(Ordering::SeqCst) {
+                return;
+            }
+            notified.await;
+        }
+    }
+}
+
+/// Sends the cancel request, bounded by [`SERVER_CANCEL_GRACE`], and records its end.
+async fn send_cancel(canceller: Arc<dyn CancelHandle>, state: Arc<CancelState>) {
+    match tokio::time::timeout(SERVER_CANCEL_GRACE, canceller.cancel()).await {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => tracing::warn!(error = %e, "server-side cancel failed"),
+        Err(_) => tracing::warn!("server-side cancel not acknowledged in time"),
+    }
+    state.done.store(true, Ordering::SeqCst);
+    state.notify.notify_waiters();
+}
+
 fn spawn_watchdog(
     deadline: tokio::time::Instant,
     canceller: Arc<dyn CancelHandle>,
-    claimed: Arc<AtomicBool>,
+    state: Arc<CancelState>,
 ) -> Option<oneshot::Sender<()>> {
-    let handle = tokio::runtime::Handle::try_current().ok()?;
+    let Ok(handle) = tokio::runtime::Handle::try_current() else {
+        tracing::warn!(
+            "result stream created outside a Tokio runtime: the timeout is only enforced while \
+             the consumer polls"
+        );
+        return None;
+    };
     let (stop, stopped) = oneshot::channel::<()>();
     handle.spawn(async move {
         tokio::select! {
             _ = stopped => {}
             () = tokio::time::sleep_until(deadline) => {
-                if !claimed.swap(true, Ordering::SeqCst) {
+                if !state.claimed.swap(true, Ordering::SeqCst) {
                     tracing::debug!("timeout reached; watchdog requesting server-side cancel");
-                    match tokio::time::timeout(SERVER_CANCEL_GRACE, canceller.cancel()).await {
-                        Ok(Ok(())) => {}
-                        Ok(Err(e)) => tracing::warn!(error = %e, "server-side cancel failed"),
-                        Err(_) => tracing::warn!("server-side cancel not acknowledged in time"),
-                    }
+                    send_cancel(canceller, state).await;
                 }
             }
         }

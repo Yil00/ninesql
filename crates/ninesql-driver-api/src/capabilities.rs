@@ -23,7 +23,7 @@
 //! | [`tls`](Capabilities::tls) | TLS modes the engine supports | TLS section disabled |
 //! | [`parameters`](Capabilities::parameters) | Bind parameters in statements | Parameter prompt not offered |
 //! | [`extra_reserved_properties`](Capabilities::extra_reserved_properties) | Driver properties this driver reserves on top of the global rule | The connection dialog and import refuse them too |
-//! | [`retains_secret_for_reconnect`](Capabilities::retains_secret_for_reconnect) | The driver keeps the secret in memory after connect, for automatic reconnects | "Reconnect" asks the core for the secret again |
+//! | [`retains_secret_after_connect`](Capabilities::retains_secret_after_connect) | The driver keeps the secret in memory after connect, for reconnects or for connections it opens later (cancel, metadata, keep-alive) | The UI can say the secret stays in memory while connected; otherwise reconnects ask the core again |
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -77,11 +77,17 @@ pub struct Capabilities {
     /// driver would refuse (integration review).
     pub extra_reserved_properties: BTreeSet<String>,
     /// The driver keeps the connection secret (password, token, key passphrase) in memory after
-    /// the handshake, zeroized on drop, to re-authenticate on automatic reconnects (L5). `false`
-    /// means the secret is dropped as soon as the handshake is done and a reconnect needs a new
-    /// [`ConnectParams`](crate::ConnectParams) from the core. Declared per driver and listed in
-    /// `docs/08-engine-capabilities.md`.
-    pub retains_secret_for_reconnect: bool,
+    /// [`Driver::connect`](crate::Driver::connect) returned, zeroized on drop, for **any** later
+    /// authentication (L5): automatic reconnects, and auxiliary connections or requests opened
+    /// after connect that must authenticate, such as a cancel (MySQL `KILL QUERY` on a new
+    /// connection, ClickHouse HTTP `KILL QUERY`, Trino `DELETE /v1/query/{id}`, Elasticsearch
+    /// `_tasks/_cancel`), a separate metadata connection or a keep-alive.
+    ///
+    /// `false` means every secret is dropped before `connect` returns: auxiliary connections
+    /// that need credentials are opened and authenticated **during** `connect`, and a reconnect
+    /// needs a new [`ConnectParams`](crate::ConnectParams) from the core. Declared per driver
+    /// and listed in `docs/08-engine-capabilities.md`.
+    pub retains_secret_after_connect: bool,
 }
 
 impl Capabilities {
@@ -106,7 +112,7 @@ impl Capabilities {
             tls: BTreeSet::new(),
             parameters: false,
             extra_reserved_properties: BTreeSet::new(),
-            retains_secret_for_reconnect: false,
+            retains_secret_after_connect: false,
         }
     }
 
@@ -438,7 +444,7 @@ mod tests {
         )]);
         let err = c.check_properties(&props).unwrap_err();
         assert!(!err.to_string().contains("read-write"));
-        assert!(!c.retains_secret_for_reconnect);
+        assert!(!c.retains_secret_after_connect);
     }
 
     #[test]
