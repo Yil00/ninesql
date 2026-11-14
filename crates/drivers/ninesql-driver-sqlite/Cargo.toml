@@ -1,0 +1,29 @@
+[package]
+name = "ninesql-driver-sqlite"
+description = "SQLite driver (file engine, rusqlite with the bundled SQLite; ADR-0003)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+ninesql-driver-api.workspace = true
+arrow-array.workspace = true
+arrow-schema.workspace = true
+async-trait.workspace = true
+futures-util.workspace = true
+rusqlite.workspace = true
+tokio = { workspace = true, features = ["macros", "rt", "sync", "time"] }
+tracing.workspace = true
+
+[dev-dependencies]
+ninesql-driver-api = { workspace = true, features = ["mock"] }
+proptest.workspace = true
+tempfile.workspace = true
+tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread", "sync", "time"] }
