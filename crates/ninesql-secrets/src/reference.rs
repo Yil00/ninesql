@@ -37,7 +37,9 @@ pub enum SecretKind {
     Token,
     /// Passphrase of a TLS client certificate key.
     ClientKeyPassphrase,
-    /// Password of an HTTP / SOCKS proxy.
+    /// Password of an HTTP / SOCKS proxy (ADR-0011 §8). Its slot is `proxy` (secret id
+    /// `<connection uuid>:proxy`); the connection model has no proxy field yet, so no slot
+    /// currently produces this kind.
     ProxyPassword,
 }
 
@@ -73,6 +75,12 @@ pub const MAX_SECRET_ID_LEN: usize = 128;
 pub struct InvalidSecretId;
 
 /// Opaque identifier of a secret inside one store.
+///
+/// For connection secrets the format is `<connection uuid>:<slot>` (ADR-0012 §4), with these
+/// slots: `auth` ([`SecretKind::Password`] or [`SecretKind::Token`]), `ssh` and `ssh-jump-N`
+/// ([`SecretKind::SshPassword`] or [`SecretKind::SshKeyPassphrase`]), `tls-client-key`
+/// ([`SecretKind::ClientKeyPassphrase`]) and `proxy` ([`SecretKind::ProxyPassword`], reserved
+/// for the proxy hop of ADR-0011 §8 until the connection model gets a proxy field).
 ///
 /// Restricted to a short ASCII alphabet so it can be used as a D-Bus attribute value and a vault
 /// key, and so it cannot plausibly hold a pasted password with spaces or symbols. The identifier

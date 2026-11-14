@@ -468,27 +468,236 @@ proptest! {
     }
 }
 
-#[test]
-fn benign_look_alike_properties_survive_sanitize() {
+/// Common driver options that are kept as plain properties: neither secret-like, nor reserved by
+/// the driver API rule, nor carrying a credential value.
+const ACCEPTED_KEYS: &[&str] = &[
+    // PostgreSQL / pgjdbc
+    "application_name",
+    "connect_timeout",
+    "search_path",
+    "currentSchema",
+    "statement_timeout",
+    "lock_timeout",
+    "idle_in_transaction_session_timeout",
+    "keepalives",
+    "keepalives_idle",
+    "tcpKeepAlive",
+    "prepareThreshold",
+    "defaultRowFetchSize",
+    "targetServerType",
+    "assumeMinServerVersion",
+    "escapeSyntaxCallMode",
+    // MySQL / MariaDB / Connector/J
+    "connectTimeout",
+    "socketTimeout",
+    "characterEncoding",
+    "charset",
+    "useUnicode",
+    "serverTimezone",
+    "zeroDateTimeBehavior",
+    "rewriteBatchedStatements",
+    "useServerPrepStmts",
+    "cachePrepStmts",
+    "prepStmtCacheSize",
+    "useCursorFetch",
+    "tinyInt1isBit",
+    "yearIsDateType",
+    "useCompression",
+    "nullCatalogMeansCurrent",
+    // Others (ClickHouse, MongoDB, Trino, generic)
+    "compress",
+    "max_result_rows",
+    "session_timezone",
+    "replicaSet",
+    "appName",
+    "retryWrites",
+    "readPreference",
+    "directConnection",
+    "serverSelectionTimeoutMS",
+    "maxPoolSize",
+    "clientTags",
+    "fetchSize",
+    "loginTimeout",
+    "ApplicationIntent",
+];
+
+/// Keys refused before and after the move to the driver API rule.
+const STILL_REFUSED_KEYS: &[&str] = &[
+    "sslmode",
+    "sslrootcert",
+    "useSSL",
+    "requireSSL",
+    "verifyServerCertificate",
+    "trustServerCertificate",
+    "hostNameInCertificate",
+    "trustStoreType",
+    "tlsAllowInvalidCertificates",
+    "secure",
+    "encrypt",
+    "keystore",
+    "host",
+    "hostaddr",
+    "port",
+    "server",
+    "user",
+    "username",
+    "uid",
+    "userid",
+    "readOnly",
+    "default_transaction_read_only",
+    // Secret-like keys (I1).
+    "password",
+    "sslpassword",
+    "pwd",
+    "apiKey",
+    // `gsslib` contains `ssl`: refused before as TLS, now as GSSAPI (fails closed).
+    "gsslib",
+];
+
+/// Keys the core accepted before and now refuses because the driver API reserves them (or, for
+/// `gssencmode`, because the core refuses it ahead of the driver API). Each one would have been
+/// stored and then refused by the driver at connect time.
+const NEWLY_REFUSED_KEYS: &[&str] = &[
+    // Was benign in core. MySQL: lets a MITM on a non-TLS connection obtain the password.
+    "allowPublicKeyRetrieval",
+    // Were benign in core. Matched by the driver API `password` fragment.
+    "passwordCharacterEncoding",
+    "password_encryption",
+    // Was benign in core. GSSAPI transport encryption bypasses the TLS settings
+    // (`PENDING_RESERVED_KEYS` until the driver API reserves it).
+    "gssencmode",
+    // Session-level settings that can change lexical or access behavior.
+    "options",
+    "sessionVariables",
+    "sql_mode",
+    "standard_conforming_strings",
+    // Multi-statements.
+    "allowMultiQueries",
+    "multiStatements",
+    // Init SQL: use `init_sql`, which is checked for password literals.
+    "initSql",
+    "init_command",
+    // Endpoint shadows: socket, service file, URLs, extra hosts, fail-over, reconnect.
+    "socket",
+    "unix_socket",
+    "socketFactory",
+    "service",
+    "servername",
+    "url",
+    "jdbcUrl",
+    "uri",
+    "connectionString",
+    "hosts",
+    "alt_hosts",
+    "failoverHosts",
+    "loadBalanceHosts",
+    "nodes",
+    "contactPoints",
+    "autoReconnect",
+    "maxReconnects",
+    // Credentials / authentication options (no typed field yet: fails closed).
+    "passfile",
+    "authSource",
+    "authMechanism",
+    "authenticationPlugins",
+    "authentication",
+    "token_type",
+    // TLS-adjacent: channel binding, Firebird wire encryption.
+    "channel_binding",
+    "wire_crypt",
+    // Proxies: use the SSH / proxy settings.
+    "proxy",
+    "http_proxy",
+    "socksProxyHost",
+    // Local file access.
+    "allowLoadLocalInfile",
+    "allowLocalInfile",
+    "localInfile",
+];
+
+fn with_property(key: &str) -> Connection {
     let mut c = basic();
-    for key in [
-        "passwordCharacterEncoding",
-        "allowPublicKeyRetrieval",
-        "gssencmode",
-        "rewriteBatchedStatements",
-    ] {
-        c.properties.insert(key.into(), "true".into());
+    c.properties.insert(key.into(), "x-value".into());
+    c
+}
+
+#[test]
+fn common_driver_properties_follow_the_driver_api_rule() {
+    for key in ACCEPTED_KEYS {
+        with_property(key)
+            .validate()
+            .unwrap_or_else(|e| panic!("{key}: {e}"));
+        assert!(!ninesql_driver_api::is_reserved_property(key), "{key}");
     }
-    assert!(c.sanitize().is_empty());
-    assert_eq!(c.properties.len(), 4);
-    c.validate().unwrap();
-    // The value check still applies to allowlisted keys.
-    c.properties.insert(
-        "passwordCharacterEncoding".into(),
-        "jdbc:mysql://root:Hunter2@db/x".into(),
+    for key in STILL_REFUSED_KEYS.iter().chain(NEWLY_REFUSED_KEYS) {
+        let err = with_property(key).validate().unwrap_err();
+        assert!(
+            matches!(
+                err,
+                ConnectionError::ReservedProperty { .. }
+                    | ConnectionError::SecretInProperties { .. }
+            ),
+            "{key}: {err}"
+        );
+        assert!(!err.to_string().contains("x-value"), "{err}");
+    }
+    assert!(ACCEPTED_KEYS.len() + STILL_REFUSED_KEYS.len() + NEWLY_REFUSED_KEYS.len() >= 60);
+}
+
+#[test]
+fn reserved_keys_win_over_benign_lists() {
+    // `passwordCharacterEncoding` is on the storage benign list (not secret-like) but the driver
+    // API reserves it: it is refused as reserved, not accepted.
+    assert!(!ninesql_storage::hygiene::is_secret_like_key(
+        "passwordCharacterEncoding"
+    ));
+    assert!(matches!(
+        with_property("passwordCharacterEncoding").validate(),
+        Err(ConnectionError::ReservedProperty { .. })
+    ));
+}
+
+/// Imported (or hand-edited) connections holding keys that are now reserved are cleaned on load
+/// and every removal is reported; nothing is silently kept.
+#[test]
+fn sanitize_reports_and_removes_now_reserved_keys() {
+    let mut c = basic();
+    c.properties
+        .insert("application_name".into(), "NineSQL".into());
+    for key in NEWLY_REFUSED_KEYS {
+        c.properties.insert((*key).into(), "true".into());
+    }
+    let issues = c.sanitize();
+    assert_eq!(issues.len(), NEWLY_REFUSED_KEYS.len(), "{issues:?}");
+    assert_eq!(
+        c.properties.keys().collect::<Vec<_>>(),
+        ["application_name"]
     );
+    c.validate().unwrap();
+    // The value check still applies to accepted keys.
+    c.properties
+        .insert("charset".into(), "jdbc:mysql://root:Hunter2@db/x".into());
     assert!(matches!(
         c.validate(),
         Err(ConnectionError::SecretInPropertyValue { .. })
     ));
+}
+
+proptest! {
+    /// Whatever the key, a property the core keeps is one the drivers accept.
+    #[test]
+    fn kept_properties_pass_the_driver_check(key in "[A-Za-z_.-]{1,24}") {
+        let mut c = with_property(&key);
+        let kept = c.validate().is_ok();
+        let issues = c.sanitize();
+        prop_assert_eq!(kept, issues.is_empty());
+        if kept {
+            let props = std::iter::once((
+                key.clone(),
+                ninesql_driver_api::PropertyValue::Plain("x".into()),
+            ))
+            .collect();
+            prop_assert!(ninesql_driver_api::check_properties(&props, &[]).is_ok(), "{}", key);
+        }
+    }
 }

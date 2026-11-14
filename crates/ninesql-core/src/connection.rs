@@ -3,7 +3,9 @@
 //! Invariants carried by the types:
 //! - **I1**: no field can hold a secret value. Credentials are a [`SecretSource`]: a
 //!   [`SecretRef`] into the keyring / vault, or "prompt at connect time". Driver properties whose
-//!   key looks like a secret are rejected by [`Connection::validate`].
+//!   key looks like a secret, or that the driver API reserves
+//!   ([`ninesql_driver_api::is_reserved_property`]), are rejected by [`Connection::validate`]
+//!   and removed by [`Connection::sanitize`] on load.
 //! - **I5**: TLS defaults to [`TlsMode::VerifyFull`], also when the `tls` key is absent from the
 //!   file; any weaker mode is an explicit value and is reported by
 //!   [`Connection::security_warnings`]. SSH host key checking cannot be turned off: there is no
@@ -341,6 +343,9 @@ impl fmt::Display for SecurityWarning {
 }
 
 /// Identifies one credential field of a connection.
+///
+/// The suffix `proxy` is reserved for the proxy password ([`SecretKind::ProxyPassword`]) of the
+/// proxy hop (ADR-0011 §8), added with the proxy field of the model.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum SecretSlot {
     /// Database password or token ([`Connection::auth`]).
@@ -526,8 +531,9 @@ impl Connection {
     }
 
     /// Removes what must never be kept in a workspace file — properties that hold or look like a
-    /// secret, properties that shadow a typed field (TLS, endpoint, user, read-only), init SQL
-    /// with a password literal — and returns one issue per removal. Used on load so that one bad
+    /// secret, properties reserved by the driver API rule ([`crate::properties::reserved`]: TLS,
+    /// endpoint, credentials, read-only, init SQL, session modes…), init SQL with a password
+    /// literal — and returns one issue per removal. Used on load so that one bad
     /// connection does not block the whole project and the next save drops the offending data.
     pub fn sanitize(&mut self) -> Vec<ConnectionError> {
         let mut issues = Vec::new();
@@ -696,10 +702,11 @@ impl Connection {
 }
 
 /// Why a driver property cannot be kept, if it cannot. Never includes the value.
+///
+/// Order: secret-like key (I1), then the reserved-key rule shared with the drivers
+/// ([`crate::properties::reserved`], which no benign list overrides), then the value detectors.
 fn property_problem(key: &str, value: &str) -> Option<ConnectionError> {
-    // Known-benign keys skip the key heuristics; their value is still checked.
-    let benign = crate::properties::is_benign(key);
-    if !benign && ninesql_storage::hygiene::is_secret_like_key(key) {
+    if ninesql_storage::hygiene::is_secret_like_key(key) {
         return Some(ConnectionError::SecretInProperties {
             key: key.to_owned(),
         });
