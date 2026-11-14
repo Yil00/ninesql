@@ -3,6 +3,20 @@
 //! Implemented here rather than with `postgres-protocol`'s helpers so that every buffer derived
 //! from the password (normalized password, salted password, client key, md5 digests) is
 //! zeroized on drop (I1, ADR-0005).
+//!
+//! # Remnants that are not zeroized (L5 of the P1-B review)
+//! Best effort only, by construction of the libraries involved:
+//! - the md5 and PBKDF2 / HMAC internal states of `md-5` and `ring` (stack copies, not
+//!   zeroized by those crates);
+//! - the `Md5` hasher's buffer when it is dropped;
+//! - the bytes of the password message once handed to the transport: the write buffer of
+//!   tokio's `BufStream` and, over TLS, rustls' plaintext / record buffers keep them until
+//!   overwritten (the driver's own message buffers are zeroed after sending);
+//! - a `stringprep` normalization that allocates (non-ASCII passwords) is copied to a zeroized
+//!   buffer and its original is dropped through `Zeroizing`, but intermediate allocations
+//!   inside `stringprep` are not under the driver's control.
+//!
+//! The `Secret` itself is dropped (zeroized) before `connect` returns.
 
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as B64;
@@ -15,7 +29,7 @@ pub(crate) const SCRAM_SHA_256: &str = "SCRAM-SHA-256";
 
 /// Upper bound on the PBKDF2 iteration count a server may ask for (PostgreSQL uses 4096 by
 /// default): a hostile server cannot make the client spin for minutes.
-const MAX_ITERATIONS: u32 = 10_000_000;
+const MAX_ITERATIONS: u32 = 1_000_000;
 
 /// Authentication failure reason; never contains the password.
 #[derive(Debug)]
@@ -97,6 +111,11 @@ impl Scram {
             auth_message: None,
             salted: None,
         }
+    }
+
+    /// `true` once the server-first message was processed.
+    pub(crate) fn has_final(&self) -> bool {
+        self.auth_message.is_some()
     }
 
     /// `client-first-message` (no channel binding: `n,,`).
@@ -204,6 +223,28 @@ impl Scram {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use proptest::prelude::*;
+
+    proptest! {
+        /// The server-first parser never panics, and accepts only a nonce extending the
+        /// client's, a base64 salt and an iteration count in range.
+        #[test]
+        fn server_first_parser_is_total(msg in "[ -~]{0,120}", extend in "[a-zA-Z0-9]{0,8}") {
+            let mut c = Scram::with_nonce(b"pw", "abc".into());
+            let _ = c.client_final(msg.as_bytes());
+            let mut c = Scram::with_nonce(b"pw", "abc".into());
+            let crafted = format!("r=abc{extend},s=c2FsdA==,i=1");
+            let ok = c.client_final(crafted.as_bytes()).is_ok();
+            prop_assert_eq!(ok, !extend.is_empty());
+        }
+
+        #[test]
+        fn server_first_parser_handles_bytes(bytes in prop::collection::vec(any::<u8>(), 0..120)) {
+            let mut c = Scram::with_nonce(b"pw", "abc".into());
+            let _ = c.client_final(&bytes);
+            let _ = c.verify_final(&bytes);
+        }
+    }
 
     /// RFC 7677 §3 test vector (user "user", password "pencil"); PostgreSQL leaves `n=` empty,
     /// so the auth message differs from the RFC's: recompute the proof the way the server does.
@@ -259,6 +300,7 @@ mod tests {
             "r=abc,s=AAAA,i=4096",
             "r=abcdef,s=AAAA,i=0",
             "r=abcdef,s=AAAA,i=99999999999",
+            "r=abcdef,s=AAAA,i=1000001",
             "r=abcdef,s=!!!,i=4096",
             "r=abcdef,i=4096",
             "m=ext,r=abcdef,s=AAAA,i=1",

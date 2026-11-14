@@ -24,6 +24,10 @@ use crate::types::BatchBuilder;
 const MAX_MESSAGE: usize = 16 * 1024 * 1024;
 /// Largest value kept by internal (metadata) queries; longer values are cut.
 const MAX_INTERNAL_VALUE: usize = 64 * 1024;
+/// Most rows an internal query may return (metadata pages are at most 10 000 + 1 rows).
+const MAX_INTERNAL_ROWS: usize = 10_001;
+/// Most bytes an internal query may return.
+const MAX_INTERNAL_BYTES: usize = 32 * 1024 * 1024;
 /// Largest fixed-width value accepted (protects the binary decoders).
 const MAX_FIXED: usize = 16;
 
@@ -92,10 +96,33 @@ pub(crate) enum RowSink<'a> {
     None,
     /// Decoded into Arrow builders under the fetch budget.
     Arrow(&'a mut BatchBuilder),
-    /// Text values of an internal query (each cut at 64 KiB).
-    Text(&'a mut Vec<Vec<Option<String>>>),
+    /// Text values of an internal query (each cut at 64 KiB; rows and bytes capped).
+    Text(&'a mut TextRows),
     /// Read and dropped (draining after a cancel or a dropped stream).
     Discard,
+}
+
+/// Rows of an internal query, under [`MAX_INTERNAL_ROWS`] and [`MAX_INTERNAL_BYTES`].
+#[derive(Debug, Default)]
+pub(crate) struct TextRows {
+    pub(crate) rows: Vec<Vec<Option<String>>>,
+    bytes: usize,
+}
+
+impl TextRows {
+    fn push(&mut self, row: Vec<Option<String>>) -> DriverResult<()> {
+        self.bytes += row
+            .iter()
+            .map(|v| v.as_ref().map_or(1, |s| s.len() + 24))
+            .sum::<usize>();
+        self.rows.push(row);
+        if self.rows.len() > MAX_INTERNAL_ROWS || self.bytes > MAX_INTERNAL_BYTES {
+            return Err(DriverError::Protocol(
+                "the server returned more rows than the driver asked for".into(),
+            ));
+        }
+        Ok(())
+    }
 }
 
 /// Server-reported parameters and the lexical flag shared with the dialect.
@@ -287,14 +314,40 @@ impl Conn {
             })
         };
         let mut scram: Option<Scram> = None;
+        let mut scram_verified = false;
+        // One password-based exchange per connection: a second request (a server switching
+        // methods to obtain a weaker proof) is refused.
+        let mut answered = false;
         loop {
             match self.next(RowSink::None).await? {
-                Msg::Other(backend::Message::AuthenticationOk) => return Ok(()),
+                Msg::Other(backend::Message::AuthenticationOk) => {
+                    if scram.is_some() && !scram_verified {
+                        // The server must prove it knows the verifier (SASLFinal) before the
+                        // session is trusted: an impostor could otherwise skip it.
+                        return Err(DriverError::Auth(
+                            "the server ended SCRAM authentication without proving it knows \
+                             the password verifier"
+                                .into(),
+                        ));
+                    }
+                    return Ok(());
+                }
+                Msg::Other(
+                    backend::Message::AuthenticationCleartextPassword
+                    | backend::Message::AuthenticationMd5Password(_)
+                    | backend::Message::AuthenticationSasl(_),
+                ) if answered => {
+                    return Err(DriverError::Auth(
+                        "the server asked for a second authentication exchange".into(),
+                    ));
+                }
                 Msg::Other(backend::Message::AuthenticationCleartextPassword) => {
+                    answered = true;
                     if !startup.protected_transport {
                         return Err(DriverError::Auth(
-                            "the server asks for a cleartext password over an unencrypted \
-                             connection; enable TLS or use SCRAM-SHA-256"
+                            "the server asks for a cleartext password over a connection that is \
+                             not protected (TLS verify-ca / verify-full, or a verified SSH \
+                             tunnel to a loopback endpoint); use SCRAM-SHA-256 or verified TLS"
                                 .into(),
                         ));
                     }
@@ -303,6 +356,15 @@ impl Conn {
                         .await?;
                 }
                 Msg::Other(backend::Message::AuthenticationMd5Password(body)) => {
+                    answered = true;
+                    if !startup.protected_transport {
+                        // Challenge-based, but the digest can be cracked offline by whoever
+                        // sees it: allowed, flagged in the log (no secret logged).
+                        tracing::warn!(
+                            "md5 password authentication over a connection that is not \
+                             protected; prefer SCRAM-SHA-256"
+                        );
+                    }
                     let hash = auth::md5_password(startup.user, pw()?, body.salt());
                     self.send_secret(|buf| frontend::password_message(hash.as_bytes(), buf))
                         .await?;
@@ -318,6 +380,7 @@ impl Conn {
                             "the server offers no supported SASL mechanism (SCRAM-SHA-256)".into(),
                         ));
                     }
+                    answered = true;
                     let s = Scram::new(pw()?).map_err(|e| DriverError::Auth(e.0))?;
                     frontend::sasl_initial_response(
                         auth::SCRAM_SHA_256,
@@ -329,13 +392,23 @@ impl Conn {
                     scram = Some(s);
                 }
                 Msg::Other(backend::Message::AuthenticationSaslContinue(body)) => {
-                    let s = scram.as_mut().ok_or_else(|| {
+                    let mut s = scram.take().ok_or_else(|| {
                         DriverError::Protocol("SASL continue without a SASL exchange".into())
                     })?;
-                    let reply = zeroize::Zeroizing::new(
-                        s.client_final(body.data())
-                            .map_err(|e| DriverError::Auth(e.0))?,
-                    );
+                    if s.has_final() {
+                        return Err(DriverError::Auth("unexpected second SASL continue".into()));
+                    }
+                    // PBKDF2 is CPU-bound: off the async workers.
+                    let data = body.data().to_vec();
+                    let (s, result) = tokio::task::spawn_blocking(move || {
+                        let r = s.client_final(&data);
+                        (s, r)
+                    })
+                    .await
+                    .map_err(|_| DriverError::Auth("SCRAM computation failed".into()))?;
+                    scram = Some(s);
+                    let reply =
+                        zeroize::Zeroizing::new(result.map_err(|e| DriverError::Auth(e.0))?);
                     self.send_secret(|buf| frontend::sasl_response(&reply, buf))
                         .await?;
                 }
@@ -345,6 +418,7 @@ impl Conn {
                     })?;
                     s.verify_final(body.data())
                         .map_err(|e| DriverError::Auth(e.0))?;
+                    scram_verified = true;
                 }
                 Msg::Other(
                     backend::Message::AuthenticationGss
@@ -426,7 +500,7 @@ impl Conn {
                     RowSink::Arrow(b) => self.read_arrow_row(body_len, b).await?,
                     RowSink::Text(rows) => {
                         let row = self.read_text_row(body_len).await?;
-                        rows.push(row);
+                        rows.push(row)?;
                     }
                     RowSink::Discard => self.skip(body_len).await?,
                     RowSink::None => {
@@ -611,6 +685,261 @@ pub(crate) fn connect_error(e: &PgError) -> DriverError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::types::{BatchBuilder, ColPlan, schema_for};
+    use ninesql_driver_api::FetchBudget;
+    use proptest::prelude::*;
+    use tokio::net::TcpListener;
+    use tokio::sync::oneshot;
+
+    // ---- fake servers (M1 of the P1-B security review) ----
+
+    async fn read_startup(s: &mut TcpStream) {
+        let len = s.read_i32().await.unwrap();
+        let mut body = vec![0; usize::try_from(len - 4).unwrap()];
+        s.read_exact(&mut body).await.unwrap();
+    }
+
+    async fn read_msg(s: &mut TcpStream) -> Option<(u8, Vec<u8>)> {
+        let tag = s.read_u8().await.ok()?;
+        let len = s.read_i32().await.ok()?;
+        let mut body = vec![0; usize::try_from(len - 4).ok()?];
+        s.read_exact(&mut body).await.ok()?;
+        Some((tag, body))
+    }
+
+    async fn auth(s: &mut TcpStream, code: i32, data: &[u8]) {
+        let mut m = vec![b'R'];
+        m.extend_from_slice(&(8 + i32::try_from(data.len()).unwrap()).to_be_bytes());
+        m.extend_from_slice(&code.to_be_bytes());
+        m.extend_from_slice(data);
+        s.write_all(&m).await.unwrap();
+    }
+
+    async fn serve<F, Fut>(script: F) -> u16
+    where
+        F: FnOnce(TcpStream) -> Fut + Send + 'static,
+        Fut: std::future::Future<Output = ()> + Send,
+    {
+        let l = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = l.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            let (s, _) = l.accept().await.unwrap();
+            script(s).await;
+        });
+        port
+    }
+
+    async fn client(port: u16, protected: bool) -> DriverResult<Conn> {
+        let (io, _) = open_transport("127.0.0.1", port, None).await?;
+        let startup = Startup {
+            user: "nine",
+            database: None,
+            application_name: "t",
+            extra: &[],
+            protected_transport: protected,
+        };
+        let pw = Secret::new("Pa55-secret".into());
+        Conn::startup(io, Arc::new(AtomicBool::new(true)), &startup, Some(&pw)).await
+    }
+
+    #[tokio::test]
+    async fn tls_required_and_refused_by_the_server_fails() {
+        let port = serve(|mut s| async move {
+            let mut req = [0u8; 8];
+            s.read_exact(&mut req).await.unwrap();
+            s.write_all(b"N").await.unwrap();
+        })
+        .await;
+        let mut cfg = ninesql_driver_api::TlsConfig::default();
+        cfg.mode = ninesql_driver_api::TlsMode::Require;
+        let tls = crate::tls::setup(&cfg, "127.0.0.1").unwrap();
+        let r = open_transport("127.0.0.1", port, tls.as_ref()).await;
+        assert!(matches!(r, Err(DriverError::Tls(_))));
+    }
+
+    #[tokio::test]
+    async fn cleartext_password_is_never_sent_unprotected() {
+        let (tx, rx) = oneshot::channel();
+        let port = serve(|mut s| async move {
+            read_startup(&mut s).await;
+            auth(&mut s, 3, &[]).await;
+            let mut rest = Vec::new();
+            let _ = s.read_to_end(&mut rest).await;
+            let _ = tx.send(rest);
+        })
+        .await;
+        assert!(matches!(
+            client(port, false).await,
+            Err(DriverError::Auth(_))
+        ));
+        let rest = rx.await.unwrap();
+        assert!(!rest.contains(&b'p'), "a password message was sent");
+        assert!(!rest.windows(6).any(|w| w == b"Pa55-s"));
+    }
+
+    async fn sasl_start(s: &mut TcpStream) -> String {
+        read_startup(s).await;
+        auth(s, 10, b"SCRAM-SHA-256\0\0").await;
+        let (tag, body) = read_msg(s).await.unwrap();
+        assert_eq!(tag, b'p');
+        let mech_end = body.iter().position(|b| *b == 0).unwrap();
+        let data = &body[mech_end + 5..];
+        let text = String::from_utf8(data.to_vec()).unwrap();
+        text.split("r=").nth(1).unwrap().to_owned()
+    }
+
+    #[tokio::test]
+    async fn authentication_ok_before_sasl_final_is_refused() {
+        let port = serve(|mut s| async move {
+            let _ = sasl_start(&mut s).await;
+            auth(&mut s, 0, &[]).await;
+            let _ = read_msg(&mut s).await;
+        })
+        .await;
+        assert!(matches!(
+            client(port, true).await,
+            Err(DriverError::Auth(_))
+        ));
+        // Also after server-first, before the final signature.
+        let port = serve(|mut s| async move {
+            let nonce = sasl_start(&mut s).await;
+            let first = format!("r={nonce}srv,s=c2FsdA==,i=4096");
+            auth(&mut s, 11, first.as_bytes()).await;
+            let _ = read_msg(&mut s).await;
+            auth(&mut s, 0, &[]).await;
+            let _ = read_msg(&mut s).await;
+        })
+        .await;
+        assert!(matches!(
+            client(port, true).await,
+            Err(DriverError::Auth(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn bad_sasl_final_is_refused() {
+        let port = serve(|mut s| async move {
+            let nonce = sasl_start(&mut s).await;
+            let first = format!("r={nonce}srv,s=c2FsdA==,i=4096");
+            auth(&mut s, 11, first.as_bytes()).await;
+            let _ = read_msg(&mut s).await;
+            auth(
+                &mut s,
+                12,
+                b"v=AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
+            )
+            .await;
+            auth(&mut s, 0, &[]).await;
+            let _ = read_msg(&mut s).await;
+        })
+        .await;
+        match client(port, true).await {
+            Err(DriverError::Auth(m)) => assert!(!m.contains("Pa55-secret")),
+            other => panic!("{:?}", other.map(|_| ())),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_second_authentication_request_is_refused() {
+        let port = serve(|mut s| async move {
+            read_startup(&mut s).await;
+            auth(&mut s, 5, &[1, 2, 3, 4]).await;
+            let _ = read_msg(&mut s).await;
+            auth(&mut s, 3, &[]).await;
+            let _ = read_msg(&mut s).await;
+        })
+        .await;
+        assert!(matches!(
+            client(port, true).await,
+            Err(DriverError::Auth(_))
+        ));
+    }
+
+    // ---- DataRow reader properties (L6) ----
+
+    fn text_builder(ncols: usize, budget: FetchBudget) -> BatchBuilder {
+        let plans: Arc<[ColPlan]> = (0..ncols)
+            .map(|i| ColPlan::new(format!("c{i}"), 25))
+            .collect();
+        let schema = schema_for(&plans, &|o| format!("oid{o}"));
+        BatchBuilder::new(schema, plans, budget)
+    }
+
+    /// Feeds `bytes` to a connection and reads one message into an Arrow sink.
+    fn read_one(bytes: Vec<u8>, b: &mut BatchBuilder) -> DriverResult<Msg> {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let (client, mut server) = tokio::io::duplex(64 * 1024);
+            tokio::spawn(async move {
+                let _ = server.write_all(&bytes).await;
+                let _ = server.shutdown().await;
+            });
+            let mut conn = Conn::new(Box::new(client), Arc::new(AtomicBool::new(true)));
+            conn.next(RowSink::Arrow(b)).await
+        })
+    }
+
+    fn data_row(values: &[Option<Vec<u8>>]) -> Vec<u8> {
+        let mut body = i16::try_from(values.len()).unwrap().to_be_bytes().to_vec();
+        for v in values {
+            match v {
+                None => body.extend_from_slice(&(-1i32).to_be_bytes()),
+                Some(v) => {
+                    body.extend_from_slice(&i32::try_from(v.len()).unwrap().to_be_bytes());
+                    body.extend_from_slice(v);
+                }
+            }
+        }
+        let mut m = vec![b'D'];
+        m.extend_from_slice(&i32::try_from(body.len() + 4).unwrap().to_be_bytes());
+        m.extend_from_slice(&body);
+        m
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(64))]
+
+        /// Well-formed rows: every value is its prefix within the value budget, never more.
+        #[test]
+        fn data_rows_are_cut_to_the_budget(
+            values in prop::collection::vec(
+                prop::option::of(prop::collection::vec(b'a'..=b'z', 0..3000)), 1..6),
+            max_value in 1u64..2000,
+        ) {
+            let budget = FetchBudget::default().with_max_value_bytes(max_value);
+            let mut b = text_builder(values.len(), budget);
+            let msg = read_one(data_row(&values), &mut b).unwrap();
+            prop_assert!(matches!(msg, Msg::Row));
+            let batch = b.finish().unwrap().unwrap();
+            for (i, v) in values.iter().enumerate() {
+                let col = arrow_array::cast::AsArray::as_string::<i32>(batch.column(i));
+                match v {
+                    None => prop_assert!(arrow_array::Array::is_null(col, 0)),
+                    Some(v) => {
+                        let got = col.value(0).as_bytes();
+                        prop_assert!(got.len() as u64 <= max_value);
+                        prop_assert!(v.starts_with(got));
+                    }
+                }
+            }
+        }
+
+        /// Arbitrary bytes after a `D` header never panic and never yield a bogus row count.
+        #[test]
+        fn malformed_data_rows_fail_cleanly(
+            body in prop::collection::vec(any::<u8>(), 0..200),
+            declared in -8i32..300,
+            ncols in 1usize..4,
+        ) {
+            let mut m = vec![b'D'];
+            m.extend_from_slice(&declared.to_be_bytes());
+            m.extend_from_slice(&body);
+            let mut b = text_builder(ncols, FetchBudget::default());
+            let _ = read_one(m, &mut b);
+        }
+    }
 
     #[test]
     fn major_version_parses() {

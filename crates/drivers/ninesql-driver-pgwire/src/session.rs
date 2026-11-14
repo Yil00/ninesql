@@ -389,49 +389,78 @@ impl std::fmt::Debug for PgMetadata {
     }
 }
 
+// Internal SQL never depends on the session's `search_path` (CVE-2018-1058 class: a user
+// object such as `public.||(name, text)` is a better match than the built-in and would run with
+// the browsing user's privileges). Every operator is `OPERATOR(pg_catalog.…)`, every function,
+// type, relation and collation is schema-qualified, and `LIKE … ESCAPE` is written as
+// `OPERATOR(pg_catalog.~~)` with `pg_catalog.like_escape`. `pg_temp` is never searched for
+// functions or operators, and qualified relations bypass it.
+
 const SCHEMAS_SQL: &str = "\
-SELECT n.nspname, pg_catalog.obj_description(n.oid, 'pg_namespace') \
+SELECT n.nspname::pg_catalog.text, \
+       pg_catalog.obj_description(n.oid, 'pg_namespace'::pg_catalog.name) \
 FROM pg_catalog.pg_namespace n \
-WHERE n.nspname !~ '^pg_toast' AND n.nspname !~ '^pg_temp_' \
-  AND ($1::text IS NULL OR n.nspname LIKE $1 ESCAPE '!') \
-  AND ($2::text IS NULL OR n.nspname COLLATE \"C\" > $2::text COLLATE \"C\") \
-ORDER BY n.nspname COLLATE \"C\" LIMIT $3::int8";
+WHERE NOT (n.nspname::pg_catalog.text OPERATOR(pg_catalog.~) '^pg_toast'::pg_catalog.text) \
+  AND NOT (n.nspname::pg_catalog.text OPERATOR(pg_catalog.~) '^pg_temp_'::pg_catalog.text) \
+  AND ($1::pg_catalog.text IS NULL OR n.nspname::pg_catalog.text OPERATOR(pg_catalog.~~) \
+       pg_catalog.like_escape($1::pg_catalog.text, '!'::pg_catalog.text)) \
+  AND ($2::pg_catalog.text IS NULL OR n.nspname::pg_catalog.text COLLATE pg_catalog.\"C\" \
+       OPERATOR(pg_catalog.>) $2::pg_catalog.text COLLATE pg_catalog.\"C\") \
+ORDER BY n.nspname::pg_catalog.text COLLATE pg_catalog.\"C\" LIMIT $3::pg_catalog.int8";
 
 const RELATIONS_SQL: &str = "\
-SELECT c.relname, pg_catalog.obj_description(c.oid, 'pg_class'), c.reltuples::int8::text, \
-       c.relkind::text \
-FROM pg_catalog.pg_class c JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace \
-WHERE n.nspname = $4 AND c.relkind::text = ANY($5::text[]) \
-  AND ($1::text IS NULL OR c.relname LIKE $1 ESCAPE '!') \
-  AND ($2::text IS NULL OR c.relname COLLATE \"C\" > $2::text COLLATE \"C\") \
-ORDER BY c.relname COLLATE \"C\" LIMIT $3::int8";
+SELECT c.relname::pg_catalog.text, \
+       pg_catalog.obj_description(c.oid, 'pg_class'::pg_catalog.name), \
+       c.reltuples::pg_catalog.int8::pg_catalog.text, c.relkind::pg_catalog.text \
+FROM pg_catalog.pg_class c JOIN pg_catalog.pg_namespace n \
+  ON n.oid OPERATOR(pg_catalog.=) c.relnamespace \
+WHERE n.nspname::pg_catalog.text OPERATOR(pg_catalog.=) $4::pg_catalog.text \
+  AND c.relkind::pg_catalog.text OPERATOR(pg_catalog.=) ANY($5::pg_catalog.text[]) \
+  AND ($1::pg_catalog.text IS NULL OR c.relname::pg_catalog.text OPERATOR(pg_catalog.~~) \
+       pg_catalog.like_escape($1::pg_catalog.text, '!'::pg_catalog.text)) \
+  AND ($2::pg_catalog.text IS NULL OR c.relname::pg_catalog.text COLLATE pg_catalog.\"C\" \
+       OPERATOR(pg_catalog.>) $2::pg_catalog.text COLLATE pg_catalog.\"C\") \
+ORDER BY c.relname::pg_catalog.text COLLATE pg_catalog.\"C\" LIMIT $3::pg_catalog.int8";
 
 const COLUMNS_SQL: &str = "\
-SELECT a.attname, pg_catalog.col_description(a.attrelid, a.attnum), a.attnum::text, \
-       pg_catalog.format_type(a.atttypid, a.atttypmod), (NOT a.attnotnull)::text, \
-       pg_catalog.pg_get_expr(d.adbin, d.adrelid), \
-       EXISTS (SELECT 1 FROM pg_catalog.pg_index i WHERE i.indrelid = a.attrelid \
-               AND i.indisprimary AND a.attnum = ANY(i.indkey))::text, \
-       (a.attidentity <> '' OR a.attgenerated <> '' \
-        OR coalesce(pg_catalog.pg_get_expr(d.adbin, d.adrelid), '') LIKE 'nextval(%')::text \
+SELECT a.attname::pg_catalog.text, pg_catalog.col_description(a.attrelid, a.attnum::pg_catalog.int4), \
+       a.attnum::pg_catalog.text, pg_catalog.format_type(a.atttypid, a.atttypmod), \
+       (NOT a.attnotnull)::pg_catalog.text, pg_catalog.pg_get_expr(d.adbin, d.adrelid), \
+       (EXISTS (SELECT 1 FROM pg_catalog.pg_index i \
+                WHERE i.indrelid OPERATOR(pg_catalog.=) a.attrelid AND i.indisprimary \
+                  AND a.attnum OPERATOR(pg_catalog.=) ANY(i.indkey::pg_catalog.int2[])))::pg_catalog.text, \
+       (a.attidentity OPERATOR(pg_catalog.<>) ''::pg_catalog.\"char\" \
+        OR a.attgenerated OPERATOR(pg_catalog.<>) ''::pg_catalog.\"char\" \
+        OR pg_catalog.strpos(COALESCE(pg_catalog.pg_get_expr(d.adbin, d.adrelid), \
+             ''::pg_catalog.text), 'nextval('::pg_catalog.text) OPERATOR(pg_catalog.=) 1)::pg_catalog.text \
 FROM pg_catalog.pg_attribute a \
-JOIN pg_catalog.pg_class c ON c.oid = a.attrelid \
-JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace \
-LEFT JOIN pg_catalog.pg_attrdef d ON d.adrelid = a.attrelid AND d.adnum = a.attnum \
-WHERE n.nspname = $4 AND c.relname = $5 AND a.attnum > 0 AND NOT a.attisdropped \
-  AND ($1::text IS NULL OR a.attname LIKE $1 ESCAPE '!') \
-  AND ($2::int4 IS NULL OR a.attnum > $2::int4) \
-ORDER BY a.attnum LIMIT $3::int8";
+JOIN pg_catalog.pg_class c ON c.oid OPERATOR(pg_catalog.=) a.attrelid \
+JOIN pg_catalog.pg_namespace n ON n.oid OPERATOR(pg_catalog.=) c.relnamespace \
+LEFT JOIN pg_catalog.pg_attrdef d ON d.adrelid OPERATOR(pg_catalog.=) a.attrelid \
+  AND d.adnum OPERATOR(pg_catalog.=) a.attnum \
+WHERE n.nspname::pg_catalog.text OPERATOR(pg_catalog.=) $4::pg_catalog.text \
+  AND c.relname::pg_catalog.text OPERATOR(pg_catalog.=) $5::pg_catalog.text \
+  AND a.attnum OPERATOR(pg_catalog.>) 0::pg_catalog.int2 AND NOT a.attisdropped \
+  AND ($1::pg_catalog.text IS NULL OR a.attname::pg_catalog.text OPERATOR(pg_catalog.~~) \
+       pg_catalog.like_escape($1::pg_catalog.text, '!'::pg_catalog.text)) \
+  AND ($2::pg_catalog.int4 IS NULL OR a.attnum::pg_catalog.int4 OPERATOR(pg_catalog.>) $2::pg_catalog.int4) \
+ORDER BY a.attnum LIMIT $3::pg_catalog.int8";
 
 const ROUTINES_SQL: &str = "\
 SELECT r.name, r.comment FROM ( \
-  SELECT p.proname || '(' || pg_catalog.pg_get_function_identity_arguments(p.oid) || ')' AS name, \
-         pg_catalog.obj_description(p.oid, 'pg_proc') AS comment, p.proname \
-  FROM pg_catalog.pg_proc p JOIN pg_catalog.pg_namespace n ON n.oid = p.pronamespace \
-  WHERE n.nspname = $4 AND p.prokind IN ('f', 'p')) r \
-WHERE ($1::text IS NULL OR r.proname LIKE $1 ESCAPE '!') \
-  AND ($2::text IS NULL OR r.name COLLATE \"C\" > $2::text COLLATE \"C\") \
-ORDER BY r.name COLLATE \"C\" LIMIT $3::int8";
+  SELECT pg_catalog.concat(p.proname::pg_catalog.text, '('::pg_catalog.text, \
+           pg_catalog.pg_get_function_identity_arguments(p.oid), ')'::pg_catalog.text) AS name, \
+         pg_catalog.obj_description(p.oid, 'pg_proc'::pg_catalog.name) AS comment, \
+         p.proname::pg_catalog.text AS proname \
+  FROM pg_catalog.pg_proc p JOIN pg_catalog.pg_namespace n \
+    ON n.oid OPERATOR(pg_catalog.=) p.pronamespace \
+  WHERE n.nspname::pg_catalog.text OPERATOR(pg_catalog.=) $4::pg_catalog.text \
+    AND p.prokind OPERATOR(pg_catalog.=) ANY('{f,p}'::pg_catalog.\"char\"[])) r \
+WHERE ($1::pg_catalog.text IS NULL OR r.proname OPERATOR(pg_catalog.~~) \
+       pg_catalog.like_escape($1::pg_catalog.text, '!'::pg_catalog.text)) \
+  AND ($2::pg_catalog.text IS NULL OR r.name COLLATE pg_catalog.\"C\" \
+       OPERATOR(pg_catalog.>) $2::pg_catalog.text COLLATE pg_catalog.\"C\") \
+ORDER BY r.name COLLATE pg_catalog.\"C\" LIMIT $3::pg_catalog.int8";
 
 fn segment(parent: &ObjectPath, idx: usize, kinds: &[ObjectKind]) -> DriverResult<String> {
     parent
@@ -522,7 +551,10 @@ impl Metadata for PgMetadata {
             }
             _ => return Err(DriverError::Unsupported(Feature::Metadata(kind))),
         };
-        let mut rows = self.link.internal(sql, params, 0).await?;
+        // The server sends at most `limit + 1` rows (the extra one tells whether a next page
+        // exists), and the text sink caps rows and bytes on top.
+        let max_rows = i32::try_from(limit).unwrap_or(i32::MAX).saturating_add(1);
+        let mut rows = self.link.internal(sql, params, max_rows).await?;
         let more = rows.len() > limit as usize;
         rows.truncate(limit as usize);
         let mut items = Vec::with_capacity(rows.len());

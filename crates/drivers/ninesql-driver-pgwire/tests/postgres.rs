@@ -1043,3 +1043,208 @@ async fn closed_session_refuses_work() {
     assert!(caps.read_only.is_liftable());
     s.close().await.unwrap();
 }
+
+/// H1 of the P1-B security review (CVE-2018-1058 class): user operators that are a better
+/// match than the built-ins (`||(name, text)`, `=(name, text)`) in a schema on the session's
+/// `search_path` never run during the driver's own queries.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn driver_queries_never_resolve_to_user_operators() {
+    let Some(dev) = dev() else { return };
+    let mut admin = connect(&dev).await;
+    for sql in [
+        "DROP SCHEMA IF EXISTS ninesql_evil CASCADE",
+        "CREATE SCHEMA ninesql_evil",
+        "CREATE TABLE ninesql_evil.calls (what text)",
+        "CREATE FUNCTION ninesql_evil.cat(name, text) RETURNS text LANGUAGE plpgsql AS \
+         $$ BEGIN INSERT INTO ninesql_evil.calls VALUES ('||'); RETURN $1::text || $2; END $$",
+        "CREATE FUNCTION ninesql_evil.eq(name, text) RETURNS boolean LANGUAGE plpgsql AS \
+         $$ BEGIN INSERT INTO ninesql_evil.calls VALUES ('='); RETURN $1::text = $2; END $$",
+        "CREATE FUNCTION ninesql_evil.eqo(oid, oid) RETURNS boolean LANGUAGE plpgsql AS \
+         $$ BEGIN INSERT INTO ninesql_evil.calls VALUES ('oid='); RETURN $1::int8 = $2::int8; END $$",
+        "CREATE OPERATOR ninesql_evil.|| (LEFTARG = name, RIGHTARG = text, FUNCTION = ninesql_evil.cat)",
+        "CREATE OPERATOR ninesql_evil.= (LEFTARG = name, RIGHTARG = text, FUNCTION = ninesql_evil.eq)",
+        "CREATE OPERATOR ninesql_evil.= (LEFTARG = oid, RIGHTARG = oid, FUNCTION = ninesql_evil.eqo)",
+        "CREATE TYPE ninesql_evil.mood2 AS ENUM ('a')",
+    ] {
+        run(admin.as_mut(), sql).await.unwrap();
+    }
+    let calls = "SELECT count(*) FROM ninesql_evil.calls";
+    let mut p = params(&dev);
+    p.properties.insert(
+        "search_path".into(),
+        ninesql_driver_api::PropertyValue::Plain("ninesql_evil, public".into()),
+    );
+    let driver = PgWireDriver::new();
+    let mut s = driver.connect(p).await.unwrap();
+    // Positive control: unqualified SQL in this session does pick the planted operator.
+    run(
+        s.as_mut(),
+        "SELECT n.nspname || 'x' FROM pg_catalog.pg_namespace n LIMIT 1",
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        scalar(&run(admin.as_mut(), calls).await.unwrap()).as_deref(),
+        Some("1")
+    );
+    run(admin.as_mut(), "TRUNCATE ninesql_evil.calls")
+        .await
+        .unwrap();
+    // Navigator, type-name lookup (enum of a new schema) and the read-only machinery.
+    let m = s.metadata();
+    let root = ObjectPath::root();
+    m.list(
+        &root,
+        ObjectKind::Schema,
+        PageRequest::first().with_filter(Some("nine".into())),
+    )
+    .await
+    .unwrap();
+    let evil = root.child(ObjectKind::Schema, "ninesql_evil");
+    let public = root.child(ObjectKind::Schema, "public");
+    for (parent, kind) in [
+        (&evil, ObjectKind::Routine),
+        (&evil, ObjectKind::Table),
+        (&public, ObjectKind::View),
+        (&public, ObjectKind::MaterializedView),
+    ] {
+        m.list(
+            parent,
+            kind,
+            PageRequest::first().with_filter(Some("a".into())),
+        )
+        .await
+        .unwrap();
+    }
+    m.list(
+        &evil.child(ObjectKind::Table, "calls"),
+        ObjectKind::Column,
+        PageRequest::first(),
+    )
+    .await
+    .unwrap();
+    let _ = m.ddl(&evil).await;
+    run(s.as_mut(), "SELECT 'a'::ninesql_evil.mood2 AS m")
+        .await
+        .unwrap();
+    run(s.as_mut(), "SELECT * FROM big_events LIMIT 300")
+        .await
+        .unwrap();
+    s.set_read_only(true).await.unwrap();
+    run(s.as_mut(), "SELECT 1").await.unwrap();
+    s.set_read_only(false).await.unwrap();
+    assert_eq!(
+        scalar(&run(admin.as_mut(), calls).await.unwrap()).as_deref(),
+        Some("0"),
+        "a user operator ran inside a driver query"
+    );
+    // pg_catalog listed after a user schema is refused as a property.
+    let mut p = params(&dev);
+    p.properties.insert(
+        "search_path".into(),
+        ninesql_driver_api::PropertyValue::Plain("ninesql_evil, pg_catalog".into()),
+    );
+    assert!(matches!(
+        driver.connect(p).await.map(|_| ()),
+        Err(DriverError::InvalidParams(_))
+    ));
+    run(admin.as_mut(), "DROP SCHEMA ninesql_evil CASCADE")
+        .await
+        .unwrap();
+}
+
+/// M3: in the driver-implicit transaction, only a portal that ran to completion is committed;
+/// a dropped stream rolls back a read-class statement's side effects.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn dropped_read_with_side_effects_is_rolled_back() {
+    let Some(dev) = dev() else { return };
+    fixtures(&dev).await;
+    let mut s = connect(&dev).await;
+    run(s.as_mut(), "CREATE TEMP TABLE m3_marker (a int)")
+        .await
+        .unwrap();
+    // A read-class statement whose function writes (the classifier cannot see it).
+    let sql = "SELECT ninesql_test.write_one(), g FROM generate_series(1, 5000) g";
+    let count = "SELECT count(*) FROM ninesql_test.written";
+    let before: i64 = scalar(&run(s.as_mut(), count).await.unwrap())
+        .unwrap()
+        .parse()
+        .unwrap();
+    let opts = ExecOptions::default().with_budget(FetchBudget::default().with_batch_rows(100));
+    let mut stream = s.execute(Statement::sql(sql), opts).await.unwrap();
+    let mut got = 0;
+    while got == 0 {
+        if let ResultItem::Rows(b) = stream.next().await.unwrap().unwrap() {
+            got = b.num_rows();
+        }
+    }
+    drop(stream);
+    let after: i64 = scalar(&run_when_idle(s.as_mut(), count).await.unwrap())
+        .unwrap()
+        .parse()
+        .unwrap();
+    assert_eq!(after, before, "a dropped statement's writes were committed");
+    // Run to completion: committed.
+    run(
+        s.as_mut(),
+        "SELECT ninesql_test.write_one(), g FROM generate_series(1, 3) g",
+    )
+    .await
+    .unwrap();
+    let done: i64 = scalar(&run(s.as_mut(), count).await.unwrap())
+        .unwrap()
+        .parse()
+        .unwrap();
+    assert_eq!(done, before + 3);
+}
+
+/// L2: the driver only lowers `idle_in_transaction_session_timeout`; a stricter session value
+/// stays in force for a paused cursor (here the server ends the session after 1 s).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn stricter_idle_timeout_is_kept() {
+    let Some(dev) = dev() else { return };
+    let mut s = connect(&dev).await;
+    run(s.as_mut(), "SET idle_in_transaction_session_timeout = '1s'")
+        .await
+        .unwrap();
+    let opts = ExecOptions::default().with_budget(FetchBudget::default().with_batch_rows(100));
+    let mut stream = s
+        .execute(Statement::sql("SELECT * FROM big_events"), opts)
+        .await
+        .unwrap();
+    let mut got = 0;
+    while got == 0 {
+        if let ResultItem::Rows(b) = stream.next().await.unwrap().unwrap() {
+            got = b.num_rows();
+        }
+    }
+    tokio::time::sleep(Duration::from_millis(2500)).await;
+    let mut failed = None;
+    while let Some(item) = stream.next().await {
+        if let Err(e) = item {
+            failed = Some(e);
+            break;
+        }
+    }
+    assert!(matches!(failed, Some(DriverError::Closed(_))), "{failed:?}");
+}
+
+/// M2 at connect: `verify-ca` needs a CA file; M4: a notice flood is delivered in chunks.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn verify_ca_needs_a_ca_file_and_notices_are_chunked() {
+    let Some(dev) = dev() else { return };
+    let mut p = params(&dev);
+    p.tls.mode = TlsMode::VerifyCa;
+    assert!(matches!(
+        PgWireDriver::new().connect(p).await.map(|_| ()),
+        Err(DriverError::Tls(_))
+    ));
+    let mut s = connect(&dev).await;
+    let c = run(
+        s.as_mut(),
+        "DO $$ BEGIN FOR i IN 1..3000 LOOP RAISE NOTICE 'n %', i; END LOOP; END $$",
+    )
+    .await
+    .unwrap();
+    assert_eq!(c.notices.len(), 3000);
+}

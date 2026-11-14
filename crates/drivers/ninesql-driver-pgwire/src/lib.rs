@@ -10,8 +10,14 @@
 //!   refused before any network traffic ([`PgWireDriver::extra_reserved_properties`] on top of
 //!   the global rule) and an allowlist of accepted ones ([`ACCEPTED_PROPERTIES`]); TLS
 //!   `disable` / `require` / `verify-ca` / `verify-full`, never a fallback to plain text;
-//!   SCRAM-SHA-256 or md5 (cleartext passwords only over TLS or an SSH tunnel); the password is
-//!   dropped (zeroized) before `connect` returns: cancel requests use the backend key.
+//!   `verify-ca` requires and trusts only `TlsConfig::ca_file`, `verify-full` trusts only the CA
+//!   file when set, the platform store otherwise (libpq `sslrootcert` semantics);
+//!   SCRAM-SHA-256 (server signature required) or md5; cleartext passwords only over verified
+//!   TLS or a host-key-verified SSH tunnel to a loopback endpoint; the password is dropped
+//!   (zeroized) before `connect` returns: cancel requests use the backend key. Remaining
+//!   password remnants outside the driver's control are listed in the `auth` module.
+//! - **Internal queries** never depend on the session's `search_path`: operators are
+//!   `OPERATOR(pg_catalog.…)`, functions, types and relations schema-qualified.
 //! - **Read-only** (I3): `SET SESSION CHARACTERISTICS AS TRANSACTION READ ONLY` before init
 //!   statements, verified by a read-back; after every statement the driver checks
 //!   `default_transaction_read_only` (`ParameterStatus` on PostgreSQL ≥ 14, a read-back before)
@@ -40,9 +46,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use ninesql_driver_api::{
     Auth, CancelSupport, Capabilities, ConnectParams, Dialect, Driver, DriverError, DriverResult,
-    EditingCapabilities, Endpoint, EngineId, ExecOptions, ExplainFormat, IsolationLevel,
-    MetadataCapabilities, ObjectKind, PropertyValue, ReadOnlyMechanism, Session, Statement,
-    TlsMode, TransactionCapabilities, redact_connection_string, redact_secret,
+    EditingCapabilities, Endpoint, EngineId, ExecOptions, ExplainFormat, HostKeyVerification,
+    IsolationLevel, MetadataCapabilities, ObjectKind, PropertyValue, ReadOnlyMechanism, Session,
+    Statement, TlsMode, TransactionCapabilities, redact_connection_string, redact_secret,
 };
 use tokio::sync::mpsc;
 
@@ -173,6 +179,37 @@ fn postgres_capabilities(server_version: Option<&str>) -> Capabilities {
     c
 }
 
+/// `true` when a `search_path` value leaves `pg_catalog` first: not listed (PostgreSQL then
+/// searches it first implicitly) or listed first. The driver's own queries are fully
+/// qualified anyway; this keeps user statements from resolving built-in names to user
+/// objects by default.
+fn pg_catalog_first(value: &str) -> bool {
+    let schemas: Vec<String> = value
+        .split(',')
+        .map(|s| {
+            let t = s.trim();
+            match t.strip_prefix('"').and_then(|x| x.strip_suffix('"')) {
+                Some(quoted) => quoted.replace("\"\"", "\""),
+                None => t.to_ascii_lowercase(),
+            }
+        })
+        .filter(|s| !s.is_empty())
+        .collect();
+    match schemas.iter().position(|s| s == "pg_catalog") {
+        None | Some(0) => true,
+        Some(_) => false,
+    }
+}
+
+/// `localhost` or a loopback IP address (the local end of an SSH tunnel).
+fn is_loopback_host(host: &str) -> bool {
+    host.eq_ignore_ascii_case("localhost")
+        || host
+            .trim_matches(|c| c == '[' || c == ']')
+            .parse::<std::net::IpAddr>()
+            .is_ok_and(|ip| ip.is_loopback())
+}
+
 fn normalize(key: &str) -> String {
     key.chars()
         .filter(char::is_ascii_alphanumeric)
@@ -198,6 +235,12 @@ fn accepted_properties(
         if v.contains('\0') {
             return Err(DriverError::InvalidParams(format!(
                 "property `{key}` holds a NUL character"
+            )));
+        }
+        if *name == "search_path" && !pg_catalog_first(v) {
+            return Err(DriverError::InvalidParams(format!(
+                "property `{key}` lists pg_catalog after another schema; the driver keeps \
+                 pg_catalog first (leave it out, or list it first)"
             )));
         }
         out.push(((*name).to_owned(), v.to_owned()));
@@ -276,15 +319,22 @@ impl Driver for PgWireDriver {
             tracing::warn!(mode = ?tls.mode, "TLS below verify-full for this connection");
         }
         let scs = Arc::new(AtomicBool::new(true));
-        let startup = Startup {
-            user: &user,
-            database: database.as_deref(),
-            application_name: &application_name,
-            extra: &extra,
-            protected_transport: tls_setup.is_some() || tunnel.is_some(),
-        };
+        let verified_tls = matches!(tls.mode, TlsMode::VerifyCa | TlsMode::VerifyFull);
+        let strict_tunnel = tunnel
+            .as_ref()
+            .is_some_and(|t| t.weakest_host_key() == HostKeyVerification::Strict)
+            && is_loopback_host(&host);
         let handshake = async {
             let (io, peer) = open_transport(&host, port, tls_setup.as_ref()).await?;
+            // Protected: verified TLS, or an SSH tunnel with verified host keys whose local end
+            // really is on this machine. `require` (unverified TLS) is not protected.
+            let startup = Startup {
+                user: &user,
+                database: database.as_deref(),
+                application_name: &application_name,
+                extra: &extra,
+                protected_transport: verified_tls || (strict_tunnel && peer.ip().is_loopback()),
+            };
             let conn = Conn::startup(io, Arc::clone(&scs), &startup, password.as_ref()).await?;
             DriverResult::Ok((conn, peer))
         };
@@ -432,6 +482,20 @@ mod tests {
         );
         let err = accepted_properties(&bad).unwrap_err().to_string();
         assert!(!err.contains("secret-v"));
+        for (v, ok) in [
+            ("app, public", true),
+            ("pg_catalog, app", true),
+            ("app, pg_catalog", false),
+            ("app, \"pg_catalog\"", false),
+            ("app, PG_CATALOG", false),
+            ("\"$user\", public", true),
+        ] {
+            let mut sp = BTreeMap::new();
+            sp.insert("search_path".into(), PropertyValue::Plain(v.into()));
+            assert_eq!(accepted_properties(&sp).is_ok(), ok, "{v}");
+        }
+        assert!(is_loopback_host("localhost") && is_loopback_host("127.0.0.1"));
+        assert!(is_loopback_host("::1") && !is_loopback_host("db.example.test"));
         let mut nul = BTreeMap::new();
         nul.insert("search_path".into(), PropertyValue::Plain("a\0b".into()));
         assert!(accepted_properties(&nul).is_err());

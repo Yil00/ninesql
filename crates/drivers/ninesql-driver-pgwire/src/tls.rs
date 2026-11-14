@@ -1,6 +1,11 @@
-//! TLS with rustls only (ADR-0011, I5): `disable`, `require`, `verify-ca`, `verify-full`, the
-//! platform trust store plus an optional CA file, `server_name` for tunnel endpoints, client
-//! certificates.
+//! TLS with rustls only (ADR-0011, I5): `disable`, `require`, `verify-ca`, `verify-full`,
+//! `server_name` for tunnel endpoints, client certificates.
+//!
+//! Trust anchors follow libpq's `sslrootcert` semantics for `TlsConfig::ca_file`:
+//! - `verify-ca` requires a CA file and trusts **only** it (a public CA vouches for any host it
+//!   signed, so chain-only verification against the platform store would accept any server
+//!   with a publicly trusted certificate);
+//! - `verify-full` with a CA file trusts only that file; without one, the platform trust store.
 
 use std::fmt;
 use std::net::IpAddr;
@@ -9,10 +14,10 @@ use std::sync::Arc;
 use ninesql_driver_api::{DriverError, DriverResult, TlsConfig, TlsMode};
 use rustls::client::WebPkiServerVerifier;
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
+use rustls::client::verify_server_cert_signed_by_trust_anchor;
 use rustls::crypto::{CryptoProvider, WebPkiSupportedAlgorithms};
-use rustls::{
-    CertificateError, ClientConfig, DigitallySignedStruct, RootCertStore, SignatureScheme,
-};
+use rustls::server::ParsedCertificate;
+use rustls::{ClientConfig, DigitallySignedStruct, RootCertStore, SignatureScheme};
 use rustls_pki_types::pem::PemObject;
 use rustls_pki_types::{CertificateDer, PrivateKeyDer, ServerName, UnixTime};
 
@@ -54,16 +59,24 @@ pub(crate) fn setup(cfg: &TlsConfig, host: &str) -> DriverResult<Option<TlsSetup
         TlsMode::Require => Arc::new(NoVerification {
             algorithms: provider.signature_verification_algorithms,
         }),
-        TlsMode::VerifyCa | TlsMode::VerifyFull => {
-            let roots = Arc::new(roots(cfg)?);
-            let webpki = WebPkiServerVerifier::builder_with_provider(roots, Arc::clone(&provider))
-                .build()
-                .map_err(|e| tls_err("cannot build the certificate verifier", e))?;
-            if mode == TlsMode::VerifyCa {
-                Arc::new(ChainOnly { inner: webpki })
-            } else {
-                webpki
+        TlsMode::VerifyCa => {
+            if cfg.ca_file.is_none() {
+                return Err(DriverError::Tls(
+                    "verify-ca needs the CA file of the server's certificate authority (it \
+                     trusts only that file); use verify-full to rely on the system trust store"
+                        .into(),
+                ));
             }
+            Arc::new(ChainOnly {
+                roots: Arc::new(roots(cfg)?),
+                algorithms: provider.signature_verification_algorithms,
+            })
+        }
+        TlsMode::VerifyFull => {
+            let roots = Arc::new(roots(cfg)?);
+            WebPkiServerVerifier::builder_with_provider(roots, Arc::clone(&provider))
+                .build()
+                .map_err(|e| tls_err("cannot build the certificate verifier", e))?
         }
         // `TlsMode` is non-exhaustive: an unknown mode fails closed.
         _ => {
@@ -117,18 +130,25 @@ fn server_name(name: &str) -> DriverResult<ServerName<'static>> {
         .map_err(|_| DriverError::InvalidParams(format!("invalid TLS server name `{name}`")))
 }
 
-/// Platform trust store plus the connection's CA file.
+/// Trust anchors: the connection's CA file only when set, the platform trust store otherwise.
 fn roots(cfg: &TlsConfig) -> DriverResult<RootCertStore> {
     let mut store = RootCertStore::empty();
-    let native = rustls_native_certs::load_native_certs();
-    if !native.errors.is_empty() {
-        tracing::debug!(
-            errors = native.errors.len(),
-            "some platform CA certificates could not be loaded"
-        );
+    if cfg.ca_file.is_none() {
+        let native = rustls_native_certs::load_native_certs();
+        if !native.errors.is_empty() {
+            tracing::debug!(
+                errors = native.errors.len(),
+                "some platform CA certificates could not be loaded"
+            );
+        }
+        let (added, ignored) = store.add_parsable_certificates(native.certs);
+        tracing::debug!(added, ignored, "platform trust store loaded");
+        if store.is_empty() {
+            return Err(DriverError::Tls(
+                "the system trust store is empty; set the server's CA file".into(),
+            ));
+        }
     }
-    let (added, ignored) = store.add_parsable_certificates(native.certs);
-    tracing::debug!(added, ignored, "platform trust store loaded");
     if let Some(path) = &cfg.ca_file {
         let certs: Vec<CertificateDer<'static>> = CertificateDer::pem_file_iter(path)
             .map_err(|e| tls_err("cannot read the CA file", e))?
@@ -148,10 +168,11 @@ fn roots(cfg: &TlsConfig) -> DriverResult<RootCertStore> {
     Ok(store)
 }
 
-/// `verify-ca`: the chain is verified against the trust store; the host name is not.
+/// `verify-ca`: the chain is verified against the CA file; the host name is not.
 #[derive(Debug)]
 struct ChainOnly {
-    inner: Arc<WebPkiServerVerifier>,
+    roots: Arc<RootCertStore>,
+    algorithms: WebPkiSupportedAlgorithms,
 }
 
 impl ServerCertVerifier for ChainOnly {
@@ -159,24 +180,20 @@ impl ServerCertVerifier for ChainOnly {
         &self,
         end_entity: &CertificateDer<'_>,
         intermediates: &[CertificateDer<'_>],
-        server_name: &ServerName<'_>,
-        ocsp_response: &[u8],
+        _server_name: &ServerName<'_>,
+        _ocsp_response: &[u8],
         now: UnixTime,
     ) -> Result<ServerCertVerified, rustls::Error> {
-        // rustls verifies the chain first and the name last, so a name error means the chain
-        // itself was valid.
-        match self.inner.verify_server_cert(
-            end_entity,
+        // Chain only, explicitly (not inferred from the order of rustls' checks).
+        let cert = ParsedCertificate::try_from(end_entity)?;
+        verify_server_cert_signed_by_trust_anchor(
+            &cert,
+            &self.roots,
             intermediates,
-            server_name,
-            ocsp_response,
             now,
-        ) {
-            Err(rustls::Error::InvalidCertificate(
-                CertificateError::NotValidForName | CertificateError::NotValidForNameContext { .. },
-            )) => Ok(ServerCertVerified::assertion()),
-            other => other,
-        }
+            self.algorithms.all,
+        )?;
+        Ok(ServerCertVerified::assertion())
     }
 
     fn verify_tls12_signature(
@@ -185,7 +202,7 @@ impl ServerCertVerifier for ChainOnly {
         cert: &CertificateDer<'_>,
         dss: &DigitallySignedStruct,
     ) -> Result<HandshakeSignatureValid, rustls::Error> {
-        self.inner.verify_tls12_signature(message, cert, dss)
+        rustls::crypto::verify_tls12_signature(message, cert, dss, &self.algorithms)
     }
 
     fn verify_tls13_signature(
@@ -194,11 +211,11 @@ impl ServerCertVerifier for ChainOnly {
         cert: &CertificateDer<'_>,
         dss: &DigitallySignedStruct,
     ) -> Result<HandshakeSignatureValid, rustls::Error> {
-        self.inner.verify_tls13_signature(message, cert, dss)
+        rustls::crypto::verify_tls13_signature(message, cert, dss, &self.algorithms)
     }
 
     fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
-        self.inner.supported_verify_schemes()
+        self.algorithms.supported_schemes()
     }
 }
 
@@ -265,9 +282,56 @@ mod tests {
         assert!(server_name("not a name").is_err());
     }
 
+    /// A CA file of one certificate taken from the platform store (skipped when empty).
+    fn one_platform_ca() -> Option<(tempfile::TempDir, std::path::PathBuf)> {
+        let cert = rustls_native_certs::load_native_certs()
+            .certs
+            .into_iter()
+            .next()?;
+        let b64 = {
+            use base64::Engine as _;
+            base64::engine::general_purpose::STANDARD.encode(cert.as_ref())
+        };
+        let mut pem = String::from("-----BEGIN CERTIFICATE-----\n");
+        for line in b64.as_bytes().chunks(64) {
+            pem.push_str(std::str::from_utf8(line).unwrap());
+            pem.push('\n');
+        }
+        pem.push_str("-----END CERTIFICATE-----\n");
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ca.pem");
+        std::fs::write(&path, pem).unwrap();
+        Some((dir, path))
+    }
+
+    #[test]
+    fn ca_file_replaces_the_platform_store() {
+        let Some((_dir, path)) = one_platform_ca() else {
+            return;
+        };
+        let mut cfg = TlsConfig::default();
+        cfg.ca_file = Some(path);
+        assert_eq!(roots(&cfg).unwrap().len(), 1, "only the CA file is trusted");
+        cfg.ca_file = None;
+        assert!(
+            roots(&cfg).unwrap().len() > 1,
+            "platform store without a CA file"
+        );
+    }
+
+    #[test]
+    fn verify_ca_requires_a_ca_file() {
+        let mut cfg = TlsConfig::default();
+        cfg.mode = TlsMode::VerifyCa;
+        assert!(matches!(
+            setup(&cfg, "db.example.test"),
+            Err(DriverError::Tls(_))
+        ));
+    }
+
     #[test]
     fn modes_build_and_server_name_overrides_host() {
-        for mode in [TlsMode::Require, TlsMode::VerifyCa, TlsMode::VerifyFull] {
+        for mode in [TlsMode::Require, TlsMode::VerifyFull] {
             let mut cfg = TlsConfig::default();
             cfg.mode = mode;
             cfg.server_name = Some("db.example.test".into());

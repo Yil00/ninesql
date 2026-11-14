@@ -8,10 +8,11 @@
 //!    its result columns are known before anything runs (one statement per protocol call).
 //! 2. Row-returning statements:
 //!    - `SELECT`-class statements outside a transaction run in a **driver-implicit read
-//!      transaction** (`BEGIN`, `SET LOCAL idle_in_transaction_session_timeout`) through a portal
-//!      fetched `batch_rows` rows at a time (`Execute` + `Sync` per batch): nothing runs ahead of
-//!      the consumer. At the end the transaction is committed; a dropped stream closes the portal
-//!      and commits; a cancel closes the portal and rolls back.
+//!      transaction** (`BEGIN`, a transaction-local `idle_in_transaction_session_timeout`, only
+//!      ever lowered) through a portal fetched `batch_rows` rows at a time (`Execute` + `Sync`
+//!      per batch): nothing runs ahead of the consumer. The transaction is committed only when
+//!      the portal ran to completion; a dropped stream, a cancel or an error closes the portal
+//!      and rolls back.
 //!    - inside the user's transaction, the same portal fetch without `BEGIN` / `COMMIT`; a cancel
 //!      or drop closes the portal (`Close` + `Sync`).
 //!    - other row-returning statements outside a transaction (`INSERT … RETURNING`, `CALL`, a
@@ -45,9 +46,10 @@ use crate::types::{BatchBuilder, ColPlan, builtin_type_name, schema_for};
 /// Name of the prepared statement the driver uses for user statements.
 const STMT: &str = "ninesql_s";
 
-/// `idle_in_transaction_session_timeout` set (with `SET LOCAL`) in the driver-implicit read
-/// transaction of a paused cursor: the server ends a session whose consumer never comes back,
-/// releasing the snapshot and locks of the open portal. Documented in docs/08.
+/// `idle_in_transaction_session_timeout` set (transaction-local, with `set_config`) in the
+/// driver-implicit read transaction of a paused cursor, unless a stricter non-zero value is
+/// already in force: the server ends a session whose consumer never comes back, releasing the
+/// snapshot and locks of the open portal. Documented in docs/08.
 pub const IDLE_CURSOR_TIMEOUT: Duration = Duration::from_secs(300);
 
 /// How long a dropped stream's statement may take to end after the driver cancelled it, or to
@@ -177,13 +179,19 @@ struct Exec {
     next_rows: i32,
     builder: Option<BatchBuilder>,
     items: Vec<DriverResult<ResultItem>>,
-    /// `CommandComplete`s of the driver's `BEGIN` / `SET LOCAL` still expected.
+    /// `CommandComplete`s of the driver's `BEGIN` / timeout setting still expected (their rows
+    /// are discarded).
     pre_completes: u8,
     fetch: Fetch,
     awaiting_ready: bool,
     tag: Option<String>,
     error: Option<PgError>,
     copy_out: bool,
+    /// Notices queued in the current chunk, and their bytes.
+    chunk_notices: u32,
+    chunk_notice_bytes: usize,
+    /// Notices dropped above the hard cap (reported once, at the end).
+    notices_dropped: u64,
     rows_seen: u64,
     /// The driver itself sent a cancel request (consumer gone during a round trip).
     self_cancelled: bool,
@@ -191,7 +199,29 @@ struct Exec {
     deadline: Option<Instant>,
 }
 
+/// Notices per chunk before the chunk is delivered.
+const CHUNK_NOTICES: u32 = 1000;
+/// Notice bytes per chunk before the chunk is delivered.
+const CHUNK_NOTICE_BYTES: usize = 1024 * 1024;
+
 impl Exec {
+    /// Queues a notice. `true` when the chunk should be delivered now (soft cap). Where the
+    /// chunk cannot be delivered (driver round trips), notices above twice the cap are dropped
+    /// and counted.
+    fn push_notice(&mut self, n: &PgError) -> bool {
+        let size = n.message.len() + n.hint.as_ref().map_or(0, String::len) + 64;
+        if self.chunk_notices >= 2 * CHUNK_NOTICES
+            || self.chunk_notice_bytes + size > 2 * CHUNK_NOTICE_BYTES
+        {
+            self.notices_dropped += 1;
+            return true;
+        }
+        self.chunk_notices += 1;
+        self.chunk_notice_bytes += size;
+        self.items.push(Ok(notice_item(n)));
+        self.chunk_notices >= CHUNK_NOTICES || self.chunk_notice_bytes >= CHUNK_NOTICE_BYTES
+    }
+
     fn cancelled(&self) -> bool {
         self.self_cancelled || self.cancel.is_requested()
     }
@@ -511,7 +541,7 @@ impl Actor {
         frontend::execute("", max_rows, out).map_err(proto)?;
         frontend::sync(out);
         self.conn.flush().await?;
-        let mut rows = Vec::new();
+        let mut rows = crate::conn::TextRows::default();
         let mut error = None;
         loop {
             match self.conn.next(RowSink::Text(&mut rows)).await? {
@@ -523,7 +553,7 @@ impl Actor {
         self.sync_status();
         match error {
             Some(e) => Err(statement_error(&e, false)),
-            None => Ok(rows),
+            None => Ok(rows.rows),
         }
     }
 
@@ -556,15 +586,22 @@ impl Actor {
             // Before 14 the setting is not reported: read it back (not possible in an aborted
             // transaction, where nothing can be written either; the next statement checks).
             _ if self.conn.txn_status == b'E' => true,
-            _ => {
-                let rows = self
-                    .internal("SHOW default_transaction_read_only", &[], 1)
-                    .await?;
-                rows.first()
-                    .and_then(|r| r.first())
-                    .and_then(Option::as_deref)
-                    == Some("on")
-            }
+            // Any failure of the read-back fails closed.
+            _ => match self
+                .internal("SHOW default_transaction_read_only", &[], 1)
+                .await
+            {
+                Ok(rows) => {
+                    rows.first()
+                        .and_then(|r| r.first())
+                        .and_then(Option::as_deref)
+                        == Some("on")
+                }
+                Err(e) => {
+                    tracing::warn!(error = ?std::mem::discriminant(&e), "read-only read-back failed");
+                    false
+                }
+            },
         };
         if on {
             Ok(())
@@ -604,10 +641,11 @@ impl Actor {
             .join(",");
         let rows = self
             .internal(
-                "SELECT oid::text, pg_catalog.format_type(oid, NULL) FROM pg_catalog.pg_type \
-                 WHERE oid = ANY($1::pg_catalog.oid[])",
+                "SELECT t.oid::pg_catalog.text, pg_catalog.format_type(t.oid, NULL) \
+                 FROM pg_catalog.pg_type t \
+                 WHERE t.oid OPERATOR(pg_catalog.=) ANY($1::pg_catalog.oid[])",
                 &[Some(format!("{{{list}}}"))],
-                0,
+                i32::try_from(missing.len()).unwrap_or(i32::MAX),
             )
             .await?;
         for row in rows {
@@ -708,7 +746,9 @@ impl Actor {
                         error = Some(e);
                     }
                 }
-                Msg::Notice(n) => ex.items.push(Ok(notice_item(&n))),
+                Msg::Notice(n) => {
+                    ex.push_notice(&n);
+                }
                 _ => {}
             }
         }
@@ -786,6 +826,9 @@ impl Actor {
             tag: None,
             error: None,
             copy_out: false,
+            chunk_notices: 0,
+            chunk_notice_bytes: 0,
+            notices_dropped: 0,
             rows_seen: 0,
             self_cancelled: false,
             deadline: None,
@@ -871,7 +914,9 @@ impl Actor {
                         error = Some(e);
                     }
                 }
-                Msg::Notice(n) => ex.items.push(Ok(notice_item(&n))),
+                Msg::Notice(n) => {
+                    ex.push_notice(&n);
+                }
                 _ => {}
             }
         }
@@ -926,10 +971,19 @@ impl Actor {
         let out = self.conn.out();
         if ex.implicit_txn {
             push_fixed(out, "BEGIN")?;
-            let secs = IDLE_CURSOR_TIMEOUT.as_secs();
+            // Transaction-local, and only ever lowered: a stricter non-zero value already set
+            // for the session or the role is kept. Its one result row is discarded.
+            let ms = IDLE_CURSOR_TIMEOUT.as_millis();
             push_fixed(
                 out,
-                &format!("SET LOCAL idle_in_transaction_session_timeout = '{secs}s'"),
+                &format!(
+                    "SELECT pg_catalog.set_config('idle_in_transaction_session_timeout'::pg_catalog.text, \
+                     CASE WHEN s.setting::pg_catalog.int8 OPERATOR(pg_catalog.>) 0::pg_catalog.int8 \
+                     AND s.setting::pg_catalog.int8 OPERATOR(pg_catalog.<) {ms}::pg_catalog.int8 \
+                     THEN s.setting ELSE '{ms}'::pg_catalog.text END, true) \
+                     FROM pg_catalog.pg_settings s WHERE s.name OPERATOR(pg_catalog.=) \
+                     'idle_in_transaction_session_timeout'::pg_catalog.text"
+                ),
             )?;
             ex.pre_completes = 2;
         }
@@ -966,6 +1020,8 @@ impl Actor {
                     items: std::mem::take(&mut ex.items),
                     done: false,
                 };
+                ex.chunk_notices = 0;
+                ex.chunk_notice_bytes = 0;
                 if r.send(chunk).is_err() {
                     return self.abandon(ex, false).await;
                 }
@@ -995,6 +1051,8 @@ impl Actor {
             }
             let may_cancel = ex.class == StatementClass::Read || ex.rows_seen == 0;
             let sink = match ex.builder.as_mut() {
+                // Rows of the driver's own pre-statements (the `set_config` above).
+                _ if ex.pre_completes > 0 => RowSink::Discard,
                 Some(b) => RowSink::Arrow(b),
                 None => RowSink::None,
             };
@@ -1012,6 +1070,7 @@ impl Actor {
             )
             .await?;
             match msg {
+                Msg::Row if ex.pre_completes > 0 => {}
                 Msg::Row => {
                     ex.rows_seen += 1;
                     if ex.builder.as_ref().is_some_and(BatchBuilder::is_full) {
@@ -1021,7 +1080,10 @@ impl Actor {
                 }
                 Msg::Notice(n) => {
                     ex.flush_batch();
-                    ex.items.push(Ok(notice_item(&n)));
+                    if ex.push_notice(&n) {
+                        // Enough notices for one chunk: deliver them before reading more.
+                        return Ok(Filled::Batch);
+                    }
                 }
                 Msg::Error(e) => {
                     if ex.error.is_none() {
@@ -1158,11 +1220,24 @@ impl Actor {
         error: Option<PgError>,
     ) -> DriverResult<()> {
         ex.flush_batch();
+        if ex.notices_dropped > 0 {
+            ex.items.push(Ok(ResultItem::Notice(Notice::new(
+                NoticeSeverity::Warning,
+                format!(
+                    "{} more server notices were not shown (too many for one result)",
+                    ex.notices_dropped
+                ),
+            ))));
+        }
         let cancelled = ex.cancelled();
         let portal_open = ex.fetch == Fetch::Suspended;
         let mut end_error = None;
         if ex.implicit_txn && self.conn.txn_status != b'I' {
-            let commit = error.is_none() && !cancelled && self.conn.txn_status == b'T';
+            // COMMIT only when the portal ran to completion (its CommandComplete was seen): a
+            // dropped, cancelled or failed statement is rolled back, so a read-class statement
+            // with side effects is never partially committed.
+            let commit =
+                error.is_none() && !cancelled && ex.tag.is_some() && self.conn.txn_status == b'T';
             let out = self.conn.out();
             if portal_open {
                 frontend::close(b'P', "", out).map_err(|e| DriverError::Protocol(e.to_string()))?;
