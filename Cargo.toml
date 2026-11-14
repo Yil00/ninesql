@@ -49,6 +49,18 @@ secret-service = { version = "=6.0.0-rc.1", default-features = false, features =
 tempfile = "3"
 libc = "0.2"
 
+# SSH tunnels (P1-D, ADR-0011 §5). russh with the `ring` provider only: no OpenSSL, no aws-lc,
+# no compression. The `rsa` feature is off: it pins rsa =0.10.0-rc.18, flagged by RUSTSEC-2023-0071
+# (no new advisory ignore allowed), so RSA host / client keys are unsupported until russh moves to
+# rsa >= 0.10.0. RustCrypto versions match the ones russh already pulls in.
+russh = { version = "0.65.1", default-features = false, features = ["ring"] }
+data-encoding = "2.3"
+hmac = "0.13"
+sha1 = "0.11"
+sha2 = "0.11"
+# Tests only (key generation); same major as russh / ssh-key.
+rand = { version = "0.10", default-features = false, features = ["std", "thread_rng"] }
+
 # Driver API (ADR-0004): Arrow sub-crates only, async contract.
 arrow-array = { version = "60.1", default-features = false }
 arrow-schema = { version = "60.1", default-features = false }
