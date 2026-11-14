@@ -1,0 +1,479 @@
+{
+  "$comment": "NineSQL dev environment (ADR-0009). Source of truth for ports, images and readiness; driver integration tests read it. Credentials are fake and dev-only. Checked against compose.yaml by `python3 dev/ready.py check`.",
+  "schema_version": 1,
+  "compose_file": "compose.yaml",
+  "profiles": {
+    "core": [
+      "core"
+    ],
+    "sql": [
+      "core",
+      "sql"
+    ],
+    "nosql": [
+      "nosql"
+    ],
+    "heavy": [
+      "heavy"
+    ],
+    "all": [
+      "core",
+      "sql",
+      "nosql",
+      "heavy"
+    ]
+  },
+  "engines": [
+    {
+      "id": "postgresql",
+      "name": "PostgreSQL",
+      "family": "pgwire",
+      "service": "postgresql",
+      "profile": "core",
+      "image": "postgres:18.7@sha256:9f4fd4aa918f52ae3d6f3b687f1de90d8f867cd4d520021545a9a50c120eae3b",
+      "host": "127.0.0.1",
+      "port": 15432,
+      "protocol": "pgwire",
+      "database": "nine",
+      "user": "nine",
+      "password": "nine_dev_only",
+      "seed": [
+        "seed/postgresql/01-nine.sql"
+      ],
+      "readiness": {
+        "healthcheck": true,
+        "seed_service": null
+      }
+    },
+    {
+      "id": "mysql",
+      "name": "MySQL",
+      "family": "mysqlwire",
+      "service": "mysql",
+      "profile": "core",
+      "image": "mysql:8.4.13@sha256:a81d043930e51745522bd5c430961cf8286f0a23f0a9a2a6e0108f7ea71b0902",
+      "host": "127.0.0.1",
+      "port": 13306,
+      "protocol": "mysqlwire",
+      "database": "nine",
+      "user": "nine",
+      "password": "nine_dev_only",
+      "seed": [
+        "seed/mysql/01-nine.sql"
+      ],
+      "readiness": {
+        "healthcheck": true,
+        "seed_service": null
+      },
+      "notes": "root password: nine_dev_only_root"
+    },
+    {
+      "id": "mariadb",
+      "name": "MariaDB",
+      "family": "mysqlwire",
+      "service": "mariadb",
+      "profile": "core",
+      "image": "mariadb:11.8.9@sha256:d36f18d65a0459510b8b0f643b226a6d299e3206486e2b64ff20754a6d291707",
+      "host": "127.0.0.1",
+      "port": 13307,
+      "protocol": "mysqlwire",
+      "database": "nine",
+      "user": "nine",
+      "password": "nine_dev_only",
+      "seed": [
+        "seed/mysql/01-nine.sql"
+      ],
+      "readiness": {
+        "healthcheck": true,
+        "seed_service": null
+      },
+      "notes": "root password: nine_dev_only_root"
+    },
+    {
+      "id": "sqlite",
+      "name": "SQLite",
+      "family": "sqlite",
+      "service": null,
+      "profile": "core",
+      "image": null,
+      "host": null,
+      "port": null,
+      "protocol": "file",
+      "database": null,
+      "user": null,
+      "password": null,
+      "seed": [
+        "seed/sqlite/nine.sql"
+      ],
+      "readiness": {
+        "healthcheck": false,
+        "seed_service": null
+      },
+      "notes": "File engine: tests apply the seed script to a temporary database file."
+    },
+    {
+      "id": "timescaledb",
+      "name": "TimescaleDB",
+      "family": "pgwire",
+      "service": "timescaledb",
+      "profile": "sql",
+      "image": "timescale/timescaledb:2.32.0-pg18@sha256:83952d54cfc74d9aebe4aba6ecf2af829c2bcf1f30058dded4c18ab3720a247a",
+      "host": "127.0.0.1",
+      "port": 15433,
+      "protocol": "pgwire",
+      "database": "nine",
+      "user": "nine",
+      "password": "nine_dev_only",
+      "seed": [
+        "seed/postgresql/01-nine.sql",
+        "seed/timescaledb/02-timescale.sql"
+      ],
+      "readiness": {
+        "healthcheck": true,
+        "seed_service": null
+      }
+    },
+    {
+      "id": "yugabytedb",
+      "name": "YugabyteDB (YSQL)",
+      "family": "pgwire",
+      "service": "yugabytedb",
+      "profile": "sql",
+      "image": "yugabytedb/yugabyte:2026.1.3.0-b100@sha256:c1ddbf9c189f6ef33f03c648efadb1b1e82b5e7c8be472c56b1357c024221528",
+      "host": "127.0.0.1",
+      "port": 15434,
+      "protocol": "pgwire",
+      "database": "nine",
+      "user": "nine",
+      "password": "nine_dev_only",
+      "seed": [
+        "seed/postgresql/01-nine.sql"
+      ],
+      "readiness": {
+        "healthcheck": true,
+        "seed_service": "yugabytedb-seed"
+      }
+    },
+    {
+      "id": "questdb",
+      "name": "QuestDB",
+      "family": "pgwire",
+      "service": "questdb",
+      "profile": "sql",
+      "image": "questdb/questdb:10.2.0@sha256:bbf5b3cb0dfb08ad667a008dbcc48794bf942d18d1ad832cb6ecb7ff87314694",
+      "host": "127.0.0.1",
+      "port": 18812,
+      "protocol": "pgwire",
+      "extra_ports": {
+        "http": 19000
+      },
+      "database": "qdb",
+      "user": "nine",
+      "password": "nine_dev_only",
+      "seed": [
+        "seed/questdb/nine.sql"
+      ],
+      "readiness": {
+        "healthcheck": true,
+        "seed_service": "questdb-seed"
+      },
+      "notes": "Read-only pg-wire user: nine_ro / nine_dev_only. HTTP console has no auth."
+    },
+    {
+      "id": "tidb",
+      "name": "TiDB",
+      "family": "mysqlwire",
+      "service": "tidb",
+      "profile": "sql",
+      "image": "pingcap/tidb:v8.5.8@sha256:df168c764bf2dfdb166dc37a5c3b0e210d29d5f3ab2d33317fd0fdf7b32037f5",
+      "host": "127.0.0.1",
+      "port": 14000,
+      "protocol": "mysqlwire",
+      "extra_ports": {
+        "status": 14080
+      },
+      "database": "nine",
+      "user": "nine",
+      "password": "nine_dev_only",
+      "seed": [
+        "seed/tidb/nine.sql"
+      ],
+      "readiness": {
+        "healthcheck": true,
+        "seed_service": "tidb-seed"
+      },
+      "notes": "root password: nine_dev_only_root (set by tidb-seed)"
+    },
+    {
+      "id": "duckdb",
+      "name": "DuckDB",
+      "family": "duckdb",
+      "service": null,
+      "profile": "sql",
+      "image": null,
+      "host": null,
+      "port": null,
+      "protocol": "file",
+      "database": null,
+      "user": null,
+      "password": null,
+      "seed": [
+        "seed/duckdb/nine.sql"
+      ],
+      "readiness": {
+        "healthcheck": false,
+        "seed_service": null
+      },
+      "notes": "File engine: tests apply the seed script to a temporary database file."
+    },
+    {
+      "id": "clickhouse",
+      "name": "ClickHouse",
+      "family": "clickhouse",
+      "service": "clickhouse",
+      "profile": "sql",
+      "image": "clickhouse/clickhouse-server:26.8.37.168@sha256:a56702852d7c8055a021a42a3a60f49daa49e9204a949ea033e51bb327948648",
+      "host": "127.0.0.1",
+      "port": 18123,
+      "protocol": "http",
+      "database": "nine",
+      "user": "nine",
+      "password": "nine_dev_only",
+      "seed": [
+        "seed/clickhouse/01-nine.sql"
+      ],
+      "readiness": {
+        "healthcheck": true,
+        "seed_service": null
+      }
+    },
+    {
+      "id": "trino",
+      "name": "Trino",
+      "family": "trino",
+      "service": "trino",
+      "profile": "sql",
+      "image": "trinodb/trino:484@sha256:2704eb53935af5e582d63d6033e9bf99d20c325e9b0e30b1016ef59a4773979f",
+      "host": "127.0.0.1",
+      "port": 18080,
+      "protocol": "http",
+      "database": "memory.nine",
+      "user": "nine",
+      "password": null,
+      "auth": "none",
+      "seed": [
+        "seed/trino/nine.sql"
+      ],
+      "readiness": {
+        "healthcheck": true,
+        "seed_service": "trino-seed"
+      },
+      "notes": "No authentication over plain HTTP; any user name is accepted. Catalogs: memory (seeded on every up), tpch."
+    },
+    {
+      "id": "firebird",
+      "name": "Firebird",
+      "family": "firebird",
+      "service": "firebird",
+      "profile": "sql",
+      "image": "firebirdsql/firebird:5.0.4@sha256:1529560400fc7847f015c57fc9d70729c44d9a9d8f9000df19c5ce1950b4c202",
+      "host": "127.0.0.1",
+      "port": 13050,
+      "protocol": "firebird",
+      "database": "/var/lib/firebird/data/nine.fdb",
+      "user": "nine",
+      "password": "nine_dev_only",
+      "seed": [
+        "seed/firebird/01-nine.sql"
+      ],
+      "readiness": {
+        "healthcheck": true,
+        "seed_service": null
+      },
+      "notes": "SYSDBA password: nine_dev_only_root. Database: the full server-side path (no alias is configured)."
+    },
+    {
+      "id": "influxdb",
+      "name": "InfluxDB 3 Core",
+      "family": "influxdb",
+      "service": "influxdb",
+      "profile": "sql",
+      "image": "influxdb:3.12.2-core@sha256:f349b303abfc33e5be9ab67f475d544c4ef53ed5b3b68267842aedb112756b82",
+      "host": "127.0.0.1",
+      "port": 18181,
+      "protocol": "http",
+      "database": "nine",
+      "user": null,
+      "password": null,
+      "auth": "token",
+      "seed": [
+        "seed/influxdb/seed.sh"
+      ],
+      "readiness": {
+        "healthcheck": true,
+        "seed_service": "influxdb-seed"
+      },
+      "notes": "Admin token (dev only): apiv3_nine-dev-only-token"
+    },
+    {
+      "id": "mongodb",
+      "name": "MongoDB",
+      "family": "mongodb",
+      "service": "mongodb",
+      "profile": "nosql",
+      "image": "mongo:8.0.38@sha256:d97fea17ccb8d004cd137be8dab54d70d0df11be69c9f422aefe4484c8414ab7",
+      "host": "127.0.0.1",
+      "port": 27117,
+      "protocol": "mongodb",
+      "database": "nine",
+      "user": "nine",
+      "password": "nine_dev_only",
+      "seed": [
+        "seed/mongodb/01-nine.js"
+      ],
+      "readiness": {
+        "healthcheck": true,
+        "seed_service": null
+      },
+      "notes": "Root user; authSource=admin."
+    },
+    {
+      "id": "redis",
+      "name": "Redis",
+      "family": "redis",
+      "service": "redis",
+      "profile": "nosql",
+      "image": "redis:8.8.4@sha256:6e61ab45b3e867bacbef2fdd969ec74f4e0f8aaca8cc946cb8ac0c494035e7e7",
+      "host": "127.0.0.1",
+      "port": 16379,
+      "protocol": "resp",
+      "database": "0",
+      "user": "default",
+      "password": "nine_dev_only",
+      "seed": [
+        "seed/redis/seed.sh"
+      ],
+      "readiness": {
+        "healthcheck": true,
+        "seed_service": "redis-seed"
+      },
+      "notes": "ACL users: default (all commands), nine_ro (read commands only), both nine_dev_only."
+    },
+    {
+      "id": "valkey",
+      "name": "Valkey",
+      "family": "redis",
+      "service": "valkey",
+      "profile": "nosql",
+      "image": "valkey/valkey:9.1.3@sha256:3add1a336a920ea54770a001ab6feb3da5fceea96a40373a3a2cd469b815f0b7",
+      "host": "127.0.0.1",
+      "port": 16380,
+      "protocol": "resp",
+      "database": "0",
+      "user": "default",
+      "password": "nine_dev_only",
+      "seed": [
+        "seed/redis/seed.sh"
+      ],
+      "readiness": {
+        "healthcheck": true,
+        "seed_service": "valkey-seed"
+      },
+      "notes": "ACL users: default (all commands), nine_ro (read commands only), both nine_dev_only."
+    },
+    {
+      "id": "elasticsearch",
+      "name": "Elasticsearch",
+      "family": "search",
+      "service": "elasticsearch",
+      "profile": "heavy",
+      "image": "elasticsearch:9.5.5@sha256:b7b0f24e9b5e90656ffe69804b3a48907499ab2b9cd67f02b7af3aff1b026a89",
+      "host": "127.0.0.1",
+      "port": 19200,
+      "protocol": "http",
+      "database": null,
+      "user": "elastic",
+      "password": "nine_dev_only",
+      "seed": [
+        "seed/search/seed.sh"
+      ],
+      "readiness": {
+        "healthcheck": true,
+        "seed_service": "elasticsearch-seed"
+      },
+      "notes": "Basic auth over plain HTTP (dev only)."
+    },
+    {
+      "id": "opensearch",
+      "name": "OpenSearch",
+      "family": "search",
+      "service": "opensearch",
+      "profile": "heavy",
+      "image": "opensearchproject/opensearch:3.9.0@sha256:3b55f6b6249cfdb92b52ee59adc8a266203ba9ef9f5d82544fad6f1af2f3609e",
+      "host": "127.0.0.1",
+      "port": 19201,
+      "protocol": "http",
+      "database": null,
+      "user": null,
+      "password": null,
+      "auth": "none",
+      "seed": [
+        "seed/search/seed.sh"
+      ],
+      "readiness": {
+        "healthcheck": true,
+        "seed_service": "opensearch-seed"
+      },
+      "notes": "Security plugin disabled (dev only)."
+    },
+    {
+      "id": "cassandra",
+      "name": "Apache Cassandra",
+      "family": "cassandra",
+      "service": "cassandra",
+      "profile": "heavy",
+      "image": "cassandra:5.0.9@sha256:acd754f07c73f3a166bb477354b56ce9a05690c3e5e2aaacc1aab2afddba6436",
+      "host": "127.0.0.1",
+      "port": 19042,
+      "protocol": "cql",
+      "database": "nine",
+      "user": null,
+      "password": null,
+      "auth": "none",
+      "seed": [
+        "seed/cassandra/nine.cql",
+        "seed/cassandra/seed.sh"
+      ],
+      "readiness": {
+        "healthcheck": true,
+        "seed_service": "cassandra-seed"
+      },
+      "notes": "AllowAllAuthenticator (image default). Keyspace: nine."
+    },
+    {
+      "id": "neo4j",
+      "name": "Neo4j Community",
+      "family": "neo4j",
+      "service": "neo4j",
+      "profile": "heavy",
+      "image": "neo4j:2026.10.2-community@sha256:4a2fd4f41ce384aa7d6a74b399f22c202e154f3966119c28a18ed9a500904f5e",
+      "host": "127.0.0.1",
+      "port": 17687,
+      "protocol": "bolt",
+      "extra_ports": {
+        "http": 17474
+      },
+      "database": "neo4j",
+      "user": "neo4j",
+      "password": "nine_dev_only",
+      "seed": [
+        "seed/neo4j/nine.cypher",
+        "seed/neo4j/seed.sh"
+      ],
+      "readiness": {
+        "healthcheck": true,
+        "seed_service": "neo4j-seed"
+      }
+    }
+  ]
+}
