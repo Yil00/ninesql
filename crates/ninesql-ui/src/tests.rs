@@ -395,3 +395,15 @@ fn every_action_has_a_name_gpui_can_build(cx: &mut TestAppContext) {
         Some(NewEditorTab.name())
     );
 }
+
+/// The X11 IME decoder in the graph is NineSQL's patched `xim-ctext` ([patch.crates-io]): the
+/// preedit that crashed the spike (ibus, m17n `latn-post`, "é" as unescaped ISO 8859-1) and the
+/// GB 2312 / KS C 5601 escapes upstream refused now decode.
+#[test]
+fn x11_ime_compound_text_decodes_without_error() {
+    let decode = |bytes: &[u8]| xim_ctext::compound_text_to_utf8(bytes).ok();
+    assert_eq!(decode(&[0xE9]).as_deref(), Some("é"));
+    assert_eq!(decode(b"\x1b$)A\xd6\xd0").as_deref(), Some("中"));
+    assert_eq!(decode(b"\x1b$)C\xb0\xa1").as_deref(), Some("가"));
+    assert_eq!(decode(b"\x1b%G").as_deref(), Some(""));
+}

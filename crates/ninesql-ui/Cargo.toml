@@ -36,3 +36,5 @@ path = "src/main.rs"
 [dev-dependencies]
 # TestAppContext for view-model tests (AGENTS.md): GPUI's own `test-support`, see root Cargo.toml.
 gpui-pre = { workspace = true, features = ["test-support"] }
+# Regression test of the patched X11 IME decoder ([patch.crates-io] in the root Cargo.toml).
+xim-ctext = { version = "=0.3.0", default-features = false }
