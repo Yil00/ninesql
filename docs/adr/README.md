@@ -19,3 +19,4 @@ New ADR: copy [template.md](template.md), take the next number, status `Proposed
 | [0011](0011-tls-and-ssh-defaults.md) | TLS and SSH defaults | Accepted |
 | [0012](0012-secret-service-client-and-msrv.md) | Secret Service client crate and minimum Rust version | Accepted |
 | [0013](0013-gpui-source-and-supply-chain.md) | GPUI source (gpui-kit / gpui-pre from crates.io) and supply-chain controls | Accepted |
+| [0014](0014-dev-environment-profiles.md) | Dev environment profiles follow ADR-0009 | Proposed (would partially supersede [0003](0003-supported-engines-v1.md)) |
