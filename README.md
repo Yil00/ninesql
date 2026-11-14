@@ -37,7 +37,7 @@
   </p>
 </div>
 
-> ⚠️ **Pre-alpha.** Nothing is released yet: this repository contains the architecture decisions, the roadmap and the workspace skeleton. See the [roadmap](docs/ROADMAP.md) for the MVP plan.
+> ⚠️ **Pre-alpha.** Nothing is released yet and nothing is usable end to end: the application shell, the PostgreSQL driver, SSH tunnels, the secret stores and the DBeaver parser exist as crates, but there is no connection UI yet. See the [roadmap](docs/ROADMAP.md) for the MVP plan.
 
 ## Why NineSQL
 DBeaver is the de facto universal database client, but it runs on the JVM and Eclipse RCP: high memory use, slow cold start, and uneven HiDPI / Wayland behavior on Linux.
@@ -45,7 +45,7 @@ DBeaver is the de facto universal database client, but it runs on the JVM and Ec
 NineSQL keeps the **feature set** DBeaver users rely on and rebuilds it as a **native Rust application** rendered on the GPU with [GPUI](https://github.com/zed-industries/zed/tree/main/crates/gpui):
 - **Native and lean**: no JVM, no webview. Startup time and memory use are measured in CI and published, not promised ([docs/04-mvp-scope.md](docs/04-mvp-scope.md#exit-criterion)).
 - **Large results stay fluid**: a virtualized, GPU-rendered grid streams results in bounded memory.
-- **Secure by default**: passwords live in the desktop keyring (Secret Service), never in config files; TLS verified by default; production connections guarded by a real read-only mode, not just a red banner ([docs/05-security.md](docs/05-security.md)).
+- **Secure by default**: passwords live in the desktop keyring (Secret Service) or an encrypted local vault, never in config files; TLS verified by default; production connections guarded by a real read-only mode, not just a red banner ([docs/05-security.md](docs/05-security.md)).
 - **Offline-first**: no telemetry, no account, no network traffic except to the databases you declare.
 - **Switch in one click**: imports DBeaver connections, folders, connection types, SSH tunnels and saved passwords ([docs/06-dbeaver-interop.md](docs/06-dbeaver-interop.md)).
 
@@ -54,7 +54,7 @@ The 20 most used **open-source, self-hostable** engines. Cloud-only services (Sn
 
 | Engine | Family | Planned in | Status |
 |:--|:--|:--|:--|
-| **PostgreSQL** | SQL · pg-wire | MVP (v0.1) | 🗓 Planned |
+| **PostgreSQL** | SQL · pg-wire | MVP (v0.1) | 🚧 Driver landed (P1-B), not usable from the UI yet |
 | **MySQL** | SQL · mysql-wire | MVP (v0.1) | 🗓 Planned |
 | **MariaDB** | SQL · mysql-wire | MVP (v0.1) | 🗓 Planned |
 | **SQLite** | SQL · embedded | MVP (v0.1) | 🗓 Planned |

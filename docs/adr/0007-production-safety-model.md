@@ -1,6 +1,6 @@
 # ADR-0007: Production safety model
 
-- **Status**: Accepted
+- **Status**: Accepted. Note (P1-D core, 2026-11-14): §3 is extended to init SQL, which is classified and confirmed when it would run at connect, not refused when saved ([docs/02](../02-architecture.md#confirmations-adr-0007-adr-0011)).
 - **Date**: 2026-11-14
 
 ## Context
