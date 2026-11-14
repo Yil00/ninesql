@@ -2287,38 +2287,17 @@ fn map_jump_hosts(
         };
         let hop_prefix = join(props_prefix, &format!("jumpServer{i}"));
         let enabled = parse_jump_enabled(get("enabled"))?;
-        if i >= count {
-            if enabled {
-                st.issues.warn(
-                    IssueKind::Unsupported,
-                    Some(hop_prefix),
-                    "enabled SSH jump server at or past `jumpServer.count`: DBeaver does not use \
-                     it, so it is not imported",
-                );
-            } else {
-                st.issues.info(
-                    IssueKind::Unsupported,
-                    Some(hop_prefix),
-                    "SSH jump server at or past `jumpServer.count`, not enabled: DBeaver does not \
-                     use it, not imported",
-                );
+        if i >= count || i != hops.len() || !enabled {
+            // DBeaver's loop does not reach this hop (past the count, after a missing index) or
+            // stops at it (not enabled).
+            let past_count = i >= count;
+            if !past_count {
+                chain_open = false;
             }
-            continue;
-        }
-        if i != hops.len() {
-            // A missing index before this one: DBeaver's loop stopped there.
-            chain_open = false;
-        }
-        if !enabled {
-            chain_open = false;
-            if fields.iter().any(|(f, _)| *f != "enabled") {
-                st.issues.info(
-                    IssueKind::Unsupported,
-                    Some(hop_prefix),
-                    "SSH jump server not enabled: DBeaver does not use it, not imported",
-                );
+            if past_count || !enabled {
+                report_skipped_hop(&fields, &hop_prefix, enabled, past_count, st);
+                continue;
             }
-            continue;
         }
         if !chain_open {
             return Err(
@@ -2404,6 +2383,63 @@ fn map_jump_hosts(
         );
     }
     Ok(hops)
+}
+
+/// A jump server DBeaver does not use: reported, never imported. Its secret-like fields still
+/// get a `SecretRemoved` entry (their values are dropped like the others); a configured host
+/// gets a warning so the user knows a hop written in the file is not used.
+fn report_skipped_hop(
+    fields: &[(&str, &Scalar)],
+    hop_prefix: &str,
+    enabled: bool,
+    past_count: bool,
+    st: &mut ConnState,
+) {
+    for (field, value) in fields {
+        if is_inline_key(field) {
+            st.issues.warn(
+                IssueKind::SecretRemoved,
+                Some(join(hop_prefix, field)),
+                "an inline private key is never imported: save it to a file and set its path",
+            );
+        } else if *field != "enabled" && is_secret_like(field, &value.as_text()) {
+            st.issues.warn(
+                IssueKind::SecretRemoved,
+                Some(join(hop_prefix, field)),
+                "looks like a secret: removed, not imported",
+            );
+        }
+    }
+    let has_host = fields
+        .iter()
+        .any(|(f, v)| *f == "host" && !v.as_text().trim().is_empty());
+    let message = match (past_count, enabled, has_host) {
+        (true, true, _) => {
+            "enabled SSH jump server at or past `jumpServer.count`: DBeaver does not use it, so \
+             it is not imported"
+        }
+        (true, false, true) => {
+            "configured SSH jump host not used, as in DBeaver (at or past `jumpServer.count`, \
+             not enabled): not imported"
+        }
+        (false, _, true) => {
+            "configured SSH jump host not used, as in DBeaver (not enabled): not imported"
+        }
+        (_, _, false) => {
+            if fields.iter().all(|(f, _)| *f == "enabled") {
+                return;
+            }
+            st.issues.info(
+                IssueKind::Unsupported,
+                Some(hop_prefix.to_owned()),
+                "SSH jump server settings not used by DBeaver (not enabled or at or past \
+                 `jumpServer.count`): not imported",
+            );
+            return;
+        }
+    };
+    st.issues
+        .warn(IssueKind::Unsupported, Some(hop_prefix.to_owned()), message);
 }
 
 /// What the file name of an SSH private key says about its type. Key files are **never read**

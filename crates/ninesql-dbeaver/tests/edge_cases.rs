@@ -1189,3 +1189,62 @@ fn unreadable_handler_data_disables() {
         Status::Imported
     );
 }
+
+// ---- Security review of the P2-A follow-ups (Low-2, Low-3) ----
+
+#[test]
+fn skipped_jump_servers_report_secrets_and_hosts() {
+    use ninesql_dbeaver::Severity;
+    // Not enabled, disabled, and past the count: none is imported, each is reported.
+    for props in [
+        r#","jumpServer0.host":"jump0.example.test","jumpServer0.name":"u",
+        "jumpServer0.keyValue":"-----BEGIN fixture-skipped-not-a-secret",
+        "jumpServer0.password":"fixture-skipped-not-a-secret""#,
+        r#","jumpServer0.enabled":false,"jumpServer0.host":"jump0.example.test",
+        "jumpServer0.keyValue":"-----BEGIN fixture-skipped-not-a-secret",
+        "jumpServer0.password":"fixture-skipped-not-a-secret""#,
+        r#","jumpServer.count":0,"jumpServer0.enabled":false,"jumpServer0.host":"jump0.example.test",
+        "jumpServer0.keyValue":"-----BEGIN fixture-skipped-not-a-secret",
+        "jumpServer0.password":"fixture-skipped-not-a-secret""#,
+        r#","jumpServer.count":0,"jumpServer0.enabled":true,"jumpServer0.host":"jump0.example.test",
+        "jumpServer0.keyValue":"-----BEGIN fixture-skipped-not-a-secret",
+        "jumpServer0.password":"fixture-skipped-not-a-secret""#,
+    ] {
+        let p = map(&ssh_with(props), None);
+        assert_eq!(jump_hosts(props), Ok(vec![]), "{props}");
+        assert!(
+            issue(&p, IssueKind::SecretRemoved, Some("jumpServer0.keyValue")),
+            "{props}"
+        );
+        assert!(
+            issue(&p, IssueKind::SecretRemoved, Some("jumpServer0.password")),
+            "{props}"
+        );
+        // A configured host that is not used is a warning, never only an info.
+        assert!(
+            p.connections[0]
+                .issues
+                .iter()
+                .any(|i| i.kind == IssueKind::Unsupported
+                    && i.severity == Severity::Warning
+                    && i.key.as_deref().is_some_and(|k| k.ends_with("jumpServer0"))),
+            "{props}"
+        );
+        let dump = format!("{p:?}");
+        assert!(!dump.contains("not-a-secret"), "{props}");
+        assert!(!dump.contains("jump0.example.test"), "{props}");
+    }
+    // Settings without a host: info only.
+    let p = map(
+        &ssh_with(r#","jumpServer0.enabled":false,"jumpServer0.port":"22""#),
+        None,
+    );
+    assert!(
+        p.connections[0]
+            .issues
+            .iter()
+            .any(|i| i.kind == IssueKind::Unsupported
+                && i.severity == Severity::Info
+                && i.key.as_deref().is_some_and(|k| k.ends_with("jumpServer0")))
+    );
+}
