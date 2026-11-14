@@ -8,10 +8,17 @@
 //! # Security
 //! The classifier is a guard rail, not the read-only mechanism (I3): engines enforce read-only
 //! themselves. It must still never under-classify, so its lexer follows the engine's lexical
-//! rules exactly ([`LexicalRules`]): a driver whose engine has a session mode that changes them
-//! (MySQL `NO_BACKSLASH_ESCAPES`, PostgreSQL `standard_conforming_strings`) builds its rules from
-//! the session's current mode. Drivers also send exactly one statement per protocol call (see
-//! [`ensure_single_statement`]).
+//! rules exactly ([`LexicalRules`]). Drivers track the session modes that change them and build
+//! the rules from their current values:
+//! - MySQL / MariaDB `sql_mode`: `NO_BACKSLASH_ESCAPES`, `ANSI_QUOTES` (`"…"` becomes an
+//!   identifier);
+//! - PostgreSQL `standard_conforming_strings`;
+//! - the client encoding (PostgreSQL `client_encoding` via `ParameterStatus`, MySQL
+//!   `character_set_client`): multi-byte encodings such as SJIS, Big5 or GBK can hide a quote
+//!   behind a backslash, so drivers connect in UTF-8 and the classifier treats any non-UTF-8
+//!   encoding change as [`StatementClass::ChangesAccessMode`].
+//!
+//! Drivers also send exactly one statement per protocol call (see [`ensure_single_statement`]).
 
 use crate::capabilities::ExplainFormat;
 use crate::error::{DriverError, DriverResult};
@@ -490,8 +497,12 @@ fn lex(text: &str, rules: LexicalRules) -> Lexed {
             push(&mut toks, TokKind::Semicolon, i, i + 1);
             i += 1;
         } else if is_word_byte(b) {
+            // With dollar quotes (PostgreSQL), `$` continues an identifier after its first
+            // character (`a$q$` is one name); a dollar tag only starts at a token start.
             let start = i;
-            while i < bytes.len() && is_word_byte(bytes[i]) {
+            while i < bytes.len()
+                && (is_word_byte(bytes[i]) || rules.dollar_quotes && bytes[i] == b'$')
+            {
                 i += 1;
             }
             push(&mut toks, TokKind::Word, start, i);
@@ -562,8 +573,8 @@ enum Item {
     Word(String),
     /// Quoted identifier, unquoted and lower-cased.
     Ident(String),
-    /// String literal.
-    Str,
+    /// String literal, contents lower-cased (quotes and `E` prefix removed).
+    Str(String),
     /// Punctuation.
     Punct(u8),
 }
@@ -604,6 +615,16 @@ fn unquote_ident(raw: &str) -> String {
         .to_lowercase()
 }
 
+fn unquote_str(raw: &str) -> String {
+    let body = raw.strip_prefix(['e', 'E']).unwrap_or(raw);
+    let inner = if body.len() >= 2 && body.starts_with('\'') && body.ends_with('\'') {
+        &body[1..body.len() - 1]
+    } else {
+        body
+    };
+    inner.to_lowercase()
+}
+
 fn locate(text: &str, toks: &[Tok]) -> Vec<Located> {
     let mut depth = 0u32;
     let mut out = Vec::with_capacity(toks.len());
@@ -612,7 +633,7 @@ fn locate(text: &str, toks: &[Tok]) -> Vec<Located> {
         let item = match t.kind {
             TokKind::Word => Item::Word(raw.to_ascii_uppercase()),
             TokKind::Ident => Item::Ident(unquote_ident(raw)),
-            TokKind::Str => Item::Str,
+            TokKind::Str => Item::Str(unquote_str(raw)),
             TokKind::Other | TokKind::Semicolon => Item::Punct(raw.as_bytes()[0]),
         };
         if item == Item::Punct(b')') {
@@ -896,10 +917,53 @@ fn classify_set_target(first: &str, seg: &[Located]) -> StatementClass {
             StatementClass::Session
         };
     }
+    if ENCODING_SETTINGS.contains(&target.as_str()) {
+        // The client encoding is a lexical mode (multi-byte encodings such as SJIS or GBK can
+        // hide a quote behind a backslash): only UTF-8 values are harmless.
+        return if encoding_value(&seg[i + 1..]).is_some_and(|v| is_utf8_value(&target, &v)) {
+            StatementClass::Session
+        } else {
+            StatementClass::ChangesAccessMode
+        };
+    }
     if HARMLESS_SETTINGS.contains(&target.as_str()) {
         StatementClass::Session
     } else {
         StatementClass::ChangesAccessMode
+    }
+}
+
+/// Settings that change the client encoding / collation (allowed with UTF-8 values only).
+const ENCODING_SETTINGS: &[&str] = &[
+    "client_encoding",
+    "names",
+    "character",
+    "character_set_client",
+    "character_set_results",
+    "character_set_connection",
+    "collation_connection",
+];
+
+/// First value after the setting name, skipping `=`, `:=`, `TO` and the `SET` of
+/// `CHARACTER SET`.
+fn encoding_value(rest: &[Located]) -> Option<String> {
+    rest.iter()
+        .find(|l| {
+            !matches!(l.item, Item::Punct(b'=' | b':')) && !matches!(word(l), Some("TO" | "SET"))
+        })
+        .and_then(|l| match &l.item {
+            Item::Word(w) => Some(w.to_ascii_lowercase()),
+            Item::Ident(v) | Item::Str(v) => Some(v.clone()),
+            Item::Punct(_) => None,
+        })
+}
+
+fn is_utf8_value(target: &str, value: &str) -> bool {
+    let v: String = value.chars().filter(|c| *c != '-').collect();
+    if target == "collation_connection" {
+        v.starts_with("utf8mb4_") || v.starts_with("utf8_")
+    } else {
+        matches!(v.as_str(), "utf8" | "utf8mb4")
     }
 }
 
@@ -1311,6 +1375,48 @@ mod tests {
             (ansi, "PRAGMA main.table_info(users)", C::Read, 1),
             (pg, "select nextval('s')", C::Unknown, 1),
             (pg, "select pg_terminate_backend(42)", C::Unknown, 1),
+            // N1: `$` inside PostgreSQL identifiers does not open a dollar quote.
+            (
+                pg,
+                "WITH a$q$ AS (DELETE FROM users RETURNING 1) SELECT 1 AS b$q$",
+                C::Unknown,
+                1,
+            ),
+            (
+                pg,
+                "SELECT x$q$, set_config('default_transaction_read_only','off',false) AS y$q$",
+                C::ChangesAccessMode,
+                1,
+            ),
+            (pg, "SELECT $q$ ; $q$ AS a$b", C::Read, 1),
+            (pg, "SELECT $1, $q$x$q$", C::Read, 1),
+            // N4: encoding changes are lexical-mode changes unless UTF-8.
+            (my, "SET NAMES sjis", C::ChangesAccessMode, 1),
+            (my, "SET NAMES 'gbk'", C::ChangesAccessMode, 1),
+            (my, "SET CHARACTER SET big5", C::ChangesAccessMode, 1),
+            (
+                my,
+                "SET character_set_client = gbk",
+                C::ChangesAccessMode,
+                1,
+            ),
+            (
+                my,
+                "SET collation_connection = gbk_chinese_ci",
+                C::ChangesAccessMode,
+                1,
+            ),
+            (pg, "SET client_encoding TO 'SJIS'", C::ChangesAccessMode, 1),
+            (pg, "RESET client_encoding", C::ChangesAccessMode, 1),
+            (pg, "SET client_encoding TO 'UTF-8'", C::Session, 1),
+            (pg, "SET client_encoding = UTF8", C::Session, 1),
+            (my, "SET CHARACTER SET utf8mb4", C::Session, 1),
+            (
+                my,
+                "SET collation_connection = utf8mb4_general_ci",
+                C::Session,
+                1,
+            ),
             // Harmless settings stay Session.
             (pg, "SET search_path TO app, public", C::Session, 1),
             (pg, "SET TIME ZONE 'UTC'", C::Session, 1),
