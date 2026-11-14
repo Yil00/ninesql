@@ -61,7 +61,7 @@ The mock driver (feature `mock` of `ninesql-driver-api`, engine id `mock`) decla
 | `cassandra` | Apache Cassandra | cassandra | 9042 | `cassandra` | heavy | v0.4 |
 | `neo4j` | Neo4j Community | neo4j | 7687 (Bolt) | `neo4j` | heavy | v0.4 |
 
-Ports in `dev/` are remapped to avoid clashes; [`dev/engines.json`](../dev/engines.json) is authoritative for host ports, pinned images and dev credentials. Image names, default ports and the InfluxDB 3 tag were verified in P0-C: every image above started and loaded the "nine" dataset locally ([dev/README.md](../dev/README.md)), with two caveats: YugabyteDB and Elasticsearch reached ready only with a local disk override that is not committed, and the heavy profile was not re-run as a whole after the last Cassandra changes. The dev-environment CI job has not run yet ([ROADMAP](ROADMAP.md#phase-0-follow-ups)).
+Ports in `dev/` are remapped to avoid clashes; [`dev/engines.json`](../dev/engines.json) is authoritative for host ports, pinned images and dev credentials. Image names, default ports and the InfluxDB 3 tag were verified in P0-C: every image above started and loaded the "nine" dataset locally ([dev/README.md](../dev/README.md)), and every profile, heavy included, came up healthy and seeded in CI on GitHub runners ([#2](https://github.com/Yil00/ninesql/pull/2)). In small local sandboxes YugabyteDB and Elasticsearch may need more free disk space ([dev/README.md](../dev/README.md)).
 
 ## Read-only mechanism (ADR-0007, I3)
 | Engine | Planned engine-side mechanism | Status |

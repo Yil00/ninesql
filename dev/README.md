@@ -29,7 +29,7 @@ Seeding happens on the first start of a container. It takes a few seconds (Postg
 
 To run a single engine: `docker compose -f dev/compose.yaml --profile sql up -d tidb tidb-seed`.
 
-Resources: the `sql` profile needs about 6 GB of RAM and 12 GB of disk for images. YugabyteDB refuses writes when the disk is nearly full (a few GB free), and the heavy JVM engines have fixed 1 GB heaps.
+Resources: the `sql` profile needs about 6 GB of RAM and 12 GB of disk for images. YugabyteDB refuses writes and Elasticsearch stops allocating shards when the disk is nearly full (a few GB free), and the heavy JVM engines have fixed 1 GB heaps. GitHub runners have enough room; small sandboxes may not.
 
 ## Engines, ports and dev credentials
 Every port is bound to `127.0.0.1`. Host ports are remapped so they do not clash with locally installed servers.
