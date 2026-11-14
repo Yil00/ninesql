@@ -9,10 +9,10 @@ Starting choices. Driver client crates are confirmed (or replaced) by their driv
 | Syntax | `tree-sitter` + SQL grammars per dialect | Completion from our own metadata cache |
 | Async runtime | `tokio` (multi-thread, bounded workers) for driver and network I/O | ADR-0004 |
 | Results | `arrow-array`, `arrow-schema` (not the full `arrow` crate) | Tabular batches; documents as an ordered value tree |
-| TLS | `rustls`, `rustls-platform-verifier` / `rustls-native-certs` | No OpenSSL (ADR-0011) |
-| SSH | `russh`, `russh-keys` | Jump hosts, agent, known_hosts |
-| Secrets | `secret-service` 6 (pure Rust, `zbus` 6, no `libsecret` / `libdbus` / OpenSSL; pinned `=6.0.0-rc.1` until 6.x is stable) instead of `keyring`, `argon2`, `chacha20poly1305`, `secrecy`, `zeroize` | ADR-0005, [ADR-0012](adr/0012-secret-service-client-and-msrv.md) |
-| Storage | `serde`, `serde_json`, `toml`, `directories` (XDG), `rusqlite` for history | ADR-0008 |
+| TLS | `rustls` 0.23 with the `ring` crypto provider, `tokio-rustls`, `rustls-native-certs` for the platform trust store | No OpenSSL, no `aws-lc-rs` (ADR-0011). `rustls-native-certs` pulls `openssl-probe`, which only locates the system CA files |
+| SSH | `russh` 0.65 (`ring` feature) | Jump hosts, agent, `known_hosts`; RSA disabled ([ADR-0016](adr/0016-ssh-rsa-and-host-key-policies.md)) |
+| Secrets | `secret-service` 6 (pure Rust, `zbus` 6, no `libsecret` / `libdbus` / OpenSSL; pinned `=6.0.0-rc.1` until 6.x is stable; feature off by default) instead of `keyring`; vault: `argon2` 0.6 (Argon2id) and `chacha20poly1305` 0.11 (XChaCha20-Poly1305), both with their `zeroize` feature; `secrecy`, `zeroize` | ADR-0005, [ADR-0012](adr/0012-secret-service-client-and-msrv.md) |
+| Storage | `serde`, `serde_json`, `toml`, `toml_edit` (writes `settings.toml` back keeping comments and unknown keys), `directories` (XDG), `rusqlite` for history | ADR-0008 |
 | HTTP (for HTTP-based engines) | `reqwest` with `rustls-tls`, no default features | ClickHouse, Trino, InfluxDB, Elasticsearch / OpenSearch |
 | Export formats | `csv`, `serde_json`, `parquet` (phase 10), `rust_xlsxwriter` (phase 10) | Streamed |
 | Errors / logs | `thiserror`, `tracing`, `tracing-subscriber`, `tracing-appender` | No values in logs |
@@ -20,10 +20,12 @@ Starting choices. Driver client crates are confirmed (or replaced) by their driv
 | Supply chain | `cargo-deny` (licenses, bans, sources, advisories) | Required CI check |
 | Packaging | `cargo-deb`, Flatpak, cosign, CycloneDX SBOM | ADR-0010 |
 
-## Driver clients (initial)
+## Driver clients
+Confirmed by a driver task when marked so; the others are the initial plan.
+
 | Family | Crate |
 |---|---|
-| pg-wire | `tokio-postgres`, `tokio-postgres-rustls` |
+| pg-wire (confirmed, P1-B) | `postgres-protocol` (message codec only) with `tokio` and `tokio-rustls`; SCRAM-SHA-256 and md5 implemented in the driver with `ring` and `md-5`. Not `tokio-postgres`: the driver needs `ParameterStatus` after every statement, full control of portals and cancel requests, and value cutting while rows are read ([docs/08](08-engine-capabilities.md#pgwire-postgresql-p1-b)) |
 | mysql-wire | `mysql_async` (rustls) |
 | SQLite | `rusqlite` (bundled) |
 | DuckDB | `duckdb` (bundled) |
