@@ -50,8 +50,8 @@ tempfile = "3"
 libc = "0.2"
 
 # Driver API (ADR-0004): Arrow sub-crates only, async contract.
-arrow-array = { version = "57", default-features = false }
-arrow-schema = { version = "57", default-features = false }
+arrow-array = { version = "60.1", default-features = false }
+arrow-schema = { version = "60.1", default-features = false }
 async-trait = "0.1"
 futures-core = { version = "0.3", default-features = false, features = ["std"] }
 futures-util = { version = "0.3", default-features = false, features = ["std"] }
