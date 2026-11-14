@@ -20,3 +20,6 @@ ninesql-editor.workspace = true
 [[bin]]
 name = "ninesql"
 path = "src/main.rs"
+
+[dev-dependencies]
+gpui-kit = { workspace = true, features = ["component", "assets", "tree-sitter-sql"] }
