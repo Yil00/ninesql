@@ -84,10 +84,9 @@ pub struct Loaded<D> {
 /// # Errors
 /// I/O, parse, version and migration errors. The file is never modified on error.
 pub fn load<D: Document>(path: &Path) -> Result<Option<Loaded<D>>, StorageError> {
-    let Some(bytes) = fs::read_limited(path, DEFAULT_READ_LIMIT)? else {
+    let Some(bytes) = fs::read_private(path, DEFAULT_READ_LIMIT)? else {
         return Ok(None);
     };
-    fs::ensure_private_file(path)?;
     let loaded = decode::<D>(path, &bytes)?;
     if !loaded.secret_like_keys.is_empty() {
         tracing::warn!(
@@ -98,7 +97,13 @@ pub fn load<D: Document>(path: &Path) -> Result<Option<Loaded<D>>, StorageError>
     }
     if let Some(from) = loaded.migrated_from {
         let bak = backup_path(path);
-        fs::write_atomic(&bak, &bytes)?;
+        if loaded.secret_like_keys.is_empty() {
+            fs::write_atomic(&bak, &bytes)?;
+        } else {
+            // Never copy a misplaced secret into one more file (I1): the backup keeps everything
+            // but the secret-looking keys.
+            fs::write_atomic(&bak, &scrubbed_backup::<D>(path, &bytes)?)?;
+        }
         save(path, &loaded.document)?;
         tracing::info!(
             path = %path.display(),
@@ -109,6 +114,33 @@ pub fn load<D: Document>(path: &Path) -> Result<Option<Loaded<D>>, StorageError>
         );
     }
     Ok(Some(loaded))
+}
+
+/// The original file re-encoded in its own format, without its secret-looking keys.
+fn scrubbed_backup<D: Document>(path: &Path, bytes: &[u8]) -> Result<Vec<u8>, StorageError> {
+    let err = |detail: String| StorageError::Migration {
+        path: path.to_path_buf(),
+        from: 0,
+        detail: format!("cannot write a backup without its secret-looking keys: {detail}"),
+    };
+    let mut value: Value = match D::FORMAT {
+        Format::Json => serde_json::from_slice(bytes).map_err(|_| err("unreadable".into()))?,
+        Format::Toml => std::str::from_utf8(bytes)
+            .ok()
+            .and_then(|t| toml::from_str(t).ok())
+            .ok_or_else(|| err("unreadable".into()))?,
+    };
+    hygiene::strip_secret_like_keys(&mut value);
+    match D::FORMAT {
+        Format::Json => {
+            let mut out = serde_json::to_vec_pretty(&value).map_err(|e| err(e.to_string()))?;
+            out.push(b'\n');
+            Ok(out)
+        }
+        Format::Toml => toml::to_string_pretty(&value)
+            .map(String::into_bytes)
+            .map_err(|e| err(e.to_string())),
+    }
 }
 
 /// Saves a document atomically with its `schema_version`. The parent directory must exist.
@@ -250,31 +282,46 @@ impl<D: Serialize> Serialize for Envelope<'_, D> {
     }
 }
 
-/// Replaces double-quoted literals in a parser message by `"…"`, so a misplaced secret in the
-/// file never reaches an error message or a log.
-fn redact(message: &str) -> String {
+/// Redacts quoted text in a parser message so a misplaced secret in the file never reaches an
+/// error message or a log (I1):
+/// - double-quoted literals (`invalid type: string "…"`) are always replaced by `"…"`;
+/// - backtick-quoted text is replaced by `` `…` `` unless it is a key name (right after
+///   `field`) or part of the schema's expectation list (after `expected`), which only hold names
+///   from NineSQL's own models.
+pub fn redact(message: &str) -> String {
     let mut out = String::with_capacity(message.len());
-    let mut in_quotes = false;
-    let mut escaped = false;
-    for c in message.chars() {
-        if in_quotes {
-            if escaped {
-                escaped = false;
-            } else if c == '\\' {
-                escaped = true;
-            } else if c == '"' {
-                in_quotes = false;
-                out.push_str("…\"");
+    let mut chars = message.char_indices().peekable();
+    while let Some((i, c)) = chars.next() {
+        match c {
+            '"' => {
+                let mut escaped = false;
+                for (_, d) in chars.by_ref() {
+                    if escaped {
+                        escaped = false;
+                    } else if d == '\\' {
+                        escaped = true;
+                    } else if d == '"' {
+                        break;
+                    }
+                }
+                out.push_str("\"…\"");
             }
-        } else {
-            out.push(c);
-            if c == '"' {
-                in_quotes = true;
+            '`' => {
+                let before = &message[..i];
+                let keep = before.trim_end().ends_with("field") || before.contains("expected");
+                let mut inner = String::new();
+                for (_, d) in chars.by_ref() {
+                    if d == '`' {
+                        break;
+                    }
+                    inner.push(d);
+                }
+                out.push('`');
+                out.push_str(if keep { &inner } else { "…" });
+                out.push('`');
             }
+            _ => out.push(c),
         }
-    }
-    if in_quotes {
-        out.push_str("…\"");
     }
     out
 }
@@ -293,6 +340,19 @@ mod tests {
         assert_eq!(redact(r#"a "b\"c" d"#), r#"a "…" d"#);
         assert_eq!(redact(r#"open "abc"#), r#"open "…""#);
         assert_eq!(redact("unknown field `x`"), "unknown field `x`");
+        assert_eq!(
+            redact("unknown variant `Hunter2-Secret`, expected one of `tcp`, `file`"),
+            "unknown variant `…`, expected one of `tcp`, `file`"
+        );
+        assert_eq!(
+            redact("invalid engine identifier `Hunter2-Secret`"),
+            "invalid engine identifier `…`"
+        );
+        assert_eq!(
+            redact("missing field `connection_type`"),
+            "missing field `connection_type`"
+        );
+        assert_eq!(redact("open `abc"), "open `…`");
     }
 
     #[test]

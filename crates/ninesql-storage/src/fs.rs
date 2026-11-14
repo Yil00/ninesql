@@ -40,12 +40,23 @@ pub fn ensure_private_dir(dir: &Path) -> Result<(), StorageError> {
 }
 
 /// Removes group / other bits from an existing NineSQL file, if any (a warning is logged).
+/// Symbolic links are refused, never followed: NineSQL does not chmod a file it does not own.
 ///
 /// # Errors
-/// I/O errors.
+/// I/O errors, [`StorageError::WrongFileType`] for a symbolic link or a non-regular file.
 pub fn ensure_private_file(file: &Path) -> Result<(), StorageError> {
-    let meta = fs::metadata(file).map_err(|e| StorageError::io(file, e))?;
+    let meta = fs::symlink_metadata(file).map_err(|e| StorageError::io(file, e))?;
+    if !meta.file_type().is_file() {
+        return Err(not_regular(file));
+    }
     restrict_mode(file, meta.permissions().mode(), FILE_MODE)
+}
+
+fn not_regular(path: &Path) -> StorageError {
+    StorageError::WrongFileType {
+        path: path.to_path_buf(),
+        expected: "regular file (symbolic links, FIFOs and devices are refused)",
+    }
 }
 
 fn restrict_mode(path: &Path, current: u32, wanted: u32) -> Result<(), StorageError> {
@@ -83,7 +94,13 @@ pub fn write_atomic(path: &Path, bytes: &[u8]) -> Result<(), StorageError> {
         let _ = fs::remove_file(&tmp_path);
         return Err(StorageError::io(path, e));
     }
-    sync_dir(dir)
+    // The new content is in place once `rename` returns. A failed directory `fsync` only weakens
+    // durability across a power loss; reporting it as an error would make callers roll back
+    // state (for example stored secrets) that the new file already references.
+    if let Err(e) = sync_dir(dir) {
+        tracing::warn!(dir = %dir.display(), error = %e, "directory fsync failed after an atomic write");
+    }
+    Ok(())
 }
 
 fn parent_dir(path: &Path) -> &Path {
@@ -133,26 +150,80 @@ fn sync_dir(dir: &Path) -> Result<(), StorageError> {
 /// Reads a whole file, refusing files larger than `limit` bytes. Returns `None` if the file does
 /// not exist.
 ///
+/// The last path component is never followed if it is a symbolic link, and the file is opened
+/// non-blocking, so a FIFO or a device planted in place of a workspace file cannot hang or trick
+/// NineSQL.
+///
 /// # Errors
-/// I/O errors, [`StorageError::WrongFileType`] for a non-regular file,
+/// I/O errors, [`StorageError::WrongFileType`] for anything but a regular file,
 /// [`StorageError::TooLarge`].
 pub fn read_limited(path: &Path, limit: u64) -> Result<Option<Vec<u8>>, StorageError> {
-    let file = match File::open(path) {
+    open_regular(path)?
+        .map(|file| read_file(path, file, limit))
+        .transpose()
+}
+
+/// [`read_limited`], and removes group / other permission bits from the file through the open
+/// descriptor (never through a path that could be swapped for a symbolic link).
+///
+/// # Errors
+/// See [`read_limited`].
+pub fn read_private(path: &Path, limit: u64) -> Result<Option<Vec<u8>>, StorageError> {
+    let Some(file) = open_regular(path)? else {
+        return Ok(None);
+    };
+    let mode = file
+        .metadata()
+        .map_err(|e| StorageError::io(path, e))?
+        .permissions()
+        .mode();
+    if mode & GROUP_OTHER != 0 {
+        tracing::warn!(
+            path = %path.display(),
+            mode = format_args!("{:o}", mode & 0o7777),
+            "tightening permissions of a NineSQL file"
+        );
+        file.set_permissions(fs::Permissions::from_mode(FILE_MODE))
+            .map_err(|e| StorageError::io(path, e))?;
+    }
+    read_file(path, file, limit).map(Some)
+}
+
+/// Opens a regular file without following a final symbolic link and without blocking.
+fn open_regular(path: &Path) -> Result<Option<File>, StorageError> {
+    match fs::symlink_metadata(path) {
+        Ok(meta) if !meta.file_type().is_file() => return Err(not_regular(path)),
+        Ok(_) => {}
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(StorageError::io(path, e)),
+    }
+    let file = match OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC)
+        .open(path)
+    {
         Ok(f) => f,
         Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
+        // Swapped for a symbolic link between the check and the open.
+        Err(e) if e.raw_os_error() == Some(libc::ELOOP) => return Err(not_regular(path)),
         Err(e) => return Err(StorageError::io(path, e)),
     };
     let meta = file.metadata().map_err(|e| StorageError::io(path, e))?;
     if !meta.is_file() {
-        return Err(StorageError::WrongFileType {
-            path: path.to_path_buf(),
-            expected: "regular file",
-        });
+        return Err(not_regular(path));
     }
-    if meta.len() > limit {
+    Ok(Some(file))
+}
+
+fn read_file(path: &Path, file: File, limit: u64) -> Result<Vec<u8>, StorageError> {
+    let size = file
+        .metadata()
+        .map_err(|e| StorageError::io(path, e))?
+        .len();
+    if size > limit {
         return Err(StorageError::TooLarge {
             path: path.to_path_buf(),
-            size: meta.len(),
+            size,
             limit,
         });
     }
@@ -168,7 +239,7 @@ pub fn read_limited(path: &Path, limit: u64) -> Result<Option<Vec<u8>>, StorageE
             limit,
         });
     }
-    Ok(Some(buf))
+    Ok(buf)
 }
 
 #[cfg(test)]
@@ -260,8 +331,47 @@ mod tests {
         ));
         assert!(matches!(
             read_limited(tmp.path(), 10),
-            Err(StorageError::WrongFileType { .. }) | Err(StorageError::Io { .. })
+            Err(StorageError::WrongFileType { .. })
         ));
+    }
+
+    #[test]
+    fn symlinks_and_fifos_are_refused_without_blocking() {
+        let tmp = tempfile::tempdir().unwrap();
+        let real = tmp.path().join("real");
+        fs::write(&real, b"x").unwrap();
+        fs::set_permissions(&real, fs::Permissions::from_mode(0o644)).unwrap();
+        let link = tmp.path().join("link");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        assert!(matches!(
+            read_private(&link, 10),
+            Err(StorageError::WrongFileType { .. })
+        ));
+        assert!(matches!(
+            ensure_private_file(&link),
+            Err(StorageError::WrongFileType { .. })
+        ));
+        // The link target was not chmod-ed through the link.
+        assert_eq!(mode(&real), 0o644);
+
+        let fifo = tmp.path().join("fifo");
+        let status = std::process::Command::new("mkfifo").arg(&fifo).status();
+        if status.is_ok_and(|s| s.success()) {
+            assert!(matches!(
+                read_limited(&fifo, 10),
+                Err(StorageError::WrongFileType { .. })
+            ));
+        }
+    }
+
+    #[test]
+    fn read_private_tightens_through_the_descriptor() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("f");
+        fs::write(&path, b"abc").unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
+        assert_eq!(read_private(&path, 10).unwrap().unwrap(), b"abc");
+        assert_eq!(mode(&path), FILE_MODE);
     }
 
     proptest! {

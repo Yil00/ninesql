@@ -303,3 +303,25 @@ proptest! {
         prop_assert_eq!(back.document, doc);
     }
 }
+
+#[test]
+fn migration_backup_drops_secret_like_keys() {
+    let tmp = tempfile::tempdir().unwrap();
+    let path = tmp.path().join("sample.json");
+    let content = br#"{ "schema_version": 1, "items": [
+        { "host": "h", "port": 1, "password": "Hunter2-Secret", "note": "kept" } ] }"#;
+    fs::write(&path, content).unwrap();
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+    let loaded = document::load::<Sample>(&path).unwrap().unwrap();
+    assert_eq!(loaded.migrated_from, Some(1));
+    assert_eq!(loaded.secret_like_keys, ["items[0].password"]);
+    let bak = fs::read_to_string(backup_path(&path)).unwrap();
+    assert!(!bak.contains("Hunter2-Secret"), "{bak}");
+    assert!(bak.contains("\"note\": \"kept\""), "{bak}");
+    assert!(bak.contains("\"schema_version\": 1"), "{bak}");
+    assert!(
+        !fs::read_to_string(&path)
+            .unwrap()
+            .contains("Hunter2-Secret")
+    );
+}

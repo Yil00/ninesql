@@ -422,6 +422,7 @@ version = "0.0.0"
 name = "ninesql-storage"
 version = "0.0.0"
 dependencies = [
+ "libc",
  "proptest",
  "serde",
  "serde_json",

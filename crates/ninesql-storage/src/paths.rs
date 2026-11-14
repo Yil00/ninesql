@@ -232,9 +232,7 @@ impl ProjectName {
         if valid {
             Ok(Self(name))
         } else {
-            Err(StorageError::InvalidProjectName(
-                name.escape_debug().to_string(),
-            ))
+            Err(StorageError::InvalidProjectName)
         }
     }
 

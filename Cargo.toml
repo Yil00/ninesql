@@ -45,6 +45,7 @@ zeroize = "1"
 secret-service = { version = "=6.0.0-rc.1", default-features = false, features = ["rt-default", "crypto-rust"] }
 proptest = "1"
 tempfile = "3"
+libc = "0.2"
 
 # GPUI and gpui-component are pinned to one git revision pair in P0-A (ADR-0001), e.g.:
 # gpui = { git = "https://github.com/zed-industries/zed", rev = "<sha>" }

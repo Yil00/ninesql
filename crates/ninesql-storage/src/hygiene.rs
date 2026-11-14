@@ -41,6 +41,20 @@ pub fn find_secret_like_keys(value: &Value) -> Vec<String> {
     found
 }
 
+/// Removes every key that [`find_secret_like_keys`] would report, in place.
+pub fn strip_secret_like_keys(value: &mut Value) {
+    match value {
+        Value::Object(map) => {
+            map.retain(|key, child| {
+                !(matches!(child, Value::String(s) if !s.is_empty()) && is_secret_like_key(key))
+            });
+            map.values_mut().for_each(strip_secret_like_keys);
+        }
+        Value::Array(items) => items.iter_mut().for_each(strip_secret_like_keys),
+        _ => {}
+    }
+}
+
 fn walk(value: &Value, path: &mut String, found: &mut Vec<String>) {
     match value {
         Value::Object(map) => {
@@ -96,5 +110,10 @@ mod tests {
                 "pwd",
             ]
         );
+        let mut stripped = v.clone();
+        strip_secret_like_keys(&mut stripped);
+        assert!(find_secret_like_keys(&stripped).is_empty());
+        assert_eq!(stripped["compass"], "north");
+        assert_eq!(stripped["connections"][0]["auth"]["method"], "password");
     }
 }
