@@ -683,6 +683,20 @@ mod tests {
 
     use super::*;
 
+    /// Takes one unit from `counter` if it is above zero. Written with
+    /// `compare_exchange` so it builds on every supported toolchain
+    /// (`fetch_update` is deprecated on newer ones, `try_update` is too new for the MSRV).
+    fn take_one(counter: &std::sync::atomic::AtomicUsize) -> bool {
+        let mut current = counter.load(Ordering::SeqCst);
+        while let Some(next) = current.checked_sub(1) {
+            match counter.compare_exchange(current, next, Ordering::SeqCst, Ordering::SeqCst) {
+                Ok(_) => return true,
+                Err(seen) => current = seen,
+            }
+        }
+        false
+    }
+
     /// Records the triggers it receives; panics on the first call when asked to.
     #[derive(Default)]
     struct Recorder {
@@ -798,13 +812,7 @@ mod tests {
                             continue;
                         }
                         match h.member().map(|m| m.as_str().to_owned()).as_deref() {
-                            Some("Inhibit")
-                                if refusals
-                                    .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| {
-                                        n.checked_sub(1)
-                                    })
-                                    .is_ok() =>
-                            {
+                            Some("Inhibit") if take_one(&refusals) => {
                                 c.reply_error(
                                     &h,
                                     "org.freedesktop.DBus.Error.AccessDenied",
