@@ -295,7 +295,8 @@ pub enum RunEnd {
 #[derive(Clone, Debug, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct RunSummary {
-    /// Items in the text (statements and client directives).
+    /// Items in the text (statements and client directives), as split last: after a
+    /// statement that may change the lexical modes, the rest of the text is split again.
     pub statements: usize,
     /// Statements sent.
     pub executed: usize,
@@ -313,7 +314,9 @@ pub struct RunSummary {
 
 /// Event of one run. Exactly one [`RunEvent::Done`] ends it. `index` is the 0-based index of
 /// the item in the request text as the dialect splits it (client directives, never sent, keep
-/// their index, so indexes are stable for [`RunRequest::resume_at`]).
+/// their index, so indexes are stable for [`RunRequest::resume_at`]). After a `Session` or
+/// `ChangesAccessMode` statement the rest of the text is split again with the session's lexical
+/// modes as they are then (review H2), so the indexes that follow come from that split.
 #[derive(Debug)]
 #[non_exhaustive]
 pub enum RunEvent {
@@ -653,6 +656,8 @@ impl ExecutionService {
     ///
     /// # Errors
     /// [`CoreError::NoDriver`] when no driver serves `engine`.
+    /// Uses the engine's default lexical modes (no session): [`SessionHandle::dialect`] gives
+    /// the modes of an open session.
     pub fn split(&self, engine: &EngineId, text: &str) -> Result<Vec<StatementSpan>, CoreError> {
         Ok(self
             .inner
@@ -692,11 +697,9 @@ impl ExecutionService {
             control: Arc::clone(&control),
             started: Instant::now(),
         };
-        let dialect = self
-            .inner
-            .manager
-            .registry()
-            .dialect(&session.info().engine);
+        // The session's own dialect: drivers keep its lexical rules in sync with the session's
+        // modes (`standard_conforming_strings`, `NO_BACKSLASH_ESCAPES`).
+        let dialect = Ok(session.dialect());
         self.inner.manager.runtime().spawn(async move {
             job.run(request, dialect, &prefs).await;
         });
@@ -744,18 +747,30 @@ struct ScriptItem {
 
 /// The items of `text` for `dialect`.
 ///
+/// Splits `text[from..]` (`from` on a `char` boundary, the end of the statement that ran last)
+/// and returns spans absolute in `text`: the execution service splits the rest of a script
+/// again after a statement that may change the lexical modes (review H2).
+///
 /// INTEGRATION POINT (P3-D, `feat/p3-d-dialects`): replace the body with
-/// `dialect.split_script(text)`, mapping `ScriptItemKind::Statement` to
+/// `dialect.split_script(&text[from..])` (shifting every span by `from`), mapping `ScriptItemKind::Statement` to
 /// [`ItemKind::Statement`], `ClientDirective` to [`ItemKind::ClientDirective`], `Refused(_)`
 /// and any future kind to [`ItemKind::Refused`] (fail-closed), and compute error positions with
 /// `LineIndex::new(text).position(item.span.start + offset)` in [`error_position`]. Until then
 /// every span of `split_statements` is a statement.
-fn script_items(dialect: &dyn ninesql_driver_api::Dialect, text: &str) -> Vec<ScriptItem> {
+fn script_items(
+    dialect: &dyn ninesql_driver_api::Dialect,
+    text: &str,
+    from: usize,
+) -> Vec<ScriptItem> {
+    let rest = text.get(from..).unwrap_or("");
     dialect
-        .split_statements(text)
+        .split_statements(rest)
         .into_iter()
         .map(|span| ScriptItem {
-            span,
+            span: StatementSpan {
+                start: span.start + from,
+                end: span.end + from,
+            },
             kind: ItemKind::Statement,
         })
         .collect()
@@ -888,6 +903,19 @@ struct RunJob {
     started: Instant,
 }
 
+/// One statement of a run, as [`RunJob::statement`] runs it.
+#[derive(Clone, Copy)]
+struct Step {
+    /// Item index.
+    index: usize,
+    /// Absolute span in the request text.
+    span: StatementSpan,
+    /// The last statement of the text (a paged result stays open).
+    last: bool,
+    /// Classified as a read just before it runs (only reads are paged or released).
+    is_read: bool,
+}
+
 /// What one statement did.
 enum StatementEnd {
     Finished,
@@ -934,11 +962,11 @@ impl RunJob {
             Ok(d) => d,
             Err(e) => return self.refuse(e, 0),
         };
-        let items = script_items(&*dialect, &request.text);
-        let total = items.len();
-        let last_statement = match check_items(&items, request.kind, !request.params.is_empty()) {
+        let mut items = script_items(&*dialect, &request.text, 0);
+        let mut last_statement = match check_items(&items, request.kind, !request.params.is_empty())
+        {
             Ok(last) => last,
-            Err(e) => return self.refuse(e, total),
+            Err(e) => return self.refuse(e, items.len()),
         };
         let info = self.session.info().clone();
         let timeout = match request.timeout {
@@ -949,12 +977,19 @@ impl RunJob {
         let budget = request.budget.unwrap_or_else(|| prefs.execution.budget());
         let on_error = request.on_error.unwrap_or(prefs.execution.on_error);
 
-        let _ = self.out.send(RunEvent::Started { statements: total }).await;
+        let _ = self
+            .out
+            .send(RunEvent::Started {
+                statements: items.len(),
+            })
+            .await;
         let (mut executed, mut succeeded, mut failed) = (0usize, 0usize, 0usize);
         let mut end = RunEnd::Completed;
-        for (index, item) in items.iter().enumerate().skip(request.start_at) {
+        let mut index = request.start_at;
+        while let Some(item) = items.get(index).copied() {
             let span = &item.span;
             if item.kind != ItemKind::Statement {
+                index += 1;
                 // Client directives are never sent.
                 continue;
             }
@@ -974,19 +1009,20 @@ impl RunJob {
                 exec_request = exec_request.confirmed(token);
             }
             let last = index == last_statement;
-            // Only reads may be paused and released: a release is a server-side cancel, which
-            // would roll back a write (`DELETE … RETURNING`, `CALL`, DML in a transaction).
-            let is_read = dialect.classify(&text) == StatementClass::Read;
+            // Classified now, with the lexical modes in force now (review H2); the session task
+            // classifies it again for the confirmation, at the moment it sends it. Only reads
+            // may be paused and released: a release is a server-side cancel, which would roll
+            // back a write (`DELETE … RETURNING`, `CALL`, DML in a transaction).
+            let class = dialect.classify(&text);
+            let is_read = class == StatementClass::Read;
+            let step = Step {
+                index,
+                span: *span,
+                last,
+                is_read,
+            };
             let outcome = self
-                .statement(
-                    index,
-                    *span,
-                    &request,
-                    exec_request,
-                    &info.engine,
-                    last,
-                    is_read,
-                )
+                .statement(step, &request, exec_request, &info.engine)
                 .await;
             match outcome {
                 StatementEnd::Finished | StatementEnd::Closed => {
@@ -1017,8 +1053,42 @@ impl RunJob {
                     }
                 }
             }
+            // A session statement may have changed the lexical modes (review H2): the rest of
+            // the script is split again, from the end of this statement, with the session's
+            // dialect as it is now. Offsets stay absolute.
+            if matches!(
+                class,
+                StatementClass::Session | StatementClass::ChangesAccessMode
+            ) {
+                let rest = script_items(&*dialect, &request.text, span.end);
+                items.truncate(index + 1);
+                items.extend(rest);
+                if items
+                    .iter()
+                    .skip(index + 1)
+                    .any(|i| i.kind == ItemKind::Refused)
+                {
+                    // The re-split found something a script cannot run: stop before it.
+                    let next = index + 1;
+                    let _ = self.out.events.try_send(RunEvent::StatementFailed {
+                        index: next,
+                        error: CoreError::InvalidRequest(
+                            "the script holds a statement that cannot run as part of a script",
+                        ),
+                        position: None,
+                        elapsed: Duration::ZERO,
+                    });
+                    end = RunEnd::Refused;
+                    break;
+                }
+                last_statement = items
+                    .iter()
+                    .rposition(|i| i.kind == ItemKind::Statement)
+                    .unwrap_or(index);
+            }
+            index += 1;
         }
-        let summary = self.summary(total, (executed, succeeded, failed), end);
+        let summary = self.summary(items.len(), (executed, succeeded, failed), end);
         self.out.done(summary);
     }
 
@@ -1027,14 +1097,17 @@ impl RunJob {
     #[allow(clippy::too_many_lines)] // One state machine; split, it would be harder to follow.
     async fn statement(
         &mut self,
-        index: usize,
-        span: StatementSpan,
+        step: Step,
         request: &RunRequest,
         exec_request: ExecuteRequest,
         engine: &EngineId,
-        last: bool,
-        is_read: bool,
     ) -> StatementEnd {
+        let Step {
+            index,
+            span,
+            last,
+            is_read,
+        } = step;
         let params = exec_request.params.len();
         let text = exec_request.text.clone();
         let timeout = exec_request.timeout;
@@ -1301,6 +1374,21 @@ mod tests {
 
     fn span(start: usize, end: usize) -> StatementSpan {
         StatementSpan { start, end }
+    }
+
+    /// Review H2: the rest of a script is split from an offset, spans stay absolute.
+    #[test]
+    fn script_items_split_the_rest_with_absolute_offsets() {
+        let d = ninesql_driver_api::AnsiDialect;
+        let text = "SET x = 1;\nSELECT 1;\nSELECT 2";
+        let all = script_items(&d, text, 0);
+        assert_eq!(all.len(), 3);
+        let rest = script_items(&d, text, all[0].span.end);
+        assert_eq!(rest.len(), 2);
+        assert_eq!(rest[0].span.text(text), "SELECT 1");
+        assert_eq!(rest[1].span.text(text), "SELECT 2");
+        assert!(script_items(&d, text, text.len()).is_empty());
+        assert!(script_items(&d, text, text.len() + 5).is_empty());
     }
 
     #[test]

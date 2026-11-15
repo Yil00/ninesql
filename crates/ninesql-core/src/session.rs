@@ -1296,10 +1296,8 @@ async fn reconnect_loop(
         deadline: tokio::time::Instant,
     ) -> Interrupted {
         let lock = async {
-            if watch_locks {
-                if locks.changed().await.is_ok() {
-                    return;
-                }
+            if watch_locks && locks.changed().await.is_ok() {
+                return;
             }
             std::future::pending::<()>().await;
         };
@@ -1678,6 +1676,7 @@ async fn open_session(
                 auto_commit: session.auto_commit(),
                 in_transaction: session.in_transaction(),
             }),
+            dialect: session.dialect(),
             // One slot more than configured: the terminal event's reserved slot.
             result_queue: shared.config.result_queue.max(1) + 1,
         }),
@@ -2031,6 +2030,8 @@ struct HandleInner {
     current: Mutex<Option<CancelToken>>,
     /// Last known transaction state, updated by the session task after every command.
     tx_state: Mutex<TransactionState>,
+    /// The session's dialect, kept in sync by the driver with the session's lexical modes.
+    dialect: Arc<dyn ninesql_driver_api::Dialect>,
     result_queue: usize,
 }
 
@@ -2138,6 +2139,14 @@ impl SessionHandle {
     /// Liveness check.
     pub fn ping(&self) -> Reply<Result<TransactionState, CoreError>> {
         self.transaction(TxOp::Ping)
+    }
+
+    /// The session's dialect ([`Session::dialect`]): drivers keep its lexical rules in sync
+    /// with the session's modes (`standard_conforming_strings`, `NO_BACKSLASH_ESCAPES`), so a
+    /// split or a classification made with it follows the modes in force when it is made.
+    #[must_use]
+    pub fn dialect(&self) -> Arc<dyn ninesql_driver_api::Dialect> {
+        Arc::clone(&self.inner.dialect)
     }
 
     /// The last known transaction state (F-SQL-07), updated after every statement and

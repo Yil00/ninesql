@@ -223,6 +223,56 @@ fn big_select_streams_first_rows_fast_and_cancels_and_production_deletes_ask() {
             Some("0"),
             "the DELETE was not rolled back"
         );
+        // Review H2: after `SET standard_conforming_strings = off`, `\'` escapes the quote, so
+        // the rest of the script is one SELECT of a string. Split up front (with the mode on),
+        // it would have been a SELECT and a DROP TABLE.
+        let (_, end) = collect_all(exec.run(
+            &h,
+            RunRequest::statement("CREATE TEMP TABLE p3c_canary (i int)"),
+        ))
+        .await;
+        assert_eq!(end, RunEnd::Completed);
+        let script =
+            "SET standard_conforming_strings = off;\nSELECT 'a\\'; DROP TABLE p3c_canary; --' AS v";
+        let mut run = exec.run(&h, RunRequest::script(script));
+        let mut started = 0;
+        let mut value = None;
+        let summary = loop {
+            match tokio::time::timeout(Duration::from_secs(30), run.next())
+                .await
+                .unwrap()
+            {
+                Some(RunEvent::StatementStarted { .. }) => started += 1,
+                Some(RunEvent::Item {
+                    index: 1,
+                    item: ResultItem::Rows(b),
+                }) if b.num_rows() > 0 => {
+                    value = b
+                        .column(0)
+                        .as_any()
+                        .downcast_ref::<StringArray>()
+                        .map(|c| c.value(0).to_owned());
+                }
+                Some(RunEvent::Done(s)) => break s,
+                Some(_) => {}
+                None => panic!("no Done"),
+            }
+        };
+        assert_eq!(summary.end, RunEnd::Completed, "{summary:?}");
+        assert_eq!(
+            started, 2,
+            "the DROP TABLE was never a statement of its own"
+        );
+        assert_eq!(summary.statements, 2);
+        assert_eq!(value.as_deref(), Some("a'; DROP TABLE p3c_canary; --"));
+        let (events, end) =
+            collect_all(exec.run(&h, RunRequest::statement("SELECT count(*) FROM p3c_canary")))
+                .await;
+        assert_eq!(
+            end,
+            RunEnd::Completed,
+            "the canary table still exists: {events:?}"
+        );
         h.close().await.unwrap().unwrap();
 
         // Production: manual commit, and a DELETE without WHERE asks first.
