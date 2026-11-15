@@ -1299,6 +1299,11 @@ impl Render for ConnectionDialog {
                 ))
             });
         let init_sql = self.form.existing.as_ref().map_or(0, |c| c.init_sql.len());
+        let init_sql_unconfirmed = self
+            .form
+            .existing
+            .as_ref()
+            .is_some_and(|c| c.init_sql_needs_confirmation);
 
         let test_status: Option<(SharedString, Hsla)> = match &self.test {
             TestState::Idle => None,
@@ -1366,9 +1371,16 @@ impl Render for ConnectionDialog {
             .child(read_only_row)
             .child(field("Folder", Input::new(&self.folder)))
             .when(init_sql > 0, |el| {
-                el.child(div().text_xs().text_color(muted).child(format!(
-                    "{init_sql} init SQL statement(s), kept as imported; they are confirmed at connect when the type asks for it."
-                )))
+                let text = if init_sql_unconfirmed {
+                    format!(
+                        "{init_sql} init SQL statement(s), imported and not confirmed yet; NineSQL asks you to confirm them at the next connect."
+                    )
+                } else {
+                    format!(
+                        "{init_sql} init SQL statement(s), kept as imported; they are confirmed at connect when the type asks for it."
+                    )
+                };
+                el.child(div().id("init-sql-summary").text_xs().text_color(muted).child(text))
             })
             .children(notices.iter().enumerate().map(|(i, n)| {
                 let color = match n.severity {

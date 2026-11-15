@@ -1607,3 +1607,128 @@ fn hub_flows_leave_no_secret_in_files_or_logs(cx: &mut TestAppContext) {
         assert!(!logs.contains(s), "a log event holds a secret");
     }
 }
+
+// ---------------------------------------------------------------------------------------------
+// Imported init SQL marker (`Connection::init_sql_needs_confirmation`).
+
+#[gpui::test]
+fn imported_init_sql_is_flagged_confirmed_and_cleared_in_the_hub(cx: &mut TestAppContext) {
+    let tmp = tempfile::tempdir().unwrap_or_else(|e| panic!("{e}"));
+    // A dev type confirms nothing by itself: only the marker asks.
+    let mut c = mock_connection("Imported", ConnectionTypeId::dev(), Auth::None);
+    c.init_sql = vec!["SET search_path TO app".into()];
+    c.init_sql_needs_confirmation = true;
+    let id = c.id;
+    let hub = mock_hub(cx, tmp.path(), vec![c]);
+    assert!(hub.read_with(cx, |h, _| h.init_sql_marker(id)));
+    let (ws, mut vcx) = open_live(cx);
+    ws.update_in(&mut vcx, |ws, window, cx| {
+        ws.connect(id, Purpose::Open, window, cx)
+    });
+    let flow = ws.read_with(&vcx, |ws, _| ws.flow().clone());
+    wait_until(&mut vcx, |vcx| {
+        matches!(
+            flow.read_with(vcx, |f, _| f.prompt().clone()),
+            PendingPrompt::InitSql(_)
+        )
+    });
+    let PendingPrompt::InitSql(view) = flow.read_with(&vcx, |f, _| f.prompt().clone()) else {
+        panic!("init SQL prompt");
+    };
+    assert!(view.imported, "the dialog shows the imported notice");
+    assert!(!view.production);
+    let flag = view.rows[0].flag.clone().unwrap_or_default();
+    assert!(flag.contains("imported and not confirmed yet"), "{flag}");
+    assert!(!flag.contains("connection type"), "{flag}");
+    vcx.update(|window, cx| flow.update(cx, |f, cx| f.confirm_init_sql(window, cx)));
+    wait_until(&mut vcx, |vcx| {
+        hub.read_with(vcx, |h, _| h.is_open(id) && !h.init_sql_marker(id))
+    });
+    let copy = hub.read_with(&vcx, |h, _| h.connection(id).cloned());
+    assert_eq!(
+        copy.map(|c| c.init_sql_needs_confirmation),
+        Some(false),
+        "the hub's copy follows ImportedInitSqlConfirmed"
+    );
+}
+
+fn imported_pg(name: &str) -> Connection {
+    let engine = EngineId::new("postgresql").unwrap_or_else(|e| panic!("{e}"));
+    let mut c = Connection::new(
+        name,
+        engine,
+        Endpoint::Tcp {
+            host: "db.example.test".into(),
+            port: None,
+            database: None,
+        },
+        Auth::Username {
+            username: "app".into(),
+        },
+        ConnectionTypeId::dev(),
+    );
+    c.init_sql = vec!["SET search_path TO app".into()];
+    c
+}
+
+#[gpui::test]
+fn edits_keep_the_imported_marker_and_never_set_it(cx: &mut TestAppContext) {
+    use super::form::ConnectionForm;
+
+    let marked = {
+        let mut c = imported_pg("Imported");
+        c.init_sql_needs_confirmation = true;
+        c
+    };
+    let plain = imported_pg("Plain");
+    let (marked_id, plain_id) = (marked.id, plain.id);
+    let mut config = HubConfig::empty();
+    config.registry = shipped();
+    config.connections = ninesql_core::Connections::from_vec(vec![marked.clone(), plain.clone()])
+        .unwrap_or_else(|e| panic!("{e}"));
+    let hub = init(cx, config);
+
+    // An edit keeps the marker and the init SQL.
+    let mut edit = ConnectionForm::from_connection(&marked);
+    edit.name = "Imported, renamed".into();
+    let saved = save_form(cx, &hub, &edit, vec![]).unwrap_or_else(|e| panic!("{e}"));
+    assert_eq!(saved.name, "Imported, renamed");
+    assert!(
+        saved.init_sql_needs_confirmation,
+        "an edit keeps the marker"
+    );
+    assert_eq!(saved.init_sql, marked.init_sql);
+
+    // An edit never sets it; neither does a duplicate.
+    let mut edit = ConnectionForm::from_connection(&plain);
+    edit.name = "Plain, renamed".into();
+    let saved = save_form(cx, &hub, &edit, vec![]).unwrap_or_else(|e| panic!("{e}"));
+    assert!(!saved.init_sql_needs_confirmation);
+    let copy = save_form(cx, &hub, &ConnectionForm::duplicate_of(&marked), vec![])
+        .unwrap_or_else(|e| panic!("{e}"));
+    assert_ne!(copy.id, marked_id);
+    assert!(
+        !copy.init_sql_needs_confirmation,
+        "a duplicate is not imported"
+    );
+    assert!(!hub.read_with(cx, |h, _| h.init_sql_marker(plain_id)));
+
+    // The core reports the confirmation: the hub clears its copy, and a form opened before it
+    // does not bring the marker back.
+    let stale = ConnectionForm::from_connection(&marked);
+    hub.update(cx, |h, cx| {
+        h.on_core_event(
+            ninesql_core::CoreEvent::ImportedInitSqlConfirmed {
+                connection: marked_id,
+            },
+            cx,
+        );
+    });
+    assert!(!hub.read_with(cx, |h, _| h.init_sql_marker(marked_id)));
+    let saved = save_form(cx, &hub, &stale, vec![]).unwrap_or_else(|e| panic!("{e}"));
+    assert!(
+        !saved.init_sql_needs_confirmation,
+        "a stale form does not re-set the marker"
+    );
+    assert_eq!(saved.init_sql, marked.init_sql, "the init SQL is kept");
+}
