@@ -718,3 +718,436 @@ async fn run(session: &mut dyn Session, sql: &str) -> Result<(), DriverError> {
     }
     Ok(())
 }
+
+// ---------------------------------------------------------------------------------------------
+// Classification corpus and script-splitting invariants (P3-D, ADR-0007)
+
+/// The shared classification corpus (`tests/corpus/classification.txt`): statements with their
+/// expected class per dialect. Every driver runs it with [`assert_classification_corpus`].
+///
+/// Format: a case starts with a `## <name>` line, followed by header lines and the statement:
+/// - `expect: <key>=<class> …` (required): keys `all`, `my` (MySQL and MariaDB), `pg`,
+///   `mysql`, `mariadb`, `sqlite`, the most specific key winning; a class is a
+///   [`StatementClass`] variant name (`Destructive`), `>=<variant>` (at least that class) or
+///   `skip` (not applicable);
+/// - `modes: <mode> …` (optional): lexical session modes the dialect must be built with
+///   (`no_backslash_escapes`, `ansi_quotes`, `scs_off`);
+/// - `escapes: yes` (optional): `\r`, `\n`, `\t`, `\\` and `\u{…}` in the statement are decoded.
+///
+/// Every following line up to the next `## ` line is the statement (trailing blank lines
+/// removed). Lines starting with `%%` are corpus comments, anywhere (a `#` line is statement
+/// text: a MySQL comment).
+pub const CLASSIFICATION_CORPUS: &str = include_str!("../tests/corpus/classification.txt");
+
+/// Dialect keys of the corpus.
+pub const CORPUS_DIALECTS: &[&str] = &["pg", "mysql", "mariadb", "sqlite"];
+
+/// The expected class of a corpus case for one dialect.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Expectation {
+    /// Exactly this class.
+    Exactly(StatementClass),
+    /// This class or a riskier one.
+    AtLeast(StatementClass),
+    /// Not applicable to the dialect.
+    Skip,
+}
+
+impl Expectation {
+    /// `true` when `class` meets the expectation.
+    #[must_use]
+    pub fn accepts(self, class: StatementClass) -> bool {
+        match self {
+            Self::Exactly(c) => class == c,
+            Self::AtLeast(c) => class >= c,
+            Self::Skip => true,
+        }
+    }
+
+    /// The lowest class the expectation accepts (`None` for [`Expectation::Skip`]).
+    #[must_use]
+    pub fn floor(self) -> Option<StatementClass> {
+        match self {
+            Self::Exactly(c) | Self::AtLeast(c) => Some(c),
+            Self::Skip => None,
+        }
+    }
+}
+
+/// One case of the corpus.
+#[derive(Clone, Debug)]
+pub struct CorpusCase {
+    /// Name (the `## ` line).
+    pub name: String,
+    /// 1-based line of the `## ` line in the corpus file.
+    pub line: usize,
+    /// The statement.
+    pub sql: String,
+    /// Lexical modes the dialect must be built with.
+    pub modes: Vec<String>,
+    expect: Vec<(String, Expectation)>,
+}
+
+impl CorpusCase {
+    /// The expectation for `dialect` (one of [`CORPUS_DIALECTS`]).
+    #[must_use]
+    pub fn expectation(&self, dialect: &str) -> Expectation {
+        let group = match dialect {
+            "mysql" | "mariadb" => Some("my"),
+            _ => None,
+        };
+        let find = |k: &str| {
+            self.expect
+                .iter()
+                .find(|(key, _)| key == k)
+                .map(|(_, e)| *e)
+        };
+        find(dialect)
+            .or_else(|| group.and_then(find))
+            .or_else(|| find("all"))
+            .unwrap_or(Expectation::Skip)
+    }
+}
+
+fn parse_class(name: &str) -> Option<StatementClass> {
+    use StatementClass as C;
+    Some(match name {
+        "Read" => C::Read,
+        "Session" => C::Session,
+        "Transaction" => C::Transaction,
+        "Write" => C::Write,
+        "Ddl" => C::Ddl,
+        "ChangesAccessMode" => C::ChangesAccessMode,
+        "Destructive" => C::Destructive,
+        "Unknown" => C::Unknown,
+        _ => return None,
+    })
+}
+
+fn decode_escapes(s: &str) -> Result<String, String> {
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars();
+    while let Some(c) = chars.next() {
+        if c != '\\' {
+            out.push(c);
+            continue;
+        }
+        match chars.next() {
+            Some('r') => out.push('\r'),
+            Some('n') => out.push('\n'),
+            Some('t') => out.push('\t'),
+            Some('\\') => out.push('\\'),
+            Some('u') => {
+                if chars.next() != Some('{') {
+                    return Err("\\u must be followed by {".into());
+                }
+                let hex: String = chars.by_ref().take_while(|c| *c != '}').collect();
+                let cp = u32::from_str_radix(&hex, 16).map_err(|e| e.to_string())?;
+                out.push(char::from_u32(cp).ok_or("invalid code point")?);
+            }
+            other => return Err(format!("unknown escape \\{other:?}")),
+        }
+    }
+    Ok(out)
+}
+
+/// Parses a corpus in the [`CLASSIFICATION_CORPUS`] format.
+///
+/// # Errors
+/// A message with the line number of the first malformed case.
+pub fn parse_classification_corpus(text: &str) -> Result<Vec<CorpusCase>, String> {
+    let mut cases: Vec<CorpusCase> = Vec::new();
+    let mut escapes = false;
+    let mut in_header = false;
+    let mut body: Vec<&str> = Vec::new();
+    let finish = |cases: &mut Vec<CorpusCase>, body: &mut Vec<&str>, escapes: bool| {
+        if let Some(case) = cases.last_mut() {
+            while body.last().is_some_and(|l| l.trim().is_empty()) {
+                body.pop();
+            }
+            let sql = body.join("\n");
+            body.clear();
+            if sql.trim().is_empty() {
+                return Err(format!("line {}: case without a statement", case.line));
+            }
+            case.sql = if escapes {
+                decode_escapes(&sql).map_err(|e| format!("line {}: {e}", case.line))?
+            } else {
+                sql
+            };
+        }
+        Ok(())
+    };
+    for (n, line) in text.lines().enumerate() {
+        let lineno = n + 1;
+        if line.starts_with("%%") {
+            continue;
+        }
+        if let Some(name) = line.strip_prefix("## ") {
+            finish(&mut cases, &mut body, escapes)?;
+            escapes = false;
+            in_header = true;
+            cases.push(CorpusCase {
+                name: name.trim().to_owned(),
+                line: lineno,
+                sql: String::new(),
+                modes: Vec::new(),
+                expect: Vec::new(),
+            });
+            continue;
+        }
+        let Some(case) = cases.last_mut() else {
+            if line.trim().is_empty() {
+                continue;
+            }
+            return Err(format!("line {lineno}: text before the first case"));
+        };
+        if in_header {
+            if let Some(rest) = line.strip_prefix("expect:") {
+                for pair in rest.split_whitespace() {
+                    let (key, value) = pair
+                        .split_once('=')
+                        .ok_or_else(|| format!("line {lineno}: `{pair}` is not key=class"))?;
+                    if !matches!(key, "all" | "my") && !CORPUS_DIALECTS.contains(&key) {
+                        return Err(format!("line {lineno}: unknown dialect key `{key}`"));
+                    }
+                    let exp = if value == "skip" {
+                        Expectation::Skip
+                    } else if let Some(v) = value.strip_prefix(">=") {
+                        Expectation::AtLeast(
+                            parse_class(v)
+                                .ok_or_else(|| format!("line {lineno}: unknown class `{v}`"))?,
+                        )
+                    } else {
+                        Expectation::Exactly(
+                            parse_class(value)
+                                .ok_or_else(|| format!("line {lineno}: unknown class `{value}`"))?,
+                        )
+                    };
+                    case.expect.push((key.to_owned(), exp));
+                }
+                continue;
+            }
+            if let Some(rest) = line.strip_prefix("modes:") {
+                case.modes = rest.split_whitespace().map(str::to_owned).collect();
+                continue;
+            }
+            if let Some(rest) = line.strip_prefix("escapes:") {
+                escapes = rest.trim() == "yes";
+                continue;
+            }
+            in_header = false;
+            if case.expect.is_empty() {
+                return Err(format!("line {}: case without `expect:`", case.line));
+            }
+        }
+        body.push(line);
+    }
+    finish(&mut cases, &mut body, escapes)?;
+    if let Some(case) = cases.iter().find(|c| c.expect.is_empty()) {
+        return Err(format!("line {}: case without `expect:`", case.line));
+    }
+    Ok(cases)
+}
+
+/// Builds a dialect for a corpus case's lexical modes (see [`assert_classification_corpus`]).
+pub type DialectFactory<'a> = dyn Fn(&[String]) -> Option<Box<dyn Dialect>> + 'a;
+
+/// Runs the [`CLASSIFICATION_CORPUS`] for one dialect key (`pg`, `mysql`, `mariadb`,
+/// `sqlite`). `make` builds the dialect for a case's lexical modes, or returns `None` when the
+/// dialect has no such mode (a case that expects a class for it then fails). Returns the number
+/// of cases checked.
+///
+/// For each case it also checks that a statement before it (`SELECT 1;`) never lowers its
+/// class, and that the whole case text classifies at least as high as every statement
+/// [`Dialect::split_script`] finds in it.
+///
+/// # Panics
+/// With the list of every failing case.
+pub fn assert_classification_corpus(dialect_key: &str, make: &DialectFactory<'_>) -> usize {
+    let cases = match parse_classification_corpus(CLASSIFICATION_CORPUS) {
+        Ok(c) => c,
+        Err(e) => panic!("corpus: {e}"),
+    };
+    let mut failures = Vec::new();
+    let mut checked = 0;
+    for case in &cases {
+        let exp = case.expectation(dialect_key);
+        if exp == Expectation::Skip {
+            continue;
+        }
+        let Some(dialect) = make(&case.modes) else {
+            failures.push(format!(
+                "line {} `{}`: modes {:?} not available",
+                case.line, case.name, case.modes
+            ));
+            continue;
+        };
+        checked += 1;
+        let class = dialect.classify(&case.sql);
+        if !exp.accepts(class) {
+            failures.push(format!(
+                "line {} `{}`: got {class:?}, expected {exp:?}\n    {}",
+                case.line,
+                case.name,
+                case.sql.replace('\n', "\n    ")
+            ));
+            continue;
+        }
+        let prefixed = format!("SELECT 1;\n{}", case.sql);
+        let p = dialect.classify(&prefixed);
+        if p < class {
+            failures.push(format!(
+                "line {} `{}`: a leading `SELECT 1;` lowered the class to {p:?}",
+                case.line, case.name
+            ));
+        }
+        for item in dialect.split_script(&case.sql) {
+            if item.kind == crate::dialect::ScriptItemKind::Statement {
+                let c = dialect.classify(item.text(&case.sql));
+                if c > class {
+                    failures.push(format!(
+                        "line {} `{}`: the script classifies {class:?} but its statement `{}` \
+                         classifies {c:?}",
+                        case.line,
+                        case.name,
+                        item.text(&case.sql)
+                    ));
+                }
+            }
+        }
+    }
+    assert!(
+        failures.is_empty(),
+        "{} corpus failure(s) for {dialect_key}:\n{}",
+        failures.len(),
+        failures.join("\n")
+    );
+    checked
+}
+
+/// Asserts the invariants of [`Dialect::split_script`] on `script`:
+/// - items are ordered, do not overlap, lie on `char` boundaries and carry the positions of
+///   their offsets;
+/// - every statement item is at most one statement for [`Dialect::split_statements`] (so
+///   [`ensure_single_statement`](crate::ensure_single_statement) accepts it) and is not blank;
+/// - the whole script classifies at least as high as every statement item (classifying a
+///   script before running it never hides what one of its statements does), unless the
+///   script holds a refused piece or a client directive (callers stop at the former, and
+///   classify the latter's script as `Unknown` anyway).
+///
+/// # Panics
+/// With the script and the broken invariant.
+pub fn assert_script_split_invariants(dialect: &dyn Dialect, script: &str) {
+    use crate::dialect::{LineIndex, ScriptItemKind};
+    let items = dialect.split_script(script);
+    let index = LineIndex::new(script);
+    let mut last_end = 0;
+    let whole = dialect.classify(script);
+    let special = items.iter().any(|i| i.kind != ScriptItemKind::Statement);
+    for item in &items {
+        let s = item.span;
+        assert!(
+            s.start >= last_end && s.start <= s.end && s.end <= script.len(),
+            "span {s:?} out of order in {script:?}"
+        );
+        assert!(
+            script.is_char_boundary(s.start) && script.is_char_boundary(s.end),
+            "span {s:?} not on char boundaries in {script:?}"
+        );
+        assert_eq!(
+            item.start,
+            index.position(s.start),
+            "start position in {script:?}"
+        );
+        assert_eq!(
+            item.end,
+            index.position(s.end),
+            "end position in {script:?}"
+        );
+        last_end = s.end;
+        if item.kind == ScriptItemKind::Statement {
+            let text = item.text(script);
+            assert!(!text.trim().is_empty(), "empty statement in {script:?}");
+            // At most one: a statement whose last token was followed, in the script, by a
+            // comment can end with a `--` that is a comment only at the end of a text (MySQL).
+            // A piece that starts inside an executable comment (after a `;` in it) is lexed
+            // without that context on its own and may split further: the driver then refuses
+            // it as several statements, which fails closed.
+            let inside_executable = dialect.lexical_rules().executable_comments
+                && (text.contains("*/") || text.contains("/*"));
+            assert!(
+                dialect.split_statements(text).len() <= 1 || inside_executable,
+                "statement item {text:?} of {script:?} is not one statement"
+            );
+            if !special {
+                let c = dialect.classify(text);
+                assert!(
+                    whole >= c,
+                    "script {script:?} classifies {whole:?} below its statement {text:?} ({c:?})"
+                );
+            }
+        }
+    }
+}
+
+/// Statements of every class, valid in the four corpus dialects, for property tests that join,
+/// split and classify them.
+pub const STATEMENT_POOL: &[&str] = &[
+    "SELECT 1",
+    "SELECT * FROM t WHERE a = 'x;y'",
+    "SELECT 'it''s' AS \"a;b\"",
+    "INSERT INTO t VALUES (1)",
+    "UPDATE t SET a = 1 WHERE id = 2",
+    "UPDATE t SET a = 1",
+    "DELETE FROM t",
+    "DELETE FROM t WHERE id = 1",
+    "DROP TABLE t",
+    "CREATE TABLE t2 (a INT)",
+    "ALTER TABLE t ADD COLUMN b INT",
+    "BEGIN",
+    "COMMIT",
+    "WITH x AS (SELECT 1) SELECT * FROM x",
+    "SELECT a /* ; */ FROM t -- ;\n",
+];
+
+/// Asserts that joining `stmts` with `sep` (`";\n"`, `" ; "`…) and splitting the script gives
+/// back exactly `stmts` (trimmed), each with its own class, and that the joined script
+/// classifies as the riskiest of them (concatenation never hides a write).
+///
+/// # Panics
+/// With the script and the mismatch.
+pub fn assert_join_split_roundtrip(dialect: &dyn Dialect, stmts: &[&str], sep: &str) {
+    let script = stmts.join(sep);
+    let items = dialect.split_script(&script);
+    let texts: Vec<&str> = items.iter().map(|i| i.text(&script)).collect();
+    let expected: Vec<String> = stmts
+        .iter()
+        .map(|s| {
+            // A trailing line comment is part of the statement's span only up to its last token.
+            let spans = dialect.split_statements(s);
+            spans
+                .first()
+                .map_or_else(String::new, |sp| sp.text(s).to_owned())
+        })
+        .collect();
+    assert_eq!(
+        texts.len(),
+        expected.len(),
+        "{script:?} split into {texts:?}"
+    );
+    for (got, want) in texts.iter().zip(&expected) {
+        assert_eq!(got, want, "{script:?}");
+        assert_eq!(dialect.classify(got), dialect.classify(want), "{script:?}");
+    }
+    let worst = stmts
+        .iter()
+        .map(|s| dialect.classify(s))
+        .max()
+        .unwrap_or(StatementClass::Read);
+    assert_eq!(
+        dialect.classify(&script),
+        worst,
+        "joining hid a statement in {script:?}"
+    );
+}
