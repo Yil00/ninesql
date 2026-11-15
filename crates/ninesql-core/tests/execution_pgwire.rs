@@ -273,6 +273,51 @@ fn big_select_streams_first_rows_fast_and_cancels_and_production_deletes_ask() {
             RunEnd::Completed,
             "the canary table still exists: {events:?}"
         );
+        // P3-D L2: a ROLLBACK that undoes the SET turns the mode back on, so the rest is split
+        // again from there (the class-based trigger missed it). Off: one SELECT of a string;
+        // on again: two SELECTs. The script above left the mode off: reset it first.
+        let (_, end) = collect_all(exec.run(
+            &h,
+            RunRequest::statement("RESET standard_conforming_strings"),
+        ))
+        .await;
+        assert_eq!(end, RunEnd::Completed);
+        let script = "BEGIN;\nSET standard_conforming_strings = off;\nSELECT 'x\\'; SELECT 1; --' AS v;\nROLLBACK;\nSELECT 'a\\' AS a; SELECT 2 AS v; --'";
+        let (events, end) = collect_all(exec.run(&h, RunRequest::script(script))).await;
+        assert_eq!(end, RunEnd::Completed, "{events:?}");
+        let started: Vec<_> = events
+            .iter()
+            .filter_map(|e| match e {
+                RunEvent::StatementStarted { span, .. } => Some(&script[span.clone()]),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            started,
+            [
+                "BEGIN",
+                "SET standard_conforming_strings = off",
+                "SELECT 'x\\'; SELECT 1; --' AS v",
+                "ROLLBACK",
+                "SELECT 'a\\' AS a",
+                "SELECT 2 AS v"
+            ]
+        );
+        let value = |index: usize| {
+            events.iter().find_map(|e| match e {
+                RunEvent::Item {
+                    index: i,
+                    item: ResultItem::Rows(b),
+                } if *i == index && b.num_rows() > 0 => b
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<StringArray>()
+                    .map(|c| c.value(0).to_owned()),
+                _ => None,
+            })
+        };
+        assert_eq!(value(2).as_deref(), Some("x'; SELECT 1; --"));
+        assert_eq!(value(4).as_deref(), Some("a\\"));
         h.close().await.unwrap().unwrap();
 
         // Production: manual commit, and a DELETE without WHERE asks first.
