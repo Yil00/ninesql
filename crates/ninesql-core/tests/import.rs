@@ -1874,3 +1874,45 @@ fn a_cancelled_preview_answers_cancelled() {
         );
     });
 }
+
+/// P2-D M1: a cut source is visible on the preview, and a cut listing that found no project is
+/// an explained error, never an empty preview.
+#[test]
+fn truncated_sources_are_reported_and_an_empty_cut_listing_is_explained() {
+    let e = env();
+    let ws = e.root.join("many-projects");
+    for i in 0..ninesql_core::dbeaver::source::MAX_SOURCE_PROJECTS + 2 {
+        let dot = ws.join(format!("p{i:04}/.dbeaver"));
+        std::fs::create_dir_all(&dot).unwrap();
+        std::fs::write(
+            dot.join("data-sources.json"),
+            format!(
+                r#"{{"folders":{{}},"connections":{{"postgres-jdbc-p{i}":{{"provider":"postgresql","driver":"postgres-jdbc","name":"p{i}","configuration":{{"host":"db.example.test","port":"5432","database":"nine","user":"u","type":"dev"}}}}}}}}"#
+            ),
+        )
+        .unwrap();
+    }
+    let preview = e.importer.preview(&ImportSource::Folder(ws)).unwrap();
+    assert!(preview.truncated());
+    assert_eq!(
+        preview.projects.len(),
+        ninesql_core::dbeaver::source::MAX_SOURCE_PROJECTS
+    );
+
+    let empty = e.root.join("cut-before-any-project");
+    for i in 0..ninesql_core::dbeaver::detect::MAX_DETECT_DIRS + 10 {
+        std::fs::create_dir_all(empty.join(format!("b{i:05}/.dbeaver"))).unwrap();
+    }
+    let err = e
+        .importer
+        .preview(&ImportSource::Folder(empty))
+        .unwrap_err();
+    assert!(matches!(err, ImportError::ListingTruncated), "{err:?}");
+
+    // A complete source is not truncated.
+    let preview = e
+        .importer
+        .preview(&ImportSource::Folder(fixture("24.3.5")))
+        .unwrap();
+    assert!(!preview.truncated());
+}
