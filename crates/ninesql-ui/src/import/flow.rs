@@ -196,8 +196,12 @@ impl ImportFlow {
         cx.notify();
     }
 
-    /// Previews `source` (known locations or a folder).
+    /// Previews `source` (known locations or a folder). Refused while the flow is busy: a
+    /// running apply must keep its task (P2-D review, L2b).
     pub fn start(&mut self, source: ImportSource, window: &mut Window, cx: &mut Context<Self>) {
+        if self.is_busy() {
+            return;
+        }
         let Some(core) = self.hub.read(cx).core().cloned() else {
             self.stage = Stage::Failed(
                 "NineSQL is still starting, or its core did not start: try again in a moment."
@@ -269,6 +273,24 @@ impl ImportFlow {
                 _ => {}
             });
         }));
+    }
+
+    /// "Cancel" while the core reads the source: drops the pending preview and returns to
+    /// idle. The core's read may finish in the background; its answer is ignored (it only
+    /// reads, I4).
+    pub fn cancel_preview(&mut self, cx: &mut Context<Self>) {
+        if !matches!(self.stage, Stage::Previewing) {
+            return;
+        }
+        self.task = None;
+        self.source = None;
+        self.preview = None;
+        self.view = None;
+        self.tests.clear();
+        self.selection.accept_tls.clear();
+        self.notice = None;
+        self.stage = Stage::Idle;
+        cx.notify();
     }
 
     /// Applies a preview answer (public for tests that drive the flow step by step).
@@ -431,10 +453,11 @@ impl ImportFlow {
             Err(ImportError::VaultNotCreated) => self.ask_vault(VaultMode::Create, window, cx),
             Err(ImportError::SourceChanged) => {
                 self.notice = Some(SOURCE_CHANGED_NOTICE.to_owned());
-                match self.source.clone() {
-                    // The notice stays over the new preview (`start` keeps it).
-                    Some(source) => self.start(source, window, cx),
-                    None => self.stage = Stage::Preview,
+                // Out of `Applying` first: `start` is refused while busy.
+                self.stage = Stage::Preview;
+                // The notice stays over the new preview (`start` keeps it).
+                if let Some(source) = self.source.clone() {
+                    self.start(source, window, cx);
                 }
             }
             Err(ImportError::NoStore(kind)) => {
@@ -488,6 +511,14 @@ impl ImportFlow {
     pub fn dismissed(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if let Some(prompt) = self.vault_prompt.take() {
             prompt.update(cx, |p, cx| p.dismissed(window, cx));
+            // The prompt's `Cancelled` no longer reaches us (the subscription sees no prompt):
+            // leave the waiting stage here, or the flow stays busy (P2-D review, L2a).
+            if matches!(self.stage, Stage::WaitingForVault(_)) {
+                self.stage = Stage::Preview;
+                self.notice = Some(
+                    "Not imported: the vault prompt was closed. Nothing was written.".to_owned(),
+                );
+            }
         }
         self.testing = None;
         cx.notify();
@@ -523,6 +554,7 @@ impl ImportFlow {
         if let Some(f) = &row.folder {
             details.push(format!("folder {f}"));
         }
+        let create_tls = row.create_tls.clone();
         let header = h_flex()
             .gap_2()
             .when(row.skippable, |el| {
@@ -551,6 +583,15 @@ impl ImportFlow {
                     }),
             )
             .child(div().text_xs().text_color(muted).child(details.join(" · ")))
+            .when_some(create_tls, |el, tls| {
+                el.child(
+                    div()
+                        .id(("row-create-tls", i))
+                        .text_xs()
+                        .text_color(if tls.weak { warning } else { muted })
+                        .child(format!("TLS {}", tls.text)),
+                )
+            })
             .when(row.testable, |el| {
                 let id = id.clone();
                 el.child(
@@ -649,15 +690,14 @@ impl ImportFlow {
                                     this.toggle_accept_tls(&id, cx);
                                 })),
                         )
-                        .when(accepted, |el| {
-                            el.child(
-                                div()
-                                    .id(("row-tls-warning", i))
-                                    .text_xs()
-                                    .text_color(danger)
-                                    .child(TLS_ACCEPT_WARNING),
-                            )
-                        })
+                        // Shown before the box is ticked too (P2-D review, L3).
+                        .child(
+                            div()
+                                .id(("row-tls-warning", i))
+                                .text_xs()
+                                .text_color(if accepted { danger } else { warning })
+                                .child(TLS_ACCEPT_WARNING),
+                        )
                     })
                 })
                 .when(!diff.secrets_dropped.is_empty(), |el| {
@@ -753,7 +793,11 @@ impl Render for ImportFlow {
                         .text_color(muted)
                         .child("Reading the DBeaver workspace…"),
                 ),
-                h_flex(),
+                h_flex().gap_2().justify_end().child(
+                    Button::new("import-cancel-preview")
+                        .label("Cancel")
+                        .on_click(cx.listener(|this, _, _, cx| this.cancel_preview(cx))),
+                ),
             ),
             Stage::Failed(e) => (
                 body.child(div().id("import-error").text_color(danger).child(e))

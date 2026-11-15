@@ -7,6 +7,7 @@
 //! offer, and "Enable connection" with the route confirmation.
 
 use std::collections::BTreeMap;
+use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
@@ -26,10 +27,12 @@ use ninesql_core::{
 
 use super::flow::{ImportFlow, RowTest, SOURCE_CHANGED_NOTICE, Stage};
 use super::model::{
-    DELETE_DBEAVER_PASSWORDS_ADVICE, INIT_SQL_NOTE, PreviewView, RowKind, Selection, TypeRowKind,
+    DELETE_DBEAVER_PASSWORDS_ADVICE, INIT_SQL_NOTE, PreviewView, RowKind, Selection,
+    TLS_ACCEPT_WARNING, TypeRowKind,
 };
 use crate::app;
 use crate::connections::connect_flow::{FlowResult, PendingPrompt};
+use crate::connections::engines::tls_label;
 use crate::connections::hub::{ConnectionHub, DetectedDbeaver, HubConfig, install, registry_with};
 use crate::connections::vault::VaultMode;
 use crate::settings::{self, SettingsState};
@@ -158,30 +161,78 @@ fn copy_dir(src: &Path, dst: &Path) {
     }
 }
 
-/// Every file under `dir` with its bytes and modification time.
-fn tree(dir: &Path) -> BTreeMap<PathBuf, (Vec<u8>, SystemTime)> {
+/// What `tree` records of one entry (I4 checks compare these).
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum TreeEntry {
+    /// A directory, with its permission bits and its entry names.
+    Dir { mode: u32, entries: Vec<OsString> },
+    /// A file, with its permission bits, bytes and modification time.
+    File {
+        mode: u32,
+        bytes: Vec<u8>,
+        modified: SystemTime,
+    },
+    /// A symbolic link (never followed), with its target.
+    Symlink { target: PathBuf },
+}
+
+#[cfg(unix)]
+fn mode_of(meta: &std::fs::Metadata) -> u32 {
+    use std::os::unix::fs::PermissionsExt as _;
+    meta.permissions().mode()
+}
+
+#[cfg(not(unix))]
+fn mode_of(meta: &std::fs::Metadata) -> u32 {
+    u32::from(meta.permissions().readonly())
+}
+
+/// Every entry under `dir` (included): directories with their mode and entry names, files
+/// with their mode, bytes and modification time, symbolic links with their target.
+fn tree(dir: &Path) -> BTreeMap<PathBuf, TreeEntry> {
     let mut out = BTreeMap::new();
     let mut stack = vec![dir.to_path_buf()];
-    while let Some(d) = stack.pop() {
-        let Ok(entries) = std::fs::read_dir(&d) else {
+    while let Some(path) = stack.pop() {
+        let Ok(meta) = std::fs::symlink_metadata(&path) else {
             continue;
         };
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if path.is_dir() {
-                stack.push(path);
-            } else if let Ok(meta) = std::fs::metadata(&path) {
-                let bytes = std::fs::read(&path).unwrap_or_default();
-                let modified = meta.modified().unwrap_or(SystemTime::UNIX_EPOCH);
-                out.insert(path, (bytes, modified));
+        let entry = if meta.file_type().is_symlink() {
+            TreeEntry::Symlink {
+                target: std::fs::read_link(&path).unwrap_or_default(),
             }
-        }
+        } else if meta.is_dir() {
+            let mut entries: Vec<OsString> = std::fs::read_dir(&path)
+                .map(|rd| {
+                    rd.flatten()
+                        .map(|e| {
+                            stack.push(e.path());
+                            e.file_name()
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            entries.sort();
+            TreeEntry::Dir {
+                mode: mode_of(&meta),
+                entries,
+            }
+        } else {
+            TreeEntry::File {
+                mode: mode_of(&meta),
+                bytes: std::fs::read(&path).unwrap_or_default(),
+                modified: meta.modified().unwrap_or(SystemTime::UNIX_EPOCH),
+            }
+        };
+        out.insert(path, entry);
     }
     out
 }
 
 fn assert_no_secret_in_files(dir: &Path) {
-    for (path, (bytes, _)) in tree(dir) {
+    for (path, entry) in tree(dir) {
+        let TreeEntry::File { bytes, .. } = entry else {
+            continue;
+        };
         for needle in FIXTURE_SECRETS {
             assert!(
                 !bytes.windows(needle.len()).any(|w| w == needle.as_bytes()),
@@ -1057,4 +1108,172 @@ fn enabling_a_connection_without_a_driver_is_refused_with_the_reason(cx: &mut Te
         vcx.update(|window, cx| window.has_active_dialog(cx)),
         "stays open"
     );
+}
+
+// ---------------------------------------------------------------------------------------------
+// P2-D review follow-ups.
+
+#[test]
+fn a_created_row_shows_its_tls_mode_and_flags_a_weak_one() {
+    let mut preview = hand_preview();
+    let mut weak = pg_connection("Weak TLS", ConnectionTypeId::dev());
+    weak.tls.mode = TlsMode::Require;
+    preview.projects[0].connections.push(plan(
+        "pg-weak",
+        Some(weak),
+        ImportStatus::Imported,
+        PlanAction::Create,
+    ));
+    let view = PreviewView::build(
+        &preview,
+        &ninesql_core::ConnectionTypes::default(),
+        &Connections::default(),
+    );
+    let row = |id: &str| view.row(id).cloned().unwrap_or_else(|| panic!("row {id}"));
+    let created = row("pg-created").create_tls;
+    assert!(created.as_ref().is_some_and(|t| !t.weak), "{created:?}");
+    let weak = row("pg-weak").create_tls;
+    assert!(
+        weak.as_ref()
+            .is_some_and(|t| t.weak && t.text == tls_label(TlsMode::Require)),
+        "{weak:?}"
+    );
+    // An update shows its TLS change in the diff, a disabled row nothing.
+    assert_eq!(row("pg-updated").create_tls, None);
+    assert_eq!(row("pg-route").create_tls, None);
+    assert!(
+        TLS_ACCEPT_WARNING
+            .contains("a different CA file lets whoever holds that CA impersonate the server")
+    );
+}
+
+#[gpui::test]
+fn closing_the_dialog_with_the_vault_prompt_open_leaves_the_flow_usable(cx: &mut TestAppContext) {
+    let tmp = tempfile::tempdir().unwrap_or_else(|e| panic!("{e}"));
+    let base = std::fs::canonicalize(tmp.path()).unwrap_or_else(|e| panic!("{e}"));
+    let source = base.join("dbeaver/workspace6");
+    copy_dir(&fixture("26.2.4"), &source);
+    let (hub, _core) = core_hub(cx, &base);
+    let (ws, mut vcx) = open(cx);
+    let flow = import_flow(&ws, &mut vcx);
+    preview(&flow, &source, &mut vcx);
+    flow.update_in(&mut vcx, |f, window, cx| f.apply(window, cx));
+    wait_until(&mut vcx, |vcx| {
+        !matches!(stage(&flow, vcx), Stage::Applying)
+    });
+    assert_eq!(
+        stage(&flow, &vcx),
+        Stage::WaitingForVault(VaultMode::Create)
+    );
+    flow.update_in(&mut vcx, |f, window, cx| f.dismissed(window, cx));
+    vcx.run_until_parked();
+    assert_eq!(stage(&flow, &vcx), Stage::Preview);
+    assert!(!flow.read_with(&vcx, |f, _| f.is_busy()));
+    assert!(flow.read_with(&vcx, |f, _| f.vault_prompt().is_none()));
+    assert!(hub.read_with(&vcx, |h, _| h.connections().is_empty()));
+
+    // The flow takes a new import (here without the passwords, so no store is needed).
+    flow.update(&mut vcx, |f, cx| f.set_import_secrets(false, cx));
+    flow.update_in(&mut vcx, |f, window, cx| f.apply(window, cx));
+    wait_until(&mut vcx, |vcx| {
+        matches!(stage(&flow, vcx), Stage::Done(_) | Stage::Preview)
+    });
+    assert!(
+        matches!(stage(&flow, &vcx), Stage::Done(_)),
+        "{:?}",
+        flow.read_with(&vcx, |f, _| f.notice().map(str::to_owned))
+    );
+}
+
+#[gpui::test]
+fn a_new_preview_is_refused_while_the_import_is_applied(cx: &mut TestAppContext) {
+    let tmp = tempfile::tempdir().unwrap_or_else(|e| panic!("{e}"));
+    let base = std::fs::canonicalize(tmp.path()).unwrap_or_else(|e| panic!("{e}"));
+    let source = crafted(&base, &[pg("pg-a", "A")]);
+    let other = crafted(&base.join("other"), &[pg("pg-b", "B"), pg("pg-c", "C")]);
+    let (hub, _core) = core_hub(cx, &base);
+    let (ws, mut vcx) = open(cx);
+    let flow = import_flow(&ws, &mut vcx);
+    preview(&flow, &source, &mut vcx);
+    flow.update_in(&mut vcx, |f, window, cx| {
+        f.apply(window, cx);
+        assert_eq!(f.stage(), &Stage::Applying);
+        // What the folder picker's answer does: refused, the apply keeps its task.
+        f.start(ImportSource::Folder(other.clone()), window, cx);
+        assert_eq!(f.stage(), &Stage::Applying);
+    });
+    wait_until(&mut vcx, |vcx| {
+        !matches!(stage(&flow, vcx), Stage::Applying)
+    });
+    assert!(
+        matches!(stage(&flow, &vcx), Stage::Done(_)),
+        "{:?}",
+        stage(&flow, &vcx)
+    );
+    assert!(!hub.read_with(&vcx, |h, _| h.is_importing()));
+    let names: Vec<String> = hub.read_with(&vcx, |h, _| {
+        h.connections().iter().map(|c| c.name.clone()).collect()
+    });
+    assert_eq!(names, ["A"]);
+}
+
+#[gpui::test]
+fn dropping_the_apply_task_still_resets_the_hub(cx: &mut TestAppContext) {
+    let tmp = tempfile::tempdir().unwrap_or_else(|e| panic!("{e}"));
+    let base = std::fs::canonicalize(tmp.path()).unwrap_or_else(|e| panic!("{e}"));
+    let source = crafted(&base, &[pg("pg-a", "A")]);
+    let (hub, core) = core_hub(cx, &base);
+    let (ws, mut vcx) = open(cx);
+    let flow = import_flow(&ws, &mut vcx);
+    preview(&flow, &source, &mut vcx);
+    let (preview, choices) = flow.read_with(&vcx, |f, _| {
+        let (Some(p), Some(v)) = (f.preview().cloned(), f.view()) else {
+            panic!("previewed")
+        };
+        (p, f.selection().choices(v))
+    });
+    let task = hub.update(&mut vcx, |h, cx| h.apply_import(preview, choices, cx));
+    assert!(hub.read_with(&vcx, |h, _| h.is_importing()));
+    drop(task);
+    wait_until(&mut vcx, |vcx| !hub.read_with(vcx, |h, _| h.is_importing()));
+    // The hub took the list as written, so a later save does not write a stale list back.
+    let disk = core
+        .workspace()
+        .load_connections()
+        .unwrap_or_else(|e| panic!("{e}"))
+        .connections;
+    assert_eq!(disk.len(), 1);
+    assert_eq!(hub.read_with(&vcx, |h, _| h.connections().len()), 1);
+}
+
+#[gpui::test]
+fn cancel_while_previewing_returns_to_idle_and_ignores_the_answer(cx: &mut TestAppContext) {
+    let tmp = tempfile::tempdir().unwrap_or_else(|e| panic!("{e}"));
+    let base = std::fs::canonicalize(tmp.path()).unwrap_or_else(|e| panic!("{e}"));
+    let source = crafted(&base, &[pg("pg-a", "A")]);
+    let (_hub, _core) = core_hub(cx, &base);
+    let (ws, mut vcx) = open(cx);
+    let flow = import_flow(&ws, &mut vcx);
+    flow.update_in(&mut vcx, |f, window, cx| {
+        f.start(ImportSource::Folder(source.clone()), window, cx);
+        assert_eq!(f.stage(), &Stage::Previewing);
+        assert!(f.is_busy());
+        f.cancel_preview(cx);
+    });
+    assert_eq!(stage(&flow, &vcx), Stage::Idle);
+    assert!(!flow.read_with(&vcx, |f, _| f.is_busy()));
+    // The core's read finishes in the background; its answer is ignored.
+    for _ in 0..20 {
+        vcx.run_until_parked();
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert_eq!(stage(&flow, &vcx), Stage::Idle);
+    assert!(flow.read_with(&vcx, |f, _| f.view().is_none()));
+
+    // Cancel does nothing outside the preview; a new preview works.
+    flow.update(&mut vcx, |f, cx| f.cancel_preview(cx));
+    preview(&flow, &source, &mut vcx);
+    assert_eq!(stage(&flow, &vcx), Stage::Preview);
+    flow.update(&mut vcx, |f, cx| f.cancel_preview(cx));
+    assert_eq!(stage(&flow, &vcx), Stage::Preview);
 }

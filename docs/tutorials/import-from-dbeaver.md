@@ -38,14 +38,15 @@ Each connection row shows its name, a badge and its engine, type and folder:
 Under it, as they apply:
 - "Saved secrets to move: Password (database)…"
 - "1 init SQL statement(s): will ask for confirmation on first connect." Imported init SQL always asks once, whatever the connection type ([ADR-0022](../adr/0022-pre-phase-2-hardening-decisions.md)).
+- For a new connection over the network, its TLS mode ("TLS Verify CA and host name", with the CA file if any), in the warning colour when it is weaker than "Verify CA and host name".
 - For an update, what changes ("Endpoint: old → new", "User name", "SSH route", "Connection type", "Driver properties changed: …", "Init SQL"), the saved secrets dropped because what they authenticate against changed ("Saved secrets dropped (asked at connect): database. …"), and TLS.
 - The report entries of the connection (notes and warnings from the import).
 
-**TLS on re-import.** When DBeaver's TLS setting is weaker than, or differs from, the one saved in NineSQL, the row says "TLS: the saved setting (…) is kept; DBeaver has …". The saved setting stays unless you tick "Accept the imported TLS settings", which shows a warning: a weaker mode lets a man in the middle read or change the traffic ([invariant I5](../../CONTEXT.md#invariants-non-negotiable)). A new preview (for example after the source changed) unticks it again.
+**TLS on re-import.** When DBeaver's TLS setting is weaker than, or differs from, the one saved in NineSQL, the row says "TLS: the saved setting (…) is kept; DBeaver has …". The saved setting stays unless you tick "Accept the imported TLS settings". A warning shows under the box, before and after you tick it: a weaker mode lets a man in the middle read or change the traffic, and a different CA file lets whoever holds that CA impersonate the server ([invariant I5](../../CONTEXT.md#invariants-non-negotiable)). A new preview (for example after the source changed) unticks it again.
 
 **Leave a connection out** with its checkbox. "Update connections imported before" (shown when some rows are updates) leaves every update out at once.
 
-**Test before importing.** "Test" (on rows imported enabled) opens the connection exactly as it would be saved, then closes it. It always asks for the credentials: a test never uses a password from DBeaver or one saved in NineSQL for settings you have not accepted yet. Init SQL asks for confirmation as it will after the import. The result shows on the row ("Test succeeded: …", "Test failed: …").
+**Test before importing.** "Test" (on rows imported enabled) opens the connection as it would be saved, then closes it. For an update whose TLS setting is kept, Test uses the kept, saved TLS setting, even when "Accept the imported TLS settings" is ticked: it never tries the weaker one before you import it. It always asks for the credentials: a test never uses a password from DBeaver or one saved in NineSQL for settings you have not accepted yet. Init SQL asks for confirmation as it will after the import. The result shows on the row ("Test succeeded: …", "Test failed: …").
 
 ## 3. Import
 Press "Import N connection(s)". NineSQL reads the DBeaver workspace again and writes only if it still gives the same preview. What can happen:
