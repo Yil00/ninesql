@@ -159,3 +159,32 @@ proptest! {
         }
     }
 }
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(256))]
+
+    /// Security review (empty-delimiter audit): this dialect has no `DELIMITER` directive and
+    /// ignores a caller-supplied `ScriptState` delimiter, whatever it is (no panic, the same
+    /// items as the default state).
+    #[test]
+    fn a_state_delimiter_is_ignored(
+        script in junk(),
+        delim in prop_oneof![
+            "\\PC{0,6}",
+            prop::sample::select(vec!["", " ", ";", "$$", "//", "\\", "'", "--", "/*"])
+                .prop_map(str::to_owned),
+        ],
+    ) {
+        use ninesql_driver_api::{ScriptState, TextPosition};
+        let d = SqliteDialect;
+        let state = ScriptState::with_delimiter(Some(delim));
+        let mut froms = vec![TextPosition::START];
+        froms.extend(d.split_script(&script).iter().map(|i| i.end));
+        for from in froms {
+            prop_assert_eq!(
+                d.split_script_ahead(&script, from, &state),
+                d.split_script_ahead(&script, from, &ScriptState::default())
+            );
+        }
+    }
+}

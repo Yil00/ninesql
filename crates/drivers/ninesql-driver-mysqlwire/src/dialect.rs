@@ -198,15 +198,29 @@ impl Dialect for MyDialect {
         if from.offset > script.len() || !script.is_char_boundary(from.offset) {
             return self.split_script_from(script, from.offset);
         }
-        // The caller passes the delimiter in force: nothing before `from` is read again.
-        let (pieces, _) = split_with_delimiters(
-            self,
-            script,
-            self.scan_rules(),
-            from.offset,
-            state.delimiter.clone(),
-            true,
-        );
+        // The caller passes the delimiter in force: nothing before `from` is read again. One
+        // that a `DELIMITER` directive refuses can never be in force: the rest is refused
+        // (fails closed; `;` is the directive's own spelling of the default).
+        let delim = match state.delimiter.as_deref() {
+            None | Some(";") => None,
+            Some(d) if delimiter_accepted(d) => Some(d.to_owned()),
+            Some(_) => {
+                let p = skip_blanks(script, from.offset);
+                if p >= script.len() {
+                    return Vec::new();
+                }
+                return script_items_from(
+                    script,
+                    from,
+                    [(
+                        trimmed(script, p, script.len()),
+                        ScriptItemKind::Refused(ScriptRefusal::InvalidDelimiter),
+                    )],
+                );
+            }
+        };
+        let (pieces, _) =
+            split_with_delimiters(self, script, self.scan_rules(), from.offset, delim, true);
         script_items_from(script, from, pieces)
     }
 
@@ -648,18 +662,31 @@ fn delimiter_directive(text: &str, p: usize) -> Option<(usize, Option<String>)> 
     let arg = text[p + WORD.len()..end].trim();
     // The mysql client takes the first word (or a quoted string, which NineSQL refuses).
     let delim = arg.split_whitespace().next().unwrap_or("");
-    let refused = delim.is_empty()
+    Some((end, delimiter_accepted(delim).then(|| delim.to_owned())))
+}
+
+/// Whether a `DELIMITER` directive accepts `delim`: non-empty, one word (no whitespace), no
+/// backslash or quote, no comment opener. The [`ScriptState`] delimiter a caller passes to
+/// [`Dialect::split_script_ahead`] is held to the same rule (security review: an empty one
+/// used to panic, and a delimiter the directive refuses could never be in force).
+fn delimiter_accepted(delim: &str) -> bool {
+    !(delim.is_empty()
+        || delim.contains(char::is_whitespace)
         || delim.contains(['\\', '\'', '"', '`'])
         || delim.starts_with('#')
         || delim.starts_with("--")
-        || delim.contains("/*");
-    Some((end, (!refused).then(|| delim.to_owned())))
+        || delim.contains("/*"))
 }
 
 /// Offset of the first occurrence of `delim` (ASCII case-insensitive) in code at or after
 /// `from`: outside strings, quoted identifiers, comments and executable comments.
+/// `None` for an empty `delim` (never in force: [`delimiter_accepted`]) or a `from` that is not
+/// a char boundary of `text`.
 fn find_delimiter(text: &str, from: usize, delim: &str, rules: ScanRules) -> Option<usize> {
-    let rest = &text[from..];
+    if delim.is_empty() {
+        return None;
+    }
+    let rest = text.get(from..)?;
     let mut in_exec = false;
     let mut found = None;
     // Stops at the first match: a script under a custom delimiter is scanned once.
@@ -695,6 +722,10 @@ fn find_delimiter(text: &str, from: usize, delim: &str, rules: ScanRules) -> Opt
 /// Bytes of script split per step in the default-delimiter mode (doubled while no statement
 /// ends inside the window).
 const SCRIPT_WINDOW: usize = 64 * 1024;
+
+/// Bytes before the end of a window whose lexing may depend on text past it: the lexers look
+/// at most four bytes ahead (`/*M!`, `-- `); the rest is slack.
+const LOOKAHEAD_MARGIN: usize = 64;
 
 /// Smallest split window.
 const MIN_WINDOW: usize = 512;
@@ -755,6 +786,59 @@ fn split_with_delimiters(
             continue;
         }
         match &delim {
+            Some(dl) if lazy => {
+                // One window of the rest (security review L2: splitting the whole block up to
+                // the next delimiter at every lazy step made a long block re-split after each
+                // statement quadratic). The lexers look at most a few bytes ahead, so text
+                // more than `LOOKAHEAD_MARGIN` bytes before the cut lexes as in the whole
+                // script: a delimiter found there is the first one of the whole rest, and when
+                // none is, the block runs at least to `cut - margin`, so the statements it ends
+                // with a `;` before that point are those of the whole block.
+                let mut cut = p.saturating_add(window).min(script.len());
+                while !script.is_char_boundary(cut) {
+                    cut += 1;
+                }
+                let complete = cut == script.len();
+                let safe = if complete {
+                    cut
+                } else {
+                    cut.saturating_sub(LOOKAHEAD_MARGIN)
+                };
+                let found = find_delimiter(&script[..cut], p, dl, rules)
+                    .filter(|q| q.saturating_add(dl.len()) <= safe);
+                if let Some(end) = found {
+                    for s in d.split_statements(&script[p..end]) {
+                        pieces.push((shifted(s, p), ScriptItemKind::Statement));
+                    }
+                    base = end + dl.len();
+                    continue;
+                }
+                if complete {
+                    for s in d.split_statements(&script[p..]) {
+                        pieces.push((shifted(s, p), ScriptItemKind::Statement));
+                    }
+                    break;
+                }
+                // No delimiter ends before `limit`: split up to it, the last statement (maybe
+                // cut) left for the next step.
+                let mut limit = safe.saturating_sub(dl.len());
+                while !script.is_char_boundary(limit) {
+                    limit -= 1;
+                }
+                let mut spans = if limit > p {
+                    d.split_statements(&script[p..limit])
+                } else {
+                    Vec::new()
+                };
+                spans.pop();
+                if spans.is_empty() {
+                    window = window.saturating_mul(2);
+                    continue;
+                }
+                for s in spans {
+                    pieces.push((shifted(s, p), ScriptItemKind::Statement));
+                }
+            }
             Some(dl) => {
                 let end = find_delimiter(script, p, dl, rules).unwrap_or(script.len());
                 for s in d.split_statements(&script[p..end]) {
