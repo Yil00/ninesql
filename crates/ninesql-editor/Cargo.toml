@@ -13,4 +13,26 @@ publish.workspace = true
 workspace = true
 
 [dependencies]
+# Connection ids (script links, session restore) and, through its re-export, the driver API
+# (`Dialect`, `LexicalRules`, `EngineId`, `Param`): the editor never talks to a driver directly.
 ninesql-core.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+# Parameter values typed in the prompt are wiped when the prompt is dropped or submitted.
+zeroize.workspace = true
+# GPUI and gpui-component's code editor (`EditorState`: rope, tree-sitter SQL highlighting with
+# the MIT `tree-sitter-sequel` grammar, search / replace, multi-cursor, folding, completion menu,
+# diagnostics) through gpui-kit, at the workspace pin (ADR-0013). Never enable `hot-reload`,
+# `tracy`, `inspector` or `gpui-fast`. `ninesql-ui` holds the exact pins of the gpui-kit siblings.
+gpui-kit = { workspace = true, features = ["component", "tree-sitter-sql"] }
+# The types of gpui-component's `CompletionProvider` trait, which it does not re-export. Both are
+# already in the graph through gpui-base (same versions as Cargo.lock; MIT / MIT OR Apache-2.0).
+lsp-types = { version = "0.97", default-features = false }
+anyhow = "1"
+
+[dev-dependencies]
+# TestAppContext for view-model tests (AGENTS.md): GPUI's own `test-support`, see root Cargo.toml.
+gpui-pre = { workspace = true, features = ["test-support"] }
+proptest.workspace = true

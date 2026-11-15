@@ -4678,7 +4678,17 @@ dependencies = [
 name = "ninesql-editor"
 version = "0.0.0"
 dependencies = [
+ "anyhow",
+ "gpui-kit",
+ "gpui-pre",
+ "lsp-types",
  "ninesql-core",
+ "proptest",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.21",
+ "tracing",
+ "zeroize",
 ]
 
 [[package]]
