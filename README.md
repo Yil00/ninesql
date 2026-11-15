@@ -37,7 +37,7 @@
   </p>
 </div>
 
-> ⚠️ **Pre-alpha.** Nothing is released yet. A development build can create, test and open connections to PostgreSQL, MySQL, MariaDB and SQLite (directly, over TLS and over SSH) from the connection dialog, but there is no SQL editor or results grid yet, the DBeaver import has no UI, and the interface awaits its visual check on real desktops, planned with the final MVP tests. Saved passwords go to the encrypted vault: the keyring backend is off by default until it is validated on GNOME and KDE. See the [roadmap](docs/ROADMAP.md) for the MVP plan.
+> ⚠️ **Pre-alpha.** Nothing is released yet. A development build can create, test and open connections to PostgreSQL, MySQL, MariaDB and SQLite (directly, over TLS and over SSH) from the connection dialog, and import connections from a DBeaver workspace from the UI (preview, saved passwords moved to the vault, re-import; [tutorial](docs/tutorials/import-from-dbeaver.md)), but there is no SQL editor or results grid yet, and the interface, import screens included, awaits its visual check on real desktops, planned with the final MVP tests (P6-F). Saved passwords go to the encrypted vault: the keyring backend is off by default until it is validated on GNOME and KDE. See the [roadmap](docs/ROADMAP.md) for the MVP plan.
 
 ## Why NineSQL
 DBeaver is the de facto universal database client, but it runs on the JVM and Eclipse RCP: high memory use, slow cold start, and uneven HiDPI / Wayland behavior on Linux.
@@ -54,10 +54,10 @@ The 20 most used **open-source, self-hostable** engines. Cloud-only services (Sn
 
 | Engine | Family | Planned in | Status |
 |:--|:--|:--|:--|
-| **PostgreSQL** | SQL · pg-wire | MVP (v0.1) | 🚧 Driver landed (P1-B); connect from the connection dialog (P1-C), no editor or grid yet |
-| **MySQL** | SQL · mysql-wire | MVP (v0.1) | 🚧 Driver landed (P1-B); connect from the connection dialog (P1-C), no editor or grid yet |
-| **MariaDB** | SQL · mysql-wire | MVP (v0.1) | 🚧 Driver landed (P1-B); connect from the connection dialog (P1-C), no editor or grid yet |
-| **SQLite** | SQL · embedded | MVP (v0.1) | 🚧 Driver landed (P1-B); connect from the connection dialog (P1-C), no editor or grid yet |
+| **PostgreSQL** | SQL · pg-wire | MVP (v0.1) | 🚧 Driver landed (P1-B); connect from the connection dialog (P1-C) or import from DBeaver (P2), no editor or grid yet |
+| **MySQL** | SQL · mysql-wire | MVP (v0.1) | 🚧 Driver landed (P1-B); connect from the connection dialog (P1-C) or import from DBeaver (P2), no editor or grid yet |
+| **MariaDB** | SQL · mysql-wire | MVP (v0.1) | 🚧 Driver landed (P1-B); connect from the connection dialog (P1-C) or import from DBeaver (P2), no editor or grid yet |
+| **SQLite** | SQL · embedded | MVP (v0.1) | 🚧 Driver landed (P1-B); connect from the connection dialog (P1-C) or import from DBeaver (P2), no editor or grid yet |
 | **TimescaleDB** | SQL · pg-wire | MVP (v0.1) | 🗓 Planned |
 | **YugabyteDB** (YSQL) | SQL · pg-wire | MVP (v0.1) | 🗓 Planned |
 | **QuestDB** | SQL · pg-wire | MVP (v0.1) | 🗓 Planned |

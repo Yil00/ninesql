@@ -17,7 +17,7 @@ Three ways:
 
 All three are in the command palette (`Ctrl+Shift+P`, type "dbeaver").
 
-Finding the workspace only lists folders. Reading it (and decrypting DBeaver's saved passwords in memory) happens when the preview runs, off the interface thread.
+Finding the workspace only lists folders. Reading it (and decrypting DBeaver's saved passwords in memory) happens when the preview runs, off the interface thread. While it runs, the screen says "Reading the DBeaver workspace…"; "Cancel" returns to the folder field. The read itself is not interrupted: it finishes in the background (it only reads) and its result is ignored.
 
 ## 2. Read the preview
 The "Import from DBeaver" screen lists, from top to bottom:
