@@ -2,7 +2,7 @@
 //!
 //! On-disk documents:
 //! - `project.json`: [`ProjectFile`] (`schema_version` 2)
-//! - `connections.json`: [`ConnectionsFile`] (`schema_version` 3)
+//! - `connections.json`: [`ConnectionsFile`] (`schema_version` 4)
 //! - `connection-types.json`: [`ConnectionTypesFile`] (`schema_version` 1)
 //!
 //! Secrets given to [`Workspace::create_connection`] go to the secret store; only their
