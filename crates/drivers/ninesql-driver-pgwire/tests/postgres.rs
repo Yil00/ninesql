@@ -337,6 +337,13 @@ async fn conformance_reserved_properties_and_multiple_statements() {
     assert_eq!(scalar(&c).as_deref(), Some("ninesql_test, public"));
 }
 
+/// I1: statement text holding a credential (init SQL included) is never logged.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn statements_with_credentials_are_never_logged() {
+    let Some(dev) = dev() else { return };
+    conformance::assert_credential_statements_not_logged(&PgWireDriver::new(), params(&dev)).await;
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn read_only_refuses_writes_engine_side() {
     let Some(dev) = dev() else { return };
