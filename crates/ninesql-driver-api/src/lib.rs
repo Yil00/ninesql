@@ -46,7 +46,8 @@ pub use capabilities::{
 pub use dialect::{
     AnsiDialect, CodeToken, CodeTokenKind, Dialect, LexicalRules, LineIndex, RowChange, RowEdit,
     ScriptItem, ScriptItemKind, ScriptRefusal, StatementClass, StatementSpan, TextPosition,
-    code_tokens, ensure_single_statement, position_at, script_items,
+    code_tokens, ensure_single_statement, item_may_change_lexical_modes, position_at, script_items,
+    shift_items,
 };
 pub use driver::{Driver, Session};
 pub use error::{DriverError, DriverResult, redact_connection_string, redact_secret};

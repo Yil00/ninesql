@@ -1151,3 +1151,67 @@ pub fn assert_join_split_roundtrip(dialect: &dyn Dialect, stmts: &[&str], sep: &
         "joining hid a statement in {script:?}"
     );
 }
+
+/// One step of [`script_plan`]: a statement's text and the class it had just before it ran,
+/// or a refused piece (`class: None`), where the plan stops.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PlannedStatement {
+    /// The text sent (or refused).
+    pub text: String,
+    /// The class computed with the session's dialect right before running; `None` for a
+    /// refused piece.
+    pub class: Option<StatementClass>,
+}
+
+/// Reference implementation of the "execute script" loop that the contract of
+/// [`Dialect::split_script`] asks of callers, without a server: each statement is classified
+/// with the current dialect right before it "runs"; `run(text)` simulates the server and
+/// returns the session's new dialect when the statement changed its lexical modes; after a
+/// statement for which [`item_may_change_lexical_modes`](crate::item_may_change_lexical_modes)
+/// holds, the rest is re-split with [`Dialect::split_script_from`] when the lexical rules
+/// changed. Client directives are skipped; the plan stops at a refused piece.
+pub fn script_plan(
+    script: &str,
+    initial: Box<dyn Dialect>,
+    run: &mut dyn FnMut(&str) -> Option<Box<dyn Dialect>>,
+) -> Vec<PlannedStatement> {
+    use crate::dialect::{ScriptItemKind, item_may_change_lexical_modes};
+    let mut current = initial;
+    let mut split_rules = current.lexical_rules();
+    let mut items = current.split_script(script);
+    let mut out = Vec::new();
+    let mut idx = 0;
+    while let Some(item) = items.get(idx).copied() {
+        let text = item.text(script);
+        match item.kind {
+            ScriptItemKind::Statement => {}
+            ScriptItemKind::ClientDirective => {
+                idx += 1;
+                continue;
+            }
+            _ => {
+                out.push(PlannedStatement {
+                    text: text.to_owned(),
+                    class: None,
+                });
+                break;
+            }
+        }
+        out.push(PlannedStatement {
+            text: text.to_owned(),
+            class: Some(current.classify(text)),
+        });
+        let may_change = item_may_change_lexical_modes(current.as_ref(), &item, script);
+        if let Some(next) = run(text) {
+            current = next;
+        }
+        if may_change && current.lexical_rules() != split_rules {
+            split_rules = current.lexical_rules();
+            items = current.split_script_from(script, item.span.end);
+            idx = 0;
+            continue;
+        }
+        idx += 1;
+    }
+    out
+}

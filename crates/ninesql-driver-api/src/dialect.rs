@@ -57,8 +57,11 @@
 //! [`Dialect::split_script`] splits a script for "execute script": statements with byte offsets,
 //! lines and columns ([`ScriptItem`]), client directives (MySQL `DELIMITER`) and refused pieces
 //! (PostgreSQL `COPY … FROM STDIN` data, psql and mysql client commands). Each statement item
-//! is then executed (and classified) on its own; [`Dialect::split_statements`] stays the
-//! single-statement check of [`ensure_single_statement`].
+//! is then executed (and classified, just before it runs) on its own;
+//! [`Dialect::split_statements`] stays the single-statement check of
+//! [`ensure_single_statement`]. Items are valid only for the lexical modes at split time: after
+//! an item that may change them ([`item_may_change_lexical_modes`]), callers re-split the rest
+//! with [`Dialect::split_script_from`] (contract on [`Dialect::split_script`]).
 
 use crate::capabilities::ExplainFormat;
 use crate::error::{DriverError, DriverResult};
@@ -91,6 +94,11 @@ pub struct LexicalRules {
     pub executable_comments: bool,
     /// `` ` `` quotes identifiers (MySQL family, SQLite, ClickHouse).
     pub backtick_identifiers: bool,
+    /// With [`backslash_escapes`](Self::backslash_escapes), a backslash also escapes inside
+    /// `"…"` (MySQL / MariaDB, where `"…"` is a string unless `ANSI_QUOTES`). Off for
+    /// PostgreSQL: with `standard_conforming_strings = off` a backslash escapes in strings
+    /// only, never in `"…"` or `U&"…"` identifiers (security review M1).
+    pub double_quote_backslash: bool,
     /// `$` is an identifier character, also at the start of a word (MySQL / MariaDB: `t$x`,
     /// `$x`; SQLite: `t$x`, its `$x` variables being rewritten by the driver first). Without it,
     /// `DELETE FROM t$WHERE` would show a `WHERE` the engine never sees. PostgreSQL continues
@@ -115,6 +123,7 @@ impl LexicalRules {
         dash_comment_needs_space: false,
         executable_comments: false,
         backtick_identifiers: false,
+        double_quote_backslash: false,
         dollar_in_identifiers: false,
         at_variables: false,
         line_comment_ends_at_cr: false,
@@ -134,6 +143,7 @@ impl LexicalRules {
         .with_dash_comment_needs_space(true)
         .with_executable_comments(true)
         .with_backtick_identifiers(true)
+        .with_double_quote_backslash(true)
         .with_dollar_in_identifiers(true)
         .with_at_variables(true);
 
@@ -198,6 +208,13 @@ impl LexicalRules {
         self
     }
 
+    /// Sets [`double_quote_backslash`](Self::double_quote_backslash).
+    #[must_use]
+    pub const fn with_double_quote_backslash(mut self, on: bool) -> Self {
+        self.double_quote_backslash = on;
+        self
+    }
+
     /// Sets [`dollar_in_identifiers`](Self::dollar_in_identifiers).
     #[must_use]
     pub const fn with_dollar_in_identifiers(mut self, on: bool) -> Self {
@@ -240,6 +257,7 @@ impl StatementSpan {
 
 /// A position in a script, for error positions (F-SQL-12) and editor navigation.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[non_exhaustive]
 pub struct TextPosition {
     /// Byte offset in the script.
     pub offset: usize,
@@ -316,9 +334,7 @@ impl ScriptRefusal {
     #[must_use]
     pub fn message(self) -> &'static str {
         match self {
-            Self::CopyFromStdin => {
-                "COPY … FROM STDIN with inline data is not supported; the data block is skipped"
-            }
+            Self::CopyFromStdin => "COPY … FROM STDIN with inline data is not supported",
             Self::PsqlMetaCommand => "psql meta-commands are not supported",
             Self::MysqlClientCommand => {
                 "mysql client commands other than DELIMITER are not supported"
@@ -344,8 +360,9 @@ pub enum ScriptItemKind {
     Refused(ScriptRefusal),
 }
 
-/// One piece of a script, from [`Dialect::split_script`].
+/// One piece of a script, from [`Dialect::split_script`]. Built with [`script_items`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct ScriptItem {
     /// The piece's bytes (no surrounding blanks or leading comments, no terminator).
     pub span: StatementSpan,
@@ -365,22 +382,109 @@ impl ScriptItem {
     }
 }
 
-/// Builds [`ScriptItem`]s with their positions (one pass over the script's lines).
+/// Positions computed in one forward pass: offsets asked in increasing order cost the bytes
+/// between them, so a script's positions cost one pass whatever its line lengths (security
+/// review M3). An offset behind the cursor restarts from the start of the text.
+struct PositionCursor<'a> {
+    text: &'a str,
+    at: TextPosition,
+}
+
+impl<'a> PositionCursor<'a> {
+    fn new(text: &'a str) -> Self {
+        Self {
+            text,
+            at: TextPosition {
+                offset: 0,
+                line: 1,
+                column: 1,
+            },
+        }
+    }
+
+    fn position(&mut self, offset: usize) -> TextPosition {
+        let mut offset = offset.min(self.text.len());
+        while !self.text.is_char_boundary(offset) {
+            offset -= 1;
+        }
+        if offset < self.at.offset {
+            self.at = TextPosition {
+                offset: 0,
+                line: 1,
+                column: 1,
+            };
+        }
+        for c in self.text[self.at.offset..offset].chars() {
+            if c == '\n' {
+                self.at.line += 1;
+                self.at.column = 1;
+            } else {
+                self.at.column += 1;
+            }
+        }
+        self.at.offset = offset;
+        self.at
+    }
+}
+
+/// Builds [`ScriptItem`]s with their positions, in one pass over the script when the pieces
+/// come in order (as every splitter returns them).
 #[must_use]
 pub fn script_items(
     script: &str,
     pieces: impl IntoIterator<Item = (StatementSpan, ScriptItemKind)>,
 ) -> Vec<ScriptItem> {
-    let index = LineIndex::new(script);
+    let mut cursor = PositionCursor::new(script);
     pieces
         .into_iter()
-        .map(|(span, kind)| ScriptItem {
-            span,
-            kind,
-            start: index.position(span.start),
-            end: index.position(span.end),
+        .map(|(span, kind)| {
+            let start = cursor.position(span.start);
+            let end = cursor.position(span.end);
+            ScriptItem {
+                span,
+                kind,
+                start,
+                end,
+            }
         })
         .collect()
+}
+
+/// Items of `script[from..]` moved to offsets and positions in the whole `script`.
+#[must_use]
+pub fn shift_items(script: &str, from: usize, items: Vec<ScriptItem>) -> Vec<ScriptItem> {
+    script_items(
+        script,
+        items.into_iter().map(|i| {
+            (
+                StatementSpan {
+                    start: i.span.start + from,
+                    end: i.span.end + from,
+                },
+                i.kind,
+            )
+        }),
+    )
+}
+
+/// `true` when running `item` may change the lexical modes the script was split with (MySQL
+/// `sql_mode`, PostgreSQL `standard_conforming_strings`, the client encoding): a statement
+/// item that `dialect` classifies [`StatementClass::Session`],
+/// [`StatementClass::ChangesAccessMode`] or [`StatementClass::Unknown`] (a `SET`, a
+/// `set_config(…)`, a procedure call…). After such an item has run, a caller running the
+/// script re-splits the rest with the session's current dialect
+/// ([`Dialect::split_script_from`]); see the contract on [`Dialect::split_script`].
+#[must_use]
+pub fn item_may_change_lexical_modes(
+    dialect: &(impl Dialect + ?Sized),
+    item: &ScriptItem,
+    script: &str,
+) -> bool {
+    item.kind == ScriptItemKind::Statement
+        && matches!(
+            dialect.classify(item.text(script)),
+            StatementClass::Session | StatementClass::ChangesAccessMode | StatementClass::Unknown
+        )
 }
 
 /// Classification of a statement, ordered by increasing risk.
@@ -519,6 +623,21 @@ pub trait Dialect: Send + Sync {
     /// [`split_statements`](Self::split_statements) (it passes [`ensure_single_statement`]) and
     /// is run and classified as such, one item per call. Default: the
     /// [`split_statements`](Self::split_statements) spans, all statements.
+    ///
+    /// # Contract for callers running a script (security review H2)
+    /// The items are valid only for the lexical modes in force when the script was split
+    /// ([`lexical_rules`](Self::lexical_rules): MySQL `NO_BACKSLASH_ESCAPES` and `ANSI_QUOTES`,
+    /// PostgreSQL `standard_conforming_strings`). A statement of the script may change them
+    /// (`SET SESSION sql_mode = 'NO_BACKSLASH_ESCAPES'; UPDATE t SET a = 'x\' -- ' WHERE …`
+    /// is a different `UPDATE` after the `SET`). So a caller:
+    /// 1. classifies each item with the session's dialect **just before running it**, and asks
+    ///    for confirmation from that class, never from a class computed earlier;
+    /// 2. after an item for which [`item_may_change_lexical_modes`] is `true` has run, takes the
+    ///    session's current dialect and, unless its `lexical_rules()` equal the ones the script
+    ///    was split with (they capture every mode the splitters use), re-splits the rest with
+    ///    [`split_script_from`](Self::split_script_from) from the end of that item.
+    ///
+    /// `conformance::script_plan` is a reference implementation.
     fn split_script(&self, script: &str) -> Vec<ScriptItem> {
         script_items(
             script,
@@ -526,6 +645,19 @@ pub trait Dialect: Send + Sync {
                 .into_iter()
                 .map(|s| (s, ScriptItemKind::Statement)),
         )
+    }
+
+    /// Splits the rest of `script` from byte `from` (the end of an item of a previous split,
+    /// see the contract on [`split_script`](Self::split_script)). Items carry offsets and
+    /// positions in the whole `script`. Splitter state from before `from` is rebuilt (MySQL:
+    /// the `DELIMITER` in force). Default: [`split_script`](Self::split_script) of the rest,
+    /// shifted.
+    fn split_script_from(&self, script: &str, from: usize) -> Vec<ScriptItem> {
+        let mut from = from.min(script.len());
+        while !script.is_char_boundary(from) {
+            from -= 1;
+        }
+        shift_items(script, from, self.split_script(&script[from..]))
     }
 
     /// Wraps a query to fetch one page (ANSI: `SELECT * FROM (<q>) AS ninesql_page LIMIT n
@@ -769,7 +901,8 @@ fn lex(text: &str, rules: LexicalRules) -> Lexed {
             // `U&"…"` / `U&'…'` (SQL standard, PostgreSQL): one token, decoded by `locate`.
             // The quoted run is skipped exactly as without the prefix, so splitting is unchanged.
             let q = bytes[i + 2];
-            let end = skip_quoted(bytes, i + 2, q, rules.backslash_escapes).min(bytes.len());
+            let backslash = rules.backslash_escapes && (q == b'\'' || rules.double_quote_backslash);
+            let end = skip_quoted(bytes, i + 2, q, backslash).min(bytes.len());
             let kind = if q == b'\'' {
                 TokKind::Str
             } else {
@@ -778,7 +911,8 @@ fn lex(text: &str, rules: LexicalRules) -> Lexed {
             push(&mut toks, kind, i, end);
             i = end;
         } else if b == b'\'' || b == b'"' || rules.backtick_identifiers && b == b'`' {
-            let backslash = rules.backslash_escapes && b != b'`';
+            let backslash = rules.backslash_escapes
+                && (b == b'\'' || b == b'"' && rules.double_quote_backslash);
             let end = skip_quoted(bytes, i, b, backslash).min(bytes.len());
             let kind = if b == b'\'' {
                 TokKind::Str
@@ -905,6 +1039,7 @@ pub enum CodeTokenKind {
 
 /// A token of a text outside comments and blanks, from [`code_tokens`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct CodeToken {
     /// What it is.
     pub kind: CodeTokenKind,
@@ -999,21 +1134,29 @@ struct Located {
 /// [`StatementClass::Unknown`] without trying every combination.
 const MAX_CONDITIONAL_COMMENTS: usize = 8;
 
+/// Largest text with conditional executable comments that is classified by trying every
+/// combination; a longer one is [`StatementClass::Unknown`] (security review L2: at most 2^8
+/// passes over 64 KiB).
+const MAX_CONDITIONAL_TEXT: usize = 64 * 1024;
+
 /// Classifies `text` with the given lexical rules (the default of [`Dialect::classify`]).
 ///
 /// With [`executable_comments`](LexicalRules::executable_comments), a conditional executable
 /// comment (`/*!80000 … */` runs only from that server version on, `/*M! … */` only on
 /// MariaDB) may or may not run: the class is the riskiest over every combination of them run or
 /// skipped, so `DELETE FROM t /*!99999 WHERE 0 */` is destructive. More than
-/// eight of them, an unterminated one, or one whose end depends on whether it runs, make the
-/// text [`StatementClass::Unknown`].
+/// eight of them, a text longer than 64 KiB holding any, an unterminated one, or one whose end
+/// depends on whether it runs, make the text [`StatementClass::Unknown`].
 #[must_use]
 pub fn classify_with_rules(text: &str, rules: LexicalRules) -> StatementClass {
     let lexed = lex(text, rules);
     if lexed.conditional.is_empty() {
         return classify_lexed(text, &lexed);
     }
-    if lexed.conditional_ambiguous || lexed.conditional.len() > MAX_CONDITIONAL_COMMENTS {
+    if lexed.conditional_ambiguous
+        || lexed.conditional.len() > MAX_CONDITIONAL_COMMENTS
+        || text.len() > MAX_CONDITIONAL_TEXT
+    {
         return StatementClass::Unknown;
     }
     let mut worst = classify_lexed(text, &lexed);
@@ -1360,8 +1503,20 @@ fn has_word(items: &[Located], w: &str) -> bool {
     items.iter().any(|l| word(l) == Some(w))
 }
 
-fn has_top_level_word(items: &[Located], w: &str) -> bool {
-    items.iter().any(|l| l.depth == 0 && word(l) == Some(w))
+/// The keyword at `items[i]`, unless the word is used as a name: right after a `.`
+/// (`x.where`) or after `AS` (`RETURNING 1 AS where`), where PostgreSQL and MySQL accept any
+/// keyword as a column or alias name (security review H1). Use it for every keyword test whose
+/// *presence* lowers a class, so a name can only over-classify.
+fn keyword_at(items: &[Located], i: usize) -> Option<&str> {
+    let w = word(items.get(i)?)?;
+    let prev = i.checked_sub(1).and_then(|p| items.get(p));
+    let as_name = prev.is_some_and(|p| p.item == Item::Punct(b'.') || word(p) == Some("AS"));
+    (!as_name).then_some(w)
+}
+
+/// A top-level `w` used as a keyword (see [`keyword_at`]).
+fn has_top_level_keyword(items: &[Located], w: &str) -> bool {
+    (0..items.len()).any(|i| items[i].depth == 0 && keyword_at(items, i) == Some(w))
 }
 
 fn classify_by_keyword(first: &str, items: &[Located]) -> StatementClass {
@@ -1399,7 +1554,7 @@ fn classify_by_keyword(first: &str, items: &[Located]) -> StatementClass {
         "INSERT" | "MERGE" | "UPSERT" | "REPLACE" => StatementClass::Write,
         "UPDATE" | "DELETE" => {
             // Only a top-level WHERE filters the statement; a WHERE inside a subquery does not.
-            if has_top_level_word(items, "WHERE") {
+            if has_top_level_keyword(items, "WHERE") {
                 StatementClass::Write
             } else {
                 StatementClass::Destructive
@@ -1412,13 +1567,24 @@ fn classify_by_keyword(first: &str, items: &[Located]) -> StatementClass {
             } else {
                 StatementClass::Ddl
             };
+            // A top-level `GRANT` / `REVOKE` inside a `CREATE` (PostgreSQL `CREATE SCHEMA …
+            // GRANT …`) changes privileges (security review M2).
+            let grants = (1..items.len()).any(|i| {
+                items[i].depth == items[0].depth
+                    && matches!(keyword_at(items, i), Some("GRANT" | "REVOKE"))
+            });
+            let base = if grants {
+                base.max(StatementClass::Destructive)
+            } else {
+                base
+            };
             base.max(classify_create_body(items))
         }
         "DROP" | "TRUNCATE" | "ALTER" | "GRANT" | "REVOKE" | "RENAME" => {
             StatementClass::Destructive
         }
         "BEGIN" | "START" | "COMMIT" | "ROLLBACK" | "SAVEPOINT" | "RELEASE" | "END" => {
-            if first == "START" && !has_word(items, "TRANSACTION") {
+            if first == "START" && keyword_at(items, 1) != Some("TRANSACTION") {
                 return StatementClass::Unknown;
             }
             if first == "BEGIN" && !is_plain_begin(&items[1..]) {
@@ -1471,6 +1637,25 @@ fn is_plain_begin(rest: &[Located]) -> bool {
     })
 }
 
+/// PostgreSQL `CREATE SCHEMA s [AUTHORIZATION r] [element …]`: every element (`CREATE TABLE`,
+/// `CREATE VIEW`, `CREATE INDEX`, `CREATE SEQUENCE`, `CREATE TRIGGER`, `GRANT`) runs; the class
+/// is the riskiest element's, at least [`StatementClass::Ddl`] (security review M2). Elements
+/// are classified on their own slices, so nothing recurses into the rest of the statement.
+fn classify_schema_elements(items: &[Located]) -> StatementClass {
+    let base = items[0].depth;
+    let starts: Vec<usize> = (1..items.len())
+        .filter(|&i| {
+            items[i].depth == base && matches!(keyword_at(items, i), Some("CREATE" | "GRANT"))
+        })
+        .collect();
+    let mut class = StatementClass::Ddl;
+    for (k, &start) in starts.iter().enumerate() {
+        let end = starts.get(k + 1).copied().unwrap_or(items.len());
+        class = class.max(classify_items(&items[start..end]));
+    }
+    class
+}
+
 /// Keywords that start a statement inside a trigger or rule body.
 const BODY_STATEMENT_KEYWORDS: &[&str] = &[
     "INSERT", "UPDATE", "DELETE", "MERGE", "REPLACE", "UPSERT", "TRUNCATE", "DROP", "ALTER",
@@ -1489,15 +1674,17 @@ fn classify_create_body(items: &[Located]) -> StatementClass {
     // [CONSTRAINT] [DEFINER = u@h] TRIGGER | RULE | EVENT`.
     let kind = items
         .iter()
-        .filter(|l| l.depth == items[0].depth)
+        .enumerate()
+        .filter(|(_, l)| l.depth == items[0].depth)
         .take(12)
-        .find_map(|l| match word(l) {
-            Some(w @ ("TRIGGER" | "RULE" | "EVENT")) => Some(w),
+        .find_map(|(i, _)| match keyword_at(items, i) {
+            Some(w @ ("TRIGGER" | "RULE" | "EVENT" | "SCHEMA")) => Some(w),
             Some("TABLE" | "VIEW" | "FUNCTION" | "PROCEDURE" | "INDEX" | "SEQUENCE") => Some(""),
             _ => None,
         });
     match kind {
         Some("EVENT") => return StatementClass::Unknown,
+        Some("SCHEMA") => return classify_schema_elements(items),
         Some("TRIGGER" | "RULE") => {}
         _ => return StatementClass::Read,
     }
@@ -1651,10 +1838,10 @@ fn with_main_statement_found(items: &[Located]) -> bool {
     if depth != 0 {
         return false;
     }
-    items
-        .iter()
-        .skip(1)
-        .any(|l| l.depth == base && word(l).is_some_and(|w| WITH_MAIN_KEYWORDS.contains(&w)))
+    (1..items.len()).any(|i| {
+        items[i].depth == base
+            && keyword_at(items, i).is_some_and(|w| WITH_MAIN_KEYWORDS.contains(&w))
+    })
 }
 
 /// `true` when a `SET` (after its scope modifiers) targets `TRANSACTION`: `SET [SESSION | LOCAL]
@@ -1662,8 +1849,8 @@ fn with_main_statement_found(items: &[Located]) -> bool {
 fn is_set_transaction(rest: &[Located]) -> bool {
     rest.iter()
         .find(|l| !matches!(word(l), Some("SESSION" | "LOCAL")))
-        .and_then(name)
-        .is_some_and(|n| n == "transaction")
+        .and_then(word)
+        .is_some_and(|w| w == "TRANSACTION")
 }
 
 /// `SET` / `RESET`: every assignment must target an allowlisted setting.
@@ -1722,8 +1909,9 @@ fn classify_set_target(first: &str, seg: &[Located]) -> StatementClass {
     if first == "RESET" && target == "all" {
         return StatementClass::ChangesAccessMode;
     }
-    if target == "transaction" {
-        // `SET TRANSACTION ISOLATION LEVEL …` is harmless; `… READ WRITE` is not.
+    if target == "transaction" && seg.get(i).and_then(word) == Some("TRANSACTION") {
+        // `SET TRANSACTION ISOLATION LEVEL …` is harmless; `… READ WRITE` is not. Only the
+        // bare keyword: a quoted `"transaction"` names a setting.
         return if has_word(seg, "WRITE") {
             StatementClass::ChangesAccessMode
         } else {
@@ -2408,6 +2596,38 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// Security review L2: conditional comments in a long text are not enumerated.
+    #[test]
+    fn long_text_with_conditional_comments_is_unknown() {
+        let mut sql = "SELECT 1 /*!50000 , 2 */ FROM t WHERE a IN (".to_owned();
+        sql.push_str(&"1, ".repeat(30_000));
+        sql.push_str("1)");
+        assert!(sql.len() > MAX_CONDITIONAL_TEXT);
+        assert_eq!(
+            classify_with_rules(&sql, LexicalRules::MYSQL),
+            StatementClass::Unknown
+        );
+        // Without conditional comments, the same text is a read.
+        let plain = sql.replace("/*!50000 , 2 */", "");
+        assert_eq!(
+            classify_with_rules(&plain, LexicalRules::MYSQL),
+            StatementClass::Read
+        );
+    }
+
+    /// Security review M3: positions cost one pass, whatever the line length.
+    #[test]
+    fn positions_are_linear_on_one_long_line() {
+        let script = "SELECT 1;".repeat(200_000);
+        let start = std::time::Instant::now();
+        let items = AnsiDialect.split_script(&script);
+        let elapsed = start.elapsed();
+        assert_eq!(items.len(), 200_000);
+        let last = items[199_999];
+        assert_eq!((last.start.line, last.start.column), (1, 9 * 199_999 + 1));
+        assert!(elapsed < std::time::Duration::from_secs(5), "{elapsed:?}");
     }
 
     #[test]

@@ -752,3 +752,89 @@ SELECT 'a\'; DELETE FROM t
 ## with plus dml in a string is never read in sqlite
 expect: sqlite=Unknown
 WITH x AS (SELECT 'delete') SELECT * FROM x WHERE 'a' = 'b' UNION SELECT 1 FROM t WHERE 0 = (DELETE)
+
+%% ------------------------------------------------------------------------------------------
+%% Keywords used as names (security review H1): after `.` or `AS` a keyword is a name, and a
+%% name can only over-classify. The first four were verified on the engines (every row hit).
+
+## pg where as a returning alias
+expect: pg=Destructive
+DELETE FROM rv RETURNING 1 AS where
+
+## pg where as a qualified column and an alias
+expect: pg=Destructive
+UPDATE rv SET a = x.where FROM (SELECT 7 AS where) x
+
+## mysql where as a qualified column in a multi-table update
+expect: my=Destructive
+UPDATE rv, (SELECT 7 AS `where`) x SET rv.a = x.where
+
+## mysql where as a qualified column in a join condition
+expect: my=Destructive
+DELETE rv FROM rv JOIN (SELECT 1 AS `where`) x ON x.where = 1
+
+## where after as in a delete alias
+expect: all=Destructive
+DELETE FROM t AS where
+
+## a real where after a qualified where column
+expect: all=Write
+UPDATE t SET a = 1 WHERE t.where = 1
+
+## start with transaction only as a name
+expect: my=Unknown
+START REPLICA FOR CHANNEL transaction
+
+## start transaction needs the keyword right after start
+expect: my=Unknown pg=Unknown
+START x.transaction
+
+## quoted transaction names a setting
+expect: pg=ChangesAccessMode
+SET "transaction" ISOLATION LEVEL READ COMMITTED
+
+## with main statement only as a qualified name
+expect: all=Unknown
+WITH x AS (SELECT 1), y AS (SELECT 2) x.select
+
+## trigger kind not hidden by a qualified name
+expect: my=Destructive
+CREATE DEFINER = x.table TRIGGER tr AFTER INSERT ON a FOR EACH ROW DELETE FROM t
+
+%% ------------------------------------------------------------------------------------------
+%% standard_conforming_strings = off: no backslash escapes in identifiers (security review M1)
+
+## scs off: a backslash does not escape inside a double-quoted alias
+expect: pg=Destructive
+modes: scs_off
+DELETE FROM rv AS "x\" -- " WHERE id = 1
+
+## scs off: a backslash does not escape inside a unicode-escaped alias
+expect: pg=>=Destructive
+modes: scs_off
+DELETE FROM rv AS U&"x\" -- " WHERE id = 1
+
+## scs off: a backslash still escapes inside a string
+expect: pg=Write
+modes: scs_off
+DELETE FROM rv WHERE a = 'x\' -- ' AND id = 1
+
+## ansi_quotes: no backslash escapes inside a double-quoted identifier
+expect: my=Destructive
+modes: ansi_quotes
+DELETE FROM rv AS "x\" -- " WHERE id = 1
+
+%% ------------------------------------------------------------------------------------------
+%% CREATE SCHEMA runs its elements (security review M2)
+
+## create schema with a grant element
+expect: pg=Destructive
+CREATE SCHEMA s AUTHORIZATION u CREATE TABLE t (a int) GRANT SELECT ON t TO PUBLIC
+
+## create schema with a table element
+expect: pg=Ddl
+CREATE SCHEMA s CREATE TABLE t (a int) CREATE VIEW v AS SELECT a FROM t
+
+## create schema with a trigger that empties a table
+expect: pg=Destructive
+CREATE SCHEMA s CREATE TRIGGER tr AFTER INSERT ON a FOR EACH ROW EXECUTE FUNCTION f() CREATE RULE r AS ON INSERT TO a DO ALSO DELETE FROM t
