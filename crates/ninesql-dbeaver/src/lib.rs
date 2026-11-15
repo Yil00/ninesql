@@ -38,12 +38,16 @@ mod fsread;
 mod jdbc;
 pub mod mapping;
 pub mod model;
+mod properties;
 pub mod report;
 
 pub use credentials::{Credentials, CredentialsError, decrypt_credentials};
 pub use detect::{InstallKind, Project, SearchRoots, Workspace, detect_workspaces, open_folder};
 pub use error::DbeaverError;
-pub use mapping::{ConnectionImport, ImportedConnection, ImportedSecret, Outcome, ProjectImport};
+pub use mapping::{
+    ConnectionImport, DroppedProperty, ImportedConnection, ImportedSecret, Outcome, ProjectImport,
+    PropertyDropReason,
+};
 pub use model::{DataSources, parse_data_sources};
 pub use report::{ImportIssue, IssueKind, Severity};
 

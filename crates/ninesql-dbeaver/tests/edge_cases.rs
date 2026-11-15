@@ -10,7 +10,8 @@ use ninesql_dbeaver::mapping::{
     Status, TlsMode, map_sources,
 };
 use ninesql_dbeaver::{
-    IssueKind, Project, decrypt_credentials, import_project, open_folder, parse_data_sources,
+    IssueKind, Project, PropertyDropReason, decrypt_credentials, import_project, open_folder,
+    parse_data_sources,
 };
 use ninesql_driver_api::EngineId;
 
@@ -147,9 +148,28 @@ fn url_mode_mysql_with_tls_parameters() {
         }
     );
     assert_eq!(c.tls.mode, TlsMode::VerifyFull);
+    // Connector/J's connectTimeout has no NineSQL property: dropped, reported.
+    assert!(c.properties.is_empty(), "{:?}", c.properties.keys());
+    assert!(issue(
+        &p,
+        IssueKind::PropertyDropped,
+        Some("configuration.url.connectTimeout")
+    ));
     assert_eq!(
-        c.properties.keys().map(String::as_str).collect::<Vec<_>>(),
-        ["connectTimeout"]
+        c.dropped_properties
+            .iter()
+            .map(|d| (d.key.as_str(), d.reason))
+            .collect::<Vec<_>>(),
+        [
+            (
+                "configuration.url.connectTimeout",
+                PropertyDropReason::NoEquivalent
+            ),
+            (
+                "configuration.url.allowLoadLocalInfile",
+                PropertyDropReason::Reserved
+            ),
+        ]
     );
     assert!(issue(
         &p,
@@ -206,14 +226,17 @@ fn reserved_secret_and_readonly_properties() {
     let p = map(&one("mysql", "mariaDB", cfg), None);
     let c = only(&p);
     assert_eq!(c.read_only, Some(true));
-    assert_eq!(
-        c.properties.keys().map(String::as_str).collect::<Vec<_>>(),
-        ["ApplicationName"]
-    );
+    // MariaDB Connector/J has no `ApplicationName`; `sql_mode` is not on mysqlwire's allowlist.
+    assert!(c.properties.is_empty(), "{:?}", c.properties.keys());
     assert!(issue(
         &p,
-        IssueKind::ReservedProperty,
-        Some("sessionVariables")
+        IssueKind::PropertyDropped,
+        Some("configuration.properties.ApplicationName")
+    ));
+    assert!(issue(
+        &p,
+        IssueKind::PropertyDropped,
+        Some("configuration.properties.sessionVariables.sql_mode")
     ));
     assert!(issue(&p, IssueKind::SecretRemoved, Some("password")));
     assert!(issue(&p, IssueKind::InvalidValue, Some("weird")));

@@ -7,8 +7,11 @@
 //!   [`ImportedConnection::secrets`]; `Prompt`: nothing saved) instead of a `SecretSource`, since
 //!   secrets are not in a store yet; P2-C moves each secret and sets the reference;
 //! - [`ImportedConnection::default_schema`], [`ImportedConnection::default_catalog`] and
-//!   [`ImportedConnection::auto_commit`] carry DBeaver settings the core model has no field for
-//!   yet (each also has a report entry);
+//!   [`ImportedConnection::auto_commit`] carry DBeaver's `bootstrap` settings, which the core
+//!   model has no field for yet (each also has a report entry until the core persists them);
+//! - [`ImportedConnection::properties`] holds NineSQL driver property names for the engines a
+//!   NineSQL driver family serves (JDBC properties are converted or dropped, see
+//!   [`ImportedConnection::dropped_properties`] and docs/06 "Driver properties");
 //! - [`ImportedConnection::dbeaver_provider`] / [`ImportedConnection::dbeaver_driver`] keep the
 //!   raw ids (ADR-0006: unknown pairs are kept, never dropped).
 //!
@@ -36,6 +39,7 @@ use crate::model::{
     ConnectionDef, ConnectionTypeDef, DataSources, FolderDef, HandlerDef, Properties, Scalar,
     parse_data_sources,
 };
+use crate::properties;
 use crate::report::{Budget, ImportIssue, IssueKind, Issues, MAX_IDENT, ident};
 
 // ---------------------------------------------------------------------------------------------
@@ -382,15 +386,32 @@ pub struct ImportedConnection {
     pub read_only: Option<bool>,
     /// Folder path, outermost first.
     pub folder: Vec<String>,
-    /// Driver properties kept (non-reserved, non-secret keys).
+    /// Driver properties.
+    ///
+    /// For engines served by a NineSQL driver family (pgwire: PostgreSQL, TimescaleDB,
+    /// YugabyteDB, QuestDB; mysqlwire: MySQL, MariaDB, TiDB; sqlite), only **NineSQL property
+    /// names** from that driver's `ConnectCapabilities::accepted_properties`, with values the
+    /// driver accepts: JDBC properties and URL parameters with an equivalent are converted
+    /// (`currentSchema` → `search_path`…), the others are listed in
+    /// [`dropped_properties`](Self::dropped_properties). For other engines (no NineSQL driver
+    /// yet), the non-reserved, non-secret JDBC properties as DBeaver stored them.
     pub properties: BTreeMap<String, String>,
+    /// Driver properties and URL parameters that were not imported, with the reason (also in
+    /// the report, as `PropertyDropped`, `ReservedProperty`, `SecretRemoved` or `InvalidValue`
+    /// issues). Keys only, never values (I1).
+    pub dropped_properties: Vec<DroppedProperty>,
     /// Init statements (`bootstrap.query`).
     pub init_sql: Vec<String>,
-    /// `bootstrap.defaultSchema` (no core field yet).
+    /// Default schema DBeaver selects after connecting (`bootstrap.defaultSchema`, trimmed;
+    /// `None` when absent or blank). No core field yet (P2-C).
     pub default_schema: Option<String>,
-    /// `bootstrap.defaultCatalog` (no core field yet).
+    /// Default catalog (database) DBeaver selects after connecting (`bootstrap.defaultCatalog`,
+    /// trimmed; `None` when absent or blank). No core field yet (P2-C).
     pub default_catalog: Option<String>,
-    /// `bootstrap.autocommit` (no per-connection core field yet).
+    /// Per-connection auto-commit (`bootstrap.autocommit`) exactly as DBeaver stored it:
+    /// `Some(false)` for manual commit, `Some(true)` for auto-commit, `None` when DBeaver
+    /// stored nothing (the connection type's `auto_commit` applies). Kept even when it equals
+    /// the type's default. No per-connection core field yet (P2-C).
     pub auto_commit: Option<bool>,
     /// `false` for disabled connections.
     pub enabled: bool,
@@ -400,6 +421,31 @@ pub struct ImportedConnection {
     pub origin: DbeaverOrigin,
     /// Secrets to move to the secret store.
     pub secrets: Vec<ImportedSecret>,
+}
+
+/// Why a driver property or URL parameter was not imported.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum PropertyDropReason {
+    /// The NineSQL driver has no equivalent setting (or the property had no effect in DBeaver).
+    NoEquivalent,
+    /// A setting with an equivalent, but a value the NineSQL driver would refuse (or none).
+    InvalidValue,
+    /// Reserved for NineSQL's typed settings (driver API rule: TLS, endpoint, credentials,
+    /// read-only, init SQL…).
+    Reserved,
+    /// The key or value looks like a secret: removed (secrets only go to the keyring, I1).
+    LooksLikeSecret,
+}
+
+/// A driver property or URL parameter that was not imported.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DroppedProperty {
+    /// DBeaver key path (`configuration.properties.ApplicationName`,
+    /// `configuration.url.connectTimeout`, `configuration.properties.options.geqo`…).
+    pub key: String,
+    /// Why.
+    pub reason: PropertyDropReason,
 }
 
 impl ImportedConnection {
@@ -426,7 +472,11 @@ impl fmt::Debug for ImportedConnection {
             .field("read_only", &self.read_only)
             .field("folder", &self.folder)
             .field("property_keys", &self.properties.keys().collect::<Vec<_>>())
+            .field("dropped_properties", &self.dropped_properties)
             .field("init_sql_count", &self.init_sql.len())
+            .field("has_default_schema", &self.default_schema.is_some())
+            .field("has_default_catalog", &self.default_catalog.is_some())
+            .field("auto_commit", &self.auto_commit)
             .field("enabled", &self.enabled)
             .field("origin", &self.origin)
             .field("secrets", &self.secrets)
@@ -1117,20 +1167,28 @@ fn match_engine(provider: &str, driver: &str) -> EngineMatch {
     let supported = |engine: EngineId, verified: bool| EngineMatch::Supported { engine, verified };
     match (p.as_str(), d.as_str()) {
         ("postgresql", "postgres-jdbc") => supported(EngineId::POSTGRESQL, true),
+        // "PostgreSQL (Old)" driver of DBeaver's PostgreSQL plugin (pgjdbc too).
+        ("postgresql", "postgresql") => supported(EngineId::POSTGRESQL, false),
         ("postgresql", "postgres-timescale-jdbc") => supported(EngineId::TIMESCALEDB, true),
         ("postgresql", d) if d.contains("yugabyte") => supported(EngineId::YUGABYTEDB, false),
         ("mysql", "mysql8") => supported(EngineId::MYSQL, true),
         ("mysql", "mysql5") => supported(EngineId::MYSQL, false),
         ("mysql", "mariadb") => supported(EngineId::MARIADB, true),
-        ("mysql" | "generic", "tidb") => supported(EngineId::TIDB, false),
+        // DBeaver's TiDB plugin declares provider `tidb`, driver `tidb` (Connector/J).
+        ("tidb" | "mysql" | "generic", "tidb") => supported(EngineId::TIDB, false),
         ("generic" | "questdb", "questdb") => supported(EngineId::QUESTDB, false),
         ("sqlite", "sqlite_jdbc") => supported(EngineId::SQLITE, true),
         ("generic", "sqlite_jdbc") => supported(EngineId::SQLITE, false),
-        ("duckdb", _) | ("generic", "duckdb_jdbc") => supported(EngineId::DUCKDB, false),
+        // Not `duckdb` / `motherduck_jdbc`: MotherDuck is a cloud service, not a local file.
+        ("duckdb" | "generic", "duckdb_jdbc") => supported(EngineId::DUCKDB, false),
         ("clickhouse", "com_clickhouse") => supported(EngineId::CLICKHOUSE, true),
         ("clickhouse" | "generic", "yandex_clickhouse") => supported(EngineId::CLICKHOUSE, false),
         ("generic" | "trino", "trino_jdbc") => supported(EngineId::TRINO, false),
-        ("jaybird" | "generic", "jaybird" | "firebird") => supported(EngineId::FIREBIRD, false),
+        // Not `jaybird_embedded` (an embedded engine on a local file).
+        (
+            "jaybird" | "generic",
+            "jaybird" | "firebird" | "firebird_jaybird" | "firebird_jaybird3",
+        ) => supported(EngineId::FIREBIRD, false),
         _ => EngineMatch::Unsupported,
     }
 }
@@ -1221,6 +1279,15 @@ struct ConnState {
     username_hint: Option<String>,
     read_only: Option<bool>,
     properties: BTreeMap<String, String>,
+    /// Property rules of the JDBC driver (set once the engine is known).
+    rules: properties::Rules,
+    /// Converted properties: NineSQL name → (precedence, value, DBeaver key path).
+    mapped: BTreeMap<&'static str, (properties::Priority, String, String)>,
+    dropped: Vec<DroppedProperty>,
+    /// Connector/J `connectionTimeZone` / `serverTimezone` (path, value).
+    cj_time_zone: Option<(String, String)>,
+    /// Connector/J `forceConnectionTimeZoneToSession` (path, value).
+    cj_force_time_zone: Option<(String, bool)>,
 }
 
 fn failed(dbeaver_id: &str, name: String, reason: &str, mut issues: Issues) -> ConnectionImport {
@@ -1252,6 +1319,11 @@ fn map_connection(
         username_hint: None,
         read_only: None,
         properties: BTreeMap::new(),
+        rules: properties::Rules::Keep,
+        mapped: BTreeMap::new(),
+        dropped: Vec::new(),
+        cj_time_zone: None,
+        cj_force_time_zone: None,
     };
     let id = def.id.as_str();
 
@@ -1328,6 +1400,7 @@ fn map_connection(
         }
     };
     let file_engine = is_file_engine(&engine);
+    st.rules = properties::Rules::for_connection(&engine, &driver);
 
     // Endpoint (and URL parameters, which go through the property rules).
     let endpoint = match map_endpoint(def, file_engine, &mut st) {
@@ -1337,16 +1410,19 @@ fn map_connection(
 
     // Driver properties.
     for key in &cfg.properties.non_scalar {
+        let path = format!("configuration.properties.{key}");
         st.issues.warn(
             IssueKind::InvalidValue,
-            Some(format!("configuration.properties.{key}")),
+            Some(path.clone()),
             "not imported: not a scalar value",
         );
+        st.drop_property(path, PropertyDropReason::InvalidValue);
     }
     for (key, value) in &cfg.properties.entries {
         let text = value.as_text();
         apply_property("configuration.properties", key, &text, &mut st);
     }
+    finish_properties(&mut st);
     for (key, _) in &cfg.provider_properties.entries {
         st.issues.info(
             IssueKind::Unsupported,
@@ -1625,6 +1701,7 @@ fn map_connection(
         read_only,
         folder,
         properties: st.properties,
+        dropped_properties: st.dropped,
         init_sql,
         default_schema,
         default_catalog,
@@ -1853,8 +1930,9 @@ fn normalize_key(key: &str) -> String {
 }
 
 /// One driver property or URL parameter: TLS keys feed the TLS settings, `user` the user name,
-/// `readOnly=true` the read-only flag; secret-like and reserved keys are dropped and reported;
-/// the rest is kept.
+/// `readOnly=true` the read-only flag; secret-like keys are dropped; for engines a NineSQL
+/// driver family serves, the property is converted to NineSQL property names or dropped
+/// ([`properties`]); otherwise reserved keys are dropped and the rest is kept.
 fn apply_property(prefix: &str, key: &str, value: &str, st: &mut ConnState) {
     let path = join(prefix, key);
     if key.trim().is_empty() || !is_valid_short(key) {
@@ -1863,6 +1941,7 @@ fn apply_property(prefix: &str, key: &str, value: &str, st: &mut ConnState) {
             Some(prefix.to_owned()),
             "a driver property with an empty, too long or invalid key was not imported",
         );
+        st.drop_property(prefix.to_owned(), PropertyDropReason::InvalidValue);
         return;
     }
     let norm = normalize_key(key);
@@ -1886,20 +1965,23 @@ fn apply_property(prefix: &str, key: &str, value: &str, st: &mut ConnState) {
         _ => {}
     }
     if is_secret_like(key, value) {
-        st.issues.warn(
-            IssueKind::SecretRemoved,
-            Some(path),
-            "looks like a secret: removed, not imported (secrets only go to the keyring)",
-        );
+        st.secret_removed(path);
         return;
     }
-    if is_reserved_property(key) {
+    if is_reserved_property(key) && !properties::handles_reserved(st.rules, key) {
         st.issues.warn(
             IssueKind::ReservedProperty,
-            Some(path),
+            Some(path.clone()),
             "not imported: reserved for NineSQL's typed settings (TLS, endpoint, credentials, \
              read-only, init SQL); set it there",
         );
+        st.drop_property(path, PropertyDropReason::Reserved);
+        return;
+    }
+    if let Some(actions) = properties::map(st.rules, &path, key, value) {
+        for action in actions {
+            st.apply_action(action);
+        }
         return;
     }
     if st
@@ -1912,6 +1994,151 @@ fn apply_property(prefix: &str, key: &str, value: &str, st: &mut ConnState) {
             Some(path),
             "set both in the URL and in the driver properties: the driver property is kept",
         );
+    }
+}
+
+impl ConnState {
+    fn drop_property(&mut self, key: String, reason: PropertyDropReason) {
+        self.dropped.push(DroppedProperty { key, reason });
+    }
+
+    fn secret_removed(&mut self, path: String) {
+        self.issues.warn(
+            IssueKind::SecretRemoved,
+            Some(path.clone()),
+            "looks like a secret: removed, not imported (secrets only go to the keyring)",
+        );
+        self.drop_property(path, PropertyDropReason::LooksLikeSecret);
+    }
+
+    fn dropped_property(&mut self, path: String, reason: properties::Drop, message: String) {
+        self.issues
+            .warn(IssueKind::PropertyDropped, Some(path.clone()), message);
+        self.drop_property(
+            path,
+            match reason {
+                properties::Drop::NoEquivalent => PropertyDropReason::NoEquivalent,
+                properties::Drop::InvalidValue => PropertyDropReason::InvalidValue,
+            },
+        );
+    }
+
+    fn apply_action(&mut self, action: properties::Action) {
+        use properties::Action;
+        match action {
+            Action::Map {
+                path,
+                target,
+                value,
+                priority,
+            } => self.map_property(path, target, value, priority),
+            Action::Drop {
+                path,
+                reason,
+                message,
+            } => self.dropped_property(path, reason, message),
+            Action::Secret { path } => self.secret_removed(path),
+            Action::ReadOnly { path } => {
+                self.read_only = Some(true);
+                self.issues.info(
+                    IssueKind::PropertyMapped,
+                    Some(path),
+                    "makes the session read-only: imported as the connection's read-only flag",
+                );
+            }
+            Action::ConnectionTimeZone { path, value } => {
+                if let Some((old, _)) = self.cj_time_zone.replace((path, value)) {
+                    self.dropped_property(
+                        old,
+                        properties::Drop::NoEquivalent,
+                        "not imported: the connection time zone is set more than once; the \
+                         last one is kept"
+                            .to_owned(),
+                    );
+                }
+            }
+            Action::ForceTimeZone { path, on } => {
+                if let Some((old, _)) = self.cj_force_time_zone.replace((path, on)) {
+                    self.drop_property(old, PropertyDropReason::NoEquivalent);
+                }
+            }
+        }
+    }
+
+    fn map_property(
+        &mut self,
+        path: String,
+        target: &'static str,
+        value: String,
+        priority: properties::Priority,
+    ) {
+        if let Some((old_priority, _, old_path)) = self.mapped.get(target) {
+            if *old_priority > priority {
+                let message = format!(
+                    "not imported: `{target}` is already set by `{}`, which takes precedence",
+                    ident(old_path, MAX_IDENT)
+                );
+                self.dropped_property(path, properties::Drop::NoEquivalent, message);
+                return;
+            }
+            let (old_path, message) = (
+                old_path.clone(),
+                format!(
+                    "not imported: `{target}` is set again by `{}`, which takes precedence",
+                    ident(&path, MAX_IDENT)
+                ),
+            );
+            self.dropped_property(old_path, properties::Drop::NoEquivalent, message);
+        }
+        self.issues.info(
+            IssueKind::PropertyMapped,
+            Some(path.clone()),
+            format!("imported as the NineSQL driver property `{target}`"),
+        );
+        self.mapped.insert(target, (priority, value, path));
+    }
+}
+
+/// Resolves the properties that depend on each other and moves the converted ones into
+/// `properties`.
+fn finish_properties(st: &mut ConnState) {
+    let force = st.cj_force_time_zone.take();
+    let force_on = force.as_ref().is_some_and(|(_, on)| *on);
+    let time_zone_set = st.cj_time_zone.is_some();
+    match st.cj_time_zone.take() {
+        Some((path, value)) if force_on => match properties::connection_time_zone(&value) {
+            Some(tz) => st.map_property(path, "time_zone", tz, properties::Priority::Direct),
+            None => st.dropped_property(
+                path,
+                properties::Drop::InvalidValue,
+                "not imported: `LOCAL`, `SERVER` or an empty value depends on the machine or \
+                 the server, not a fixed time zone"
+                    .to_owned(),
+            ),
+        },
+        Some((path, _)) => st.dropped_property(
+            path,
+            properties::Drop::NoEquivalent,
+            "not imported: without `forceConnectionTimeZoneToSession=true`, Connector/J only \
+             uses it to convert dates on the client; it does not set the session time zone"
+                .to_owned(),
+        ),
+        None => {}
+    }
+    if let Some((path, on)) = force {
+        // Consumed with the time zone above; on its own it has no effect.
+        if !on || !time_zone_set {
+            st.dropped_property(
+                path,
+                properties::Drop::NoEquivalent,
+                "not imported: no NineSQL equivalent on its own (it only matters with a \
+                 connection time zone)"
+                    .to_owned(),
+            );
+        }
+    }
+    for (target, (_, value, _)) in std::mem::take(&mut st.mapped) {
+        st.properties.insert(target.to_owned(), value);
     }
 }
 
@@ -2935,6 +3162,34 @@ mod tests {
             match_engine("oracle", "oracle_thin"),
             EngineMatch::Unsupported
         ));
+        // Provider / driver pairs from DBeaver's plugin descriptors (no fixture yet).
+        let engine = |p: &str, d: &str| match match_engine(p, d) {
+            EngineMatch::Supported { engine, .. } => Some(engine),
+            EngineMatch::Unsupported => None,
+        };
+        assert_eq!(engine("tidb", "tidb"), Some(EngineId::TIDB));
+        assert_eq!(
+            engine("postgresql", "postgres-yugabytedb-jdbc"),
+            Some(EngineId::YUGABYTEDB)
+        );
+        assert_eq!(
+            engine("postgresql", "postgresql"),
+            Some(EngineId::POSTGRESQL)
+        );
+        assert_eq!(engine("duckdb", "duckdb_jdbc"), Some(EngineId::DUCKDB));
+        assert_eq!(engine("duckdb", "motherduck_jdbc"), None);
+        assert_eq!(
+            engine("generic", "firebird_jaybird3"),
+            Some(EngineId::FIREBIRD)
+        );
+        assert_eq!(engine("jaybird", "jaybird_embedded"), None);
+        assert_eq!(
+            engine("clickhouse", "yandex_clickhouse"),
+            Some(EngineId::CLICKHOUSE)
+        );
+        assert_eq!(engine("generic", "trino_jdbc"), Some(EngineId::TRINO));
+        assert_eq!(engine("sqlite", "libsql_jdbc"), None);
+        assert_eq!(engine("mysql", "mysql_ndb"), None);
     }
 
     #[test]

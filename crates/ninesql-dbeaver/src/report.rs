@@ -56,6 +56,13 @@ pub enum IssueKind {
     FileInsideDbeaver,
     /// Init statements were imported: the user should review them.
     InitSql,
+    /// A JDBC driver property or URL parameter was converted to a NineSQL driver property
+    /// (`currentSchema` → `search_path`…).
+    PropertyMapped,
+    /// A JDBC driver property or URL parameter has no NineSQL equivalent, or a value the NineSQL
+    /// driver does not accept: not imported (listed in
+    /// [`ImportedConnection::dropped_properties`](crate::mapping::ImportedConnection::dropped_properties)).
+    PropertyDropped,
 }
 
 /// One entry of the import report.

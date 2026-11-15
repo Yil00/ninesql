@@ -152,10 +152,24 @@ fn every_fixture_maps_as_documented() {
         assert_eq!(tcp(c), ("pg-dev.example.invalid", Some(5432), Some("nine")));
         assert_eq!(c.folder, ["Team A"]);
         assert_eq!(c.connection_type, "dev");
+        // pgjdbc's ApplicationName and connectTimeout have no NineSQL property.
+        assert!(c.properties.is_empty(), "[{v}] {:?}", c.properties.keys());
         assert_eq!(
-            c.properties.keys().map(String::as_str).collect::<Vec<_>>(),
-            ["ApplicationName", "connectTimeout"]
+            c.dropped_properties
+                .iter()
+                .map(|d| d.key.as_str())
+                .collect::<Vec<_>>(),
+            [
+                "configuration.properties.ApplicationName",
+                "configuration.properties.connectTimeout"
+            ]
         );
+        assert!(has_issue(
+            &p,
+            "pg-dev",
+            IssueKind::PropertyDropped,
+            Some("ApplicationName")
+        ));
         assert_eq!(c.init_sql, ["SET statement_timeout = 30000"]);
         assert_eq!(c.default_schema.as_deref(), Some("app"));
         assert!(has_issue(
@@ -288,10 +302,13 @@ fn every_fixture_maps_as_documented() {
             IssueKind::Unsupported,
             Some("autocommit")
         ));
-        assert_eq!(
-            c.properties.keys().map(String::as_str).collect::<Vec<_>>(),
-            ["connectTimeout"]
-        );
+        assert!(c.properties.is_empty(), "[{v}] {:?}", c.properties.keys());
+        assert!(has_issue(
+            &p,
+            "mysql-test",
+            IssueKind::PropertyDropped,
+            Some("connectTimeout")
+        ));
         assert_eq!(c.tls.mode, TlsMode::Require);
         assert!(has_issue(&p, "mysql-test", IssueKind::TlsNotVerified, None));
         assert!(secret_is(
