@@ -1,6 +1,6 @@
 # ADR-0022: Pre-phase-2 hardening decisions
 
-- **Status**: Proposed (the maintainer accepts it). Until then, the accepted ADRs it notes ([ADR-0005](0005-secrets-storage.md), [ADR-0017](0017-workspace-lock-rewrite-on-load-and-project-identity.md), [ADR-0021](0021-phase-1-core-secrets-and-storage-decisions.md)) are unchanged.
+- **Status**: Accepted (maintainer, 2026-11-15). It adds notes to [ADR-0005](0005-secrets-storage.md), [ADR-0017](0017-workspace-lock-rewrite-on-load-and-project-identity.md) and [ADR-0021](0021-phase-1-core-secrets-and-storage-decisions.md) without rewriting their decisions.
 - **Date**: 2026-11-15
 
 ## Context
