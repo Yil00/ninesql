@@ -350,6 +350,15 @@ async fn conformance_reserved_properties_and_multiple_statements() {
     }
 }
 
+/// I1: statement text holding a credential (init SQL included) is never logged.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn statements_with_credentials_are_never_logged() {
+    for dev in devs() {
+        conformance::assert_credential_statements_not_logged(&MySqlWireDriver::new(), params(&dev))
+            .await;
+    }
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn read_only_refuses_writes_engine_side() {
     for dev in devs() {

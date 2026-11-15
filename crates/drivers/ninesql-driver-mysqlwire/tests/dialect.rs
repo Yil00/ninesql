@@ -509,3 +509,279 @@ proptest! {
         }
     }
 }
+
+// ---------------------------------------------------------------------------------------------
+// Caller-supplied `ScriptState` delimiters and the lazy split under a custom delimiter
+
+/// Walks `script` lazily from every item boundary of the full split and asserts each
+/// `split_script_ahead` step gives exactly the next items of the full split (with the state the
+/// items before it leave), and that the whole lazy walk is the full split.
+fn assert_lazy_equals_full(d: &MyDialect, script: &str) {
+    use ninesql_driver_api::{ScriptState, TextPosition};
+    let full = d.split_script(script);
+    let mut state = ScriptState::default();
+    let mut at = TextPosition::START;
+    let mut states = Vec::with_capacity(full.len() + 1);
+    states.push((at, state.clone()));
+    for item in &full {
+        state = d.script_state_after(script, item, &state);
+        at = item.end;
+        states.push((at, state.clone()));
+    }
+    for (i, (from, st)) in states.iter().enumerate() {
+        let ahead = d.split_script_ahead(script, *from, st);
+        let rest = d.split_script_from(script, from.offset);
+        let want = &rest[..ahead.len().min(rest.len())];
+        assert_eq!(ahead.as_slice(), want, "step {i} of {script:?}");
+        assert_eq!(ahead.is_empty(), rest.is_empty(), "step {i} of {script:?}");
+    }
+    // The walk a caller does, consuming whole steps. A resumption inside an executable
+    // comment lexes the rest without that context (the documented exception: it can only
+    // split further, and the driver refuses a piece holding several statements).
+    if script.contains("/*!") || script.contains("/*M!") {
+        return;
+    }
+    let mut walked = Vec::new();
+    let mut state = ScriptState::default();
+    let mut at = TextPosition::START;
+    loop {
+        let more = d.split_script_ahead(script, at, &state);
+        if more.is_empty() {
+            break;
+        }
+        for item in more {
+            state = d.script_state_after(script, &item, &state);
+            at = item.end;
+            walked.push(item);
+        }
+    }
+    assert_eq!(walked, full, "lazy walk of {script:?}");
+}
+
+/// Security review: a caller-supplied delimiter that the `DELIMITER` directive would refuse
+/// (an empty one used to panic) refuses the rest of the script.
+#[test]
+fn invalid_state_delimiters_refuse_the_rest() {
+    use ninesql_driver_api::{ScriptState, TextPosition};
+    let d = MyDialect::mysql();
+    let script = "  -- c\nSELECT 1; DELETE FROM t $$\nSELECT 2 ;  ";
+    for bad in [
+        "", " ", "$ $", "a\tb", "\\", "'", "\"", "`", "#x", "--", "-- ", "/*", "a/*b", "\u{2003}",
+    ] {
+        let state = ScriptState::with_delimiter(Some(bad.to_owned()));
+        let items = d.split_script_ahead(script, TextPosition::START, &state);
+        assert_eq!(items.len(), 1, "{bad:?}: {items:?}");
+        assert_eq!(
+            items[0].kind,
+            ScriptItemKind::Refused(ScriptRefusal::InvalidDelimiter),
+            "{bad:?}"
+        );
+        assert_eq!(
+            items[0].text(script),
+            "SELECT 1; DELETE FROM t $$\nSELECT 2 ;",
+            "{bad:?}"
+        );
+        // The state stays invalid: a caller stops at the refused item anyway.
+        assert_eq!(d.script_state_after(script, &items[0], &state), state);
+        // Only blanks and comments left: nothing.
+        assert!(
+            d.split_script_ahead("  # c\n /* x */ ", TextPosition::START, &state)
+                .is_empty(),
+            "{bad:?}"
+        );
+    }
+    // `;` is the directive's spelling of the default.
+    let semi = ScriptState::with_delimiter(Some(";".to_owned()));
+    assert_eq!(
+        d.split_script_ahead(script, TextPosition::START, &semi),
+        d.split_script_ahead(script, TextPosition::START, &ScriptState::default())
+    );
+    // A valid custom delimiter still works.
+    let dollar = ScriptState::with_delimiter(Some("$$".to_owned()));
+    let items = d.split_script_ahead(script, TextPosition::START, &dollar);
+    let texts: Vec<_> = items.iter().map(|i| i.text(script)).collect();
+    assert_eq!(texts, ["SELECT 1", "DELETE FROM t"]);
+}
+
+/// Security review L2: a long `DELIMITER $$` block whose statements each change the lexical
+/// modes is re-split after every statement; each lazy step costs a window, not the block.
+#[test]
+fn long_custom_delimiter_block_with_mode_changes_runs_in_linear_time() {
+    use ninesql_driver_api::conformance::script_plan;
+    let mut toggle = |text: &str| -> Option<Box<dyn Dialect>> {
+        let t = text.to_ascii_uppercase();
+        if t.starts_with("SET SESSION SQL_MODE='NO_BACKSLASH_ESCAPES'") {
+            Some(Box::new(
+                MyDialect::mysql().with_sql_mode("NO_BACKSLASH_ESCAPES"),
+            ))
+        } else if t.starts_with("SET SESSION SQL_MODE=''") {
+            Some(Box::new(MyDialect::mysql()))
+        } else {
+            None
+        }
+    };
+    let pair = "SET SESSION sql_mode='NO_BACKSLASH_ESCAPES';\nSET SESSION sql_mode='';\n";
+    let n = 300_000 / pair.len();
+    let script = format!(
+        "DELIMITER $$\n{}$$\nDELIMITER ;\nSELECT 1;\n",
+        pair.repeat(n)
+    );
+    let start = std::time::Instant::now();
+    let plan = script_plan(&script, Box::new(MyDialect::mysql()), &mut toggle);
+    let elapsed = start.elapsed();
+    assert_eq!(plan.len(), 2 * n + 1);
+    assert_eq!(plan.last().map(|p| p.text.as_str()), Some("SELECT 1"));
+    assert!(elapsed < std::time::Duration::from_secs(5), "{elapsed:?}");
+}
+
+/// The windowed lazy step under a custom delimiter is the full split at every boundary, on
+/// blocks larger than a window, with delimiters in strings, comments and executable comments
+/// and long tokens across window ends.
+#[test]
+fn lazy_custom_delimiter_steps_equal_the_full_split() {
+    let d = MyDialect::mysql();
+    let long = "x".repeat(700);
+    let mut s = String::from("DELIMITER $$\n");
+    for i in 0..60 {
+        s.push_str(&format!(
+            "SELECT {i}, '$$;{long}' /* $$ ; */ ;\n-- $$ ;\n# $$\nSELECT /*!50000 1; $$ */ {i};\n"
+        ));
+        if i % 7 == 0 {
+            s.push_str("$$\nDELIMITER //\nSELECT 'a' //\nDELIMITER $$\n");
+        }
+        if i % 11 == 0 {
+            s.push_str(&format!(
+                "CREATE PROCEDURE p{i}() BEGIN SELECT 1; SELECT '{long}'; END$$\n"
+            ));
+        }
+    }
+    s.push_str("$$\nDELIMITER ;\nSELECT 'end';");
+    assert_lazy_equals_full(&d, &s);
+    // Without executable comments the whole lazy walk is checked too.
+    let plain = s.replace("/*!50000", "/*");
+    assert_lazy_equals_full(&d, &plain);
+    assert_lazy_equals_full(
+        &MyDialect::mysql().with_sql_mode("NO_BACKSLASH_ESCAPES"),
+        &s,
+    );
+    assert_lazy_equals_full(&MyDialect::mariadb().with_sql_mode("ANSI_QUOTES"), &s);
+    // A delimiter longer than a window, and a block with no closing delimiter.
+    let big = "@".repeat(2_000);
+    let s = format!(
+        "DELIMITER {big}\n{}SELECT 9",
+        format!("SELECT 1;\n{big}\n").repeat(5)
+    );
+    assert_lazy_equals_full(&d, &s);
+    let s = format!("DELIMITER $$\n{}", format!("SELECT '{long}';\n").repeat(50));
+    assert_lazy_equals_full(&d, &s);
+}
+
+fn custom_block_script() -> impl Strategy<Value = String> {
+    let long = format!("'{}'", "y".repeat(300));
+    (
+        prop::sample::select(vec!["$$", "//", ";;", "@@@", "END"]),
+        prop::collection::vec(
+            prop::sample::select(vec![
+                "'".to_owned(),
+                "\"".to_owned(),
+                "`".to_owned(),
+                "/*".to_owned(),
+                "/*!".to_owned(),
+                "/*!50000".to_owned(),
+                "/*M!".to_owned(),
+                "*/".to_owned(),
+                "-- ".to_owned(),
+                "--".to_owned(),
+                "#".to_owned(),
+                "\n".to_owned(),
+                ";".to_owned(),
+                ";\n".to_owned(),
+                "\\".to_owned(),
+                "BEGIN".to_owned(),
+                "END".to_owned(),
+                "CREATE PROCEDURE p()".to_owned(),
+                "DELIMITER //\n".to_owned(),
+                "DELIMITER $$\n".to_owned(),
+                "DELIMITER ;\n".to_owned(),
+                "//".to_owned(),
+                "$$".to_owned(),
+                "$".to_owned(),
+                "/".to_owned(),
+                "@".to_owned(),
+                "SELECT 1".to_owned(),
+                "SET sql_mode=''".to_owned(),
+                " ".to_owned(),
+                "é".to_owned(),
+                long,
+            ]),
+            0..120,
+        ),
+    )
+        .prop_map(|(delim, v)| format!("DELIMITER {delim}\n{}", v.concat()))
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(256))]
+
+    /// Any caller-supplied delimiter: no panic, invalid ones refuse the rest, valid ones split
+    /// with the usual invariants.
+    #[test]
+    fn any_state_delimiter_is_handled(
+        script in junk(),
+        delim in prop_oneof![
+            "\\PC{0,6}",
+            prop::sample::select(vec![
+                "", " ", ";", "$$", "//", "\\", "'", "--", "#", "/*", "*/", "é", "\u{2000}",
+            ]).prop_map(str::to_owned),
+        ],
+        cut in 0usize..400,
+    ) {
+        use ninesql_driver_api::{LineIndex, ScriptState, TextPosition};
+        let d = MyDialect::mysql();
+        let state = ScriptState::with_delimiter(Some(delim.clone()));
+        let index = LineIndex::new(&script);
+        let mut from_offsets = vec![0, cut.min(script.len())];
+        from_offsets.extend(d.split_script(&script).iter().map(|i| i.end.offset));
+        for off in from_offsets {
+            let from = if script.is_char_boundary(off) { index.position(off) } else { TextPosition::START };
+            let items = d.split_script_ahead(&script, from, &state);
+            let mut last = from.offset;
+            for item in &items {
+                prop_assert!(item.span.start >= last && item.span.end <= script.len());
+                prop_assert_eq!(item.start, index.position(item.span.start));
+                prop_assert_eq!(item.end, index.position(item.span.end));
+                last = item.span.end;
+                if item.kind == ScriptItemKind::Statement {
+                    let text = item.text(&script);
+                    prop_assert!(!text.bytes().all(|b| b.is_ascii_whitespace()));
+                    let inside_executable = text.contains("*/") || text.contains("/*");
+                    prop_assert!(d.split_statements(text).len() <= 1 || inside_executable,
+                        "{:?} of {:?}", text, script);
+                }
+            }
+            let valid = !delim.is_empty()
+                && !delim.contains(char::is_whitespace)
+                && !delim.contains(['\\', '\'', '"', '`'])
+                && !delim.starts_with('#')
+                && !delim.starts_with("--")
+                && !delim.contains("/*");
+            if !valid && delim != ";" {
+                prop_assert!(items.len() <= 1);
+                prop_assert!(items.iter().all(|i| i.kind
+                    == ScriptItemKind::Refused(ScriptRefusal::InvalidDelimiter)));
+            }
+        }
+    }
+
+    /// The lazy split under a custom delimiter is the full split at every boundary.
+    #[test]
+    fn lazy_steps_equal_the_full_split(s in custom_block_script()) {
+        assert_lazy_equals_full(&MyDialect::mysql(), &s);
+        assert_lazy_equals_full(&MyDialect::mysql().with_sql_mode("NO_BACKSLASH_ESCAPES"), &s);
+    }
+
+    #[test]
+    fn lazy_steps_equal_the_full_split_on_junk(s in junk()) {
+        assert_lazy_equals_full(&MyDialect::mysql(), &s);
+    }
+}

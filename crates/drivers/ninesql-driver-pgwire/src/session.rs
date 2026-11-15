@@ -62,7 +62,8 @@ pub struct PgSession {
     pub(crate) cancel_target: Arc<CancelTarget>,
     pub(crate) auto_commit: bool,
     /// Statement text may be logged at `trace` level (`ConnectParams::may_log_statements`:
-    /// the connection type allows it and the connection is not production, ADR-0007 §6).
+    /// the connection type allows it and the connection is not production, ADR-0007 §6), and
+    /// only a text that holds no credential (`may_log_statement_text`, I1).
     pub(crate) log_statements: bool,
     /// Cancel flag of the current execution, shared with `Session::cancel_handle`.
     pub(crate) current_exec: std::sync::Mutex<Arc<ExecCancel>>,
@@ -96,7 +97,8 @@ impl PgSession {
         class: StatementClass,
     ) -> DriverResult<ResultStream> {
         let shared = &self.link.shared;
-        if self.log_statements {
+        // Never a text that may hold a credential, init SQL included (I1).
+        if ninesql_driver_api::may_log_statement_text(self.log_statements, &statement.text) {
             tracing::trace!(statement = %statement.text, "pgwire execute");
         }
         let guard = self.link.tracker.begin()?;

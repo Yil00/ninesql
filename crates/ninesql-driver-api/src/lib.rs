@@ -18,6 +18,7 @@
 //! - [`Capabilities`]: plain data the UI reads to offer only what the engine supports (I8);
 //!   mirrored in `docs/08-engine-capabilities.md`.
 //! - [`DriverError`]: typed, user-presentable errors that never carry secrets or values.
+//! - [`text_may_hold_credentials`]: statement text that drivers never log (I1).
 //!
 //! With the `mock` feature, `mock` provides an in-memory driver for UI and core tests.
 #![forbid(unsafe_code)]
@@ -30,6 +31,7 @@ pub mod dialect;
 pub mod driver;
 pub mod error;
 pub mod execution;
+pub mod hygiene;
 pub mod metadata;
 #[cfg(feature = "mock")]
 pub mod mock;
@@ -52,6 +54,7 @@ pub use dialect::{
 pub use driver::{Driver, Session};
 pub use error::{DriverError, DriverResult, redact_connection_string, redact_secret};
 pub use execution::{ExecutionGuard, ExecutionId, ExecutionTracker};
+pub use hygiene::{may_log_statement_text, text_may_hold_credentials};
 pub use metadata::{
     ColumnInfo, Metadata, ObjectDetails, ObjectInfo, ObjectPath, Page, PageRequest, PathSegment,
     TableInfo, escape_like,

@@ -750,8 +750,10 @@ pub struct ConnectParams {
     /// The connection type allows query text in logs (`log_query_text` of the connection type,
     /// ADR-0007 §1). Drivers log statement text (at `trace` level only) when
     /// [`ConnectParams::may_log_statements`] is `true`, i.e. this flag is set **and** the
-    /// connection is not [`production`](Self::production). Defaults to `true`; the core sets it
-    /// from the connection type (L1 of the wave 2 integration review).
+    /// connection is not [`production`](Self::production), and never a text for which
+    /// [`text_may_hold_credentials`](crate::text_may_hold_credentials) is `true` (init SQL
+    /// included; see [`may_log_statement_text`](crate::may_log_statement_text)). Defaults to
+    /// `true`; the core sets it from the connection type (L1 of the wave 2 integration review).
     pub log_statements: bool,
     /// Which password exchanges the driver may use (default [`PasswordExchange::Any`]). A driver
     /// refuses a policy it does not list in
