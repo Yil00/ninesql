@@ -23,7 +23,6 @@
 
 use std::io;
 use std::path::Path;
-use std::sync::Mutex;
 use std::time::Duration;
 
 use gpui_kit::{App, Global, Task};
@@ -39,9 +38,6 @@ use crate::settings::{
 
 /// Quiet time after the last change before the file is written.
 pub const DEBOUNCE: Duration = Duration::from_millis(500);
-
-/// Serializes read-modify-write cycles on the file (the debounced writer and the quit flush).
-static SAVE_LOCK: Mutex<()> = Mutex::new(());
 
 /// One setting changed from the UI.
 #[derive(Debug, Clone, PartialEq)]
@@ -221,9 +217,10 @@ fn report(result: Result<(), Diagnostic>, cx: &mut App) {
 /// # Errors
 /// A user-presentable diagnostic; the file is left unchanged.
 pub fn save_blocking(configured: &Path, changes: &[SettingsChange]) -> Result<(), Diagnostic> {
-    let _guard = SAVE_LOCK
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    // The process-wide lock of settings.toml read-modify-write cycles (P3-C review L2): the
+    // core writes `[execution]`, `[history]` and `[confirmations]` into the same file
+    // (`CoreServices::save_preferences`), so a UI write never interleaves with a core write.
+    let _guard = ninesql_core::preferences::settings_write_lock();
     let file = resolve_settings_file(configured)
         .map_err(|problem| Diagnostic::new(format!("settings not saved: {}", problem.message())))?;
     if file == configured
@@ -433,6 +430,40 @@ NoSuchAction = "ctrl-x"
 [editor]
 tab_size = 4
 "#;
+
+    #[test]
+    fn saving_takes_the_core_settings_lock() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let Ok(dir) = tempfile::tempdir() else {
+            panic!("no temp dir");
+        };
+        let file = dir.path().join("settings.toml");
+        let done = Arc::new(AtomicBool::new(false));
+        let guard = ninesql_core::preferences::settings_write_lock();
+        let writer = {
+            let done = done.clone();
+            let file = file.clone();
+            std::thread::spawn(move || {
+                let r = super::save_blocking(&file, &[SettingsChange::Zoom(1.0)]);
+                done.store(true, Ordering::SeqCst);
+                r
+            })
+        };
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        assert!(
+            !done.load(Ordering::SeqCst),
+            "the save waited for the lock held by the core"
+        );
+        assert!(!file.exists());
+        drop(guard);
+        let Ok(result) = writer.join() else {
+            panic!("writer panicked");
+        };
+        assert!(result.is_ok(), "{result:?}");
+        assert!(done.load(Ordering::SeqCst));
+        assert!(std::fs::read_to_string(&file).is_ok_and(|t| t.contains("zoom")));
+    }
 
     #[test]
     fn edits_only_the_changed_keys() {

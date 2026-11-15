@@ -558,6 +558,26 @@ tab_size = 4
     }
 
     #[test]
+    fn core_preference_sections_are_not_flagged() {
+        // `[execution]`, `[history]` and `[confirmations]` belong to the core's preferences
+        // (P3-C); the UI's diagnostics leave them alone.
+        let (_, diags) = parse(
+            r#"
+[execution]
+default_timeout_secs = 30
+[history]
+enabled = false
+[confirmations]
+close_with_open_transaction = true
+[keybindings]
+"ninesql_editor::ExecuteStatement" = "f5"
+"ninesql_grid::FetchAllRows" = []
+"#,
+        );
+        assert!(diags.is_empty(), "{diags:?}");
+    }
+
+    #[test]
     fn invalid_bindings_are_reported_not_fatal() {
         let (settings, diags) = parse(
             r#"

@@ -1,10 +1,10 @@
 //! Statement splitting through the dialect (F-SQL-03).
 //!
 //! The editor never splits or classifies SQL itself: [`StatementSplitter`] is the seam to the
-//! dialect of the connection's driver. [`DialectSplitter`] adapts today's
-//! [`Dialect::split_statements`]; once P3-D lands `Dialect::split_script` / `code_tokens`, the
-//! adapter forwards to them (client directives and refused items included) and the interim
-//! lexer below goes away.
+//! dialect of the connection's driver. [`DialectSplitter`] forwards to
+//! [`Dialect::split_script`] (statements, client directives such as MySQL `DELIMITER`, and
+//! refused pieces such as `COPY … FROM STDIN` data or psql meta-commands) and builds its
+//! segments from the driver API's shared lexer ([`code_tokens`]).
 //!
 //! [`segments`](StatementSplitter::segments) only tells code from strings, quoted identifiers
 //! and comments, for parameter detection and completion context. It is never used to decide
@@ -13,7 +13,7 @@
 use std::ops::Range;
 use std::sync::Arc;
 
-use ninesql_core::driver_api::{Dialect, LexicalRules};
+use ninesql_core::driver_api::{CodeTokenKind, Dialect, LexicalRules, ScriptItemKind, code_tokens};
 
 /// What one item of a script is.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -99,69 +99,33 @@ impl std::fmt::Debug for DialectSplitter {
 impl StatementSplitter for DialectSplitter {
     fn split(&self, text: &str) -> Vec<ScriptItem> {
         self.dialect
-            .split_statements(text)
+            .split_script(text)
             .into_iter()
-            .map(|s| ScriptItem {
-                span: s.start..s.end,
-                kind: ItemKind::Statement,
+            .map(|item| ScriptItem {
+                span: item.span.start..item.span.end,
+                kind: match item.kind {
+                    ScriptItemKind::Statement => ItemKind::Statement,
+                    ScriptItemKind::ClientDirective => ItemKind::ClientDirective,
+                    ScriptItemKind::Refused(why) => ItemKind::Refused(why.message().to_owned()),
+                    // Fail-closed: a kind this editor does not know is never sent as SQL.
+                    _ => ItemKind::Refused("this part of the script cannot run".to_owned()),
+                },
             })
             .collect()
     }
 
     fn segments(&self, text: &str) -> Vec<Segment> {
-        lex_segments(text, self.dialect.lexical_rules())
+        code_segments(text, self.dialect.lexical_rules())
     }
 }
 
-fn is_word_byte(b: u8) -> bool {
-    b.is_ascii_alphanumeric() || b == b'_' || b >= 0x80
-}
-
-/// End (exclusive) of a quoted run opened at `start` by `quote`; doubled quotes and, with
-/// `backslash`, backslash escapes stay inside. Unterminated: the end of the text.
-fn skip_quoted(bytes: &[u8], start: usize, quote: u8, backslash: bool) -> usize {
-    let mut i = start + 1;
-    while i < bytes.len() {
-        let b = bytes[i];
-        if backslash && b == b'\\' {
-            i += 2;
-            continue;
-        }
-        if b == quote {
-            if bytes.get(i + 1) == Some(&quote) {
-                i += 2;
-                continue;
-            }
-            return i + 1;
-        }
-        i += 1;
-    }
-    bytes.len()
-}
-
-fn dollar_tag(bytes: &[u8], start: usize) -> Option<usize> {
-    let mut i = start + 1;
-    if bytes.get(i).is_some_and(u8::is_ascii_digit) {
-        return None;
-    }
-    while i < bytes.len() && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_') {
-        i += 1;
-    }
-    (bytes.get(i) == Some(&b'$')).then_some(i + 1 - start)
-}
-
-fn find_sub(hay: &[u8], needle: &[u8], from: usize) -> Option<usize> {
-    hay.get(from..)?
-        .windows(needle.len())
-        .position(|w| w == needle)
-        .map(|p| p + from)
-}
-
-/// Interim lexer over [`LexicalRules`], until P3-D's `code_tokens`: only separates code from
-/// strings, quoted identifiers and comments. Never used for classification.
+/// Segments of `text` from the shared lexer of the driver API ([`code_tokens`], the tokens the
+/// splitter and the classifier read): string literals and quoted identifiers are the lexer's
+/// tokens, everything else between tokens is code, except comments, which only live between
+/// tokens (blanks and comments are what [`code_tokens`] skips). A string's prefix (`E`, `U&`,
+/// `N`…) is code, so a segment of kind [`SegmentKind::String`] starts at its quote.
 #[must_use]
-pub fn lex_segments(text: &str, rules: LexicalRules) -> Vec<Segment> {
-    let bytes = text.as_bytes();
+pub fn code_segments(text: &str, rules: LexicalRules) -> Vec<Segment> {
     let mut out: Vec<Segment> = Vec::new();
     let mut push = |range: Range<usize>, kind: SegmentKind| {
         if range.is_empty() {
@@ -176,91 +140,94 @@ pub fn lex_segments(text: &str, rules: LexicalRules) -> Vec<Segment> {
         }
         out.push(Segment { range, kind });
     };
-    let mut code_start = 0;
-    let mut i = 0;
-    while i < bytes.len() {
-        let b = bytes[i];
-        let prev_word = i > 0 && is_word_byte(bytes[i - 1]);
-        let found: Option<(usize, SegmentKind)> = match b {
-            b'\'' => {
-                let e_prefix = rules.e_string_backslash
-                    && i > 0
-                    && matches!(bytes[i - 1], b'e' | b'E')
-                    && !(i > 1 && is_word_byte(bytes[i - 2]));
-                let backslash = rules.backslash_escapes || e_prefix;
-                Some((skip_quoted(bytes, i, b'\'', backslash), SegmentKind::String))
+    let mut at = 0;
+    for tok in code_tokens(text, rules) {
+        let (start, end) = (tok.start.max(at), tok.end.min(text.len()));
+        if start > at {
+            gap_segments(text, at..start, rules, &mut push);
+        }
+        if end <= start {
+            continue;
+        }
+        match tok.kind {
+            CodeTokenKind::Str => {
+                let quote = text[start..end]
+                    .find(['\'', '$', '"'])
+                    .map_or(start, |p| start + p);
+                push(start..quote, SegmentKind::Code);
+                push(quote..end, SegmentKind::String);
             }
-            b'"' if rules.backslash_escapes => {
-                Some((skip_quoted(bytes, i, b'"', true), SegmentKind::String))
-            }
-            b'"' => Some((
-                skip_quoted(bytes, i, b'"', false),
-                SegmentKind::QuotedIdentifier,
-            )),
-            b'`' if rules.backtick_identifiers => Some((
-                skip_quoted(bytes, i, b'`', false),
-                SegmentKind::QuotedIdentifier,
-            )),
-            b'-' if bytes.get(i + 1) == Some(&b'-')
-                && (!rules.dash_comment_needs_space
-                    || bytes
-                        .get(i + 2)
-                        .is_none_or(|c| c.is_ascii_whitespace() || c.is_ascii_control())) =>
+            // MySQL / MariaDB without `ANSI_QUOTES`: `"…"` is a string (the lexer reads it as
+            // a quoted token either way; only its role differs).
+            CodeTokenKind::QuotedIdent
+                if rules.double_quote_backslash && text[start..end].starts_with('"') =>
             {
-                let end = find_sub(bytes, b"\n", i).unwrap_or(bytes.len());
-                Some((end, SegmentKind::Comment))
+                push(start..end, SegmentKind::String);
             }
-            b'#' if rules.hash_comments => {
-                let end = find_sub(bytes, b"\n", i).unwrap_or(bytes.len());
-                Some((end, SegmentKind::Comment))
-            }
-            b'/' if bytes.get(i + 1) == Some(&b'*') => {
-                let executable =
-                    rules.executable_comments && matches!(bytes.get(i + 2), Some(b'!' | b'M'));
-                if executable {
-                    // MySQL / MariaDB executable comments are code; their delimiters are left
-                    // in the code segment.
-                    None
-                } else {
-                    let mut depth = 1usize;
-                    let mut j = i + 2;
-                    while j < bytes.len() && depth > 0 {
-                        if rules.nested_block_comments
-                            && bytes[j] == b'/'
-                            && bytes.get(j + 1) == Some(&b'*')
-                        {
-                            depth += 1;
-                            j += 2;
-                        } else if bytes[j] == b'*' && bytes.get(j + 1) == Some(&b'/') {
-                            depth -= 1;
-                            j += 2;
-                        } else {
-                            j += 1;
-                        }
+            CodeTokenKind::QuotedIdent => push(start..end, SegmentKind::QuotedIdentifier),
+            _ => push(start..end, SegmentKind::Code),
+        }
+        at = end;
+    }
+    if at < text.len() {
+        gap_segments(text, at..text.len(), rules, &mut push);
+    }
+    out
+}
+
+/// Splits a gap between two tokens (only blanks and comments, by construction of
+/// [`code_tokens`]) into code (blanks, executable-comment markers) and comments. A block comment
+/// still open at the end of the gap runs to its end: the lexer found no token before it.
+fn gap_segments(
+    text: &str,
+    gap: Range<usize>,
+    rules: LexicalRules,
+    push: &mut impl FnMut(Range<usize>, SegmentKind),
+) {
+    let bytes = text.as_bytes();
+    let mut i = gap.start;
+    let mut code_start = gap.start;
+    while i < gap.end {
+        let rest = &bytes[i..gap.end];
+        let comment_end = if rest.starts_with(b"/*") && !rest.starts_with(b"/*!") {
+            let mut depth = 0usize;
+            let mut j = i;
+            let mut end = gap.end;
+            while j + 1 < gap.end {
+                if bytes[j] == b'/' && bytes[j + 1] == b'*' {
+                    depth += 1;
+                    j += 2;
+                } else if bytes[j] == b'*' && bytes[j + 1] == b'/' {
+                    depth = depth.saturating_sub(1);
+                    j += 2;
+                    if depth == 0 {
+                        end = j;
+                        break;
                     }
-                    Some((j.min(bytes.len()), SegmentKind::Comment))
+                } else {
+                    j += 1;
                 }
             }
-            b'$' if rules.dollar_quotes && !prev_word => dollar_tag(bytes, i).map(|len| {
-                let tag = &bytes[i..i + len];
-                let end = find_sub(bytes, tag, i + len).map_or(bytes.len(), |p| p + len);
-                (end, SegmentKind::String)
-            }),
-            _ => None,
+            Some(end)
+        } else if rest.starts_with(b"--") || rest.starts_with(b"#") {
+            let stop = |b: &u8| *b == b'\n' || (rules.line_comment_ends_at_cr && *b == b'\r');
+            Some(rest.iter().position(stop).map_or(gap.end, |p| i + p))
+        } else {
+            None
         };
-        match found {
-            Some((end, kind)) => {
+        match comment_end {
+            Some(end) => {
                 push(code_start..i, SegmentKind::Code);
-                push(i..end, kind);
+                push(i..end, SegmentKind::Comment);
                 i = end;
                 code_start = end;
             }
             None => i += 1,
         }
     }
-    push(code_start..bytes.len(), SegmentKind::Code);
-    // Byte scanning only stops on ASCII delimiters, so every boundary is a `char` boundary.
-    out
+    // Gaps are cut at token boundaries and comment delimiters are ASCII: every boundary is a
+    // `char` boundary.
+    push(code_start..gap.end, SegmentKind::Code);
 }
 
 /// The item containing `cursor`, or the one the cursor is right after or right before on the
@@ -298,7 +265,7 @@ mod tests {
     use ninesql_core::driver_api::AnsiDialect;
 
     fn kinds(text: &str, rules: LexicalRules) -> Vec<(&str, SegmentKind)> {
-        lex_segments(text, rules)
+        code_segments(text, rules)
             .into_iter()
             .map(|s| (&text[s.range], s.kind))
             .collect()
@@ -307,7 +274,7 @@ mod tests {
     #[test]
     fn segments_cover_the_text() {
         let text = "select 'a''b', \"x\"\"y\" -- c\n/* d */ $q$ e $q$ from t";
-        let segs = lex_segments(text, LexicalRules::POSTGRES);
+        let segs = code_segments(text, LexicalRules::POSTGRES);
         let mut at = 0;
         for s in &segs {
             assert_eq!(s.range.start, at);
@@ -347,6 +314,91 @@ mod tests {
         let texts: Vec<&str> = items.iter().map(|i| i.text(text)).collect();
         assert_eq!(texts, ["select 1", "select ';'", "select 3"]);
         assert!(items.iter().all(|i| i.kind == ItemKind::Statement));
+    }
+
+    /// A dialect whose script splitter reports a client directive and a refused piece.
+    struct Scripted;
+    impl Dialect for Scripted {
+        fn split_script(&self, script: &str) -> Vec<ninesql_core::driver_api::ScriptItem> {
+            use ninesql_core::driver_api::{ScriptRefusal, StatementSpan, script_items};
+            let spans = self.split_statements(script);
+            script_items(
+                script,
+                spans.into_iter().map(|s| {
+                    let kind = match &script[s.start..s.end] {
+                        t if t.starts_with("DELIMITER") => ScriptItemKind::ClientDirective,
+                        t if t.starts_with('\\') => {
+                            ScriptItemKind::Refused(ScriptRefusal::PsqlMetaCommand)
+                        }
+                        _ => ScriptItemKind::Statement,
+                    };
+                    (
+                        StatementSpan {
+                            start: s.start,
+                            end: s.end,
+                        },
+                        kind,
+                    )
+                }),
+            )
+        }
+    }
+
+    #[test]
+    fn script_items_keep_their_kind() {
+        let splitter = DialectSplitter::new(Arc::new(Scripted));
+        let text = "select 1; DELIMITER //; \\connect x; select 2";
+        let kinds: Vec<ItemKind> = splitter.split(text).into_iter().map(|i| i.kind).collect();
+        assert_eq!(
+            kinds,
+            [
+                ItemKind::Statement,
+                ItemKind::ClientDirective,
+                ItemKind::Refused("psql meta-commands are not supported".to_owned()),
+                ItemKind::Statement,
+            ]
+        );
+    }
+
+    #[test]
+    fn segments_follow_the_shared_lexer() {
+        // An unterminated block comment runs to the end; a line comment stops before the
+        // newline; executable comment content is code.
+        let k = kinds("select 1 /* open", LexicalRules::POSTGRES);
+        assert_eq!(k.last(), Some(&("/* open", SegmentKind::Comment)));
+        let k = kinds("select 1 -- c\nfrom t", LexicalRules::ANSI);
+        assert!(k.contains(&("-- c", SegmentKind::Comment)));
+        assert!(
+            k.iter()
+                .any(|(t, kind)| t.contains("from t") && *kind == SegmentKind::Code)
+        );
+        let k = kinds("select /*!50000 1 */ from t", LexicalRules::MYSQL);
+        assert!(
+            k.iter()
+                .any(|(t, kind)| t.contains('1') && *kind == SegmentKind::Code)
+        );
+        // Unicode text keeps char boundaries.
+        let text = "select 'é' /* ü */ \"ñ\"";
+        let segs = code_segments(text, LexicalRules::POSTGRES);
+        assert!(segs.iter().all(|s| text.is_char_boundary(s.range.start)
+            && text.is_char_boundary(s.range.end)));
+    }
+
+    proptest::proptest! {
+        #[test]
+        fn segments_always_cover_the_text(text in "[ a-z'\"`$#;/*\\\n-é]{0,64}") {
+            for rules in [LexicalRules::ANSI, LexicalRules::POSTGRES, LexicalRules::MYSQL, LexicalRules::SQLITE] {
+                let segs = code_segments(&text, rules);
+                let mut at = 0;
+                for s in &segs {
+                    proptest::prop_assert_eq!(s.range.start, at);
+                    proptest::prop_assert!(s.range.end > s.range.start);
+                    proptest::prop_assert!(text.is_char_boundary(s.range.end));
+                    at = s.range.end;
+                }
+                proptest::prop_assert_eq!(at, text.len());
+            }
+        }
     }
 
     #[test]

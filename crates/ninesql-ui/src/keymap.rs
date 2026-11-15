@@ -9,7 +9,7 @@ use std::rc::Rc;
 
 use gpui_kit::{App, Global, KeyBinding, KeyBindingContextPredicate};
 
-use crate::actions::{ACTIONS, ActionSpec};
+use crate::actions::{ActionSpec, registry};
 use crate::settings::Diagnostic;
 
 const MODIFIERS: &[&str] = &[
@@ -138,7 +138,7 @@ impl EffectiveKeymap {
     /// Merges the registry defaults with `overrides`.
     #[must_use]
     pub fn resolve(overrides: &BindingOverrides) -> Self {
-        let entries = ACTIONS
+        let entries = registry()
             .iter()
             .map(|spec| {
                 let keys = match overrides.get(spec.name()) {
@@ -205,7 +205,7 @@ fn reinstall(keymap: EffectiveKeymap, cx: &mut App) -> Vec<Diagnostic> {
         .key_bindings()
         .borrow()
         .bindings()
-        .filter(|b| !b.action().name().starts_with("ninesql::"))
+        .filter(|b| !crate::actions::is_ours(b.action().name()))
         .cloned()
         .collect();
     cx.clear_key_bindings();

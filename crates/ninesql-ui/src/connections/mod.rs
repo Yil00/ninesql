@@ -26,4 +26,4 @@ pub mod vault;
 pub mod visuals;
 
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;

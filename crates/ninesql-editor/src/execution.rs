@@ -378,7 +378,7 @@ mod tests {
             DialectSplitter::new(Arc::new(AnsiDialect)).split(text)
         }
         fn segments(&self, text: &str) -> Vec<crate::split::Segment> {
-            crate::split::lex_segments(text, LexicalRules::POSTGRES)
+            crate::split::code_segments(text, LexicalRules::POSTGRES)
         }
     }
 

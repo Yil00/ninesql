@@ -29,9 +29,5 @@ pub mod services;
 pub mod settings;
 pub mod workspace;
 
-// Dependency graph of docs/02-architecture.md, made explicit until the UI uses these crates.
-use ninesql_editor as _;
-use ninesql_grid as _;
-
 #[cfg(test)]
 mod tests;

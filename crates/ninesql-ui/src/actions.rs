@@ -1,8 +1,14 @@
 //! Every user-facing action of the shell, with its default key bindings and its command palette
 //! entry (F-WS-02, AGENTS.md "Conventions – UI").
 //!
-//! [`ACTIONS`] is the single registry: the keymap, the command palette and the tests all read it,
-//! so an action cannot exist without a binding and a palette entry.
+//! [`ACTIONS`] holds the shell's own actions (`ninesql::`); [`registry`] merges them with the SQL
+//! editor's ([`ninesql_editor::EDITOR_ACTIONS`], `ninesql_editor::`, key context
+//! `SqlEditor > Input`) and the results grid's ([`ninesql_grid::actions::GRID_ACTIONS`],
+//! `ninesql_grid::`, key context `ResultGrid`). The keymap, the command palette, the
+//! `[keybindings]` overrides and the tests all read [`registry`], so an action cannot exist
+//! without a binding and a palette entry.
+
+use std::sync::LazyLock;
 
 use gpui_kit::{Action, actions};
 
@@ -71,6 +77,12 @@ actions!(
         ImportFromDbeaverFolder,
         /// Enable the disabled connection selected in the navigator (shows why it was disabled).
         EnableConnection,
+        /// Choose the open connection the active SQL editor runs on.
+        ChooseEditorConnection,
+        /// Commit the open transaction of the active SQL editor's session.
+        CommitTransaction,
+        /// Roll back the open transaction of the active SQL editor's session.
+        RollbackTransaction,
     ]
 );
 
@@ -81,6 +93,21 @@ pub enum Scope {
     App,
     /// Per window: bound in the [`WORKSPACE_CONTEXT`] key context, handled by the workspace.
     Workspace,
+    /// The SQL editor's actions (`ninesql_editor::`), bound under
+    /// [`ninesql_editor::EDITOR_BINDING_CONTEXT`] and handled by the focused editor.
+    Editor,
+    /// The results grid's actions (`ninesql_grid::`), bound in
+    /// [`ninesql_grid::actions::GRID_CONTEXT`] and handled by the focused results view.
+    Grid,
+}
+
+/// Prefixes of the action names NineSQL registers (shell, editor, grid).
+pub const ACTION_PREFIXES: &[&str] = &["ninesql::", "ninesql_editor::", "ninesql_grid::"];
+
+/// Whether `name` is the name of one of NineSQL's actions (as opposed to a widget's).
+#[must_use]
+pub fn is_ours(name: &str) -> bool {
+    ACTION_PREFIXES.iter().any(|p| name.starts_with(p))
 }
 
 /// Key context set by the workspace root element.
@@ -93,6 +120,8 @@ impl Scope {
         match self {
             Self::App => None,
             Self::Workspace => Some(WORKSPACE_CONTEXT),
+            Self::Editor => Some(ninesql_editor::EDITOR_BINDING_CONTEXT),
+            Self::Grid => Some(ninesql_grid::actions::GRID_CONTEXT),
         }
     }
 }
@@ -100,7 +129,8 @@ impl Scope {
 /// One registered action.
 #[derive(Clone, Copy)]
 pub struct ActionSpec {
-    /// GPUI action name, `ninesql::<Type>`; the key of `[keybindings]` in settings.toml.
+    /// GPUI action name (`ninesql::<Type>`, `ninesql_editor::<Type>`, `ninesql_grid::<Type>`);
+    /// the key of `[keybindings]` in settings.toml.
     pub name: fn() -> &'static str,
     /// Command palette label.
     pub label: &'static str,
@@ -391,14 +421,71 @@ pub const ACTIONS: &[ActionSpec] = &[
         ["ctrl-k ctrl-shift-e"],
         keywords = ["disabled", "imported", "route", "activate"]
     ),
+    spec!(
+        ChooseEditorConnection,
+        "Choose editor connection",
+        "SQL editor",
+        Workspace,
+        ["ctrl-k ctrl-p"],
+        keywords = ["session", "database", "datasource", "active", "switch"]
+    ),
+    spec!(
+        CommitTransaction,
+        "Commit transaction",
+        "SQL editor",
+        Workspace,
+        ["ctrl-k ctrl-c"],
+        keywords = ["transaction", "save", "manual commit"]
+    ),
+    spec!(
+        RollbackTransaction,
+        "Roll back transaction",
+        "SQL editor",
+        Workspace,
+        ["ctrl-k ctrl-r"],
+        keywords = ["transaction", "rollback", "undo", "discard"]
+    ),
 ];
 
-/// Looks up an action by its full name (`ninesql::NewEditorTab`) or its short name
+/// Every action of the application: [`ACTIONS`], then the editor's and the grid's registries,
+/// in that order.
+#[must_use]
+pub fn registry() -> &'static [ActionSpec] {
+    static ALL: LazyLock<Vec<ActionSpec>> = LazyLock::new(|| {
+        let editor = ninesql_editor::EDITOR_ACTIONS.iter().map(|e| ActionSpec {
+            name: e.name,
+            label: e.label,
+            category: e.category,
+            keywords: e.keywords,
+            scope: Scope::Editor,
+            default_keys: e.default_keys,
+            in_palette: true,
+            build: e.build,
+        });
+        let grid = ninesql_grid::actions::GRID_ACTIONS
+            .iter()
+            .map(|g| ActionSpec {
+                name: g.name,
+                label: g.label,
+                category: g.category,
+                keywords: g.keywords,
+                scope: Scope::Grid,
+                default_keys: g.default_keys,
+                in_palette: true,
+                build: g.build,
+            });
+        ACTIONS.iter().copied().chain(editor).chain(grid).collect()
+    });
+    &ALL
+}
+
+/// Looks up an action by its full name (`ninesql::NewEditorTab`,
+/// `ninesql_editor::ExecuteStatement`) or, for the shell's own actions, its short name
 /// (`NewEditorTab`).
 #[must_use]
 pub fn find(name: &str) -> Option<&'static ActionSpec> {
     let short = name.strip_prefix("ninesql::").unwrap_or(name);
-    ACTIONS
+    registry()
         .iter()
         .find(|spec| spec.name() == name || spec.name().strip_prefix("ninesql::") == Some(short))
 }
@@ -407,18 +494,18 @@ pub fn find(name: &str) -> Option<&'static ActionSpec> {
 #[must_use]
 pub fn spec_of(action: &dyn Action) -> Option<&'static ActionSpec> {
     let name = action.name();
-    ACTIONS.iter().find(|spec| spec.name() == name)
+    registry().iter().find(|spec| spec.name() == name)
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{ACTIONS, CommandPalette, NewEditorTab, Scope, find, spec_of};
+    use super::{ACTIONS, CommandPalette, NewEditorTab, Scope, find, is_ours, registry, spec_of};
     use crate::keymap::validate_keys;
     use std::collections::HashSet;
 
     #[test]
     fn every_action_has_a_valid_default_binding() {
-        for spec in ACTIONS {
+        for spec in registry() {
             assert!(
                 !spec.default_keys.is_empty(),
                 "{} has no binding",
@@ -436,7 +523,7 @@ mod tests {
 
     #[test]
     fn every_action_but_the_palette_is_in_the_palette() {
-        for spec in ACTIONS {
+        for spec in registry() {
             let expected = spec.name() != "ninesql::CommandPalette";
             assert_eq!(spec.in_palette, expected, "{}", spec.name());
             assert!(!spec.label.is_empty());
@@ -448,6 +535,15 @@ mod tests {
         let mut seen = HashSet::new();
         for spec in ACTIONS {
             assert!(spec.name().starts_with("ninesql::"), "{}", spec.name());
+        }
+        for spec in registry() {
+            assert!(is_ours(spec.name()), "{}", spec.name());
+            let expected = match spec.scope {
+                Scope::Editor => "ninesql_editor::",
+                Scope::Grid => "ninesql_grid::",
+                Scope::App | Scope::Workspace => "ninesql::",
+            };
+            assert!(spec.name().starts_with(expected), "{}", spec.name());
             assert!(seen.insert(spec.name()), "duplicate {}", spec.name());
             assert_eq!((spec.build)().name(), spec.name());
         }
@@ -456,9 +552,10 @@ mod tests {
     #[test]
     fn default_bindings_do_not_collide_within_a_scope() {
         let mut seen = HashSet::new();
-        for spec in ACTIONS {
+        for spec in registry() {
             for keys in spec.default_keys {
-                // App bindings apply in the workspace too, so compare across both scopes.
+                // App bindings apply in the workspace too, and workspace bindings inside the
+                // editor and the grid (an inner binding would shadow them): compare across all.
                 assert!(seen.insert(*keys), "{keys} bound twice");
             }
         }
@@ -481,5 +578,40 @@ mod tests {
             Some(Scope::Workspace)
         );
         assert_eq!(spec_of(&CommandPalette).map(|s| s.in_palette), Some(false));
+        assert_eq!(
+            find("ninesql_editor::ExecuteStatement").map(|s| s.scope),
+            Some(Scope::Editor)
+        );
+        assert_eq!(
+            find("ninesql_grid::FetchAllRows").map(|s| s.scope),
+            Some(Scope::Grid)
+        );
+        assert_eq!(
+            spec_of(&ninesql_grid::actions::CopySelection).map(|s| s.label),
+            Some("Copy selected cells")
+        );
+        assert!(
+            find("ExecuteStatement").is_none(),
+            "short names are the shell's only"
+        );
+    }
+
+    #[test]
+    fn registry_merges_editor_and_grid_actions() {
+        assert_eq!(
+            registry().len(),
+            ACTIONS.len()
+                + ninesql_editor::EDITOR_ACTIONS.len()
+                + ninesql_grid::actions::GRID_ACTIONS.len()
+        );
+        for e in ninesql_editor::EDITOR_ACTIONS {
+            let spec = find(e.name()).unwrap_or_else(|| panic!("{}", e.name()));
+            assert_eq!(spec.scope.key_context(), Some("SqlEditor > Input"));
+            assert_eq!(spec.default_keys, e.default_keys);
+        }
+        for g in ninesql_grid::actions::GRID_ACTIONS {
+            let spec = find(g.name()).unwrap_or_else(|| panic!("{}", g.name()));
+            assert_eq!(spec.scope.key_context(), Some("ResultGrid"));
+        }
     }
 }

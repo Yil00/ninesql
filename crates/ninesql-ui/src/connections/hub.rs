@@ -236,6 +236,7 @@ pub struct ConnectionHub {
     saving: bool,
     importing: bool,
     detected: Option<Vec<DetectedDbeaver>>,
+    local_execution: Option<ninesql_core::ExecutionService>,
     _events: Option<Task<()>>,
 }
 
@@ -261,6 +262,7 @@ impl ConnectionHub {
             saving: false,
             importing: false,
             detected: None,
+            local_execution: None,
             _events: None,
         }
     }
@@ -412,6 +414,49 @@ impl ConnectionHub {
     #[must_use]
     pub fn sessions(&self, id: ConnectionId) -> &[SessionHandle] {
         self.sessions.get(&id).map_or(&[], |s| s.handles.as_slice())
+    }
+
+    /// Every open session, by connection name (the editor's connection picker).
+    #[must_use]
+    pub fn open_sessions(&self) -> Vec<SessionHandle> {
+        let mut out: Vec<SessionHandle> = self
+            .sessions
+            .values()
+            .flat_map(|s| s.handles.iter().cloned())
+            .filter(|h| !h.is_closed())
+            .collect();
+        out.sort_by(|a, b| a.info().connection_name.cmp(&b.info().connection_name));
+        out
+    }
+
+    /// The execution service (P3-C): the core's, or one over the session manager when the
+    /// hub was assembled without a core (tests). `None` when the driver runtime did not start.
+    #[must_use]
+    pub fn execution(&mut self) -> Option<ninesql_core::ExecutionService> {
+        if let Some(core) = &self.core {
+            return Some(core.execution().clone());
+        }
+        if self.local_execution.is_none()
+            && let Some(manager) = &self.manager
+        {
+            self.local_execution = Some(ninesql_core::ExecutionService::new(
+                manager.clone(),
+                None,
+                ninesql_core::preferences::Preferences::default(),
+            ));
+        }
+        self.local_execution.clone()
+    }
+
+    /// The preferences in effect (`[execution]`, `[history]`, `[confirmations]` of
+    /// settings.toml), defaults without a core.
+    #[must_use]
+    pub fn preferences(&self) -> ninesql_core::preferences::Preferences {
+        match (&self.core, &self.local_execution) {
+            (Some(core), _) => core.preferences(),
+            (None, Some(exec)) => exec.preferences(),
+            (None, None) => ninesql_core::preferences::Preferences::default(),
+        }
     }
 
     /// Whether a connection has an open session.
@@ -879,6 +924,9 @@ impl ConnectionHub {
                 self.secrets_locked = Some(reason);
                 cx.emit(HubEvent::SecretsLocked(reason));
             }
+            CoreEvent::TransactionChanged { session, state, .. } => {
+                cx.emit(HubEvent::TransactionChanged { session, state });
+            }
             CoreEvent::ImportedInitSqlConfirmed {
                 connection,
                 statements,
@@ -963,6 +1011,14 @@ impl ConnectionHub {
 pub enum HubEvent {
     /// The core locked the secrets (vault locked, "ask every time" answers forgotten).
     SecretsLocked(SecretsLockReason),
+    /// The transaction state of a session changed (`CoreEvent::TransactionChanged`): the
+    /// editors on that session update their transaction indicator (F-SQL-07).
+    TransactionChanged {
+        /// Session.
+        session: ninesql_core::SessionId,
+        /// The new state.
+        state: ninesql_core::TransactionState,
+    },
 }
 
 impl EventEmitter<HubEvent> for ConnectionHub {}

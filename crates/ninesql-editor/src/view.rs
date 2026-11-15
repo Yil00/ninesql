@@ -160,6 +160,33 @@ impl SqlEditor {
         fixes.len()
     }
 
+    /// Replaces the setup (the editor's connection changed): splitting, parameter style,
+    /// completion keywords, quoting and metadata follow the new dialect. The text is kept.
+    pub fn set_setup(&mut self, setup: EditorSetup, cx: &mut Context<Self>) {
+        let provider = SqlCompletionProvider::new(
+            setup.completion.clone(),
+            setup.splitter.clone(),
+            setup.metadata.clone(),
+        );
+        self.editor.update(cx, |state, _| {
+            state.lsp_mut().completion_provider = Some(Rc::new(provider));
+        });
+        self.setup = setup;
+        cx.notify();
+    }
+
+    /// The current setup.
+    #[must_use]
+    pub fn setup(&self) -> &EditorSetup {
+        &self.setup
+    }
+
+    /// Shows an info message under the editor ("no connection"…).
+    pub fn set_notice(&mut self, notice: Option<SharedString>, cx: &mut Context<Self>) {
+        self.notice = notice;
+        cx.notify();
+    }
+
     /// Sends execution requests to `sink` (the core's execution service).
     pub fn set_sink(&mut self, sink: Rc<dyn ExecutionSink>) {
         self.sink = Some(sink);

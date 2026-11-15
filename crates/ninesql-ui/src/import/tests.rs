@@ -1317,3 +1317,93 @@ fn a_report_that_cannot_be_saved_does_not_fail_the_import(cx: &mut TestAppContex
     assert_eq!(hub.read_with(&vcx, |h, _| h.connections().len()), 1);
     assert!(!hub.read_with(&vcx, |h, _| h.is_importing()));
 }
+
+#[gpui::test]
+fn the_cancel_button_cancels_the_core_preview(cx: &mut TestAppContext) {
+    let tmp = tempfile::tempdir().unwrap_or_else(|e| panic!("{e}"));
+    let base = std::fs::canonicalize(tmp.path()).unwrap_or_else(|e| panic!("{e}"));
+    let source = crafted(&base, &[pg("pg-a", "A")]);
+    let (_hub, _core) = core_hub(cx, &base);
+    let (ws, mut vcx) = open(cx);
+    let flow = import_flow(&ws, &mut vcx);
+    let handle = flow.update_in(&mut vcx, |f, window, cx| {
+        f.start(ImportSource::Folder(source.clone()), window, cx);
+        f.preview_cancel().cloned()
+    });
+    let Some(handle) = handle else {
+        panic!("a running preview has a cancel handle");
+    };
+    assert!(!handle.is_cancelled());
+    // What the "Cancel" button of the previewing stage runs.
+    flow.update(&mut vcx, |f, cx| f.cancel_preview(cx));
+    assert!(handle.is_cancelled(), "the core's preview is told to stop");
+    assert!(flow.read_with(&vcx, |f, _| f.preview_cancel().is_none()));
+    assert_eq!(stage(&flow, &vcx), Stage::Idle);
+}
+
+#[gpui::test]
+fn a_cancelled_or_truncated_listing_is_not_a_failure(cx: &mut TestAppContext) {
+    let tmp = tempfile::tempdir().unwrap_or_else(|e| panic!("{e}"));
+    let base = std::fs::canonicalize(tmp.path()).unwrap_or_else(|e| panic!("{e}"));
+    let (_hub, _core) = core_hub(cx, &base);
+    let (ws, mut vcx) = open(cx);
+    let flow = import_flow(&ws, &mut vcx);
+    flow.update_in(&mut vcx, |f, window, cx| {
+        f.on_preview(Some(Err(ninesql_core::ImportError::Cancelled)), window, cx);
+    });
+    assert_eq!(stage(&flow, &vcx), Stage::Idle);
+    assert!(
+        flow.read_with(&vcx, |f, _| f.notice().map(str::to_owned))
+            .is_some_and(|n| n.contains("cancelled"))
+    );
+    flow.update_in(&mut vcx, |f, window, cx| {
+        f.on_preview(
+            Some(Err(ninesql_core::ImportError::ListingTruncated)),
+            window,
+            cx,
+        );
+    });
+    assert_eq!(stage(&flow, &vcx), Stage::ChooseFolder);
+    assert!(
+        flow.read_with(&vcx, |f, _| f.notice().map(str::to_owned))
+            .is_some_and(|n| n.contains("too many entries"))
+    );
+}
+
+#[test]
+fn a_truncated_preview_is_flagged_with_its_source_issues() {
+    use ninesql_core::dbeaver::{IssueKind, Severity};
+    let mut preview = hand_preview();
+    assert!(
+        !PreviewView::build(
+            &preview,
+            &ninesql_core::ConnectionTypes::default(),
+            &Connections::default()
+        )
+        .truncated
+    );
+    for (kind, message) in [
+        (
+            IssueKind::Truncated,
+            "the source holds more than 100 projects: the rest is not read",
+        ),
+        (IssueKind::Duplicate, "the folder was read once"),
+    ] {
+        preview.issues.push(ninesql_core::dbeaver::ImportIssue {
+            severity: Severity::Warning,
+            kind,
+            key: None,
+            message: message.to_owned(),
+        });
+    }
+    let view = PreviewView::build(
+        &preview,
+        &ninesql_core::ConnectionTypes::default(),
+        &Connections::default(),
+    );
+    assert!(view.truncated);
+    let texts: Vec<String> = view.source_issues().map(|i| i.text()).collect();
+    assert_eq!(texts.len(), 2, "{texts:?}");
+    assert!(texts[0].contains("more than 100 projects"));
+    assert!(texts[1].contains("read once"));
+}

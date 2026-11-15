@@ -24,7 +24,7 @@ use gpui_kit::component::{
 };
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
-use ninesql_core::{ImportError, ImportPreview, ImportSource};
+use ninesql_core::{ImportCancel, ImportError, ImportPreview, ImportSource};
 
 use super::model::{
     ConnectionRow, INIT_SQL_NOTE, OutcomeView, PreviewView, RowKind, Selection, TLS_ACCEPT_WARNING,
@@ -86,6 +86,8 @@ pub struct ImportFlow {
     vault_prompt: Option<Entity<VaultPrompt>>,
     folder: Entity<InputState>,
     task: Option<Task<()>>,
+    /// Stops the running preview in the core (P2-D M1).
+    preview_cancel: Option<ImportCancel>,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -122,6 +124,7 @@ impl ImportFlow {
             vault_prompt: None,
             folder,
             task: None,
+            preview_cancel: None,
             _subscriptions: vec![sub],
         }
     }
@@ -174,6 +177,12 @@ impl ImportFlow {
         &self.folder
     }
 
+    /// The cancel handle of the running preview (P2-D M1), while it runs.
+    #[must_use]
+    pub fn preview_cancel(&self) -> Option<&ImportCancel> {
+        self.preview_cancel.as_ref()
+    }
+
     /// Whether a "Test" of this flow is running in the connect flow.
     #[must_use]
     pub fn is_testing(&self) -> bool {
@@ -210,7 +219,8 @@ impl ImportFlow {
             cx.notify();
             return;
         };
-        let reply = core.preview_import(source.clone());
+        let (reply, cancel) = core.preview_import_cancellable(source.clone());
+        self.preview_cancel = Some(cancel);
         self.source = Some(source);
         self.stage = Stage::Previewing;
         cx.notify();
@@ -275,12 +285,15 @@ impl ImportFlow {
         }));
     }
 
-    /// "Cancel" while the core reads the source: drops the pending preview and returns to
-    /// idle. The core's read may finish in the background; its answer is ignored (it only
-    /// reads, I4).
+    /// "Cancel" while the core reads the source: stops the core's read
+    /// (`ImportCancel::cancel`, it stops between DBeaver projects), drops the pending preview
+    /// and returns to idle. Nothing is written either way (I4).
     pub fn cancel_preview(&mut self, cx: &mut Context<Self>) {
         if !matches!(self.stage, Stage::Previewing) {
             return;
+        }
+        if let Some(cancel) = self.preview_cancel.take() {
+            cancel.cancel();
         }
         self.task = None;
         self.source = None;
@@ -300,6 +313,7 @@ impl ImportFlow {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        self.preview_cancel = None;
         match result {
             Some(Ok(preview)) => {
                 let view = {
@@ -323,6 +337,16 @@ impl ImportFlow {
             Some(Err(ImportError::NothingFound)) => {
                 self.stage = Stage::ChooseFolder;
                 self.notice = Some(NOTHING_FOUND.to_owned());
+            }
+            // A cancel is not a failure: back to idle, nothing to report.
+            Some(Err(ImportError::Cancelled)) => {
+                self.source = None;
+                self.stage = Stage::Idle;
+                self.notice = Some("Import preview cancelled: nothing was imported.".to_owned());
+            }
+            Some(Err(e @ ImportError::ListingTruncated)) => {
+                self.stage = Stage::ChooseFolder;
+                self.notice = Some(format!("Cannot preview: {e}."));
             }
             Some(Err(e)) => {
                 self.stage = Stage::Failed(format!("Cannot read the DBeaver workspace: {e}"))
@@ -847,7 +871,31 @@ impl Render for ImportFlow {
                     None
                 };
                 let has_updates = view.rows().any(|r| r.updates);
+                let source_issues: Vec<String> = view.source_issues().map(|i| i.text()).collect();
                 let mut body = body
+                    .when(view.truncated, |el| {
+                        el.child(
+                            div()
+                                .id("import-truncated")
+                                .p_2()
+                                .border_1()
+                                .border_color(warning)
+                                .text_color(warning)
+                                .font_weight(FontWeight::SEMIBOLD)
+                                .child("Incomplete preview: a limit was reached while reading the DBeaver workspace, so some projects or connections are not listed and will not be imported. Pick a smaller folder (one project) to import the rest."),
+                        )
+                    })
+                    .when(!source_issues.is_empty(), |el| {
+                        el.child(section("Source issues")).children(
+                            source_issues.iter().enumerate().map(|(i, t)| {
+                                div()
+                                    .id(("import-source-issue", i))
+                                    .text_xs()
+                                    .text_color(warning)
+                                    .child(t.clone())
+                            }),
+                        )
+                    })
                     .child(section("Source"))
                     .children(view.sources.iter().enumerate().map(|(i, s)| {
                         div().id(("import-source", i)).text_xs().child(s.clone())
