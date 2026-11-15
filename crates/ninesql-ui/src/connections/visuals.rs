@@ -114,6 +114,41 @@ impl ConnectionBadges {
         }
     }
 
+    /// Badges of an open session whose saved connection is gone (deleted, or not loaded yet):
+    /// everything comes from the session itself, with the built-in production or development
+    /// type color, so a production session never loses its badge and frame (ADR-0007 §4).
+    #[must_use]
+    pub fn of_session(session: &SessionHandle) -> Self {
+        let info = session.info();
+        let production = info.policy.production;
+        let ty = if production {
+            ConnectionType::production()
+        } else {
+            ConnectionType::development()
+        };
+        let color = hsla(ty.color);
+        Self {
+            type_name: ty.name.into(),
+            color,
+            on_color: text_on(color),
+            production,
+            read_only: info.read_only,
+            security_warnings: info.warnings.len(),
+            dbeaver_read_only: info.inside_dbeaver_workspace,
+            pending_reconnect: false,
+        }
+    }
+
+    /// Badges of `session` under `hub`: from its saved connection when there is one, else from
+    /// the session alone ([`Self::of_session`]).
+    #[must_use]
+    pub fn of_open_session(hub: &super::hub::ConnectionHub, session: &SessionHandle) -> Self {
+        match hub.connection(session.info().connection) {
+            Some(c) => Self::of(c, hub.types(), std::slice::from_ref(session)),
+            None => Self::of_session(session),
+        }
+    }
+
     /// The contrast of the type badge text.
     #[must_use]
     pub fn badge_contrast(&self) -> f32 {

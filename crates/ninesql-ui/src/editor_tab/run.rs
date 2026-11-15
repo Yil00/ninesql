@@ -152,7 +152,12 @@ pub fn build_run_request(
             let (Some(first), Some(last)) = (items.first(), items.last()) else {
                 return Err("Nothing to run here.".to_owned());
             };
-            let Some(text) = document.get(first.span.start..last.span.end) else {
+            // The whole range runs, text between the items included: it must be exactly what
+            // the editor planned, not only each item.
+            let text = document
+                .get(first.span.start..last.span.end)
+                .filter(|t| *t == request.range_text.as_str());
+            let Some(text) = text else {
                 return Err("The script changed since the run was asked: run it again.".to_owned());
             };
             RunRequest::selection(text.to_owned(), first.span.start)
@@ -274,6 +279,19 @@ mod tests {
         // An edited buffer refuses the run instead of running other text.
         let edited = "  select 9; -- c\nselect 2;  ";
         assert!(build_run_request(&r, edited, FetchBudget::default(), 100).is_err());
+    }
+
+    #[test]
+    fn text_edited_between_the_items_refuses_the_run() {
+        let doc = "select 1; -- c\nselect 2;";
+        let r = request(doc, ExecutionKind::Script, 0);
+        // Same length, items unchanged, a statement slipped in between them.
+        let edited = "select 1;\ndrop;select 2;";
+        assert_eq!(edited.len(), doc.len());
+        assert_eq!(edited.get(r.items[0].span.clone()), Some("select 1"));
+        assert_eq!(edited.get(r.items[1].span.clone()), Some("select 2"));
+        let err = build_run_request(&r, edited, FetchBudget::default(), 100);
+        assert!(err.is_err_and(|e| e.contains("changed")));
     }
 
     #[test]

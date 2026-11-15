@@ -288,3 +288,291 @@ fn editor_and_grid_actions_are_in_the_keymap_and_the_palette(cx: &mut TestAppCon
     let notice = editor.read_with(&vcx, |e, _| e.notice().cloned());
     assert!(notice.is_some(), "the editor handled the palette's action");
 }
+
+/// A window on the mock driver with `connections` saved; the first one is opened in the active
+/// editor.
+fn connected_with(
+    cx: &mut TestAppContext,
+    connections: Vec<ninesql_core::Connection>,
+    dir: &std::path::Path,
+) -> (
+    Entity<Workspace>,
+    Entity<crate::connections::hub::ConnectionHub>,
+    Entity<SqlEditorTab>,
+    VisualTestContext,
+) {
+    let id = connections[0].id;
+    let hub = mock_hub(cx, dir, connections);
+    let (ws, mut vcx) = open_live(cx);
+    ws.update_in(&mut vcx, |ws, window, cx| {
+        ws.connect(id, Purpose::Open, window, cx);
+    });
+    wait_until(&mut vcx, |vcx| hub.read_with(vcx, |h, _| h.is_open(id)));
+    let Some(tab) = ws.read_with(&vcx, |ws, _| ws.active_editor().cloned()) else {
+        panic!("an editor tab");
+    };
+    wait_until(&mut vcx, |vcx| {
+        tab.read_with(vcx, |t, _| t.connection() == Some(id))
+    });
+    (ws, hub, tab, vcx)
+}
+
+fn production_color() -> gpui::Hsla {
+    crate::connections::visuals::hsla(ninesql_core::ConnectionType::production().color)
+}
+
+fn message(tab: &Entity<SqlEditorTab>, vcx: &VisualTestContext) -> String {
+    tab.read_with(vcx, |t, _| {
+        t.message().map(|m| m.text.to_string()).unwrap_or_default()
+    })
+}
+
+fn in_transaction(tab: &Entity<SqlEditorTab>, vcx: &VisualTestContext) -> bool {
+    tab.read_with(vcx, |t, _| {
+        t.session()
+            .is_some_and(|s| s.transaction_state().in_transaction)
+    })
+}
+
+#[gpui::test]
+fn a_confirmed_statement_runs_only_on_the_session_the_run_started_on(cx: &mut TestAppContext) {
+    let tmp = tempfile::tempdir().unwrap_or_else(|e| panic!("{e}"));
+    let live = mock_connection("Live", ConnectionTypeId::prod(), Auth::None);
+    let other = mock_connection("Other", ConnectionTypeId::dev(), Auth::None);
+    let (live_id, other_id) = (live.id, other.id);
+    let (ws, hub, tab, mut vcx) = connected_with(cx, vec![live, other], tmp.path());
+    let Some(live_session) = tab.read_with(&vcx, |t, _| t.session().map(|s| s.id())) else {
+        panic!("a session");
+    };
+    run(
+        &tab,
+        "SELECT * FROM numbers(1);\nDELETE FROM t",
+        ExecutionKind::Script,
+        &mut vcx,
+    );
+    wait_until(&mut vcx, |vcx| {
+        tab.read_with(vcx, |t, _| t.awaiting_confirmation())
+    });
+    // The dialog shows the run's session: production, in the production color.
+    let badges = tab.read_with(&vcx, |t, cx| t.run_badges(cx));
+    let Some(badges) = badges else {
+        panic!("badges of the run's session");
+    };
+    assert!(badges.production);
+    assert_eq!(badges.color, production_color());
+
+    // Another connection opens meanwhile: the editor keeps its session.
+    ws.update_in(&mut vcx, |ws, window, cx| {
+        ws.connect(other_id, Purpose::Open, window, cx);
+    });
+    wait_until(&mut vcx, |vcx| {
+        hub.read_with(vcx, |h, _| h.is_open(other_id))
+    });
+    let Some(other_session) = hub.read_with(&vcx, |h, _| h.sessions(other_id).last().cloned())
+    else {
+        panic!("the other session");
+    };
+    // The picker cannot move a running editor to another session.
+    let changed = tab.update(&mut vcx, |t, cx| t.set_session(Some(other_session), cx));
+    assert!(!changed, "refused during a run");
+    assert!(message(&tab, &vcx).contains("run is going on"));
+    let none = tab.update(&mut vcx, |t, cx| t.set_session(None, cx));
+    assert!(!none);
+    assert_eq!(
+        tab.read_with(&vcx, |t, _| t.session().map(|s| s.id())),
+        Some(live_session)
+    );
+
+    // The run's session closes while the dialog is up, and a background connect finishes:
+    // the running editor is not given the new session.
+    hub.update(&mut vcx, |h, cx| h.disconnect(live_id, cx));
+    wait_until(&mut vcx, |vcx| {
+        tab.read_with(vcx, |t, _| t.session().is_none())
+    });
+    ws.update_in(&mut vcx, |ws, window, cx| {
+        ws.connect(other_id, Purpose::Open, window, cx);
+    });
+    wait_until(&mut vcx, |vcx| {
+        hub.read_with(vcx, |h, _| h.sessions(other_id).len() == 2)
+    });
+    vcx.run_until_parked();
+    assert!(tab.read_with(&vcx, |t, _| t.session().is_none()));
+    assert_eq!(
+        tab.read_with(&vcx, |t, _| t.run_session().map(|s| s.id())),
+        Some(live_session)
+    );
+
+    // "Run" now ends the run: nothing goes to another session.
+    vcx.update(|window, cx| {
+        window.close_dialog(cx);
+        tab.update(cx, |t, cx| t.confirm(window, cx));
+    });
+    vcx.run_until_parked();
+    assert!(!tab.read_with(&vcx, |t, _| t.is_running()));
+    assert!(
+        update_counts(&tab, &vcx).is_empty(),
+        "the DELETE was not run"
+    );
+    assert!(message(&tab, &vcx).contains("closed"));
+    let other_counts = hub.read_with(&vcx, |h, _| {
+        h.sessions(other_id)
+            .iter()
+            .filter(|s| s.transaction_state().in_transaction)
+            .count()
+    });
+    assert_eq!(other_counts, 0);
+}
+
+#[gpui::test]
+fn a_production_session_without_its_saved_connection_keeps_badge_and_frames(
+    cx: &mut TestAppContext,
+) {
+    let tmp = tempfile::tempdir().unwrap_or_else(|e| panic!("{e}"));
+    let live = mock_connection("Live", ConnectionTypeId::prod(), Auth::None);
+    let id = live.id;
+    let (ws, hub, tab, mut vcx) = connected_with(cx, vec![live], tmp.path());
+    hub.update(&mut vcx, |h, cx| h.forget_connection(id, cx));
+    assert!(hub.read_with(&vcx, |h, _| h.connection(id).is_none()));
+    assert_eq!(
+        tab.read_with(&vcx, |t, cx| t.frame_color(cx)),
+        Some(production_color())
+    );
+    assert!(ws.read_with(&vcx, |ws, cx| ws.frame_color(cx).is_some()));
+
+    // Split views: each pane has its own production frame.
+    ws.update_in(&mut vcx, |ws, window, cx| {
+        ws.split(crate::layout::SplitAxis::Horizontal, window, cx);
+    });
+    let panes = ws.read_with(&vcx, |ws, _| ws.layout().pane_order());
+    assert_eq!(panes.len(), 2);
+    for pane in &panes {
+        assert!(
+            ws.read_with(&vcx, |ws, cx| ws.pane_frame_color(*pane, cx).is_some()),
+            "both editors run on the production session"
+        );
+    }
+    let Some(second) = ws.read_with(&vcx, |ws, _| ws.active_editor().cloned()) else {
+        panic!("the new editor");
+    };
+    assert!(second.update(&mut vcx, |t, cx| t.set_session(None, cx)));
+    let framed: Vec<bool> = panes
+        .iter()
+        .map(|p| ws.read_with(&vcx, |ws, cx| ws.pane_frame_color(*p, cx).is_some()))
+        .collect();
+    assert_eq!(framed, vec![true, false]);
+}
+
+#[gpui::test]
+fn commit_waits_for_the_run_and_close_tab_waits_for_the_commit(cx: &mut TestAppContext) {
+    let tmp = tempfile::tempdir().unwrap_or_else(|e| panic!("{e}"));
+    let live = mock_connection("Live", ConnectionTypeId::prod(), Auth::None);
+    let (ws, _hub, tab, mut vcx) = connected_with(cx, vec![live], tmp.path());
+    run(&tab, "BEGIN", ExecutionKind::Statement, &mut vcx);
+    wait_until(&mut vcx, |vcx| !tab.read_with(vcx, |t, _| t.is_running()));
+    assert!(in_transaction(&tab, &vcx));
+
+    run(
+        &tab,
+        "SELECT * FROM slow_numbers(1000000, 50)",
+        ExecutionKind::Statement,
+        &mut vcx,
+    );
+    wait_until(&mut vcx, |vcx| tab.read_with(vcx, |t, _| t.is_running()));
+    // The keyboard's Commit cannot land in the middle of a run.
+    ws.update(&mut vcx, |ws, cx| ws.end_transaction(true, cx));
+    vcx.run_until_parked();
+    assert!(message(&tab, &vcx).contains("run is going on"));
+    assert!(in_transaction(&tab, &vcx));
+
+    // Closing the tab asks; "Commit and close" refused by the run keeps the tab.
+    let Some(tab_id) = ws.read_with(&vcx, |ws, _| ws.layout().active_tab()) else {
+        panic!("a tab");
+    };
+    ws.update_in(&mut vcx, |ws, window, cx| ws.close_tab(tab_id, window, cx));
+    assert!(vcx.update(|window, cx| window.has_active_dialog(cx)));
+    vcx.update(|window, cx| window.close_dialog(cx));
+    ws.update_in(&mut vcx, |ws, window, cx| {
+        ws.end_transaction_and_close_tab(tab_id, true, window, cx);
+    });
+    vcx.run_until_parked();
+    assert!(
+        ws.read_with(&vcx, |ws, _| ws.editor(tab_id).is_some()),
+        "kept: the commit did not happen"
+    );
+    assert!(in_transaction(&tab, &vcx));
+
+    // Once the run is over, the commit succeeds and only then the tab closes.
+    tab.update_in(&mut vcx, |t, window, cx| t.cancel_run(window, cx));
+    wait_until(&mut vcx, |vcx| !tab.read_with(vcx, |t, _| t.is_running()));
+    let session = tab.read_with(&vcx, |t, _| t.session().cloned());
+    let Some(session) = session else {
+        panic!("a session");
+    };
+    ws.update_in(&mut vcx, |ws, window, cx| {
+        ws.end_transaction_and_close_tab(tab_id, true, window, cx);
+    });
+    wait_until(&mut vcx, |vcx| {
+        ws.read_with(vcx, |ws, _| ws.editor(tab_id).is_none())
+    });
+    assert!(!session.transaction_state().in_transaction, "committed");
+}
+
+#[gpui::test]
+fn deleting_a_connection_asks_about_its_open_transaction(cx: &mut TestAppContext) {
+    let tmp = tempfile::tempdir().unwrap_or_else(|e| panic!("{e}"));
+    let live = mock_connection("Live", ConnectionTypeId::prod(), Auth::None);
+    let id = live.id;
+    let (ws, hub, tab, mut vcx) = connected_with(cx, vec![live], tmp.path());
+    run(&tab, "BEGIN", ExecutionKind::Statement, &mut vcx);
+    wait_until(&mut vcx, |vcx| !tab.read_with(vcx, |t, _| t.is_running()));
+    assert!(in_transaction(&tab, &vcx));
+    let Some(session) = tab.read_with(&vcx, |t, _| t.session().cloned()) else {
+        panic!("a session");
+    };
+
+    ws.update_in(&mut vcx, |ws, window, cx| {
+        ws.delete_connection_now(id, window, cx);
+    });
+    vcx.run_until_parked();
+    assert!(
+        vcx.update(|window, cx| window.has_active_dialog(cx)),
+        "asks first"
+    );
+    assert!(hub.read_with(&vcx, |h, _| h.connection(id).is_some()));
+    assert!(!session.is_closed(), "nothing ended silently");
+
+    // "Roll back and close": the session closes, then the connection is deleted.
+    vcx.update(|window, cx| window.close_dialog(cx));
+    ws.update_in(&mut vcx, |ws, window, cx| {
+        ws.delete_connection_ending_transactions(id, false, window, cx);
+    });
+    wait_until(&mut vcx, |vcx| {
+        hub.read_with(vcx, |h, _| h.connection(id).is_none())
+    });
+    wait_until(&mut vcx, |_| session.is_closed());
+}
+
+#[gpui::test]
+fn a_confirmation_that_vanishes_ends_the_run(cx: &mut TestAppContext) {
+    let tmp = tempfile::tempdir().unwrap_or_else(|e| panic!("{e}"));
+    let (_ws, tab, mut vcx) = connected(cx, ConnectionTypeId::prod(), tmp.path());
+    run(&tab, "DELETE FROM t", ExecutionKind::Statement, &mut vcx);
+    wait_until(&mut vcx, |vcx| {
+        tab.read_with(vcx, |t, _| t.awaiting_confirmation())
+    });
+    // Closed by other code: neither "Run" nor "Cancel" was called.
+    vcx.update(|window, cx| window.close_all_dialogs(cx));
+    for _ in 0..50 {
+        vcx.executor()
+            .advance_clock(std::time::Duration::from_millis(100));
+        vcx.run_until_parked();
+        if !tab.read_with(&vcx, |t, _| t.is_running()) {
+            break;
+        }
+    }
+    assert!(!tab.read_with(&vcx, |t, _| t.is_running()), "the run ended");
+    assert!(update_counts(&tab, &vcx).is_empty(), "not run");
+    assert!(message(&tab, &vcx).contains("without an answer"));
+    let editor = tab.read_with(&vcx, |t, _| t.editor().clone());
+    assert!(editor.read_with(&vcx, |e, _| e.running().is_none()));
+}

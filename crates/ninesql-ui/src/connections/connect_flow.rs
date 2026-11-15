@@ -648,16 +648,21 @@ pub type ConfirmCallback = Rc<dyn Fn(&mut Window, &mut App)>;
 /// connection name in the type color, the reason and a warning when the script holds
 /// bidirectional controls. `on_confirm` resends the statement with the token; `on_cancel` runs
 /// on "Cancel", Escape, the close button or a click outside (exactly one of the two runs).
+/// `dismiss_guard` is owned by the dialog and dropped with it, so the caller can tell a dialog
+/// that went away without either callback (closed by other code, its window closed).
 pub fn open_statement_confirmation(
     view: StatementConfirmView,
     type_color: Hsla,
     on_confirm: ConfirmCallback,
     on_cancel: ConfirmCallback,
+    dismiss_guard: Option<Rc<dyn std::any::Any>>,
     window: &mut Window,
     cx: &mut App,
 ) {
     let decided = Rc::new(std::cell::Cell::new(false));
     window.open_dialog(cx, move |dialog, _window, cx| {
+        // Owned by the dialog only (not by its buttons): dropped when the dialog goes away.
+        let _guard = &dismiss_guard;
         let mono = cx.theme().mono_font_family.clone();
         let muted = cx.theme().muted_foreground;
         let warn = cx.theme().warning;

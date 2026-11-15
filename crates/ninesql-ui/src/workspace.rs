@@ -43,6 +43,9 @@ use crate::settings::SettingsState;
 use gpui_kit::component::notification::Notification;
 use ninesql_core::ConnectionId;
 
+/// What runs once sessions were closed as the user chose (see `Workspace::close_sessions_then`).
+type AfterClose = Rc<dyn Fn(&mut Workspace, &mut Window, &mut Context<Workspace>)>;
+
 /// Width of the navigator dock when the window opens.
 const NAVIGATOR_WIDTH: Pixels = px(260.);
 
@@ -188,9 +191,10 @@ impl Workspace {
                 .unwrap_or_default();
             crate::editor_tab::open_close_confirmation(
                 name,
-                Rc::new(move |end, window, cx| {
-                    editor.update(cx, |e, cx| e.end_transaction(end, cx));
-                    let _ = this.update(cx, |ws, cx| ws.close_tab_now(tab, window, cx));
+                Rc::new(move |commit, window, cx| {
+                    let _ = this.update(cx, |ws, cx| {
+                        ws.end_transaction_and_close_tab(tab, commit, window, cx);
+                    });
                 }),
                 window,
                 cx,
@@ -198,6 +202,33 @@ impl Workspace {
             return;
         }
         self.close_tab_now(tab, window, cx);
+    }
+
+    /// The close confirmation's choice: commits (`commit = true`) or rolls back the tab's
+    /// transaction, and closes the tab only once that succeeded. On an error (a run going on, a
+    /// failed commit) the tab stays open with the error shown: nothing is lost silently
+    /// (ADR-0007 §5).
+    pub fn end_transaction_and_close_tab(
+        &mut self,
+        tab: TabId,
+        commit: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(editor) = self.tabs.get(&tab).cloned() else {
+            return;
+        };
+        let ended = editor.update(cx, |e, cx| e.end_transaction(commit, cx));
+        cx.spawn_in(window, async move |this, cx| {
+            let result = ended.await;
+            let _ = this.update_in(cx, |ws, window, cx| match result {
+                Ok(()) => ws.close_tab_now(tab, window, cx),
+                Err(e) => {
+                    window.push_notification(Notification::error(e).title("Tab not closed"), cx)
+                }
+            });
+        })
+        .detach();
     }
 
     /// Closes a tab without asking.
@@ -457,8 +488,31 @@ impl Workspace {
         });
     }
 
-    /// Deletes a connection without asking (the confirmed path of "Delete connection").
+    /// Deletes a connection (the confirmed path of "Delete connection"). Its open sessions
+    /// close first: one with an open transaction that the preferences ask about (always for
+    /// production, ADR-0007 §5) asks how to end it, as "Disconnect" does; an error there keeps
+    /// the connection.
     pub fn delete_connection_now(
+        &mut self,
+        id: ConnectionId,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let asking = self.sessions_asking_on_close(id, cx);
+        if !asking.is_empty() {
+            return self.end_transactions_then(
+                asking,
+                "Not deleted",
+                Rc::new(move |ws, window, cx| ws.remove_connection_now(id, window, cx)),
+                window,
+                cx,
+            );
+        }
+        self.remove_connection_now(id, window, cx);
+    }
+
+    /// Removes a connection without asking (its sessions are closed by the hub).
+    fn remove_connection_now(
         &mut self,
         id: ConnectionId,
         window: &mut Window,
@@ -528,53 +582,114 @@ impl Workspace {
         let Some(id) = self.selected_connection(cx) else {
             return Self::notify_no_selection(window, cx);
         };
-        let prefs = self.hub.read(cx).preferences();
-        let asking: Vec<ninesql_core::SessionHandle> = self
-            .hub
-            .read(cx)
-            .sessions(id)
-            .iter()
-            .filter(|s| s.close_needs_confirmation(&prefs.confirmations))
-            .cloned()
-            .collect();
-        if let Some(first) = asking.first() {
-            // ADR-0007 §5: an open transaction is never ended silently.
-            let name = first.info().connection_name.clone();
-            let this = cx.entity().downgrade();
-            crate::editor_tab::open_close_confirmation(
-                name,
-                Rc::new(move |commit, window, cx| {
-                    let end = if commit {
-                        ninesql_core::TransactionEnd::Commit
-                    } else {
-                        ninesql_core::TransactionEnd::Rollback
-                    };
-                    let sessions = asking.clone();
-                    let this = this.clone();
-                    window
-                        .spawn(cx, async move |cx| {
-                            for s in &sessions {
-                                if let Err(e) = s.close_with(end).await {
-                                    let text = crate::editor_tab::run::core_error_text(&e);
-                                    let _ = cx.update(|window, cx| {
-                                        window.push_notification(
-                                            Notification::error(text).title("Not disconnected"),
-                                            cx,
-                                        );
-                                    });
-                                    return;
-                                }
-                            }
-                            let _ = this.update(cx, |ws, cx| ws.disconnect_now(id, cx));
-                        })
-                        .detach();
-                }),
+        let asking = self.sessions_asking_on_close(id, cx);
+        if !asking.is_empty() {
+            return self.end_transactions_then(
+                asking,
+                "Not disconnected",
+                Rc::new(move |ws, _, cx| ws.disconnect_now(id, cx)),
                 window,
                 cx,
             );
-            return;
         }
         self.disconnect_now(id, cx);
+    }
+
+    /// The open sessions of `id` whose close must ask first: an open transaction the
+    /// preferences ask about (always for production, ADR-0007 §5).
+    fn sessions_asking_on_close(
+        &self,
+        id: ConnectionId,
+        cx: &App,
+    ) -> Vec<ninesql_core::SessionHandle> {
+        let hub = self.hub.read(cx);
+        let prefs = hub.preferences();
+        hub.sessions(id)
+            .iter()
+            .filter(|s| s.close_needs_confirmation(&prefs.confirmations))
+            .cloned()
+            .collect()
+    }
+
+    /// Asks how to end the open transactions of `asking` (ADR-0007 §5: never ended silently),
+    /// then [`Self::close_sessions_then`] with the choice; Cancel does nothing.
+    fn end_transactions_then(
+        &self,
+        asking: Vec<ninesql_core::SessionHandle>,
+        error_title: &'static str,
+        then: AfterClose,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(first) = asking.first() else {
+            return;
+        };
+        let name = first.info().connection_name.clone();
+        let this = cx.entity().downgrade();
+        crate::editor_tab::open_close_confirmation(
+            name,
+            Rc::new(move |commit, window, cx| {
+                let (asking, then) = (asking.clone(), then.clone());
+                let _ = this.update(cx, |ws, cx| {
+                    ws.close_sessions_then(asking, commit, error_title, then, window, cx);
+                });
+            }),
+            window,
+            cx,
+        );
+    }
+
+    /// Ends the open transaction of each of `sessions` (commit or roll back) and closes them,
+    /// then runs `then`. The first failure stops there, with a notification titled
+    /// `error_title` (a failed commit leaves its session open).
+    fn close_sessions_then(
+        &self,
+        sessions: Vec<ninesql_core::SessionHandle>,
+        commit: bool,
+        error_title: &'static str,
+        then: AfterClose,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let end = if commit {
+            ninesql_core::TransactionEnd::Commit
+        } else {
+            ninesql_core::TransactionEnd::Rollback
+        };
+        cx.spawn_in(window, async move |this, cx| {
+            for s in &sessions {
+                if let Err(e) = s.close_with(end).await {
+                    let text = crate::editor_tab::run::core_error_text(&e);
+                    let _ = cx.update(|window, cx| {
+                        window.push_notification(Notification::error(text).title(error_title), cx);
+                    });
+                    return;
+                }
+            }
+            let _ = this.update_in(cx, |ws, window, cx| then(ws, window, cx));
+        })
+        .detach();
+    }
+
+    /// The close confirmation's choice for "Delete connection": ends the open transactions of
+    /// its sessions (commit or roll back) and closes them, then deletes the connection; a
+    /// failure keeps the connection.
+    pub fn delete_connection_ending_transactions(
+        &mut self,
+        id: ConnectionId,
+        commit: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let asking = self.sessions_asking_on_close(id, cx);
+        self.close_sessions_then(
+            asking,
+            commit,
+            "Not deleted",
+            Rc::new(move |ws, window, cx| ws.remove_connection_now(id, window, cx)),
+            window,
+            cx,
+        );
     }
 
     /// Closes the sessions of a connection without asking.
@@ -591,6 +706,14 @@ impl Workspace {
         let Some(editor) = self.active_editor().cloned() else {
             return window.push_notification(Notification::info("Open an SQL editor first."), cx);
         };
+        if editor.read(cx).is_running() {
+            return window.push_notification(
+                Notification::info(
+                    "A run is going on in this editor: cancel it before choosing another connection.",
+                ),
+                cx,
+            );
+        }
         let sessions = self.hub.read(cx).open_sessions();
         let current = editor
             .read(cx)
@@ -602,7 +725,7 @@ impl Workspace {
     /// Commits or rolls back the active editor's transaction.
     pub fn end_transaction(&mut self, commit: bool, cx: &mut Context<Self>) {
         if let Some(editor) = self.active_editor().cloned() {
-            editor.update(cx, |e, cx| e.end_transaction(commit, cx));
+            editor.update(cx, |e, cx| e.end_transaction(commit, cx).detach());
         }
     }
 
@@ -626,8 +749,10 @@ impl Workspace {
                 warnings,
             } => {
                 self.active_connection = Some(*connection);
-                // The active editor without a connection takes the session just opened.
+                // The active editor without a connection takes the session just opened; never
+                // one with a run going on (its run stays on the session it started on).
                 if let Some(editor) = self.active_editor().cloned()
+                    && !editor.read(cx).is_running()
                     && editor.read(cx).session().is_none()
                     && let Some(session) = self.hub.read(cx).sessions(*connection).last().cloned()
                 {
@@ -1096,6 +1221,14 @@ impl Workspace {
             Some(editor) => div()
                 .flex_1()
                 .min_h_0()
+                // With several panes, each production editor gets its own frame, whichever
+                // pane is active (ADR-0007 §4).
+                .when_some(
+                    multi_pane
+                        .then(|| self.pane_frame_color(pane, cx))
+                        .flatten(),
+                    |el, color| el.border_2().border_color(color),
+                )
                 .child(editor.clone())
                 .into_any_element(),
             None => {
@@ -1373,6 +1506,14 @@ impl Workspace {
         let c = hub.connection(id)?;
         let b = ConnectionBadges::of(c, hub.types(), hub.sessions(id));
         b.production.then_some(b.color)
+    }
+
+    /// The production frame color of a pane: its active editor's, when production rules apply
+    /// to that editor's session.
+    #[must_use]
+    pub fn pane_frame_color(&self, pane: PaneId, cx: &App) -> Option<Hsla> {
+        let tab = self.layout.pane(pane)?.active_tab()?;
+        self.tabs.get(&tab)?.read(cx).frame_color(cx)
     }
 
     fn frame_editor_area(&self, area: AnyElement, cx: &App) -> AnyElement {
