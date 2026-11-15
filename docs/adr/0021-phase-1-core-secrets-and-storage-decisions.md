@@ -1,6 +1,6 @@
 # ADR-0021: Phase 1 core, secrets and storage decisions
 
-- **Status**: Proposed
+- **Status**: Accepted (maintainer, 2026-11-15)
 - **Date**: 2026-11-15
 
 ## Context

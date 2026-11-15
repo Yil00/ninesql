@@ -1,6 +1,6 @@
 # ADR-0020: Phase 1 driver decisions
 
-- **Status**: Proposed
+- **Status**: Accepted (maintainer, 2026-11-15)
 - **Date**: 2026-11-15
 
 ## Context

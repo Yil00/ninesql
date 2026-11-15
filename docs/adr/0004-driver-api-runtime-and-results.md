@@ -1,6 +1,6 @@
 # ADR-0004: Driver API, async runtime and result model
 
-- **Status**: Accepted. Amendment **proposed** (sqlite session threads, 2026-11-15) in the [section at the end](#amendment-sqlite-session-threads-2026-11-15): a synchronous client may own one dedicated thread per session instead of using `spawn_blocking`; until the maintainer accepts it, the decision above is unchanged.
+- **Status**: Accepted. Amended (sqlite session threads, accepted by the maintainer on 2026-11-15) by the [section at the end](#amendment-sqlite-session-threads-2026-11-15): a synchronous client may own one dedicated thread per session instead of using `spawn_blocking`; the Decision above is unchanged.
 - **Date**: 2026-11-14
 
 ## Context
@@ -41,7 +41,7 @@ The UI (GPUI) has its own foreground and background executors. Most Rust databas
 - **GPUI's executor for driver I/O**: most clients require Tokio; mixing would make cancellation and timeouts unreliable.
 
 ## Amendment (sqlite session threads, 2026-11-15)
-**Status: Proposed** (the maintainer accepts it). It adds to the Consequences above and changes no point of the Decision. Raised by the P1-E review: `ninesql-driver-sqlite` does not follow the wording of the third Consequence. Behaviour as implemented: `crates/drivers/ninesql-driver-sqlite/src/worker.rs` and [docs/08](../08-engine-capabilities.md#sqlite-sqlite-p1-b).
+**Status: Accepted** (maintainer, 2026-11-15). It adds to the Consequences above and changes no point of the Decision. Raised by the P1-E review: `ninesql-driver-sqlite` does not follow the wording of the third Consequence. Behaviour as implemented: `crates/drivers/ninesql-driver-sqlite/src/worker.rs` and [docs/08](../08-engine-capabilities.md#sqlite-sqlite-p1-b).
 
 **Context.** The third Consequence above says drivers built on a synchronous client must not block Tokio worker threads and names `spawn_blocking` as the way to run such clients (`rusqlite`, `duckdb`). A `rusqlite::Connection` is used by one thread at a time, and the sqlite driver streams results lazily under the caller's budget (I6): each poll of the `ResultStream` steps at most one batch, so a paused grid pauses the statement. A paused statement keeps its prepared statement, and so the thread that owns the connection, waiting for the next demand, for up to `PAUSED_RESULT_TIMEOUT` (300 s). Tokio's blocking pool is shared by the whole driver runtime (the core's secret reads also run there); a task that waits for minutes on a paused result would hold one of its threads for that long.
 

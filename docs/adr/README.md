@@ -9,10 +9,10 @@ New ADR: copy [template.md](template.md), take the next number, status `Proposed
 | [0001](0001-native-stack-rust-gpui.md) | Native stack – Rust and GPUI | Accepted, partially superseded by [0013](0013-gpui-source-and-supply-chain.md) |
 | [0002](0002-licensing-and-dependency-policy.md) | Licensing and dependency policy | Accepted, partially superseded by [0013](0013-gpui-source-and-supply-chain.md), partially amended by [0015](0015-allow-0bsd-license.md), partially amended by [0018](0018-patched-third-party-crates.md) |
 | [0003](0003-supported-engines-v1.md) | Supported engines for v1 and driver families | Accepted, partially superseded by [0014](0014-dev-environment-profiles.md) |
-| [0004](0004-driver-api-runtime-and-results.md) | Driver API, async runtime and result model | Accepted, [amendment proposed](0004-driver-api-runtime-and-results.md#amendment-sqlite-session-threads-2026-11-15) (sqlite session threads, 2026-11-15) |
+| [0004](0004-driver-api-runtime-and-results.md) | Driver API, async runtime and result model | Accepted, [amended](0004-driver-api-runtime-and-results.md#amendment-sqlite-session-threads-2026-11-15) (sqlite session threads, 2026-11-15) |
 | [0005](0005-secrets-storage.md) | Secrets storage | Accepted, partially superseded by [0012](0012-secret-service-client-and-msrv.md), [amended](0005-secrets-storage.md#amendment-p1-d-wiring-2026-11-15) (P1-D wiring, 2026-11-15: default-on `desktop-lock`, Flatpak permissions) |
-| [0006](0006-dbeaver-interoperability.md) | DBeaver interoperability | Accepted, note on file connections proposed in [0020](0020-phase-1-driver-decisions.md) §8 |
-| [0007](0007-production-safety-model.md) | Production safety model | Accepted |
+| [0006](0006-dbeaver-interoperability.md) | DBeaver interoperability | Accepted, note on file connections in [0020](0020-phase-1-driver-decisions.md) §8 |
+| [0007](0007-production-safety-model.md) | Production safety model | Accepted, [amendment proposed](0007-production-safety-model.md#amendment-classifier-2026-11-15) (classifier, 2026-11-15) |
 | [0008](0008-workspace-and-config-storage.md) | Workspace and configuration storage | Accepted, partially amended by [0017](0017-workspace-lock-rewrite-on-load-and-project-identity.md) |
 | [0009](0009-container-first-test-environment.md) | Container-first test environment, runnable in CI and cloud agent sandboxes | Accepted |
 | [0010](0010-packaging-and-distribution.md) | Packaging and distribution | Accepted, Flatpak permissions noted by the [0005 amendment](0005-secrets-storage.md#amendment-p1-d-wiring-2026-11-15) |
@@ -22,8 +22,8 @@ New ADR: copy [template.md](template.md), take the next number, status `Proposed
 | [0014](0014-dev-environment-profiles.md) | Dev environment profiles follow ADR-0009 | Accepted |
 | [0015](0015-allow-0bsd-license.md) | Allow the 0BSD license | Accepted |
 | [0016](0016-ssh-rsa-and-host-key-policies.md) | SSH – RSA keys disabled until russh moves to rsa ≥ 0.10, and non-strict host-key policies | Accepted |
-| [0017](0017-workspace-lock-rewrite-on-load-and-project-identity.md) | Workspace lock, rewrite-on-load and project identity | Accepted, [amendment proposed](0017-workspace-lock-rewrite-on-load-and-project-identity.md#amendment-known_hosts-lock-wait-2026-11-15) (`known_hosts` lock wait, 2026-11-15) |
+| [0017](0017-workspace-lock-rewrite-on-load-and-project-identity.md) | Workspace lock, rewrite-on-load and project identity | Accepted, [amended](0017-workspace-lock-rewrite-on-load-and-project-identity.md#amendment-known_hosts-lock-wait-2026-11-15) (`known_hosts` lock wait, 2026-11-15) |
 | [0018](0018-patched-third-party-crates.md) | Patched third-party crates | Accepted |
 | [0019](0019-tls-ca-file-semantics.md) | TLS CA-file semantics | Accepted |
-| [0020](0020-phase-1-driver-decisions.md) | Phase 1 driver decisions | Proposed |
-| [0021](0021-phase-1-core-secrets-and-storage-decisions.md) | Phase 1 core, secrets and storage decisions | Proposed |
+| [0020](0020-phase-1-driver-decisions.md) | Phase 1 driver decisions | Accepted |
+| [0021](0021-phase-1-core-secrets-and-storage-decisions.md) | Phase 1 core, secrets and storage decisions | Accepted |
