@@ -622,6 +622,8 @@ struct Shared {
     workspace: std::sync::OnceLock<crate::workspace::Workspace>,
     /// Keep-alive interval in milliseconds, `0` = off; read by every session task.
     keep_alive_ms: Arc<AtomicU64>,
+    /// Bumped on every [`CoreEvent::SecretsLocked`]: reconnects holding prompted secrets stop.
+    locks: tokio::sync::watch::Sender<u64>,
 }
 
 impl Shared {
@@ -635,6 +637,10 @@ impl Shared {
     }
 
     fn emit(&self, event: CoreEvent) {
+        if matches!(event, CoreEvent::SecretsLocked { .. }) {
+            // Every lock path (lock now, sleep, screen lock, idle) comes through here.
+            self.locks.send_modify(|n| *n = n.wrapping_add(1));
+        }
         // Never waits on the UI. A full queue (the UI does not read it, or did not take it)
         // drops the event and counts it; a dropped receiver is not an error.
         // `SessionClosed` is never dropped: when the channel is full (or a backlog exists, to
@@ -786,6 +792,7 @@ impl SessionManager {
                 init_sql: Mutex::new(Pending::new(MAX_PENDING_OPEN_CONFIRMATIONS)),
                 workspace: std::sync::OnceLock::new(),
                 keep_alive_ms: Arc::new(AtomicU64::new(keep_alive)),
+                locks: tokio::sync::watch::Sender::new(0),
             }),
             events_rx: Arc::new(Mutex::new(Some(events_rx))),
         })
@@ -982,6 +989,14 @@ impl SessionManager {
         }
     }
 
+    /// Reports that secrets left memory (the vault locked, the "ask every time" cache cleared):
+    /// emits [`CoreEvent::SecretsLocked`] and stops every [`Self::reconnect`] that holds
+    /// prompted secrets, which then ends with [`OpenOutcome::NeedsSecrets`]. [`crate::CoreServices`]
+    /// calls it through its lock hooks (lock now, sleep, screen lock) and its idle timer.
+    pub fn notify_secrets_locked(&self, reason: SecretsLockReason) {
+        self.shared.emit(CoreEvent::SecretsLocked { reason });
+    }
+
     /// Open sessions with an open transaction ([`SessionHandle::transaction_state`]), for the
     /// "quit with uncommitted work" confirmation (ADR-0007 §5).
     #[must_use]
@@ -1015,8 +1030,11 @@ impl SessionManager {
     ///   vault, a host key to confirm, an authentication failure, a refused TLS certificate.
     ///
     /// Prompted secrets in `request` stay in memory (zeroized when dropped) until the reconnect
-    /// ends, so that each attempt can use them; nothing else is kept. Dropping the
-    /// [`Reconnect`] stops it where it stands.
+    /// ends, so that each attempt can use them; nothing else is kept. A secrets lock (lock now,
+    /// sleep, screen lock, idle lock: [`CoreEvent::SecretsLocked`]) ends such a reconnect at
+    /// once with [`OpenOutcome::NeedsSecrets`] and drops them. The policy is clamped
+    /// ([`ReconnectPolicy::clamped`]) and the whole reconnect lasts at most
+    /// [`MAX_RECONNECT_TIME`]. Dropping the [`Reconnect`] stops it where it stands.
     #[must_use]
     pub fn reconnect(&self, request: OpenRequest, policy: ReconnectPolicy) -> Reconnect {
         let (tx, events) = mpsc::channel(8);
@@ -1077,6 +1095,14 @@ fn keep_alive_millis(interval: Option<Duration>) -> u64 {
 // ---------------------------------------------------------------------------------------------
 // Reconnect (F-CON-10)
 
+/// Most attempts of one reconnect ([`ReconnectPolicy::clamped`]).
+pub const MAX_RECONNECT_ATTEMPTS: u32 = 20;
+/// Longest wait between two reconnect attempts.
+pub const MAX_RECONNECT_DELAY: Duration = Duration::from_secs(60);
+/// Longest wall-clock time of one reconnect, waits and attempts included; it then ends with
+/// the last error.
+pub const MAX_RECONNECT_TIME: Duration = Duration::from_secs(5 * 60);
+
 /// Attempts and backoff of [`SessionManager::reconnect`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
@@ -1115,6 +1141,18 @@ impl ReconnectPolicy {
         self.initial_delay = initial;
         self.max_delay = max.max(initial);
         self
+    }
+
+    /// The policy within its bounds: 1 to [`MAX_RECONNECT_ATTEMPTS`] attempts, delays of at
+    /// most [`MAX_RECONNECT_DELAY`]. [`SessionManager::reconnect`] applies it.
+    #[must_use]
+    pub fn clamped(self) -> Self {
+        let initial = self.initial_delay.min(MAX_RECONNECT_DELAY);
+        Self {
+            attempts: self.attempts.clamp(1, MAX_RECONNECT_ATTEMPTS),
+            initial_delay: initial,
+            max_delay: self.max_delay.clamp(initial, MAX_RECONNECT_DELAY),
+        }
     }
 
     /// The wait after failed attempt number `failed` (1-based).
@@ -1218,6 +1256,17 @@ fn copy_prompted(prompted: &[(SecretSlot, SecretString)]) -> Vec<(SecretSlot, Se
         .collect()
 }
 
+/// Why a reconnect attempt did not finish.
+enum Interrupted {
+    /// The [`Reconnect`] was dropped or cancelled.
+    Gone,
+    /// Secrets were locked: prompted secrets must not outlive the lock.
+    Locked,
+    /// [`MAX_RECONNECT_TIME`] is spent.
+    OutOfTime,
+}
+
+#[allow(clippy::too_many_lines)] // One loop with its exits; split, it would be harder to follow.
 async fn reconnect_loop(
     shared: &Arc<Shared>,
     request: OpenRequest,
@@ -1227,13 +1276,41 @@ async fn reconnect_loop(
     let OpenRequest {
         connection,
         policy: safety,
-        prompted,
+        mut prompted,
         mut init_sql_confirmation,
     } = request;
-    let attempts = policy.attempts.max(1);
+    let policy = policy.clamped();
+    let attempts = policy.attempts;
     let id = connection.id;
+    let deadline = tokio::time::Instant::now() + MAX_RECONNECT_TIME;
+    // Lock, sleep, screen lock and idle lock all emit `SecretsLocked`, which bumps this.
+    let mut locks = shared.locks.subscribe();
+    locks.mark_unchanged();
+    // Waits for whatever interrupts the reconnect. Only a lock while prompted secrets are held
+    // counts: without them nothing secret is kept here (a locked vault answers
+    // `NeedsVaultUnlock` through the open flow itself).
+    async fn interrupted(
+        tx: &mpsc::Sender<ReconnectEvent>,
+        locks: &mut tokio::sync::watch::Receiver<u64>,
+        watch_locks: bool,
+        deadline: tokio::time::Instant,
+    ) -> Interrupted {
+        let lock = async {
+            if watch_locks {
+                if locks.changed().await.is_ok() {
+                    return;
+                }
+            }
+            std::future::pending::<()>().await;
+        };
+        tokio::select! {
+            () = tx.closed() => Interrupted::Gone,
+            () = lock => Interrupted::Locked,
+            () = tokio::time::sleep_until(deadline) => Interrupted::OutOfTime,
+        }
+    }
     let mut attempt = 1;
-    loop {
+    let end = loop {
         if tx
             .send(ReconnectEvent::Attempt {
                 attempt,
@@ -1252,13 +1329,18 @@ async fn reconnect_loop(
             // Spent by the attempt that reaches the driver: later attempts ask again.
             init_sql_confirmation: init_sql_confirmation.take(),
         };
+        let watch_locks = !prompted.is_empty();
         let outcome = tokio::select! {
             biased;
             outcome = open_session(shared, request) => outcome,
-            () = tx.closed() => return,
+            why = interrupted(tx, &mut locks, watch_locks, deadline) => break Err(why),
         };
         match outcome {
-            Err(e) if is_transient(&e) && attempt < attempts => {
+            Err(e)
+                if is_transient(&e)
+                    && attempt < attempts
+                    && tokio::time::Instant::now() + policy.delay_after(attempt) < deadline =>
+            {
                 let delay = policy.delay_after(attempt);
                 tracing::info!(connection = %id, error = e.kind(), delay_ms = delay.as_millis(), "reconnect attempt failed");
                 if tx
@@ -1270,24 +1352,40 @@ async fn reconnect_loop(
                 }
                 tokio::select! {
                     () = tokio::time::sleep(delay) => {}
-                    () = tx.closed() => return,
+                    why = interrupted(tx, &mut locks, watch_locks, deadline) => break Err(why),
                 }
                 attempt += 1;
             }
-            outcome => {
-                if let Err(e) = &outcome {
-                    tracing::info!(connection = %id, error = e.kind(), "reconnect failed");
-                }
-                // Nobody listens any more: a session opened meanwhile is closed.
-                if let Err(mpsc::error::SendError(ReconnectEvent::Done(Ok(OpenOutcome::Opened(
-                    h,
-                ))))) = tx.send(ReconnectEvent::Done(outcome)).await
-                {
-                    let _ = h.close().await;
-                }
-                return;
-            }
+            outcome => break Ok(outcome),
         }
+    };
+    let outcome = match end {
+        Ok(outcome) => outcome,
+        Err(Interrupted::Gone) => return,
+        Err(Interrupted::Locked) => {
+            // The prompted secrets leave memory with the lock (zeroized); the user types them
+            // again after unlocking.
+            prompted.clear();
+            tracing::info!(connection = %id, "secrets locked during a reconnect: prompted secrets dropped");
+            Ok(OpenOutcome::NeedsSecrets(connect::missing_prompts(
+                &connection,
+                &[],
+            )))
+        }
+        Err(Interrupted::OutOfTime) => {
+            tracing::info!(connection = %id, "reconnect out of time");
+            Err(CoreError::ConnectTimeout(MAX_RECONNECT_TIME))
+        }
+    };
+    drop(prompted);
+    if let Err(e) = &outcome {
+        tracing::info!(connection = %id, error = e.kind(), "reconnect failed");
+    }
+    // Nobody listens any more: a session opened meanwhile is closed.
+    if let Err(mpsc::error::SendError(ReconnectEvent::Done(Ok(OpenOutcome::Opened(h))))) =
+        tx.send(ReconnectEvent::Done(outcome)).await
+    {
+        let _ = h.close().await;
     }
 }
 

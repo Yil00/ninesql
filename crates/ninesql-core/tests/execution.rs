@@ -535,6 +535,10 @@ impl Session for FlakySession {
         self.inner.metadata()
     }
     async fn execute(&mut self, s: Statement, o: ExecOptions) -> DriverResult<ResultStream> {
+        if s.text.contains("broken_stream()") {
+            // Two pages of rows, then an engine error (not a cancel).
+            return Ok(ResultStream::from_items(broken_stream_items(), &o));
+        }
         self.inner.execute(s, o).await
     }
     fn cancel_handle(&self) -> Arc<dyn CancelHandle> {
@@ -565,6 +569,116 @@ impl Session for FlakySession {
     async fn close(self: Box<Self>) -> DriverResult<()> {
         self.inner.close().await
     }
+}
+
+fn broken_stream_items() -> Vec<DriverResult<ResultItem>> {
+    use ninesql_core::driver_api::arrow_array::{Int64Array, RecordBatch};
+    use ninesql_core::driver_api::arrow_schema::{DataType, Field, Schema};
+    let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
+    let batch = |from: i64| {
+        RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![Arc::new(Int64Array::from_iter_values(from..from + 100))],
+        )
+        .unwrap()
+    };
+    vec![
+        Ok(ResultItem::ResultSet(api::ResultSetHeader::tabular(
+            0,
+            Arc::clone(&schema),
+        ))),
+        Ok(ResultItem::Rows(batch(0))),
+        Ok(ResultItem::Rows(batch(100))),
+        Err(DriverError::Query {
+            code: Some("XX000".into()),
+            message: "disk read error".into(),
+            position: None,
+        }),
+    ]
+}
+
+/// Review M1: an engine error that arrives around a release is a failure, never a closed
+/// (successful) statement; only a confirmed cancel is `StatementClosed`.
+#[test]
+fn an_error_after_a_release_is_reported_as_a_failure() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (manager, _) = manager(Arc::new(Flaky::new(mock_driver())), tmp.path());
+    let types = ConnectionTypes::default();
+    let exec = service(&manager, None);
+    ui(async {
+        let h = open_ok(&manager, mock_connection(ConnectionTypeId::dev()), &types).await;
+        let mut run = exec.run(
+            &h,
+            RunRequest::statement("SELECT broken_stream()")
+                .with_budget(FetchBudget::default().with_batch_rows(100))
+                .with_paging(100),
+        );
+        let mut n = 0;
+        until(&mut run, &mut n, |e| matches!(e, RunEvent::PageEnd { .. })).await;
+        // The session task queued the engine error meanwhile.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        run.release(0);
+        let e = until(&mut run, &mut n, |e| {
+            matches!(
+                e,
+                RunEvent::StatementClosed { .. } | RunEvent::StatementFailed { .. }
+            )
+        })
+        .await;
+        assert!(
+            matches!(
+                e,
+                RunEvent::StatementFailed {
+                    error: CoreError::Driver(DriverError::Query { .. }),
+                    ..
+                }
+            ),
+            "{e:?}"
+        );
+        let e = until(&mut run, &mut n, |e| matches!(e, RunEvent::Done(_))).await;
+        assert!(matches!(
+            e,
+            RunEvent::Done(RunSummary {
+                end: RunEnd::Failed { index: 0 },
+                ..
+            })
+        ));
+    });
+    manager.shutdown(Duration::from_secs(5));
+}
+
+/// Review M1: `release` is ignored for a statement that is not a read; it streams to its end.
+#[test]
+fn non_reads_are_neither_paged_nor_released() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (manager, _) = manager(Arc::new(mock_driver()), tmp.path());
+    let types = ConnectionTypes::default();
+    let exec = service(&manager, None);
+    ui(async {
+        let h = open_ok(&manager, mock_connection(ConnectionTypeId::dev()), &types).await;
+        let run = exec.run(
+            &h,
+            RunRequest::script("INSERT INTO t VALUES (1);\nINSERT INTO t VALUES (2)")
+                .with_paging(1),
+        );
+        run.release(0);
+        let (events, summary) = collect_run(run).await;
+        assert!(events.iter().any(|e| matches!(
+            e,
+            RunEvent::StatementFinished {
+                index: 0,
+                update_count: Some(1),
+                ..
+            }
+        )));
+        assert!(
+            !events
+                .iter()
+                .any(|e| matches!(e, RunEvent::StatementClosed { index: 0, .. }))
+        );
+        assert_eq!(summary.end, RunEnd::Completed);
+    });
+    manager.shutdown(Duration::from_secs(5));
 }
 
 #[test]
@@ -1082,6 +1196,95 @@ fn paging_delivers_the_first_page_then_waits_for_fetch_or_release() {
                 ..
             })
         ));
+    });
+    manager.shutdown(Duration::from_secs(5));
+}
+
+/// Review M2: a secrets lock ends a reconnect that holds prompted secrets, and the policy is
+/// clamped.
+#[test]
+fn a_secrets_lock_stops_a_reconnect_holding_prompted_secrets() {
+    use ninesql_core::{Auth, SecretSlot, SecretSource, SecretsLockReason};
+    let clamped = ReconnectPolicy::with_attempts(1_000)
+        .with_delays(Duration::from_secs(600), Duration::from_secs(6_000))
+        .clamped();
+    assert_eq!(clamped.attempts, ninesql_core::MAX_RECONNECT_ATTEMPTS);
+    assert_eq!(clamped.max_delay, ninesql_core::MAX_RECONNECT_DELAY);
+    assert_eq!(clamped.initial_delay, ninesql_core::MAX_RECONNECT_DELAY);
+    assert_eq!(ReconnectPolicy::with_attempts(0).clamped().attempts, 1);
+
+    let tmp = tempfile::tempdir().unwrap();
+    let flaky = Flaky::new(mock_driver().with_password(Secret::new("right-pw".to_owned())));
+    let (manager, _) = manager(Arc::new(flaky.clone()), tmp.path());
+    let types = ConnectionTypes::default();
+    ui(async {
+        let mut c = mock_connection(ConnectionTypeId::dev());
+        c.auth = Auth::Password {
+            username: "nine".into(),
+            secret: SecretSource::Prompt,
+        };
+        flaky.fail_connects.store(100, Ordering::SeqCst);
+        let request = OpenRequest::new(c, &types).with_secret(
+            SecretSlot::Auth,
+            ninesql_secrets::SecretString::from("right-pw".to_owned()),
+        );
+        let mut r = manager.reconnect(
+            request,
+            ReconnectPolicy::with_attempts(10)
+                .with_delays(Duration::from_secs(2), Duration::from_secs(2)),
+        );
+        loop {
+            match tokio::time::timeout(Duration::from_secs(10), r.next())
+                .await
+                .unwrap()
+            {
+                Some(ReconnectEvent::RetryIn { .. }) => break,
+                Some(_) => {}
+                None => panic!("ended early"),
+            }
+        }
+        // "Lock secrets now" (or sleep, screen lock, idle lock) while it waits.
+        manager.notify_secrets_locked(SecretsLockReason::Requested);
+        let (_, outcome) = reconnect_to_end(r).await;
+        match outcome {
+            Ok(OpenOutcome::NeedsSecrets(prompts)) => {
+                assert_eq!(prompts.len(), 1, "the password is asked again");
+            }
+            other => panic!("{other:?}"),
+        }
+        let connects = flaky.connects.load(Ordering::SeqCst);
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert_eq!(
+            flaky.connects.load(Ordering::SeqCst),
+            connects,
+            "no further attempt"
+        );
+    });
+    manager.shutdown(Duration::from_secs(5));
+
+    // Without prompted secrets a lock does not stop it (nothing secret is held).
+    let open_flaky = Flaky::new(mock_driver());
+    let (manager, _) = support::manager(Arc::new(open_flaky.clone()), tmp.path());
+    ui(async {
+        open_flaky.fail_connects.store(1, Ordering::SeqCst);
+        let mut r = manager.reconnect(
+            OpenRequest::new(mock_connection(ConnectionTypeId::dev()), &types),
+            ReconnectPolicy::with_attempts(3)
+                .with_delays(Duration::from_millis(200), Duration::from_millis(200)),
+        );
+        loop {
+            match tokio::time::timeout(Duration::from_secs(10), r.next())
+                .await
+                .unwrap()
+            {
+                Some(ReconnectEvent::RetryIn { .. }) => break,
+                Some(_) => {}
+                None => panic!("ended early"),
+            }
+        }
+        manager.notify_secrets_locked(SecretsLockReason::Idle);
+        let (_, outcome) = reconnect_to_end(r).await;
+        assert!(matches!(outcome, Ok(OpenOutcome::Opened(_))), "{outcome:?}");
     });
     manager.shutdown(Duration::from_secs(5));
 }

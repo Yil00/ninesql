@@ -56,9 +56,10 @@ pub use services::{
 pub use session::{
     CloseReason, ConfirmReason, ConfirmationRequest, ConfirmationToken, CoreEvent, CoreEvents,
     ExecEvent, ExecuteRequest, Execution, HostKeyConfirmation, HostKeyToken, InitSqlConfirmation,
-    InitSqlToken, KnownHostsFiles, ManagerConfig, Next, OpenOutcome, OpenRequest, Reconnect,
-    ReconnectEvent, ReconnectPolicy, Reply, SecretsLockReason, SessionHandle, SessionId,
-    SessionInfo, SessionManager, SessionWarning, TransactionEnd, TransactionState,
+    InitSqlToken, KnownHostsFiles, MAX_RECONNECT_ATTEMPTS, MAX_RECONNECT_DELAY, MAX_RECONNECT_TIME,
+    ManagerConfig, Next, OpenOutcome, OpenRequest, Reconnect, ReconnectEvent, ReconnectPolicy,
+    Reply, SecretsLockReason, SessionHandle, SessionId, SessionInfo, SessionManager,
+    SessionWarning, TransactionEnd, TransactionState,
 };
 pub use workspace::{
     ConnectionTypesFile, Connections, ConnectionsFile, LoadIssue, LoadedConnections, MarkerClear,

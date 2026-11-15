@@ -58,7 +58,7 @@ use std::time::{Duration, Instant, SystemTime};
 
 use ninesql_driver_api::{
     CancelToken, DriverError, ExecutionId, FetchBudget, Param, QueryLanguage, ResultItem,
-    StatementSpan,
+    StatementClass, StatementSpan,
 };
 use ninesql_storage::history::EntryStatus;
 use tokio::sync::mpsc;
@@ -221,6 +221,12 @@ impl RunRequest {
     /// (other statements and transaction commands wait) until the result is fetched to its end
     /// or released. In a script, every statement but the last is released after its first page
     /// ([`RunEvent::StatementClosed`]) so that the next one can run; the last one stays open.
+    /// **Only statements the dialect classifies as reads are paged or released**: a release is
+    /// a server-side cancel, which would roll back a write (`DELETE … RETURNING`, `CALL`), so
+    /// any other statement streams to its end under the budget, and `release` is ignored for
+    /// it. A released statement ends with [`RunEvent::StatementClosed`] only when the engine
+    /// confirms the cancel; an engine error that arrived meanwhile is
+    /// [`RunEvent::StatementFailed`].
     /// Choose `FetchBudget::batch_rows` no larger than `rows`: a page ends on a batch boundary.
     #[must_use]
     pub fn with_paging(mut self, rows: u32) -> Self {
@@ -654,6 +660,16 @@ impl ExecutionService {
     }
 }
 
+/// The error a cancelled statement ends with: [`DriverError::Cancelled`], or the engine's own
+/// "cancelled" error (SQLSTATE `57014`, PostgreSQL `query_canceled`).
+fn is_cancel_error(error: &CoreError) -> bool {
+    match error {
+        CoreError::Driver(DriverError::Cancelled) => true,
+        CoreError::Driver(DriverError::Query { code, .. }) => code.as_deref() == Some("57014"),
+        _ => false,
+    }
+}
+
 /// Kind of one item of a script, as the execution service runs it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ItemKind {
@@ -908,8 +924,19 @@ impl RunJob {
                 exec_request = exec_request.confirmed(token);
             }
             let last = index == last_statement;
+            // Only reads may be paused and released: a release is a server-side cancel, which
+            // would roll back a write (`DELETE … RETURNING`, `CALL`, DML in a transaction).
+            let is_read = dialect.classify(&text) == StatementClass::Read;
             let outcome = self
-                .statement(index, *span, &request, exec_request, &info.engine, last)
+                .statement(
+                    index,
+                    *span,
+                    &request,
+                    exec_request,
+                    &info.engine,
+                    last,
+                    is_read,
+                )
                 .await;
             match outcome {
                 StatementEnd::Finished | StatementEnd::Closed => {
@@ -956,6 +983,7 @@ impl RunJob {
         exec_request: ExecuteRequest,
         engine: &EngineId,
         last: bool,
+        is_read: bool,
     ) -> StatementEnd {
         let params = exec_request.params.len();
         let text = exec_request.text.clone();
@@ -964,7 +992,12 @@ impl RunJob {
         let started = Instant::now();
         let mut execution = self.session.execute(exec_request);
         let base = request.offset;
-        let page = request.page_rows.map(|n| u64::from(n.max(1)));
+        // Non-reads are never paged: they stream under the budget without pausing, and are
+        // never released (see `RunRequest::with_paging`).
+        let page = request
+            .page_rows
+            .filter(|_| is_read)
+            .map(|n| u64::from(n.max(1)));
         // Run cancelled ("Stop") / stream released (grid, or the script moving on).
         let mut cancel_sent = false;
         let mut releasing = false;
@@ -1034,7 +1067,9 @@ impl RunJob {
                 control = self.control.recv(), if self.control_open => {
                     match control {
                         None => self.control_open = false,
-                        Some(Control::Release(i)) if i == index && !releasing && !cancel_sent => {
+                        Some(Control::Release(i))
+                            if i == index && is_read && !releasing && !cancel_sent =>
+                        {
                             execution.cancel();
                             releasing = true;
                         }
@@ -1141,19 +1176,21 @@ impl RunJob {
                 }
                 ExecEvent::Failed(error) => {
                     let elapsed = started.elapsed();
+                    let cancel_error = is_cancel_error(&error);
                     return match error {
-                        // Run cancelled by the user ("Stop"): a cancel, whatever the engine
-                        // answered (`Cancelled`, or SQLSTATE 57014).
-                        _ if cancel_sent => {
+                        // Run cancelled by the user ("Stop"), and the engine confirmed a cancel
+                        // (`Cancelled`, or SQLSTATE 57014). Any other error stays an error.
+                        _ if cancel_sent && cancel_error => {
                             record(EntryStatus::Cancelled, Some(delivered), update_count, None);
                             self.out
                                 .send_end(RunEvent::StatementCancelled { index, elapsed })
                                 .await;
                             StatementEnd::Cancelled
                         }
-                        // Stream released early (grid or script): the rows read were what the
-                        // user asked for.
-                        _ if releasing => {
+                        // Stream released early (grid or script, reads only) and the engine
+                        // confirmed the cancel: the rows read were what the user asked for. A
+                        // real engine error that arrived meanwhile is reported as a failure.
+                        _ if releasing && cancel_error => {
                             record(EntryStatus::Succeeded, Some(delivered), update_count, None);
                             self.out
                                 .send_end(RunEvent::StatementClosed {

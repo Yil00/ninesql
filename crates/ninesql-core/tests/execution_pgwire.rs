@@ -13,7 +13,8 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use ninesql_core::driver_api::ResultItem;
+use ninesql_core::driver_api::arrow_array::StringArray;
+use ninesql_core::driver_api::{FetchBudget, ResultItem};
 use ninesql_core::{
     Auth, Connection, ConnectionTypeId, ConnectionTypes, Endpoint, EngineId, ExecutionService,
     OpenOutcome, OpenRequest, Preferences, RunEnd, RunEvent, RunRequest, SecretSlot, SecretSource,
@@ -175,6 +176,53 @@ fn big_select_streams_first_rows_fast_and_cancels_and_production_deletes_ask() {
             .expect("position");
         assert!(script[position.offset..].starts_with("nope_column"));
         assert_eq!((position.line, position.column), (2, 8));
+        // Review M1: a write that returns rows, in a paged script, is never released (a
+        // release is a server-side cancel, which would roll it back): it runs to its end.
+        let script = "CREATE TEMP TABLE p3c_returning (i int);\n\
+            INSERT INTO p3c_returning SELECT g FROM generate_series(1, 1000) AS g;\n\
+            DELETE FROM p3c_returning WHERE i > 0 RETURNING i;\n\
+            SELECT count(*)::text FROM p3c_returning";
+        let (events, end) = collect_all(
+            exec.run(
+                &h,
+                RunRequest::script(script)
+                    .with_budget(FetchBudget::default().with_batch_rows(50))
+                    .with_paging(100),
+            ),
+        )
+        .await;
+        assert_eq!(end, RunEnd::Completed, "{events:?}");
+        let deleted: usize = events
+            .iter()
+            .map(|e| match e {
+                RunEvent::Item {
+                    index: 2,
+                    item: ResultItem::Rows(b),
+                } => b.num_rows(),
+                _ => 0,
+            })
+            .sum();
+        assert_eq!(deleted, 1000, "every RETURNING row streamed");
+        assert!(!events.iter().any(|e| matches!(
+            e,
+            RunEvent::StatementClosed { index: 2, .. } | RunEvent::PageEnd { index: 2, .. }
+        )));
+        let count = events.iter().find_map(|e| match e {
+            RunEvent::Item {
+                index: 3,
+                item: ResultItem::Rows(b),
+            } if b.num_rows() > 0 => b
+                .column(0)
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .map(|c| c.value(0).to_owned()),
+            _ => None,
+        });
+        assert_eq!(
+            count.as_deref(),
+            Some("0"),
+            "the DELETE was not rolled back"
+        );
         h.close().await.unwrap().unwrap();
 
         // Production: manual commit, and a DELETE without WHERE asks first.
