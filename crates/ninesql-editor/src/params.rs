@@ -429,11 +429,11 @@ impl ParameterPrompt {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::split::lex_segments;
+    use crate::split::code_segments;
     use ninesql_core::driver_api::LexicalRules;
 
     fn keys(text: &str, rules: LexicalRules, style: ParameterStyle) -> Vec<String> {
-        let segs = lex_segments(text, rules);
+        let segs = code_segments(text, rules);
         find_parameters(text, &segs, style)
             .into_iter()
             .map(|r| text[r.span].to_owned())
@@ -487,7 +487,7 @@ mod tests {
     fn refs_of(texts: &[&str], rules: LexicalRules, style: ParameterStyle) -> Vec<Vec<ParamRef>> {
         texts
             .iter()
-            .map(|t| find_parameters(t, &lex_segments(t, rules), style))
+            .map(|t| find_parameters(t, &code_segments(t, rules), style))
             .collect()
     }
 
