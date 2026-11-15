@@ -13,6 +13,12 @@ Ubuntu 22.04 and Debian 12 support depends on GPUI's Vulkan and Wayland requirem
 - A GPU with Vulkan 1.2+ drivers (Mesa `radv`, `anv`, NVIDIA proprietary). Software Vulkan (`lavapipe`) works for testing but is slow.
 - Wayland or X11 session.
 - A Secret Service provider (GNOME Keyring, KWallet ≥ 5.97 with Secret Service, KeePassXC) for saved passwords; otherwise NineSQL uses its encrypted vault.
+- systemd-logind on the system bus, to lock saved secrets on sleep and screen lock ([docs/05](05-security.md#vault-format-v1)); without it only the idle lock applies.
+
+### Flatpak permissions
+The Flatpak manifest needs these D-Bus permissions (and no network permission beyond the user's connections):
+- `--talk-name=org.freedesktop.secrets`: the Secret Service, for saved passwords ([ADR-0005](adr/0005-secrets-storage.md));
+- `--system-talk-name=org.freedesktop.login1`: logind on the system bus, so the vault is locked and the "ask every time" cache cleared on sleep and screen lock (`DesktopLockWatcher`, default-on `desktop-lock` feature). Without it the watcher cannot start: NineSQL reports it and relies on the idle lock.
 
 ## Build requirements (Debian / Ubuntu)
 Rust **1.89 or newer**, installed with `rustup` (the repository pins the `stable` channel in `rust-toolchain.toml`; 1.89 is the floor, [ADR-0012](adr/0012-secret-service-client-and-msrv.md)). The default `rustc` package of Debian 12 and Ubuntu 24.04 is older than that and cannot build NineSQL. This does not affect them as release targets: the `.deb` is built in CI with stable Rust and the Flatpak with the Flatpak Rust SDK extension, so users need no Rust toolchain.
