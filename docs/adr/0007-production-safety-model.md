@@ -1,6 +1,6 @@
 # ADR-0007: Production safety model
 
-- **Status**: Accepted. Note (P1-D core, 2026-11-14): §3 is extended to init SQL, which is classified and confirmed when it would run at connect, not refused when saved ([docs/02](../02-architecture.md#confirmations-adr-0007-adr-0011)). Amendment **proposed** (classifier, 2026-11-15) in the [section at the end](#amendment-classifier-2026-11-15): two deliberate over-classifications of `EXPLAIN` / `DESCRIBE` and `ANALYZE`; until the maintainer accepts it, the decision above is unchanged.
+- **Status**: Accepted. Note (P1-D core, 2026-11-14): §3 is extended to init SQL, which is classified and confirmed when it would run at connect, not refused when saved ([docs/02](../02-architecture.md#confirmations-adr-0007-adr-0011)). Amended (classifier, accepted by the maintainer on 2026-11-15) in the [section at the end](#amendment-classifier-2026-11-15): two deliberate over-classifications of `EXPLAIN` / `DESCRIBE` and `ANALYZE`, and `CREATE OR REPLACE` as destructive.
 - **Date**: 2026-11-14
 
 ## Context
@@ -24,7 +24,7 @@ DBeaver offers connection types (Development, Test, Production) with a color, an
 - **Regex-based detection**: misses comments, quoting and multi-statement scripts.
 
 ## Amendment (classifier, 2026-11-15)
-**Status: Proposed** (the maintainer accepts it). It adds to Decision §3 and changes none of its points. Raised by the P1-E review (M1). Behaviour as implemented on the branch `fix/p2-pre-classifier` (commit 3291ca0, `fix(driver-api): classify running EXPLAIN forms and CREATE OR REPLACE`; not merged into `dev` when this amendment was written): the shared statement classifier of `ninesql-driver-api` and its conformance lists `POSTGRES_EXPLAIN_WRITES` and `MYSQL_EXPLAIN_WRITES`.
+**Status: Accepted** (maintainer, 2026-11-15). It adds to Decision §3 and changes none of its points. Raised by the P1-E review (M1). Behaviour as implemented by commit 3291ca0 (`fix(driver-api): classify running EXPLAIN forms and CREATE OR REPLACE`, branch `fix/p2-pre-classifier`, security-reviewed; merged into the pre-phase-2 integration branch on 2026-11-15, it reaches `dev` with that PR): the shared statement classifier of `ninesql-driver-api` and its conformance lists `POSTGRES_EXPLAIN_WRITES` and `MYSQL_EXPLAIN_WRITES`.
 
 **Context.** §3 classifies statements before execution, and the same classes decide what a read-only session refuses client-side (I3, on top of the engine-side mechanism). Some `EXPLAIN` forms run the statement they explain: PostgreSQL `EXPLAIN ANALYZE`, with the option also written quoted or `U&`-escaped inside a parenthesised list (`EXPLAIN ("analyze") DELETE …`, `EXPLAIN (U&"analyze") DELETE …`), MySQL `EXPLAIN ANALYZE`, MariaDB `EXPLAIN ANALYZE` and `DESC ANALYZE`, and MariaDB `ANALYZE <statement>`. The classifier used to detect `ANALYZE` as a bare word only, so `EXPLAIN ("analyze") DELETE FROM t` was a read and skipped the production confirmation while PostgreSQL deleted the rows. Reading every option list exactly as each engine does would make the classifier depend on engine and version details it cannot see.
 
@@ -32,6 +32,7 @@ DBeaver offers connection types (Development, Test, Production) with a color, an
 1. An `EXPLAIN` / `DESCRIBE` / `DESC` with a **parenthesised option list**, or with `ANALYZE` / `ANALYSE` **in any form** (bare, quoted, backquoted, `U&`-escaped), is classified as the statement it would run: the riskiest of the statements starting at any explainable keyword after it, never below `Read`, and `Unknown` when nothing explainable follows the options or the list is unbalanced. So `EXPLAIN (FORMAT JSON) DELETE FROM t` asks for confirmation on a production connection and is refused in a read-only session, although PostgreSQL does not run the `DELETE` for it.
 2. **Every statement starting with `ANALYZE` / `ANALYSE` is `Unknown`**, whatever follows (MariaDB `ANALYZE <statement>` runs the statement; `ANALYZE [TABLE] t` writes statistics on PostgreSQL, MySQL and SQLite). So MariaDB `ANALYZE SELECT …` is refused in read-only sessions and confirmed on production, although it only reads.
 3. A plain `EXPLAIN` (no option list, no `ANALYZE`), SQLite `EXPLAIN [QUERY PLAN]` and `DESCRIBE t` stay reads.
+4. `CREATE OR REPLACE …` is `Destructive`, not `Ddl`: it silently overwrites an existing object, which the production rule (confirm destructive statements) would otherwise not confirm.
 
 **Consequences.**
 - No form of `EXPLAIN` or `ANALYZE` that runs a write can skip the production confirmation or pass the client-side read-only check.

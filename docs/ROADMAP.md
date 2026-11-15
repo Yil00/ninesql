@@ -79,7 +79,7 @@ Exit criterion, assessed at the close on 2026-11-15:
 - Met as amended: passwords are saved in the encrypted vault, not the keyring (Secret Service off by default; the desktop round trip on GNOME / KDE is still open, [Phase 0 follow-ups](#phase-0-follow-ups)).
 - Deferred to the final tests at the end of the MVP (P6-F): the manual run of the scenario on a desktop (create, restart, reconnect without retyping, `grep` under `$XDG_*/ninesql`) and the visual pass of the UI with screenshots on Wayland and X11.
 
-Next: the pre-phase-2 hardening (the "Before P2-B / P2-C merges" block below), then P2-B / P2-C.
+Next: P2-B / P2-C. The pre-phase-2 hardening (the "Before P2-B / P2-C merges" block below) landed on 2026-11-15.
 
 ### Phase 1 follow-ups
 Items deferred by phase 1 decisions and reviews. The deadline is when the item must have landed.
@@ -88,15 +88,20 @@ Items deferred by phase 1 decisions and reviews. The deadline is when the item m
 
 | Origin | Item | State |
 |---|---|---|
-| P1-E (M1) | The EXPLAIN classifier fix; its two deliberate over-classifications are recorded in the [ADR-0007 amendment](adr/0007-production-safety-model.md#amendment-classifier-2026-11-15) (**Proposed**) | In progress on `fix/p2-pre-classifier` |
+| P1-E (M1) | ~~The EXPLAIN classifier fix; its two deliberate over-classifications are recorded in the [ADR-0007 amendment](adr/0007-production-safety-model.md#amendment-classifier-2026-11-15)~~ | **Done** (pre-P2 hardening, 2026-11-15): an `EXPLAIN` / `DESC` with a parenthesised option list, or with `ANALYZE` in any form, is classified as what it runs; every statement starting with `ANALYZE` (MariaDB `ANALYZE <stmt>`) is `Unknown`; `DESC ANALYZE` fixed; conformance lists `POSTGRES_EXPLAIN_WRITES` / `MYSQL_EXPLAIN_WRITES` with engine tests on their own schemas. The ADR-0007 amendment was accepted by the maintainer on 2026-11-15 |
 | P1-E (M2) | ~~ADRs for the two deviations from accepted ADRs and the security-relevant decisions with no ADR~~ | **Done**, accepted by the maintainer on 2026-11-15: [ADR-0004 amendment](adr/0004-driver-api-runtime-and-results.md#amendment-sqlite-session-threads-2026-11-15), [ADR-0017 amendment](adr/0017-workspace-lock-rewrite-on-load-and-project-identity.md#amendment-known_hosts-lock-wait-2026-11-15), [ADR-0020](adr/0020-phase-1-driver-decisions.md), [ADR-0021](adr/0021-phase-1-core-secrets-and-storage-decisions.md) |
-| P1-E (L2) | Core-side read-only for files inside a DBeaver workspace | In progress on `fix/p2-pre-core` |
-| P1-E | Init SQL of an imported connection always confirmed once | In progress on `fix/p2-pre-core` |
+| P1-E (L2) | ~~Core-side read-only for files inside a DBeaver workspace~~ | **Done** (pre-P2 hardening, 2026-11-15): the core opens such a file as a read-only session and refuses one the driver does not report read-only (`ReadOnlyNotEnforced`) |
+| P1-E | ~~Init SQL of an imported connection always confirmed once~~ | **Done** (pre-P2 hardening, 2026-11-15): `Connection::init_sql_needs_confirmation` (`connections.json` schema 4); while set, every init statement asks for confirmation (`ConfirmReason::Imported`) whatever the type; the core ORs the on-disk marker into the request (fail-closed); `InitSqlKey` binds `imported`; the marker is cleared on disk only if the confirmed statements still match (`MarkerClear`), reported by `CoreEvent::ImportedInitSqlConfirmed`; the hub clears its copy only on a match ([docs/02](02-architecture.md#confirmations-adr-0007-adr-0011), [ADR-0022](adr/0022-pre-phase-2-hardening-decisions.md) §1, **Proposed**). P2-C requirements: rows below |
 | P1-B (pgwire) / P2-C | pgjdbc properties kept by the DBeaver import (JDBC URL parameters and driver properties without a NineSQL equivalent) are refused by pgwire's property allowlist at connect: the import must map or drop them, with a report entry, before persisting | Open; lands with P2-C |
 | P2-C | Convert the mirror model to `ninesql_core::Connection` and run `sanitize()` / `validate()` before persisting, with an I1 test (no imported secret in any workspace file) | Open; lands with P2-C |
 | P2-C | Persist the disabled reason, so that a connection disabled for a missing hop, profile or handler cannot simply be re-enabled without fixing it | Open; lands with P2-C |
 | P2-C | Imported connection types never overwrite a built-in type and never weaken an existing type (confirmations, auto-commit, read-only rules) | Open; lands with P2-C |
 | P2-C | Move imported secrets to the keyring and drop the imported values (zeroized); use `import_project`, not `map_sources` | Open; lands with P2-C |
+| P2-C (marker) | Set `init_sql_needs_confirmation` on every imported connection with non-empty init SQL, and set it again on any re-import that changes or re-applies init SQL (security review of the pre-P2 hardening) | Open; lands with P2-C |
+| P2-C (marker) | Write imported connections through a path that keeps the marker, not the new-connection path of `hub.save` (which drops a marker its own copy does not have) | Open; lands with P2-C |
+| P2-C (marker) | Never take the marker's value from the DBeaver file: NineSQL sets it | Open; lands with P2-C |
+| P2-C (marker) | Set the marker in the request of any test-before-save of an import preview (the connection is not on disk yet, so the core uses the request's marker) | Open; lands with P2-C |
+| P2-C (marker) | An end-to-end test: a crafted "dev" connection with init SQL, imported, gives `InitSqlNeedsConfirmation` with `imported = true` | Open; lands with P2-C |
 | P2-C / P1-B | Drivers open files flagged as inside `DBeaverData` read-only (I4). The flag exists (driver-API PR, 2026-11-15): `ConnectParams::inside_dbeaver_workspace`. sqlite honours it by opening the file read-only **and immutable**, whatever `read_only` says and whatever its journal mode, so no journal, `-wal` or `-shm` file is created next to it ([docs/08](08-engine-capabilities.md#sqlite-sqlite-p1-b)). Residual: committed pages held only in a `-wal` file (a writer that crashed or still running) or a hot journal are not visible in such a session (stale data; the session's first notice says so). The core computes the flag for every file endpoint since wave 3 (L2 row below) | Open; lands with P2-C |
 | P2-C (core) | Core fields for the default schema / catalog and per-connection auto-commit, so the mapped DBeaver `bootstrap` values are not lost | Open; lands with P2-C |
 | Wave 3 (core) | `Workspace::update_connection`, so the UI does not rewrite the whole list to edit one connection | Open; lands with P2-C |
@@ -105,11 +110,19 @@ Items deferred by phase 1 decisions and reviews. The deadline is when the item m
 
 | Origin | Item | State |
 |---|---|---|
-| P1-E | Classify `CREATE OR REPLACE` as destructive | In progress |
-| P1-E | The `ca_file` documentation | Open, not scheduled |
-| P1-E | A minimum length for the vault master password | Open, not scheduled |
-| P1-E | Init SQL is classified with the default lexical rules (residual) | Open, not scheduled |
-| P1-E | UI test coverage for I1 | Open, not scheduled |
+| P1-E | ~~Classify `CREATE OR REPLACE` as destructive~~ | **Done** (pre-P2 hardening, 2026-11-15); recorded in the [ADR-0007 amendment](adr/0007-production-safety-model.md#amendment-classifier-2026-11-15) |
+| P1-E | ~~The `ca_file` documentation~~ | **Done** (pre-P2 hardening, 2026-11-15): the `TlsConfig::ca_file` rustdoc follows [ADR-0019](adr/0019-tls-ca-file-semantics.md) |
+| P1-E | ~~A minimum length for the vault master password~~ | **Done** (pre-P2 hardening, 2026-11-15): a new master password (create or change) has at least 12 characters and is not only whitespace; unlocking is unaffected ([ADR-0022](adr/0022-pre-phase-2-hardening-decisions.md) §3, **Proposed**) |
+| P1-E (L5) | Init SQL is classified with the default lexical rules (residual) | **Documented** as a residual with its mitigations ([docs/02](02-architecture.md#confirmations-adr-0007-adr-0011), [docs/05](05-security.md)) |
+| P1-E | ~~UI test coverage for I1~~ | **Done** (pre-P2 hardening, 2026-11-15): a GPUI test runs the hub flows (vault create, save, edit, duplicate, test connection, lock, unlock, an "ask every time" password at connect) and checks that no database or master password reaches a file under the NineSQL directories or a captured log event |
+| Pre-P2 review (R1) | The open-time load does not report load issues to the user (they are fixed on disk and logged only) | Open, not scheduled |
+| Pre-P2 review (R2) | The hub should reload the connections when a confirmation returns `cleared = Some(false)` because its copy differs from disk (today it keeps the marker and asks again at the next open) | Open, not scheduled |
+| Pre-P2 review (R3) | A test for the M2 read-failure branch (a failed read of `connections.json` counts as marked) | Open, not scheduled |
+| Pre-P2 review | The L1 policy / connection type is not part of `InitSqlKey` (informational) | Informational |
+| Pre-P2 review | The SSH passphrase is not covered by the UI I1 flow test | Open, not scheduled |
+| Pre-P2 review (L-a) | Refine the `EXPLAIN` over-classification (a list of known options that do not run the statement) before the P3 explain feature; needs a new amendment and a security review | Before the P3 explain feature |
+| Pre-P2 review | `DbeaverRoots` does not detect hard links to a DBeaver file, nor DBeaver workspaces in a custom location that were never picked for an import | Open, not scheduled |
+| ADR candidates (pre-P2 hardening) | `connections.json` schema 4 and its migration keeping a hand-set marker; the core writing `connections.json` from the session manager under a process-wide guard (note on ADR-0017); the 12-character minimum, whitespace refused (note on ADR-0005): written as [ADR-0022](adr/0022-pre-phase-2-hardening-decisions.md) | **Proposed**, awaiting the maintainer. The classifier [ADR-0007 amendment](adr/0007-production-safety-model.md#amendment-classifier-2026-11-15) is **accepted** (maintainer, 2026-11-15) |
 
 **Other phase 1 follow-ups**:
 
@@ -206,6 +219,13 @@ Details in [docs/08](08-engine-capabilities.md). Not done: the optional SQLite r
 - P1-C (UI): the connection dialog (F-CON-12, F-CON-06, F-CON-05, F-CON-08, F-CON-03, F-CON-01), the navigator list with folders, duplicate and delete (F-CON-02), production visuals driven by the open session; every `OpenOutcome` handled, with the vault unlock / create prompt; a `SecretsLocked` notice and a "Lock secrets now" action; the "SCRAM only" toggle; the "Read-only: DBeaver file" badge; unique secret ids with write-then-swap and deletion of orphaned secrets; password inputs with no reveal and no copy; nine new actions (28 in total), each with a key binding and a palette entry. The pgwire, mysqlwire and sqlite drivers are registered by the `ninesql` binary (L5).
 - Not done: the local visual pass and screenshots (deferred to the MVP-end tests, P6-F); the Secret Service backend stays off by default. New follow-ups and ADR candidates are in the [Phase 1 follow-ups](#phase-1-follow-ups) table.
 
+**Landed: pre-P2 hardening** (2026-11-15), from `fix/p2-pre-classifier` and `fix/p2-pre-core`, both security-reviewed and approved:
+- Classifier (P1-E M1, L1): running `EXPLAIN` / `DESC` forms (a parenthesised option list, `ANALYZE` in any form) classified as what they run; every statement starting with `ANALYZE` is `Unknown`; `DESC ANALYZE` fixed; `CREATE OR REPLACE` is `Destructive`; new conformance lists, and engine tests with their own schemas ([ADR-0007 amendment](adr/0007-production-safety-model.md#amendment-classifier-2026-11-15), accepted by the maintainer on 2026-11-15).
+- Core: files inside a DBeaver workspace forced read-only, a session that is not read-only refused (L2); the imported init SQL marker with `connections.json` schema 4 (a version 3 file is migrated, keeping `connections.json.bak` and any hand-set marker; an older NineSQL refuses schema 4); a process-wide write guard of `connections.json`; the `ca_file` rustdoc (L3); the init SQL lexical residual documented (L5).
+- Secrets: a new master password has at least 12 characters and is not only whitespace, on create and on change; unlocking is unaffected (L4).
+- UI: the imported init SQL reason text and notice in the "Confirm init SQL" dialog; the I1 flow test over files and logs (L6).
+- ADR candidates: [ADR-0022](adr/0022-pre-phase-2-hardening-decisions.md), Proposed. Follow-ups: the P2-C marker rows and the "Pre-P2 review" rows of the [Phase 1 follow-ups](#phase-1-follow-ups).
+
 ## Phase 2 – DBeaver import
 *Objective: a DBeaver user switches in one click.*
 
@@ -213,12 +233,12 @@ Details in [docs/08](08-engine-capabilities.md). Not done: the optional SQLite r
 |----------|--------------|--------|
 | P2-A Parser | `interop-engineer` | [x] Workspace detection: native, Flatpak, Snap, custom folder (ADR-0006). *The Flatpak and Snap paths are not verified on a real install* · [x] `data-sources*.json` model with an `extra` map for unknown keys; folders; connection types · [x] `credentials-config.json` decryption into zeroized buffers; master-password-protected files detected and skipped · [x] Mapping to NineSQL connections: engines in the v1 set, the others as disabled connections; JDBC URL and driver properties → NineSQL options; SSH and TLS handlers; fail-closed rules ([docs/06](06-dbeaver-interop.md#import-rules-enforced-by-the-parser-p2-a)). *Output is a mirror model, not yet persisted (P2-C); the engine mappings marked "to verify" in docs/06 have no fixture. Wave 2 follow-ups: blank profile values, DBeaver's jump-host selection, RSA key file flag* · [x] Fixtures from P0-E, property tests, fuzz targets for both decoders. *Both cargo-fuzz targets ran for 300 s each without a crash (wave 2, [results](../crates/ninesql-dbeaver/fuzz/README.md#results)); longer campaigns before P2-D* |
 | P2-B Import flow | `ui-engineer` | [ ] First-run "Import from DBeaver" screen and a menu entry · [ ] Preview: connections, what maps, what does not, secrets to move · [ ] Import report saved in the project; idempotent re-import by `origin.dbeaver_id` (F-CON-14) |
-| P2-C Core | `core-engineer` | [ ] Persist imported connections and move secrets to the store; optional copy of DBeaver SQL scripts into the project |
+| P2-C Core | `core-engineer` | [ ] Persist imported connections and move secrets to the store; optional copy of DBeaver SQL scripts into the project · [ ] Set the imported init SQL marker (`init_sql_needs_confirmation`) as required by the "P2-C (marker)" rows of the [Phase 1 follow-ups](#phase-1-follow-ups), with the end-to-end "dev" connection test |
 | P2-D Review | `security-reviewer` | [ ] Review: I1 and I4 (no write to DBeaver files, no secret on disk or in logs), parser robustness |
 
 **Exit criterion**: importing each fixture workspace yields the expected connections, folders, types and secrets (snapshot tests without secret values); DBeaver files are byte-identical before and after (checksum test); a 100-connection workspace imports in under 2 s.
 
-**Status** (2026-11-15): phase 2 not started; P2-A landed during phase 1. P2-B and P2-C merge after the "Before P2-B / P2-C merges" block of the [Phase 1 follow-ups](#phase-1-follow-ups).
+**Status** (2026-11-15): phase 2 not started; P2-A landed during phase 1. The pre-P2 hardening (the "Before P2-B / P2-C merges" block of the [Phase 1 follow-ups](#phase-1-follow-ups)) landed on 2026-11-15; the rows of that block still open land with P2-C. Next: P2-B / P2-C.
 
 ## Phase 3 – SQL editor and results grid
 *Objective: the daily loop. Write SQL, run it, read large results without lag.*
