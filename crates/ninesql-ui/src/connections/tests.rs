@@ -873,29 +873,322 @@ fn the_frame_and_badges_follow_the_open_session(cx: &mut TestAppContext) {
     assert!(ws.read_with(&vcx, |ws, cx| ws.frame_color(cx).is_none()));
 }
 
-#[test]
-fn the_unsaved_known_hosts_live_in_a_private_directory() {
-    use std::os::unix::fs::PermissionsExt as _;
+// ---------------------------------------------------------------------------------------------
+// Integration with the core's `CoreServices` (feat/p1-d-app-wiring).
+
+const MASTER: &str = "correct horse battery staple";
+
+fn temp_paths(base: &std::path::Path) -> Paths {
+    let base = base.to_path_buf();
+    let xdg = XdgDirs::from_lookup(|k| {
+        let dir = match k {
+            "XDG_CONFIG_HOME" => "config",
+            "XDG_DATA_HOME" => "data",
+            "XDG_STATE_HOME" => "state",
+            "XDG_CACHE_HOME" => "cache",
+            "HOME" => "home",
+            _ => return None,
+        };
+        Some(base.join(dir).into_os_string())
+    })
+    .unwrap_or_else(|e| panic!("{e}"));
+    Paths::new(&xdg)
+}
+
+fn wait_reply<T>(mut reply: ninesql_core::Reply<T>) -> T {
+    for _ in 0..2000 {
+        match reply.try_take() {
+            ninesql_core::Next::Ready(v) => return v,
+            ninesql_core::Next::Pending => std::thread::sleep(Duration::from_millis(5)),
+            ninesql_core::Next::Ended => panic!("no answer"),
+        }
+    }
+    panic!("no answer in time");
+}
+
+/// A real `CoreServices` on the mock driver under `base` (no Secret Service, no desktop lock
+/// watcher, so new secrets go to the vault), installed as the hub.
+fn core_hub(
+    cx: &mut TestAppContext,
+    base: &std::path::Path,
+) -> (Entity<ConnectionHub>, ninesql_core::CoreServices) {
+    let registry = registry_with(vec![Arc::new(MockDriver::new())]);
+    let mut config =
+        ninesql_core::CoreConfig::new(temp_paths(base), ProjectName::default_project(), registry);
+    config.use_secret_service = false;
+    config.watch_desktop_lock = false;
+    config.manager.workers = 1;
+    let core = ninesql_core::CoreServices::start_blocking(config).unwrap_or_else(|e| panic!("{e}"));
+    let hub = init(cx, HubConfig::load_from_core(core.clone()));
+    (hub, core)
+}
+
+fn create_test_vault(core: &ninesql_core::CoreServices) {
+    wait_reply(core.create_vault_with(
+        secret(MASTER),
+        ninesql_core::secrets::KdfParams::insecure_for_tests(),
+    ))
+    .unwrap_or_else(|e| panic!("{e}"));
+}
+
+/// Awaits a hub task that runs on the driver runtime, with parking allowed.
+fn await_task<T: 'static>(vcx: &mut VisualTestContext, task: gpui::Task<T>) -> T {
+    let done = std::rc::Rc::new(std::cell::RefCell::new(None));
+    let slot = done.clone();
+    vcx.foreground_executor()
+        .spawn(async move {
+            *slot.borrow_mut() = Some(task.await);
+        })
+        .detach();
+    wait_until(vcx, |_| done.borrow().is_some());
+    let value = done.borrow_mut().take();
+    value.unwrap_or_else(|| panic!("done"))
+}
+
+fn vaulted_mock(vcx: &mut VisualTestContext, hub: &Entity<ConnectionHub>) -> ConnectionId {
+    let c = mock_connection(
+        "Vaulted",
+        ConnectionTypeId::dev(),
+        Auth::Password {
+            username: "app".into(),
+            secret: SecretSource::Prompt,
+        },
+    );
+    let task = hub.update(vcx, |h, cx| {
+        h.save(
+            super::form::BuiltConnection {
+                connection: c,
+                to_store: vec![(ninesql_core::SecretSlot::Auth, secret("db-password"))],
+                to_delete: Vec::new(),
+            },
+            cx,
+        )
+    });
+    await_task(vcx, task).unwrap_or_else(|e| panic!("{e}"))
+}
+
+use ninesql_core::ConnectionId;
+
+#[gpui::test]
+fn the_hub_uses_the_core_stores_and_backend(cx: &mut TestAppContext) {
     let tmp = tempfile::tempdir().unwrap_or_else(|e| panic!("{e}"));
-    let before = std::fs::metadata(tmp.path())
-        .unwrap_or_else(|e| panic!("{e}"))
-        .permissions()
-        .mode();
-    let a = super::hub::unsaved_known_hosts(tmp.path()).unwrap_or_else(|e| panic!("{e}"));
-    let b = super::hub::unsaved_known_hosts(tmp.path()).unwrap_or_else(|e| panic!("{e}"));
-    let Some(dir) = a.parent() else {
-        panic!("parent")
+    let (hub, core) = core_hub(cx, tmp.path());
+    assert_eq!(core.secret_backend(), ninesql_core::SecretBackend::Vault);
+    assert_eq!(
+        hub.read_with(cx, |h, _| h.store_for_new_secrets()),
+        Some(ninesql_core::secrets::StoreKind::Vault)
+    );
+    // The watcher is off in this test: the problems dialog says so.
+    let problems = hub.read_with(cx, |h, _| h.problems());
+    assert!(
+        problems.iter().any(|p| p.contains("Lock secrets now")),
+        "{problems:?}"
+    );
+}
+
+#[gpui::test]
+fn needs_vault_unlock_prompts_unlocks_and_reopens(cx: &mut TestAppContext) {
+    let tmp = tempfile::tempdir().unwrap_or_else(|e| panic!("{e}"));
+    let (hub, core) = core_hub(cx, tmp.path());
+    create_test_vault(&core);
+    let (ws, mut vcx) = open_live(cx);
+    let id = vaulted_mock(&mut vcx, &hub);
+    let saved = hub.read_with(&vcx, |h, _| h.connection(id).cloned());
+    let Some(saved) = saved else { panic!("saved") };
+    let r = stored(&saved, ninesql_core::SecretSlot::Auth);
+    assert_eq!(r.store, ninesql_core::secrets::StoreKind::Vault);
+
+    // Lock, then connect: the core answers NeedsVaultUnlock.
+    wait_reply(core.lock_now());
+    wait_until(&mut vcx, |vcx| {
+        hub.read_with(vcx, |h, _| h.secrets_locked().is_some())
+    });
+    ws.update_in(&mut vcx, |ws, window, cx| {
+        ws.connect(id, Purpose::Open, window, cx)
+    });
+    let flow = ws.read_with(&vcx, |ws, _| ws.flow().clone());
+    wait_until(&mut vcx, |vcx| {
+        flow.read_with(vcx, |f, _| f.prompt().clone()) == PendingPrompt::VaultUnlock
+    });
+    let Some(prompt) = flow.read_with(&vcx, |f, _| f.vault_prompt()) else {
+        panic!("vault prompt");
     };
-    assert_ne!(a.parent(), b.parent(), "never shared");
-    assert_eq!(dir.parent(), Some(tmp.path()));
-    let mode = std::fs::metadata(dir)
-        .unwrap_or_else(|e| panic!("{e}"))
-        .permissions()
-        .mode();
-    assert_eq!(mode & 0o777, 0o700);
-    let after = std::fs::metadata(tmp.path())
-        .unwrap_or_else(|e| panic!("{e}"))
-        .permissions()
-        .mode();
-    assert_eq!(before, after, "the base directory is untouched");
+    assert_eq!(
+        prompt.read_with(&vcx, |p, _| p.mode()),
+        super::vault::VaultMode::Unlock
+    );
+    assert!(vcx.update(|window, cx| window.has_active_dialog(cx)));
+    let (master, _) = prompt.read_with(&vcx, |p, _| p.inputs());
+    set(Some(&master), MASTER, &mut vcx);
+    vcx.update(|window, cx| prompt.update(cx, |p, cx| p.submit(window, cx)));
+    assert!(
+        vcx.read(|cx| super::secret_input::is_empty(&master, cx)),
+        "cleared at once"
+    );
+    // Unlocked, then opened again with the saved password.
+    wait_until(&mut vcx, |vcx| hub.read_with(vcx, |h, _| h.is_open(id)));
+    let last = flow.read_with(&vcx, |f, _| f.last_result().map(|r| r.result.clone()));
+    assert!(matches!(last, Some(FlowResult::Opened { .. })), "{last:?}");
+    assert_eq!(hub.read_with(&vcx, |h, _| h.secrets_locked()), None);
+}
+
+#[gpui::test]
+fn cancelling_the_vault_prompt_cancels_the_open(cx: &mut TestAppContext) {
+    let tmp = tempfile::tempdir().unwrap_or_else(|e| panic!("{e}"));
+    let (hub, core) = core_hub(cx, tmp.path());
+    create_test_vault(&core);
+    let (ws, mut vcx) = open_live(cx);
+    let id = vaulted_mock(&mut vcx, &hub);
+    wait_reply(core.lock_now());
+    ws.update_in(&mut vcx, |ws, window, cx| {
+        ws.connect(id, Purpose::Open, window, cx)
+    });
+    let flow = ws.read_with(&vcx, |ws, _| ws.flow().clone());
+    wait_until(&mut vcx, |vcx| {
+        flow.read_with(vcx, |f, _| f.vault_prompt().is_some())
+    });
+    let Some(prompt) = flow.read_with(&vcx, |f, _| f.vault_prompt()) else {
+        panic!("vault prompt");
+    };
+    let (master, _) = prompt.read_with(&vcx, |p, _| p.inputs());
+    set(Some(&master), "half", &mut vcx);
+    // What Escape / a click outside runs.
+    vcx.update(|window, cx| {
+        window.close_dialog(cx);
+        prompt.update(cx, |p, cx| p.dismissed(window, cx));
+    });
+    vcx.run_until_parked();
+    assert!(vcx.read(|cx| super::secret_input::is_empty(&master, cx)));
+    assert!(!flow.read_with(&vcx, |f, _| f.is_busy()));
+    let last = flow.read_with(&vcx, |f, _| f.last_result().map(|r| r.result.clone()));
+    assert_eq!(last, Some(FlowResult::Cancelled));
+    assert!(!hub.read_with(&vcx, |h, _| h.is_open(id)));
+}
+
+#[gpui::test]
+fn lock_secrets_action_shows_the_lock_notice(cx: &mut TestAppContext) {
+    let tmp = tempfile::tempdir().unwrap_or_else(|e| panic!("{e}"));
+    let (hub, core) = core_hub(cx, tmp.path());
+    create_test_vault(&core);
+    let (_ws, mut vcx) = open_live(cx);
+    vcx.update(|window, cx| window.clear_notifications(cx));
+    vcx.simulate_keystrokes("ctrl-alt-l");
+    wait_until(&mut vcx, |vcx| {
+        hub.read_with(vcx, |h, _| h.secrets_locked().is_some())
+    });
+    assert_eq!(
+        hub.read_with(&vcx, |h, _| h.secrets_locked()),
+        Some(ninesql_core::SecretsLockReason::Requested)
+    );
+    vcx.run_until_parked();
+    let notes = vcx.update(|window, cx| window.notifications(cx).len());
+    assert!(notes >= 1, "the lock notice is shown");
+    let status = wait_reply(core.vault_status()).unwrap_or_else(|e| panic!("{e}"));
+    assert_eq!(status, ninesql_core::secrets::VaultStatus::Locked);
+    assert_eq!(
+        super::hub::lock_reason_text(ninesql_core::SecretsLockReason::Sleep),
+        "the computer went to sleep"
+    );
+}
+
+#[gpui::test]
+fn saving_a_password_to_a_locked_vault_unlocks_it_first(cx: &mut TestAppContext) {
+    let tmp = tempfile::tempdir().unwrap_or_else(|e| panic!("{e}"));
+    let (hub, core) = core_hub(cx, tmp.path());
+    create_test_vault(&core);
+    wait_reply(core.lock_now());
+    let c = mock_connection(
+        "Edited",
+        ConnectionTypeId::dev(),
+        Auth::Password {
+            username: "app".into(),
+            secret: SecretSource::Prompt,
+        },
+    );
+    let (ws, mut vcx) = open_live(cx);
+    let mut form = super::form::ConnectionForm::from_connection(&c);
+    form.existing = None;
+    form.auth_secret.mode = SecretMode::Save;
+    ws.update_in(&mut vcx, |ws, window, cx| {
+        ws.open_connection_dialog(form, "New connection", window, cx);
+    });
+    let Some(dialog) = ws.read_with(&vcx, |ws, _| ws.connection_dialog().cloned()) else {
+        panic!("dialog");
+    };
+    let secret_input = dialog.read_with(&vcx, |d, _| d.input("secret").cloned());
+    set(secret_input.as_ref(), "db-password", &mut vcx);
+    vcx.update(|window, cx| dialog.update(cx, |d, cx| d.save(window, cx)));
+    // The vault is locked: the master-password prompt opens instead of a failed save.
+    wait_until(&mut vcx, |vcx| {
+        dialog.read_with(vcx, |d, _| d.vault_prompt().is_some())
+    });
+    assert_eq!(hub.read_with(&vcx, |h, _| h.connections().len()), 0);
+    let Some(prompt) = dialog.read_with(&vcx, |d, _| d.vault_prompt().cloned()) else {
+        panic!("vault prompt");
+    };
+    assert_eq!(
+        prompt.read_with(&vcx, |p, _| p.mode()),
+        super::vault::VaultMode::Unlock
+    );
+    let (master, _) = prompt.read_with(&vcx, |p, _| p.inputs());
+    set(Some(&master), MASTER, &mut vcx);
+    vcx.update(|window, cx| prompt.update(cx, |p, cx| p.submit(window, cx)));
+    // Unlocked, then saved, with the password in the vault.
+    wait_until(&mut vcx, |vcx| {
+        hub.read_with(vcx, |h, _| h.connections().len() == 1)
+    });
+    let saved = hub.read_with(&vcx, |h, _| h.connections().iter().next().cloned());
+    let Some(saved) = saved else { panic!("saved") };
+    let r = stored(&saved, ninesql_core::SecretSlot::Auth);
+    assert_eq!(r.store, ninesql_core::secrets::StoreKind::Vault);
+    assert!(secret_input.is_some_and(|i| vcx.read(|cx| super::secret_input::is_empty(&i, cx))));
+}
+
+#[gpui::test]
+fn the_scram_only_toggle_follows_the_driver(cx: &mut TestAppContext) {
+    let hub = shipped_hub(cx);
+    let (ws, mut vcx) = open(cx);
+    vcx.simulate_keystrokes("ctrl-alt-n");
+    let Some(dialog) = ws.read_with(&vcx, |ws, _| ws.connection_dialog().cloned()) else {
+        panic!("dialog");
+    };
+    // PostgreSQL (pgwire enforces ScramOnly): shown.
+    assert!(dialog.read_with(&vcx, |d, cx| d.scram_only_shown(cx)));
+    let inputs = dialog.read_with(&vcx, |d, _| {
+        ["name", "host", "username"].map(|f| d.input(f).cloned())
+    });
+    set(inputs[0].as_ref(), "Scram", &mut vcx);
+    set(inputs[1].as_ref(), "db.example.test", &mut vcx);
+    set(inputs[2].as_ref(), "app", &mut vcx);
+    dialog.update(&mut vcx, |d, cx| {
+        d.form_mut().connection_type = Some(ConnectionTypeId::dev());
+        d.toggle_scram_only(cx);
+    });
+    // Below verify-ca the warning appears; at verify-full it does not.
+    dialog.update(&mut vcx, |d, _| d.form_mut().tls_mode = TlsMode::Require);
+    let notices = dialog.read_with(&vcx, |d, cx| d.current_notices(cx));
+    assert!(
+        notices.iter().any(|n| n.text.contains("SCRAM only")),
+        "{notices:?}"
+    );
+    dialog.update(&mut vcx, |d, _| d.form_mut().tls_mode = TlsMode::VerifyFull);
+    let notices = dialog.read_with(&vcx, |d, cx| d.current_notices(cx));
+    assert!(!notices.iter().any(|n| n.text.contains("SCRAM only")));
+    vcx.update(|window, cx| dialog.update(cx, |d, cx| d.save(window, cx)));
+    vcx.run_until_parked();
+    let saved = hub.read_with(&vcx, |h, _| h.connections().iter().next().cloned());
+    let Some(saved) = saved else { panic!("saved") };
+    assert_eq!(
+        saved.password_exchange,
+        ninesql_core::PasswordExchange::ScramOnly
+    );
+    // MySQL (mysqlwire refuses ScramOnly): hidden, and the toggle does nothing.
+    vcx.simulate_keystrokes("ctrl-alt-n");
+    let Some(dialog) = ws.read_with(&vcx, |ws, _| ws.connection_dialog().cloned()) else {
+        panic!("dialog");
+    };
+    dialog.update(&mut vcx, |d, cx| d.set_engine("mysql", cx));
+    assert!(!dialog.read_with(&vcx, |d, cx| d.scram_only_shown(cx)));
+    dialog.update(&mut vcx, |d, cx| d.toggle_scram_only(cx));
+    assert!(!dialog.read_with(&vcx, |d, _| d.form().scram_only));
 }

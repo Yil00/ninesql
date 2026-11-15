@@ -50,6 +50,9 @@ pub struct ConnectionBadges {
     /// (TLS and SSH downgrades, host keys recorded without asking, credentials in clear,
     /// client-side-only read-only), of the saved settings otherwise.
     pub security_warnings: usize,
+    /// An open session is read-only because its file lies inside a DBeaver workspace
+    /// (`SessionInfo::inside_dbeaver_workspace`, I4).
+    pub dbeaver_read_only: bool,
     /// The saved settings differ from the open session's (type or read-only edited while
     /// connected): they apply on reconnect.
     pub pending_reconnect: bool,
@@ -106,6 +109,7 @@ impl ConnectionBadges {
             production,
             read_only,
             security_warnings,
+            dbeaver_read_only: sessions.iter().any(|s| s.info().inside_dbeaver_workspace),
             pending_reconnect,
         }
     }
@@ -159,7 +163,11 @@ pub fn badges(key: &str, b: &ConnectionBadges, show_type: bool, cx: &App) -> Div
         .when(b.read_only, |el| {
             el.child(pill(
                 SharedString::from(format!("ro-badge-{key}")),
-                "Read-only",
+                if b.dbeaver_read_only {
+                    "Read-only: DBeaver file"
+                } else {
+                    "Read-only"
+                },
                 ro_bg,
                 ro_fg,
             ))

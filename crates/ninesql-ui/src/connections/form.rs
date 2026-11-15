@@ -14,11 +14,11 @@ use ninesql_core::driver_api::{AuthKind, ReadOnlyMechanism};
 use ninesql_core::secrets::{SecretRef, SecretString, StoreKind};
 use ninesql_core::{
     Auth, ClientCertificate, Connection, ConnectionTypeId, ConnectionTypes, Endpoint, EngineId,
-    HostKeyPolicy, SecretSlot, SecretSource, SecurityWarning, SshAuth, SshHop, SshTunnel,
-    TlsConfig, TlsMode,
+    HostKeyPolicy, PasswordExchange, SecretSlot, SecretSource, SecurityWarning, SshAuth, SshHop,
+    SshTunnel, TlsConfig, TlsMode,
 };
 
-use super::engines::{EngineOffer, tls_rank};
+use super::engines::EngineOffer;
 use super::url::ParsedUrl;
 
 /// Database authentication choice.
@@ -309,14 +309,10 @@ pub struct ConnectionForm {
     pub read_only: Option<bool>,
     /// Folder path in the navigator, `/`-separated.
     pub folder: String,
-    /// SCRAM-only password exchange.
-    ///
-    /// INTEGRATION POINT (core, feat/p1-d-app-wiring): the model on `dev` has no
-    /// `password_exchange` field, so this value is not saved and the toggle is not shown; only
-    /// the warning logic is in place ([`notices`]). Hook-up: map to
-    /// `Connection.password_exchange` (`PasswordExchange::ScramOnly`) in `build` /
-    /// `from_connection`, show the toggle when `EngineOffer::scram_only`, and drive the notice
-    /// from `Connection::scram_without_verified_tls()`.
+    /// SCRAM-only password exchange (`Connection::password_exchange` =
+    /// `PasswordExchange::ScramOnly`). Offered only when the driver declares it in
+    /// `ConnectCapabilities::password_exchanges` ([`EngineOffer::scram_only`]) and for password
+    /// authentication.
     pub scram_only: bool,
 }
 
@@ -412,6 +408,7 @@ impl ConnectionForm {
             .iter()
             .map(|(k, v)| (k.clone(), v.clone()))
             .collect();
+        form.scram_only = c.password_exchange == PasswordExchange::ScramOnly;
         form.connection_type = Some(c.connection_type.clone());
         form.read_only = c.read_only;
         form.folder = c.folder.join("/");
@@ -574,6 +571,17 @@ impl ConnectionForm {
             out.push((SecretSlot::TlsClientKey, &self.client_key_secret));
         }
         out
+    }
+
+    /// Whether the "SCRAM only" toggle is shown: the driver enforces it and the connection
+    /// authenticates with a password.
+    #[must_use]
+    pub fn scram_only_offered(&self, offer: &EngineOffer) -> bool {
+        offer.scram_only && self.auth == AuthChoice::Password
+    }
+
+    fn scram_only_applies(&self, offer: &EngineOffer) -> bool {
+        self.scram_only && self.scram_only_offered(offer)
     }
 
     fn tls_section_applies(&self, offer: &EngineOffer) -> bool {
@@ -829,6 +837,11 @@ impl ConnectionForm {
         connection.read_only = self.read_only;
         connection.folder = folder;
         connection.properties = properties;
+        connection.password_exchange = if self.scram_only_applies(offer) {
+            PasswordExchange::ScramOnly
+        } else {
+            PasswordExchange::Any
+        };
         // Every saved secret of the previous version that the new one no longer references:
         // a value replaced, a field switched to "ask", or a credential field gone (auth kind
         // changed, SSH off, hop removed, passphrase unticked, client certificate cleared, TLS
@@ -999,12 +1012,7 @@ pub fn security_warning_text(c: &Connection, w: SecurityWarning) -> String {
 /// `verify-ca` CA-file rule (ADR-0019), SCRAM-only below `verify-ca`, the cleartext leg behind
 /// an SSH tunnel (wave 2 review L4) and client-side-only read-only (ADR-0007 §2).
 #[must_use]
-pub fn notices(
-    c: &Connection,
-    offer: &EngineOffer,
-    types: &ConnectionTypes,
-    scram_only: bool,
-) -> Vec<Notice> {
+pub fn notices(c: &Connection, offer: &EngineOffer, types: &ConnectionTypes) -> Vec<Notice> {
     let mut out: Vec<Notice> = c
         .security_warnings()
         .into_iter()
@@ -1021,7 +1029,7 @@ pub fn notices(
             text: "Verify CA trusts only the CA file you give: choose the CA file, or use \"Verify CA and host name\" to rely on the system trust store.".to_owned(),
         });
     }
-    if scram_only && offer.scram_only && tls_rank(c.tls.mode) < tls_rank(TlsMode::VerifyCa) {
+    if c.scram_without_verified_tls() {
         out.push(Notice::warning(
             "SCRAM only stops password-method downgrades, not a man in the middle: below Verify CA, an attacker who relays the exchange still gets in. Use \"Verify CA and host name\".",
         ));
@@ -1038,13 +1046,14 @@ pub fn notices(
     if let Endpoint::File { path } = &c.endpoint
         && inside_dbeaver_directory(path)
     {
-        // INTEGRATION POINT (core, M5 of the P1-C review): core sets
-        // `ConnectParams::inside_dbeaver_workspace` from the canonical path at connect, and
-        // sqlite then opens the file read-only and immutable. This notice is the dialog's
-        // lexical early warning only (no file system access on the foreground thread, I6).
-        out.push(Notice::warning(
-            "This database file is inside a DBeaver directory. NineSQL never modifies DBeaver files (I4): keep this connection read-only, or copy the file elsewhere.",
-        ));
+        // An early, lexical hint only (no file system access on the foreground thread, I6).
+        // The decision is the core's: at connect it checks the canonical path against the
+        // DBeaver roots and opens the file read-only (`SessionInfo::inside_dbeaver_workspace`,
+        // shown on the session badge).
+        out.push(Notice {
+            severity: Severity::Info,
+            text: "This file looks like it is inside a DBeaver directory: NineSQL never modifies DBeaver files (I4), so it will open it read-only.".to_owned(),
+        });
     }
     let policy = c.policy(types);
     if policy.read_only && offer.capabilities.read_only == ReadOnlyMechanism::ClientSideOnly {
@@ -1405,6 +1414,24 @@ mod tests {
     }
 
     #[test]
+    fn scram_only_round_trips_and_is_offered_only_for_passwords() {
+        let o = offer("postgresql");
+        let types = ConnectionTypes::default();
+        let mut f = pg_form();
+        assert!(f.scram_only_offered(&o));
+        assert!(!f.scram_only_offered(&offer("mysql")));
+        f.scram_only = true;
+        let c = f.build(&o, vec![], &types, None).unwrap().connection;
+        assert_eq!(c.password_exchange, PasswordExchange::ScramOnly);
+        assert!(!c.scram_without_verified_tls(), "verify-full by default");
+        assert!(ConnectionForm::from_connection(&c).scram_only);
+        f.set_auth(AuthChoice::UserOnly);
+        assert!(!f.scram_only_offered(&o));
+        let c = f.build(&o, vec![], &types, None).unwrap().connection;
+        assert_eq!(c.password_exchange, PasswordExchange::Any);
+    }
+
+    #[test]
     fn dbeaver_directories_are_flagged() {
         assert!(inside_dbeaver_directory(std::path::Path::new(
             "/home/me/.local/share/DBeaverData/workspace6/General/db.sqlite"
@@ -1423,7 +1450,7 @@ mod tests {
         f.adapt_to(&o);
         let types = ConnectionTypes::default();
         let built = f.build(&o, vec![], &types, None).unwrap();
-        let n = notices(&built.connection, &o, &types, false);
+        let n = notices(&built.connection, &o, &types);
         assert!(n.iter().any(|n| n.text.contains("DBeaver directory")));
     }
 
@@ -1506,7 +1533,7 @@ mod tests {
         let mut f = pg_form();
         f.tls_mode = TlsMode::VerifyCa;
         let c = f.build(&o, vec![], &types, None).unwrap().connection;
-        let n = notices(&c, &o, &types, false);
+        let n = notices(&c, &o, &types);
         assert!(
             n.iter()
                 .any(|n| n.severity == Severity::Error && n.text.contains("CA file"))
@@ -1519,15 +1546,21 @@ mod tests {
         f.tls_mode = TlsMode::Require;
         f.scram_only = true;
         let c = f.build(&o, vec![], &types, None).unwrap().connection;
-        let n = notices(&c, &o, &types, f.scram_only);
+        assert_eq!(c.password_exchange, PasswordExchange::ScramOnly);
+        let n = notices(&c, &o, &types);
         assert!(n.iter().any(|n| n.text.contains("SCRAM only")));
-        // Not offered by mysqlwire: no SCRAM notice there.
+        // Not offered by mysqlwire: the policy is not saved, so no SCRAM notice there.
+        let mut m = f.clone();
+        m.engine = "mysql".into();
         let my = offer("mysql");
+        let c_my = m.build(&my, vec![], &types, None).unwrap().connection;
+        assert_eq!(c_my.password_exchange, PasswordExchange::Any);
         assert!(
-            !notices(&c, &my, &types, true)
+            !notices(&c_my, &my, &types)
                 .iter()
                 .any(|n| n.text.contains("SCRAM"))
         );
+        f.scram_only = false;
 
         f.tls_mode = TlsMode::Disable;
         f.ssh_enabled = true;
@@ -1538,13 +1571,13 @@ mod tests {
             ..HopForm::default()
         }];
         let c = f.build(&o, vec![], &types, None).unwrap().connection;
-        let n = notices(&c, &o, &types, false);
+        let n = notices(&c, &o, &types);
         assert!(n.iter().any(|n| n.text.contains("trust on first use")));
         assert!(n.iter().any(|n| n.text.contains("in clear")));
         f.connection_type = Some(ConnectionTypeId::prod());
         let c = f.build(&o, vec![], &types, None).unwrap().connection;
         assert!(
-            notices(&c, &o, &types, false)
+            notices(&c, &o, &types)
                 .iter()
                 .any(|n| n.text.starts_with("Production"))
         );

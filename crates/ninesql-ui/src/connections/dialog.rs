@@ -17,7 +17,7 @@ use gpui_kit::component::{
 };
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
-use ninesql_core::secrets::SecretString;
+use ninesql_core::secrets::{SecretString, StoreKind, VaultStatus};
 use ninesql_core::{ConnectionId, ConnectionTypeId, HostKeyPolicy, SecretSlot, TlsMode};
 
 use super::connect_flow::{ConnectFlow, FlowFinished, FlowResult, Purpose};
@@ -27,6 +27,7 @@ use super::form::{
     SshAuthChoice, notices, policy_label,
 };
 use super::hub::ConnectionHub;
+use super::vault::{VaultMode, VaultPromptEvent, open_vault_prompt};
 use super::visuals::{hsla, text_on};
 
 struct HopInputs {
@@ -84,6 +85,10 @@ pub struct ConnectionDialog {
     error: Option<String>,
     test: TestState,
     saving: bool,
+    /// The vault was found unlocked (or just unlocked / created) for the save in progress.
+    vault_ready: bool,
+    /// The master-password prompt opened by a save, while it is open.
+    vault_prompt: Option<Entity<super::vault::VaultPrompt>>,
     _subscription: Subscription,
 }
 
@@ -157,6 +162,8 @@ impl ConnectionDialog {
             error: None,
             test: TestState::Idle,
             saving: false,
+            vault_ready: false,
+            vault_prompt: None,
             _subscription: subscription,
         }
     }
@@ -340,7 +347,7 @@ impl ConnectionDialog {
         }
         match probe.build(&offer, Vec::new(), hub.types(), hub.store_for_new_secrets()) {
             Ok(built) => {
-                let mut out = notices(&built.connection, &offer, hub.types(), self.form.scram_only);
+                let mut out = notices(&built.connection, &offer, hub.types());
                 if let Some(existing) = &self.form.existing
                     && hub.is_open(existing.id)
                 {
@@ -541,6 +548,30 @@ impl ConnectionDialog {
                 return;
             }
         };
+        // A password saved to the vault needs it created and unlocked first.
+        let vault_core = {
+            let h = hub.read(cx);
+            (!built.to_store.is_empty() && h.store_for_new_secrets() == Some(StoreKind::Vault))
+                .then(|| h.core().cloned())
+                .flatten()
+        };
+        if let Some(core) = vault_core
+            && !std::mem::take(&mut self.vault_ready)
+        {
+            // The typed secrets are dropped (zeroized) here and read again after the prompt.
+            drop(built);
+            let reply = core.vault_status();
+            self.saving = true;
+            self.error = None;
+            cx.notify();
+            cx.spawn_in(window, async move |this, cx| {
+                let status = reply.await;
+                let _ =
+                    this.update_in(cx, |d, window, cx| d.after_vault_status(status, window, cx));
+            })
+            .detach();
+            return;
+        }
         let task = hub.update(cx, |hub, cx| hub.save(built, cx));
         self.saving = true;
         self.error = None;
@@ -560,6 +591,90 @@ impl ConnectionDialog {
             });
         })
         .detach();
+    }
+
+    fn after_vault_status(
+        &mut self,
+        status: Option<Result<VaultStatus, ninesql_core::CoreError>>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.saving = false;
+        let mode = match status {
+            Some(Ok(VaultStatus::Unlocked)) => {
+                self.vault_ready = true;
+                self.save(window, cx);
+                return;
+            }
+            Some(Ok(VaultStatus::NotCreated)) => VaultMode::Create,
+            Some(Ok(_)) => VaultMode::Unlock,
+            Some(Err(e)) => {
+                self.error = Some(super::vault::vault_error_text(&e));
+                cx.notify();
+                return;
+            }
+            None => {
+                self.error = Some("The vault did not answer; try again.".to_owned());
+                cx.notify();
+                return;
+            }
+        };
+        let prompt = open_vault_prompt(self.hub.clone(), mode, window, cx);
+        self.vault_prompt = Some(prompt.clone());
+        cx.subscribe_in(
+            &prompt,
+            window,
+            move |this, _, event, window, cx| match event {
+                VaultPromptEvent::Done => {
+                    this.vault_prompt = None;
+                    this.vault_ready = true;
+                    this.save(window, cx);
+                }
+                VaultPromptEvent::Cancelled => {
+                    this.vault_prompt = None;
+                    this.error = Some(
+                        match mode {
+                            VaultMode::Create => {
+                                "Not saved: create the vault, or choose \"Ask every time\"."
+                            }
+                            VaultMode::Unlock => {
+                                "Not saved: unlock the vault, or choose \"Ask every time\"."
+                            }
+                        }
+                        .to_owned(),
+                    );
+                    cx.notify();
+                }
+            },
+        )
+        .detach();
+    }
+
+    /// Whether the "SCRAM only" toggle is shown (the driver enforces it, password auth).
+    #[must_use]
+    pub fn scram_only_shown(&self, cx: &App) -> bool {
+        self.offer(cx)
+            .is_some_and(|o| self.form.scram_only_offered(&o))
+    }
+
+    /// The "SCRAM only" toggle.
+    pub fn toggle_scram_only(&mut self, cx: &mut Context<Self>) {
+        if self.scram_only_shown(cx) {
+            self.form.scram_only = !self.form.scram_only;
+            cx.notify();
+        }
+    }
+
+    /// The master-password prompt a save opened, while it is open (tests type into it).
+    #[must_use]
+    pub fn vault_prompt(&self) -> Option<&Entity<super::vault::VaultPrompt>> {
+        self.vault_prompt.as_ref()
+    }
+
+    /// Whether a save is waiting for the vault status, for tests.
+    #[must_use]
+    pub fn is_saving(&self) -> bool {
+        self.saving
     }
 
     fn choice_row<T: Copy + PartialEq + 'static>(
@@ -964,7 +1079,26 @@ impl Render for ConnectionDialog {
                         cx,
                     ))
                 },
-            );
+            )
+            .when(self.form.scram_only_offered(&offer), |el| {
+                el.child(
+                    h_flex()
+                        .gap_2()
+                        .child(
+                            Button::new("scram-only")
+                                .small()
+                                .outline()
+                                .label("SCRAM only")
+                                .selected(self.form.scram_only)
+                                .on_click(cx.listener(|this, _, _, cx| this.toggle_scram_only(cx))),
+                        )
+                        .child(
+                            div().text_xs().text_color(muted).child(
+                                "Refuse md5, cleartext and servers that skip authentication.",
+                            ),
+                        ),
+                )
+            });
 
         let tls = if offer.file_based {
             None

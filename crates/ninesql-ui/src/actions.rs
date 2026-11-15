@@ -63,6 +63,8 @@ actions!(
         TestConnection,
         /// List the problems found while loading the connections.
         ShowConnectionProblems,
+        /// Lock the vault and forget the passwords asked for this session.
+        LockSecrets,
     ]
 );
 
@@ -350,6 +352,14 @@ pub const ACTIONS: &[ActionSpec] = &[
         Workspace,
         ["ctrl-k ctrl-l"],
         keywords = ["load", "errors", "issues", "removed"]
+    ),
+    spec!(
+        LockSecrets,
+        "Lock secrets now",
+        "Connection",
+        Workspace,
+        ["ctrl-alt-l"],
+        keywords = ["vault", "password", "keyring", "forget", "master"]
     ),
 ];
 

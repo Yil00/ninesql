@@ -5,19 +5,21 @@
 //! I6: nothing here waits on I/O on the foreground thread. Workspace writes and secret-store
 //! calls run on the driver runtime's blocking pool (`spawn_blocking`), connects run on the
 //! runtime through `SessionManager::open`, and the answers come back as futures that GPUI awaits
-//! on its own executor. The only file reads on the foreground thread happen in [`assemble`],
-//! before the event loop starts (as for settings.toml).
+//! on its own executor. The core itself is started by [`start`]: `CoreConfig::new` (which
+//! canonicalizes `$HOME`), `CoreServices::start` and the first load of the connections all run
+//! off the UI thread; the hub is installed empty ("starting") and filled when they are done.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::Duration;
 
-use gpui_kit::{App, AppContext as _, Context, Entity, Global, Task};
+use gpui_kit::{App, AppContext as _, Context, Entity, EventEmitter, Global, Task};
 use ninesql_core::secrets::{SecretId, SecretMeta, SecretRef, SecretStores, StoreKind};
 use ninesql_core::storage::{Paths, ProjectName};
 use ninesql_core::{
-    Connection, ConnectionId, ConnectionTypes, Connections, CoreEvent, CoreEvents, DriverRegistry,
-    ManagerConfig, SecretSlot, SessionHandle, SessionManager, Workspace,
+    Connection, ConnectionId, ConnectionTypes, Connections, CoreConfig, CoreEvent, CoreEvents,
+    CoreServices, DriverRegistry, SecretBackend, SecretSlot, SecretsLockReason, SessionHandle,
+    SessionManager, Workspace,
 };
 
 use super::engines::{self, EngineOffer};
@@ -35,14 +37,15 @@ pub struct HubConfig {
     pub connections: Connections,
     /// Connection types.
     pub types: ConnectionTypes,
-    /// Secret stores.
-    ///
-    /// INTEGRATION POINT (core, feat/p1-d-app-wiring): `CoreServices::start` assembles the
-    /// stores (keyring → vault → ask, `LockHooks`, `DesktopLockWatcher`, idle lock); until it
-    /// lands, [`assemble`] registers no store, so every credential is "ask every time" and the
-    /// dialog says that no keyring or vault is available. Hook-up: take the stores, workspace,
-    /// session manager and registry from `CoreServices`, and `secret_backend()` for the label.
+    /// Secret stores (from `CoreServices::secret_stores`: keyring when a Secret Service
+    /// answers, the vault always, never plaintext).
     pub stores: SecretStores,
+    /// Where new secrets go (`CoreServices::secret_backend`); `None`: the first store of
+    /// `stores` that takes new secrets (tests without a core).
+    pub backend: Option<SecretBackend>,
+    /// The started core (vault unlock / create, "lock secrets", lock watcher, shutdown);
+    /// `None` in tests that assemble the parts by hand.
+    pub core: Option<CoreServices>,
     /// Problems found while starting: load issues (`LoadIssue`), secret-looking keys removed,
     /// a workspace or runtime that could not start. Shown in the "connection problems" dialog.
     pub problems: Vec<String>,
@@ -60,109 +63,85 @@ impl HubConfig {
             connections: Connections::default(),
             types: ConnectionTypes::default(),
             stores: SecretStores::new(),
+            backend: None,
+            core: None,
             problems: Vec::new(),
         }
     }
-}
 
-/// Opens the default project, loads its connections and types and starts the session manager
-/// with `registry`. Runs before the event loop (small local reads, as for settings.toml).
-/// Failures become problems shown in the UI; NineSQL still starts.
-#[must_use]
-pub fn assemble(registry: DriverRegistry) -> HubConfig {
-    let mut config = HubConfig::empty();
-    let paths = match Paths::from_env() {
-        Ok(p) => Some(p),
-        Err(e) => {
-            config.problems.push(format!(
-                "No workspace location ({e}): connections are not saved."
-            ));
-            None
-        }
-    };
-    if let Some(paths) = &paths {
-        match Workspace::open(paths.clone(), ProjectName::default_project()) {
-            Ok(ws) => {
-                match ws.load_connections() {
-                    Ok(loaded) => {
-                        for issue in &loaded.issues {
-                            config
-                                .problems
-                                .push(format!("Connection \"{}\": {}", issue.name, issue.problem));
-                        }
-                        for key in &loaded.secret_like_keys {
-                            config.problems.push(format!(
-                                "connections.json: the key `{key}` looked like a secret and was removed."
-                            ));
-                        }
-                        config.connections = loaded.connections;
-                    }
-                    Err(e) => config
+    /// The hub's parts from a started core: its workspace, session manager, registry, stores
+    /// and secret backend, plus the saved connections and types. **Blocking** (reads
+    /// `connections.json` and `connection-types.json`): call it off the UI thread.
+    #[must_use]
+    pub fn load_from_core(core: CoreServices) -> Self {
+        let mut config = Self::empty();
+        let ws = core.workspace().clone();
+        match ws.load_connections() {
+            Ok(loaded) => {
+                for issue in &loaded.issues {
+                    config
                         .problems
-                        .push(format!("Cannot load the connections: {e}")),
+                        .push(format!("Connection \"{}\": {}", issue.name, issue.problem));
                 }
-                match ws.load_connection_types() {
-                    Ok(t) => config.types = t,
-                    Err(e) => config.problems.push(format!(
-                        "Cannot load the connection types ({e}): built-in types are used."
-                    )),
+                for key in &loaded.secret_like_keys {
+                    config.problems.push(format!(
+                        "connections.json: the key `{key}` looked like a secret and was removed."
+                    ));
                 }
-                config.workspace = Some(ws);
+                config.connections = loaded.connections;
             }
+            Err(e) => config
+                .problems
+                .push(format!("Cannot load the connections: {e}")),
+        }
+        match ws.load_connection_types() {
+            Ok(t) => config.types = t,
             Err(e) => config.problems.push(format!(
-                "Cannot open the workspace ({e}): connections are not saved in this window."
+                "Cannot load the connection types ({e}): built-in types are used."
             )),
         }
-    }
-    let manager_config = match &paths {
-        Some(p) => Some(ManagerConfig::new(p)),
-        None => match unsaved_known_hosts(&std::env::temp_dir()) {
-            Ok(own) => {
-                config.problems.push(
-                    "SSH host keys you trust are kept only until NineSQL exits (no workspace location)."
-                        .to_owned(),
-                );
-                Some(ManagerConfig::with_known_hosts(
-                    ninesql_core::KnownHostsFiles { own, user: None },
-                ))
-            }
-            Err(e) => {
-                config.problems.push(format!(
-                    "No private directory for SSH host keys ({e}): connections cannot be opened."
-                ));
-                None
-            }
-        },
-    };
-    if let Some(manager_config) = manager_config {
-        match SessionManager::new(manager_config, registry.clone(), config.stores.clone()) {
-            Ok(m) => config.manager = Some(m),
-            Err(e) => config.problems.push(format!(
-                "The driver runtime did not start ({e}): connections cannot be opened."
-            )),
+        if let Some(e) = core.vault_error() {
+            config.problems.push(format!(
+                "The vault cannot be used ({e}): passwords cannot be saved in it."
+            ));
         }
+        config.registry = core.registry().clone();
+        config.manager = Some(core.sessions().clone());
+        config.workspace = Some(ws);
+        config.stores = core.secret_stores().clone();
+        config.backend = Some(core.secret_backend());
+        config.core = Some(core);
+        config
     }
-    config.registry = registry;
-    config
 }
 
-/// The `known_hosts` file used when there is no workspace location: inside a new directory of
-/// `base` that only this process created, mode 0700, named with the process id and a random
-/// suffix. Never a fixed path in a shared directory, so the SSH layer never tightens the
-/// permissions of `base` itself (for example `/tmp` when run as root) and nobody else can
-/// plant or read the file.
-///
-/// # Errors
-/// The directory could not be created (it is never reused if it already exists).
-pub fn unsaved_known_hosts(base: &std::path::Path) -> std::io::Result<std::path::PathBuf> {
-    use std::os::unix::fs::DirBuilderExt as _;
-    let dir = base.join(format!(
-        "ninesql-{}-{}",
-        std::process::id(),
-        uuid::Uuid::new_v4().simple()
-    ));
-    std::fs::DirBuilder::new().mode(0o700).create(&dir)?;
-    Ok(dir.join("known_hosts"))
+/// Installs the application's hub, empty and "starting", and starts the core off the UI
+/// thread: `CoreConfig::new` (blocking: it canonicalizes `$HOME`), `CoreServices::start`
+/// (awaited on GPUI's executor; it opens the workspace and assembles the secret stores, the
+/// vault, the lock hooks and the desktop lock watcher) and the first load of the connections.
+/// The hub is filled when they are done; a failure becomes a connection problem.
+pub fn start(registry: DriverRegistry, cx: &mut App) -> Entity<ConnectionHub> {
+    let mut config = HubConfig::empty();
+    config.registry = registry.clone();
+    let hub = install(config, cx);
+    hub.update(cx, |h, _| h.starting = true);
+    let startup = cx.background_spawn(async move {
+        let paths = Paths::from_env()
+            .map_err(|e| format!("No workspace location ({e}): connections are not available."))?;
+        let config = CoreConfig::new(paths, ProjectName::default_project(), registry);
+        let core = CoreServices::start(config)
+            .await
+            .ok_or_else(|| "The core did not start.".to_owned())?
+            .map_err(|e| format!("The core did not start ({e}): connections are not available."))?;
+        Ok::<_, String>(HubConfig::load_from_core(core))
+    });
+    let weak = hub.downgrade();
+    cx.spawn(async move |cx| {
+        let result = startup.await;
+        let _ = weak.update(cx, |h, cx| h.attach(result, cx));
+    })
+    .detach();
+    hub
 }
 
 /// A fresh reference for a secret about to be stored: `<connection>:<slot>:<random>`. Never
@@ -233,6 +212,10 @@ pub struct ConnectionHub {
     connections: Connections,
     types: ConnectionTypes,
     stores: SecretStores,
+    backend: Option<SecretBackend>,
+    core: Option<CoreServices>,
+    starting: bool,
+    secrets_locked: Option<SecretsLockReason>,
     problems: Vec<String>,
     sessions: BTreeMap<ConnectionId, OpenSessions>,
     dropped_seen: u64,
@@ -252,6 +235,10 @@ impl ConnectionHub {
             connections: config.connections,
             types: config.types,
             stores: config.stores,
+            backend: config.backend,
+            core: config.core,
+            starting: false,
+            secrets_locked: None,
             problems: config.problems,
             sessions: BTreeMap::new(),
             dropped_seen: 0,
@@ -306,13 +293,68 @@ impl ConnectionHub {
     /// Where a newly saved secret goes; `None` when only "ask every time" is possible.
     #[must_use]
     pub fn store_for_new_secrets(&self) -> Option<StoreKind> {
-        self.stores.store_for_new_secrets()
+        match self.backend {
+            Some(b) => b.store(),
+            None => self.stores.store_for_new_secrets(),
+        }
     }
 
-    /// Startup and load problems to show to the user.
+    /// The started core, once [`start`] finished (vault, "lock secrets", lock watcher).
     #[must_use]
-    pub fn problems(&self) -> &[String] {
-        &self.problems
+    pub fn core(&self) -> Option<&CoreServices> {
+        self.core.as_ref()
+    }
+
+    /// Whether the core is still starting.
+    #[must_use]
+    pub fn is_starting(&self) -> bool {
+        self.starting
+    }
+
+    /// Why secrets were last locked, until the UI unlocks the vault again.
+    #[must_use]
+    pub fn secrets_locked(&self) -> Option<SecretsLockReason> {
+        self.secrets_locked
+    }
+
+    /// The vault was unlocked (or created) from the UI.
+    pub fn mark_unlocked(&mut self, cx: &mut Context<Self>) {
+        self.secrets_locked = None;
+        cx.notify();
+    }
+
+    /// Fills a hub installed by [`start`] with the started core, or records why it failed.
+    pub fn attach(&mut self, result: Result<HubConfig, String>, cx: &mut Context<Self>) {
+        self.starting = false;
+        match result {
+            Ok(config) => {
+                let mut problems = std::mem::take(&mut self.problems);
+                let mut next = Self::new(config);
+                next.problems.append(&mut problems);
+                *self = next;
+                self.start_event_pump(cx);
+            }
+            Err(e) => self.problems.push(e),
+        }
+        cx.notify();
+    }
+
+    /// Startup and load problems to show to the user, plus the state of the desktop lock
+    /// watcher when it does not run (read live: it may lose the system bus later).
+    #[must_use]
+    pub fn problems(&self) -> Vec<String> {
+        let mut out = self.problems.clone();
+        if let Some(core) = &self.core {
+            let status = core.lock_watcher_status();
+            if !status.is_running {
+                out.push(match (status.built, &status.error) {
+                    (false, _) => "Sleep and screen lock are not watched in this build: the vault does not lock itself when the computer sleeps or the screen locks (it still locks after being idle). Use \"Lock secrets now\" before leaving the computer.".to_owned(),
+                    (true, Some(e)) => format!("Sleep and screen lock are not watched ({e}): use \"Lock secrets now\" before leaving the computer."),
+                    (true, None) => "Sleep and screen lock are not watched: use \"Lock secrets now\" before leaving the computer.".to_owned(),
+                });
+            }
+        }
+        out
     }
 
     /// Adds a problem to the list.
@@ -407,7 +449,13 @@ impl ConnectionHub {
         if self.saving {
             return Task::ready(Err("another change is being saved; try again".to_owned()));
         }
+        if self.starting {
+            return Task::ready(Err(
+                "NineSQL is still starting; try again in a moment".to_owned()
+            ));
+        }
         let store = self.store_for_new_secrets();
+        let registry = self.registry.clone();
         let stores = self.stores.clone();
         let workspace = self.workspace.clone();
         let current = self.connections.clone();
@@ -421,10 +469,9 @@ impl ConnectionHub {
         let work = move || -> Result<(Connections, ConnectionId), String> {
             let mut next = current;
             let mut connection = connection;
-            // INTEGRATION POINT (core): there is no `Workspace::update_connection`; this path
-            // serves both create and edit. Hook-up: `create_connection_checked` /
-            // `save_connections_checked(&conns, &registry)` for the file write, keeping the
-            // fresh-id / write-then-swap order below.
+            // One path for create and edit (core has no `update_connection`): fresh-id secrets
+            // first, then the file through `save_connections_checked`, which runs
+            // `DriverRegistry::validate_connection` on every connection before writing.
             let mut stored: Vec<SecretRef> = Vec::new();
             let result = (|| {
                 for (slot, secret) in &to_store {
@@ -455,7 +502,8 @@ impl ConnectionHub {
                     None => next.insert(connection.clone()).map_err(|e| e.to_string())?,
                 }
                 if let Some(ws) = &workspace {
-                    ws.save_connections(&next).map_err(|e| e.to_string())?;
+                    ws.save_connections_checked(&next, &registry)
+                        .map_err(|e| e.to_string())?;
                 }
                 Ok::<_, String>(id)
             })();
@@ -504,6 +552,11 @@ impl ConnectionHub {
     pub fn remove(&mut self, id: ConnectionId, cx: &mut Context<Self>) -> Task<Result<(), String>> {
         if self.saving {
             return Task::ready(Err("another change is being saved; try again".to_owned()));
+        }
+        if self.starting {
+            return Task::ready(Err(
+                "NineSQL is still starting; try again in a moment".to_owned()
+            ));
         }
         if self.connections.get(id).is_none() {
             return Task::ready(Err("this connection no longer exists".to_owned()));
@@ -555,9 +608,11 @@ impl ConnectionHub {
     }
 
     fn start_event_pump(&mut self, cx: &mut Context<Self>) {
-        let Some(mut events): Option<CoreEvents> =
-            self.manager.as_ref().and_then(SessionManager::take_events)
-        else {
+        let events = match &self.core {
+            Some(core) => core.take_events(),
+            None => self.manager.as_ref().and_then(SessionManager::take_events),
+        };
+        let Some(mut events): Option<CoreEvents> = events else {
             return;
         };
         self._events = Some(cx.spawn(async move |this, cx| {
@@ -596,9 +651,10 @@ impl ConnectionHub {
                     }
                 }
             }
-            // INTEGRATION POINT (core, feat/p1-d-app-wiring): `CoreEvent::SecretsLocked
-            // { reason }` lands here; hook-up: a status-bar notice "Secrets locked (sleep /
-            // screen lock / idle)".
+            CoreEvent::SecretsLocked { reason } => {
+                self.secrets_locked = Some(reason);
+                cx.emit(HubEvent::SecretsLocked(reason));
+            }
             _ => {}
         }
         self.check_dropped_events();
@@ -635,9 +691,38 @@ impl ConnectionHub {
     /// the quit path, after the windows are gone).
     pub fn shutdown(&mut self, timeout: Duration) {
         self.sessions.clear();
-        if let Some(m) = self.manager.take() {
-            m.shutdown(timeout);
+        let manager = self.manager.take();
+        match self.core.take() {
+            Some(core) => {
+                drop(manager);
+                core.shutdown(timeout);
+            }
+            None => {
+                if let Some(m) = manager {
+                    m.shutdown(timeout);
+                }
+            }
         }
+    }
+}
+
+/// Events of the hub, for the windows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HubEvent {
+    /// The core locked the secrets (vault locked, "ask every time" answers forgotten).
+    SecretsLocked(SecretsLockReason),
+}
+
+impl EventEmitter<HubEvent> for ConnectionHub {}
+
+/// What the status notice says about a lock.
+#[must_use]
+pub fn lock_reason_text(reason: SecretsLockReason) -> &'static str {
+    match reason {
+        SecretsLockReason::Sleep => "the computer went to sleep",
+        SecretsLockReason::SessionLock => "the screen was locked",
+        SecretsLockReason::Idle => "the vault was not used for a while",
+        _ => "you asked for it",
     }
 }
 

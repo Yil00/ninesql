@@ -8,6 +8,8 @@
 //!   are asked again: nobody keeps them while the user decides);
 //! - `InitSqlNeedsConfirmation`: every init statement, flagged ones marked; "Run" opens again
 //!   with the `InitSqlToken`;
+//! - `NeedsVaultUnlock`: the vault's master-password prompt ([`super::vault`]), then open
+//!   again (the prompted secrets are asked again);
 //! - `Opened`: the session is recorded in the hub (or closed at once for "Test connection"),
 //!   and its security warnings are shown.
 
@@ -29,6 +31,7 @@ use super::flow::{
 };
 use super::hub::ConnectionHub;
 use super::secret_input::{self, read_secret, secret_field};
+use super::vault::{VaultMode, VaultPromptEvent, open_vault_prompt};
 use super::visuals::{hsla, text_on};
 
 /// Why a connection is being opened.
@@ -76,6 +79,8 @@ pub enum PendingPrompt {
     HostKey(HostKeyView),
     /// Init SQL to confirm.
     InitSql(InitSqlView),
+    /// The vault's master password.
+    VaultUnlock,
 }
 
 struct Run {
@@ -92,6 +97,7 @@ enum Waiting {
     },
     HostKey(HostKeyToken),
     InitSql(InitSqlToken),
+    Vault(Entity<super::vault::VaultPrompt>),
 }
 
 /// Emitted when a run ends.
@@ -144,6 +150,15 @@ impl ConnectFlow {
     #[must_use]
     pub fn is_busy(&self) -> bool {
         self.run.is_some()
+    }
+
+    /// The vault prompt in progress, if any (tests type into it).
+    #[must_use]
+    pub fn vault_prompt(&self) -> Option<Entity<super::vault::VaultPrompt>> {
+        match &self.waiting {
+            Some(Waiting::Vault(p)) => Some(p.clone()),
+            _ => None,
+        }
     }
 
     /// The masked inputs of a secret prompt (tests type into them).
@@ -227,11 +242,14 @@ impl ConnectFlow {
             Some(Err(e)) => self.finish_in(FlowResult::Failed(error_text(&e)), window, cx),
             Some(Ok(OpenOutcome::Opened(handle))) => {
                 let info = handle.info();
-                let warnings: Vec<String> = info
+                let mut warnings: Vec<String> = info
                     .warnings
                     .iter()
                     .map(|w| session_warning_text(w, info.tunnel.as_ref()))
                     .collect();
+                if info.inside_dbeaver_workspace {
+                    warnings.push(DBEAVER_READ_ONLY.to_owned());
+                }
                 let result = match purpose {
                     Purpose::Test => {
                         let server_version = info.server_version.clone();
@@ -272,9 +290,38 @@ impl ConnectFlow {
                 self.waiting = Some(Waiting::InitSql(conf.token));
                 open_prompt_dialog(cx.entity(), window, cx);
             }
-            // INTEGRATION POINT (core, feat/p1-d-app-wiring): `OpenOutcome::NeedsVaultUnlock
-            // { connection, slot }` lands here; hook-up: a masked master-password dialog calling
-            // `CoreServices::unlock_vault`, then `dispatch` again (prompted secrets asked again).
+            Some(Ok(OpenOutcome::NeedsVaultUnlock { .. })) => {
+                if self.hub.read(cx).core().is_none() {
+                    self.finish_in(
+                        FlowResult::Failed(
+                            "The vault is locked and cannot be unlocked in this session."
+                                .to_owned(),
+                        ),
+                        window,
+                        cx,
+                    );
+                } else {
+                    let prompt = open_vault_prompt(self.hub.clone(), VaultMode::Unlock, window, cx);
+                    cx.subscribe_in(&prompt, window, |flow, _, event, window, cx| {
+                        if !matches!(flow.waiting, Some(Waiting::Vault(_))) {
+                            return;
+                        }
+                        match event {
+                            VaultPromptEvent::Done => {
+                                flow.waiting = None;
+                                // Open again; secrets asked earlier are asked again.
+                                flow.dispatch(window, cx);
+                            }
+                            VaultPromptEvent::Cancelled => {
+                                flow.finish_in(FlowResult::Cancelled, window, cx);
+                            }
+                        }
+                    })
+                    .detach();
+                    self.prompt = PendingPrompt::VaultUnlock;
+                    self.waiting = Some(Waiting::Vault(prompt));
+                }
+            }
             Some(Ok(_)) => self.finish_in(
                 FlowResult::Failed("this NineSQL build cannot handle the core's answer".to_owned()),
                 window,
@@ -361,10 +408,16 @@ impl ConnectFlow {
 
     /// Drops the prompt in progress, emptying its secret inputs first.
     fn clear_waiting(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if let Some(Waiting::Secrets { inputs, .. }) = self.waiting.take() {
-            for input in &inputs {
-                secret_input::clear(input, window, cx);
+        match self.waiting.take() {
+            Some(Waiting::Secrets { inputs, .. }) => {
+                for input in &inputs {
+                    secret_input::clear(input, window, cx);
+                }
             }
+            // Clears its master-password inputs; its Cancelled event is ignored (no longer
+            // waiting).
+            Some(Waiting::Vault(prompt)) => prompt.update(cx, |p, cx| p.dismissed(window, cx)),
+            _ => {}
         }
     }
 
@@ -379,6 +432,11 @@ impl ConnectFlow {
     }
 }
 
+/// Shown with the session warnings when a file was opened read-only because it lies inside a
+/// DBeaver workspace (`SessionInfo::inside_dbeaver_workspace`, I4).
+pub const DBEAVER_READ_ONLY: &str =
+    "Opened read-only: the file is inside a DBeaver workspace, which NineSQL never modifies.";
+
 /// The user-facing text of a connect error. A locked vault gets its own sentence.
 #[must_use]
 pub fn error_text(e: &CoreError) -> String {
@@ -387,10 +445,12 @@ pub fn error_text(e: &CoreError) -> String {
             source: SecretError::Locked(StoreKind::Vault),
             ..
         } => {
-            // INTEGRATION POINT (core): map this to the vault unlock prompt
-            // (`prompts::VaultUnlockView`) once core exposes the vault unlock flow.
-            "The vault is locked: unlock it, then connect again.".to_owned()
+            // A lock that won a race with the open (the open itself answers NeedsVaultUnlock
+            // when it finds the vault locked first).
+            "The vault was locked while connecting: connect again and type the master password."
+                .to_owned()
         }
+        CoreError::Vault(_) | CoreError::NoVault(_) => super::vault::vault_error_text(e),
         other => other.to_string(),
     }
 }
@@ -540,7 +600,9 @@ fn open_prompt_dialog(flow: Entity<ConnectFlow>, window: &mut Window, cx: &mut A
                     .child(body)
                     .footer(h_flex().gap_2().justify_end().child(cancel).child(ok))
             }
-            PendingPrompt::None | PendingPrompt::Running => dialog.title("Connecting…"),
+            PendingPrompt::None | PendingPrompt::Running | PendingPrompt::VaultUnlock => {
+                dialog.title("Connecting…")
+            }
         }
     });
 }

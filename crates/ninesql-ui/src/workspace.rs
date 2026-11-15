@@ -18,7 +18,7 @@ use gpui_kit::*;
 use crate::actions::{
     self, CloseTab, CloseWindow, CommandPalette, ConnectConnection, DeleteConnection,
     DisconnectConnection, DuplicateConnection, EditConnection, FocusNavigator, FocusNextPane,
-    FocusPreviousPane, NewConnection, NewEditorTab, NextTab, PreviousTab, Scope,
+    FocusPreviousPane, LockSecrets, NewConnection, NewEditorTab, NextTab, PreviousTab, Scope,
     ShowConnectionProblems, ShowSettingsProblems, SplitDown, SplitRight, TestConnection,
     ToggleNavigator, WORKSPACE_CONTEXT,
 };
@@ -28,7 +28,7 @@ use crate::connections::dialog::{
     ConnectionDialog, ConnectionDialogCancelled, ConnectionSaved, new_form,
 };
 use crate::connections::form::ConnectionForm;
-use crate::connections::hub::{ConnectionHub, hub_or_install_empty};
+use crate::connections::hub::{ConnectionHub, HubEvent, hub_or_install_empty, lock_reason_text};
 use crate::connections::visuals::{ConnectionBadges, badges};
 use crate::editor_tab::SqlEditorTab;
 use crate::keymap::EffectiveKeymap;
@@ -65,6 +65,7 @@ impl Workspace {
         let subscriptions = vec![
             cx.observe(&hub, |_, _, cx| cx.notify()),
             cx.subscribe_in(&flow, window, Self::on_flow_finished),
+            cx.subscribe_in(&hub, window, Self::on_hub_event),
         ];
         let mut this = Self {
             focus: cx.focus_handle(),
@@ -533,8 +534,44 @@ impl Workspace {
         cx.notify();
     }
 
+    /// "Lock secrets now": locks the vault and forgets the passwords asked this session
+    /// (`CoreServices::lock_now`); the core's `SecretsLocked` event brings the notice.
+    pub fn lock_secrets(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(core) = self.hub.read(cx).core().cloned() else {
+            window.push_notification(
+                Notification::info("NineSQL is still starting: there are no secrets to lock yet."),
+                cx,
+            );
+            return;
+        };
+        drop(core.lock_now());
+    }
+
+    fn on_hub_event(
+        &mut self,
+        _: &Entity<ConnectionHub>,
+        event: &HubEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        match event {
+            HubEvent::SecretsLocked(reason) => {
+                window.push_notification(
+                    Notification::info(format!(
+                        "Secrets locked because {}: the vault needs its master password again, and passwords asked this session will be asked again.",
+                        lock_reason_text(*reason)
+                    ))
+                    .title("Secrets locked"),
+                    cx,
+                );
+                cx.notify();
+            }
+        }
+    }
+
     /// Lists the problems found while loading connections (removed data, unknown keys that
-    /// looked like secrets, a workspace or runtime that could not start).
+    /// looked like secrets, a workspace or runtime that could not start, a desktop lock
+    /// watcher that is not running).
     pub fn show_connection_problems(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let problems: Rc<Vec<SharedString>> = Rc::new(
             self.hub
@@ -684,6 +721,8 @@ impl Workspace {
             self.disconnect_selected(window, cx);
         } else if any.is::<ShowConnectionProblems>() {
             self.show_connection_problems(window, cx);
+        } else if any.is::<LockSecrets>() {
+            self.lock_secrets(window, cx);
         } else if any.is::<CloseWindow>() {
             window.remove_window();
         } else {
@@ -862,6 +901,10 @@ impl Workspace {
                 .into_any_element(),
         };
         let connection_problems = self.hub.read(cx).problems().len();
+        let (starting, locked) = {
+            let hub = self.hub.read(cx);
+            (hub.is_starting(), hub.secrets_locked())
+        };
         let problems = cx
             .try_global::<SettingsState>()
             .map_or(0, |s| s.diagnostics.len());
@@ -900,6 +943,17 @@ impl Workspace {
                     .on_click(move |_, window, cx| {
                         let _ = this.update(cx, |ws, cx| ws.show_connection_problems(window, cx));
                     }),
+            );
+        }
+        if starting {
+            bar = bar.left(div().id("status-starting").text_xs().child("Starting…"));
+        }
+        if let Some(reason) = locked {
+            bar = bar.left(
+                div()
+                    .id("status-secrets-locked")
+                    .text_xs()
+                    .child(format!("Secrets locked ({})", lock_reason_text(reason))),
             );
         }
         if problems > 0 {
@@ -1024,6 +1078,7 @@ impl Render for Workspace {
             DisconnectConnection,
             TestConnection,
             ShowConnectionProblems,
+            LockSecrets,
         );
         let content = root
             .when(client_decorated, |el| {

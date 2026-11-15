@@ -109,18 +109,15 @@ pub fn open_window(cx: &mut App) -> Option<(AnyWindowHandle, Entity<Workspace>)>
 /// Entry point of the `ninesql` binary, with the drivers it ships registered in `registry`
 /// (L5; src/main.rs).
 pub fn run(registry: ninesql_core::DriverRegistry) {
-    // Small local file reads before the event loop starts; no I/O happens on the foreground
-    // thread once windows are open (I6).
+    // A small local file read before the event loop starts (settings.toml); no I/O happens on
+    // the foreground thread once windows are open (I6).
     let settings = crate::settings::load_from_env();
-    // INTEGRATION POINT (core, feat/p1-d-app-wiring): replace with
-    // `CoreServices::start(CoreConfig::new(paths, project, registry))`, awaited on the GPUI
-    // executor (it opens the workspace itself and assembles the secret stores, the vault, the
-    // lock hooks and the desktop lock watcher), then build the hub from `CoreServices`.
-    let hub_config = crate::connections::hub::assemble(registry);
     let app = gpui_kit::application().with_assets(gpui_kit::assets::Assets);
     app.run(move |cx| {
         init(settings, cx);
-        crate::connections::hub::install(hub_config, cx);
+        // The core (workspace, secret stores, vault, lock watcher, driver runtime) starts off
+        // the UI thread; windows open at once and the hub fills in when it is ready.
+        crate::connections::hub::start(registry, cx);
         cx.on_app_quit(|cx| {
             if let Some(hub) = crate::connections::hub::Hub::get(cx) {
                 hub.update(cx, |hub, _| hub.shutdown(std::time::Duration::from_secs(2)));
