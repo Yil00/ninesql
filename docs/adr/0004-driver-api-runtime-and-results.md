@@ -1,6 +1,6 @@
 # ADR-0004: Driver API, async runtime and result model
 
-- **Status**: Accepted
+- **Status**: Accepted. Amendment **proposed** (sqlite session threads, 2026-11-15) in the [section at the end](#amendment-sqlite-session-threads-2026-11-15): a synchronous client may own one dedicated thread per session instead of using `spawn_blocking`; until the maintainer accepts it, the decision above is unchanged.
 - **Date**: 2026-11-14
 
 ## Context
@@ -39,3 +39,25 @@ The UI (GPUI) has its own foreground and background executors. Most Rust databas
 - **A generic `Vec<Vec<Value>>` row model**: simple, but doubles memory for wide results and makes columnar export slower.
 - **`sqlx` as the common layer**: covers only PostgreSQL / MySQL / SQLite, hides server-side cancel and catalog specifics, and does not help with the 17 other engines.
 - **GPUI's executor for driver I/O**: most clients require Tokio; mixing would make cancellation and timeouts unreliable.
+
+## Amendment (sqlite session threads, 2026-11-15)
+**Status: Proposed** (the maintainer accepts it). It adds to the Consequences above and changes no point of the Decision. Raised by the P1-E review: `ninesql-driver-sqlite` does not follow the wording of the third Consequence. Behaviour as implemented: `crates/drivers/ninesql-driver-sqlite/src/worker.rs` and [docs/08](../08-engine-capabilities.md#sqlite-sqlite-p1-b).
+
+**Context.** The third Consequence above says drivers built on a synchronous client must not block Tokio worker threads and names `spawn_blocking` as the way to run such clients (`rusqlite`, `duckdb`). A `rusqlite::Connection` is used by one thread at a time, and the sqlite driver streams results lazily under the caller's budget (I6): each poll of the `ResultStream` steps at most one batch, so a paused grid pauses the statement. A paused statement keeps its prepared statement, and so the thread that owns the connection, waiting for the next demand, for up to `PAUSED_RESULT_TIMEOUT` (300 s). Tokio's blocking pool is shared by the whole driver runtime (the core's secret reads also run there); a task that waits for minutes on a paused result would hold one of its threads for that long.
+
+**Decision.**
+1. A driver built on a synchronous client **may** give each session one dedicated OS thread that owns the client connection, instead of running each call through `spawn_blocking`. The rule of the third Consequence stands: no synchronous client call runs on a Tokio worker thread or on the GPUI foreground executor.
+2. The async side talks to that thread through channels: commands go in, and results come back one batch per demand of the result stream (Tokio `oneshot`), so the thread never runs ahead of the consumer (I6).
+3. The thread is bounded like any other driver I/O: cancel and timeout reach it (sqlite: `sqlite3_interrupt` and a flag read between rows and while a result is paused), the driver's own statements have a deadline (sqlite: 60 s), a thread that does not answer in time closes the session (sqlite: 120 s), and a result left paused longer than its limit is closed (sqlite: 300 s). Dropping the stream or the session stops a running statement. Closing the session ends the thread.
+4. `ninesql-driver-sqlite` applies this: one thread named `ninesql-sqlite` per session, started by `connect`. A panic while opening is caught and reported as a connect error.
+
+**Consequences.**
+- One OS thread per open SQLite session, on top of the Tokio runtime's bounded workers and blocking pool. There is no separate cap on these threads: the number of open sessions bounds them.
+- A paused result never takes a thread of the shared blocking pool, so it cannot starve the core's secret reads or other drivers' blocking calls.
+- A navigator call while a result streams on the same session fails with `Busy` (the session's thread serves both).
+- Later synchronous clients (DuckDB, P7) choose between `spawn_blocking` and a session thread by the same test: a client that must keep a statement open between demands uses a session thread.
+
+**Rejected alternatives.**
+- **`spawn_blocking` per call**: a paused result would hold a blocking-pool thread for up to 300 s, and the connection would have to move between pool threads between calls.
+- **Reading the whole result in one blocking call**: breaks the memory budget (I6).
+
