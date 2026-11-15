@@ -1418,3 +1418,174 @@ fn properties_of_a_connection_without_a_driver_are_checked_at_enable() {
         );
     }
 }
+
+fn pg_ssh(id: &str, auth: &str, jumps: &str) -> String {
+    pg(
+        id,
+        "ssh",
+        &format!(
+            r#", "handlers": {{ "ssh_tunnel": {{ "type": "TUNNEL", "enabled": true,
+                 "save-password": true, "user": "nine_ssh", "password": "Ssh-Pa55-0021",
+                 "properties": {{ "host": "bastion.example.invalid", "port": "22", {auth} {jumps} }} }} }}"#
+        ),
+    )
+}
+
+fn update_diff(preview: &ImportPreview, name: &str) -> ninesql_core::UpdateDiff {
+    match &plan(preview, name).action {
+        PlanAction::Update { diff, .. } => (**diff).clone(),
+        other => panic!("{other:?}"),
+    }
+}
+
+/// Review L-a: changed driver properties and init SQL show in the diff, also when the saved
+/// password is kept.
+#[test]
+fn the_update_diff_lists_properties_and_init_sql() {
+    let e = env();
+    let first = pg(
+        "postgres-jdbc-d",
+        "d",
+        r#", "password": "Diff-Pa55-0031", "properties": { "search_path": "app" },
+           "bootstrap": { "query": ["SET statement_timeout = 1000"] }"#,
+    );
+    let source = crafted(&e.root, &format!(r#"{{ "connections": {{ {first} }} }}"#));
+    import_all(&e, &source, Some(StoreKind::Vault));
+    rewrite(
+        &source,
+        &[pg(
+            "postgres-jdbc-d",
+            "d",
+            r#", "properties": { "search_path": "evil, public" },
+               "bootstrap": { "query": ["SET statement_timeout = 0"] }"#,
+        )],
+    );
+    let preview = e.importer.preview(&ImportSource::Folder(source)).unwrap();
+    let diff = update_diff(&preview, "d");
+    assert!(
+        diff.properties.as_ref().is_some_and(
+            |p| p.imported.get("search_path").map(String::as_str) == Some("evil, public")
+        )
+    );
+    assert!(diff.init_sql.is_some());
+    assert_eq!(diff.secrets[0].change, SecretChangeKind::Kept);
+}
+
+/// Review L-b: a saved key passphrase is dropped when the key file changes.
+#[test]
+fn a_changed_ssh_key_file_drops_the_saved_passphrase() {
+    let e = env();
+    let key = |name: &str| {
+        format!(r#""authType": "PUBLIC_KEY", "keyPath": "/home/nine_user/.ssh/{name}""#)
+    };
+    let source = crafted(
+        &e.root,
+        &format!(
+            r#"{{ "connections": {{ {} }} }}"#,
+            pg_ssh("postgres-jdbc-k1", &key("id_ed25519"), "")
+        ),
+    );
+    import_all(&e, &source, Some(StoreKind::Vault));
+    let saved_refs = saved(&e.workspace)
+        .iter()
+        .next()
+        .unwrap()
+        .secret_refs()
+        .len();
+    assert!(saved_refs >= 1);
+    // The new file has no saved passphrase: only the key path differs.
+    rewrite(
+        &source,
+        &[pg_ssh("postgres-jdbc-k1", &key("id_ed25519_other"), "")
+            .replace(r#""password": "Ssh-Pa55-0021","#, "")],
+    );
+    let preview = e.importer.preview(&ImportSource::Folder(source)).unwrap();
+    let diff = update_diff(&preview, "ssh");
+    assert!(
+        diff.secrets
+            .iter()
+            .any(|s| s.slot == SecretSlot::SshServer && s.change == SecretChangeKind::Dropped)
+    );
+    e.importer
+        .apply(&preview, &ImportChoices::all(Some(StoreKind::Vault)))
+        .unwrap();
+    let c = saved(&e.workspace);
+    assert!(
+        c.iter()
+            .next()
+            .unwrap()
+            .secret_refs()
+            .iter()
+            .all(|(s, _, _)| *s != SecretSlot::SshServer)
+    );
+}
+
+/// Review L-c: a jump host added in front of the SSH server drops the server's saved password
+/// and never carries its non-strict host key policy over.
+#[test]
+fn a_changed_route_resets_the_host_key_policy_and_drops_the_server_secret() {
+    let e = env();
+    let password = r#""authType": "PASSWORD""#;
+    let source = crafted(
+        &e.root,
+        &format!(
+            r#"{{ "connections": {{ {} }} }}"#,
+            pg_ssh("postgres-jdbc-j", password, "")
+        ),
+    );
+    import_all(&e, &source, Some(StoreKind::Vault));
+    let mut connections = saved(&e.workspace);
+    let mut c = connections.iter().next().unwrap().clone();
+    c.ssh.as_mut().unwrap().server.host_key_policy = ninesql_core::HostKeyPolicy::AcceptNew;
+    e.workspace
+        .update_connection(&mut connections, c, &registry())
+        .unwrap();
+
+    // Same route: the policy and the password are kept.
+    let preview = e
+        .importer
+        .preview(&ImportSource::Folder(source.clone()))
+        .unwrap();
+    let same = plan(&preview, "ssh").connection.clone().unwrap();
+    assert_eq!(
+        same.ssh.as_ref().unwrap().server.host_key_policy,
+        ninesql_core::HostKeyPolicy::AcceptNew
+    );
+
+    // A jump host in front of the server, no saved SSH password in the file any more.
+    let jump = r#", "jumpServer.count": "1", "jumpServer0.enabled": "true",
+        "jumpServer0.host": "jump.example.invalid", "jumpServer0.port": "22",
+        "jumpServer0.name": "nine_jump", "jumpServer0.authType": "AGENT""#;
+    rewrite(
+        &source,
+        &[
+            pg_ssh("postgres-jdbc-j", password, jump)
+                .replace(r#""password": "Ssh-Pa55-0021","#, ""),
+        ],
+    );
+    let preview = e.importer.preview(&ImportSource::Folder(source)).unwrap();
+    let p = plan(&preview, "ssh");
+    let c = p.connection.as_ref().unwrap();
+    let ssh = c.ssh.as_ref().unwrap();
+    assert_eq!(ssh.jump_hosts.len(), 1, "{:?}", p.issues);
+    assert_eq!(
+        ssh.server.host_key_policy,
+        ninesql_core::HostKeyPolicy::Strict
+    );
+    assert!(
+        p.issues
+            .iter()
+            .any(|i| i.message.contains("host key policy is not kept"))
+    );
+    let diff = update_diff(&preview, "ssh");
+    assert!(
+        diff.secrets
+            .iter()
+            .any(|s| s.slot == SecretSlot::SshServer && s.change == SecretChangeKind::Dropped)
+    );
+    assert!(
+        c.secret_refs()
+            .iter()
+            .all(|(s, _, _)| *s != SecretSlot::SshServer)
+    );
+}

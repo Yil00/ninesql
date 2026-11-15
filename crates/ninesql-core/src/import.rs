@@ -196,6 +196,10 @@ pub struct UpdateDiff {
     pub connection_type: Option<(Change<ConnectionTypeId>, bool)>,
     /// Saved secrets: kept, replaced or dropped.
     pub secrets: Vec<SecretChange>,
+    /// Driver properties (non-secret engine options such as `search_path`).
+    pub properties: Option<Change<BTreeMap<String, String>>>,
+    /// Init SQL statements (marked for confirmation again in any case).
+    pub init_sql: Option<Change<Vec<String>>>,
 }
 
 /// A secret DBeaver saved that the import moves to the secret store (never the value, I1).
@@ -1440,11 +1444,33 @@ fn ssh_route(c: &Connection) -> Vec<String> {
         .unwrap_or_default()
 }
 
+/// The private key file of a hop authenticated by key.
+fn key_path(h: &SshHop) -> Option<&Path> {
+    match &h.auth {
+        SshAuth::PublicKey { key_path, .. } => Some(key_path),
+        SshAuth::Password { .. } | SshAuth::Agent => None,
+    }
+}
+
+/// The SSH hops crossed before the hop of `slot` (`user@host:port`, first first): every jump
+/// host for the tunnel server, the earlier jump hosts for a jump host.
+fn route_before(c: &Connection, slot: SecretSlot) -> Vec<String> {
+    let Some(t) = &c.ssh else {
+        return Vec::new();
+    };
+    let n = match slot {
+        SecretSlot::SshJump(i) => i.min(t.jump_hosts.len()),
+        _ => t.jump_hosts.len(),
+    };
+    t.jump_hosts[..n].iter().map(hop_label).collect()
+}
+
 /// Whether a secret saved for `slot` of `old` may keep being used by `new`: everything it
 /// authenticates against is unchanged (review, H1).
 /// - database password / token: engine, host, port (or socket / file), user name, TLS mode and
 ///   CA file, and the SSH route it travels through;
-/// - SSH password / key passphrase: the hop's host, port and user name;
+/// - SSH password / key passphrase: the hop's host, port, user name and key file, and the hops
+///   in front of it (review L-b, L-c);
 /// - TLS client key passphrase: the certificate and key files and the database host.
 fn secret_still_applies(old: &Connection, new: &Connection, slot: SecretSlot) -> bool {
     let hop = |c: &Connection| -> Option<SshHop> {
@@ -1465,7 +1491,13 @@ fn secret_still_applies(old: &Connection, new: &Connection, slot: SecretSlot) ->
                 && ssh_route(old) == ssh_route(new)
         }
         SecretSlot::SshServer | SecretSlot::SshJump(_) => match (hop(old), hop(new)) {
-            (Some(a), Some(b)) => a.host == b.host && a.port == b.port && a.username == b.username,
+            (Some(a), Some(b)) => {
+                a.host == b.host
+                    && a.port == b.port
+                    && a.username == b.username
+                    && key_path(&a) == key_path(&b)
+                    && route_before(old, slot) == route_before(new, slot)
+            }
             _ => false,
         },
         SecretSlot::TlsClientKey => {
@@ -1536,31 +1568,60 @@ fn merge_update(
             imported: ssh_route(&new),
         });
     }
+    if old.properties != new.properties {
+        diff.properties = Some(Change {
+            saved: old.properties.clone(),
+            imported: new.properties.clone(),
+        });
+    }
+    if old.init_sql != new.init_sql {
+        diff.init_sql = Some(Change {
+            saved: old.init_sql.clone(),
+            imported: new.init_sql.clone(),
+        });
+    }
     new.id = old.id;
     new.name.clone_from(&old.name);
     new.description.clone_from(&old.description);
     new.folder.clone_from(&old.folder);
     new.password_exchange = old.password_exchange;
     if let (Some(n), Some(o)) = (&mut new.ssh, &old.ssh) {
-        let old_hops: Vec<&SshHop> = o.hops().collect();
-        let count = n.jump_hosts.len() + 1;
+        // A hop inherits its saved host-key policy only when it is the same hop (user, host,
+        // port) behind the same route (the hops in front of it). A non-strict policy is never
+        // carried across a route change: the hop stays strict, with a report entry (L-c).
+        let old_hops: Vec<SshHop> = o.hops().cloned().collect();
+        let new_labels: Vec<String> = n.hops().map(hop_label).collect();
+        let old_labels: Vec<String> = old_hops.iter().map(hop_label).collect();
+        let mut reset = false;
         for (i, h) in n
             .jump_hosts
             .iter_mut()
             .chain(std::iter::once(&mut n.server))
             .enumerate()
         {
-            // Same position counted from the server, same host and port.
-            let offset = count - i;
-            if let Some(oh) = old_hops
-                .len()
-                .checked_sub(offset)
-                .and_then(|j| old_hops.get(j))
-                && oh.host == h.host
-                && oh.port == h.port
-            {
-                h.host_key_policy = oh.host_key_policy;
+            let same = old_labels.get(..=i) == new_labels.get(..=i);
+            match old_hops.get(i) {
+                Some(oh) if same => h.host_key_policy = oh.host_key_policy,
+                _ => {
+                    // The saved hop at this place, or the saved hop with this label anywhere.
+                    let prior = old_hops
+                        .iter()
+                        .find(|oh| hop_label(oh) == new_labels[i])
+                        .or_else(|| old_hops.get(i));
+                    if prior.is_some_and(|oh| oh.host_key_policy.is_downgrade()) {
+                        reset = true;
+                    }
+                }
             }
+        }
+        if reset {
+            issues.push(issue(
+                Severity::Warning,
+                IssueKind::SshHostKeyToConfirm,
+                Some("configuration.handlers.ssh_tunnel"),
+                "the SSH route changed: a saved non-strict host key policy is not kept, the hop \
+                 is checked strictly again",
+            ));
         }
     }
     if old.read_only == Some(true) {
