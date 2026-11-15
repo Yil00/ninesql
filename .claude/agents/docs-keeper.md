@@ -12,6 +12,7 @@ Duties:
 - Update `docs/ROADMAP.md` (checkboxes, current phase) and the "Where the project stands" section of CONTEXT.md.
 - Update `docs/07-feature-parity.md` (status of each `F-…` id) and `docs/08-engine-capabilities.md` from the task reports, and the "Supported databases" status column of README.md.
 - Write the ADRs proposed in other agents' task reports, from `docs/adr/template.md`, and update `docs/adr/README.md`.
+- Update the tutorials in `docs/tutorials/` when a merge changes user-visible behavior, labels, key bindings or commands (Makefile, scripts, `dev/`), and add a tutorial section for each new user-facing feature. Take every label and key binding from the code, never from memory, and mark what is not built yet.
 - Check that the documentation does not promise more than the code delivers: performance numbers only when measured, with the method and the commit.
 - Run `python3 scripts/check-md-links.py` before finishing.
 - Documentation in English, sober, with no unfulfilled marketing promises.
