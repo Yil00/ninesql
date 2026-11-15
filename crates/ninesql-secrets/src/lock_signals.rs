@@ -430,6 +430,59 @@ fn classify(msg: &Message, session_path: Option<&str>, owner: Option<&str>) -> O
     }
 }
 
+/// First wait before asking logind again for a sleep delay inhibitor it did not hand out.
+const INHIBIT_RETRY_FIRST: Duration = if cfg!(test) {
+    Duration::from_millis(50)
+} else {
+    Duration::from_secs(1)
+};
+/// Longest wait between two inhibitor requests (the back-off doubles up to this bound).
+const INHIBIT_RETRY_MAX: Duration = if cfg!(test) {
+    Duration::from_millis(400)
+} else {
+    Duration::from_secs(60)
+};
+
+/// Resolves after `d`. A helper thread sleeps and wakes the task, so no async runtime is needed
+/// (the watcher runs on `zbus::block_on`). When the thread cannot be spawned it resolves at once.
+fn delay(d: Duration) -> impl Future<Output = ()> + Send {
+    let shared: Arc<Mutex<(bool, Option<Waker>)>> = Arc::default();
+    let timer = Arc::clone(&shared);
+    let spawned = std::thread::Builder::new()
+        .name("ninesql-lock-retry".into())
+        .spawn(move || {
+            std::thread::sleep(d);
+            let mut g = timer.lock().unwrap_or_else(PoisonError::into_inner);
+            g.0 = true;
+            if let Some(w) = g.1.take() {
+                w.wake();
+            }
+        })
+        .is_ok();
+    poll_fn(move |cx| {
+        let mut g = shared.lock().unwrap_or_else(PoisonError::into_inner);
+        if !spawned || g.0 {
+            Poll::Ready(())
+        } else {
+            g.1 = Some(cx.waker().clone());
+            Poll::Pending
+        }
+    })
+}
+
+type Retake = Pin<Box<dyn Future<Output = Option<OwnedFd>> + Send>>;
+
+/// An `Inhibit` call, after `wait` when it is a retry.
+fn inhibit_request(conn: &Connection, wait: Option<Duration>) -> Retake {
+    let c = conn.clone();
+    Box::pin(async move {
+        if let Some(d) = wait {
+            delay(d).await;
+        }
+        take_sleep_delay(&c).await
+    })
+}
+
 /// Calls the hook; a panic inside it is logged, never propagated.
 fn run_hook(hook: &dyn LockHook, trigger: LockTrigger) {
     if catch_unwind(AssertUnwindSafe(|| hook.lock_now(trigger))).is_err() {
@@ -514,9 +567,17 @@ async fn watch(
         // `start` gave up waiting.
         return;
     }
-    // The `Inhibit` call after a resume runs alongside the streams, so signals are handled
-    // while logind answers.
-    let mut retake: Option<Pin<Box<dyn Future<Output = Option<OwnedFd>> + Send>>> = None;
+    // The `Inhibit` call after a resume or an owner change runs alongside the streams, so
+    // signals are handled while logind answers. A refused or unanswered call is retried with a
+    // bounded back-off while logind is on the bus, no inhibitor is held and no sleep is under way
+    // (review P1-D wiring, L1).
+    let mut asleep = false;
+    let mut backoff = INHIBIT_RETRY_FIRST;
+    let mut retake: Option<Retake> = None;
+    if inhibitor.is_none() && owner.is_some() {
+        retake = Some(inhibit_request(&conn, Some(backoff)));
+        backoff = (backoff * 2).min(INHIBIT_RETRY_MAX);
+    }
     loop {
         let next = poll_fn(|cx| {
             if stop.poll_stopped(cx) {
@@ -543,20 +604,30 @@ async fn watch(
                 status
                     .sleep_delay
                     .store(inhibitor.is_some(), Ordering::SeqCst);
+                if inhibitor.is_some() {
+                    backoff = INHIBIT_RETRY_FIRST;
+                } else if owner.is_some() && !asleep {
+                    tracing::debug!(retry_in = ?backoff, "sleep delay inhibitor refused: retrying");
+                    retake = Some(inhibit_request(&conn, Some(backoff)));
+                    backoff = (backoff * 2).min(INHIBIT_RETRY_MAX);
+                }
             }
             Next::Message(Some(Ok(msg))) => {
                 match classify(&msg, session_path.as_deref(), owner.as_deref()) {
                     Some(Event::SleepStarting) => {
                         run_hook(&*hook, LockTrigger::Sleep);
                         // Secrets are gone: let the suspend go on.
+                        asleep = true;
                         retake = None;
                         inhibitor = None;
                         status.sleep_delay.store(false, Ordering::SeqCst);
                     }
                     Some(Event::Resumed) => {
-                        if inhibitor.is_none() && retake.is_none() {
-                            let c = conn.clone();
-                            retake = Some(Box::pin(async move { take_sleep_delay(&c).await }));
+                        asleep = false;
+                        if inhibitor.is_none() {
+                            // A pending back-off retry is replaced by an immediate request.
+                            backoff = INHIBIT_RETRY_FIRST;
+                            retake = Some(inhibit_request(&conn, None));
                         }
                     }
                     Some(Event::SessionLocked) => run_hook(&*hook, LockTrigger::SessionLock),
@@ -567,10 +638,11 @@ async fn watch(
                             // more: drop it, and take one from the new logind when it appears.
                             retake = None;
                             inhibitor = None;
+                            asleep = false;
+                            backoff = INHIBIT_RETRY_FIRST;
                             status.sleep_delay.store(false, Ordering::SeqCst);
                             if new.is_some() {
-                                let c = conn.clone();
-                                retake = Some(Box::pin(async move { take_sleep_delay(&c).await }));
+                                retake = Some(inhibit_request(&conn, None));
                             }
                         }
                         owner = new;
@@ -704,10 +776,15 @@ mod tests {
 
     impl FakeLogind {
         fn start(address: &str) -> Self {
+            Self::start_refusing(address, 0)
+        }
+
+        /// Like [`Self::start`], refusing the first `refuse` `Inhibit` calls.
+        fn start_refusing(address: &str, refuse: usize) -> Self {
             let conn = connect_to(address);
-            zbus::block_on(conn.request_name(LOGIND)).unwrap();
+            let refusals = Arc::new(std::sync::atomic::AtomicUsize::new(refuse));
             let inhibitors: Arc<StdMutex<Vec<UnixStream>>> = Arc::default();
-            let (c, inh) = (conn.clone(), Arc::clone(&inhibitors));
+            let (c, inh, refusals) = (conn.clone(), Arc::clone(&inhibitors), Arc::clone(&refusals));
             let (ready_tx, ready_rx) = mpsc::channel();
             std::thread::spawn(move || {
                 zbus::block_on(async move {
@@ -721,6 +798,21 @@ mod tests {
                             continue;
                         }
                         match h.member().map(|m| m.as_str().to_owned()).as_deref() {
+                            Some("Inhibit")
+                                if refusals
+                                    .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| {
+                                        n.checked_sub(1)
+                                    })
+                                    .is_ok() =>
+                            {
+                                c.reply_error(
+                                    &h,
+                                    "org.freedesktop.DBus.Error.AccessDenied",
+                                    &"refused",
+                                )
+                                .await
+                                .unwrap();
+                            }
                             Some("Inhibit") => {
                                 let (ours, theirs) = UnixStream::pair().unwrap();
                                 let fd = OwnedFd::from(std::os::fd::OwnedFd::from(theirs));
@@ -752,6 +844,10 @@ mod tests {
                 });
             });
             ready_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+            // The name is taken only once the message stream above listens: a watcher reacting
+            // to the owner change at once (`Inhibit`) must find the fake answering
+            // (review P1-D wiring, M1).
+            zbus::block_on(conn.request_name(LOGIND)).unwrap();
             Self { conn, inhibitors }
         }
 
@@ -1002,6 +1098,33 @@ mod tests {
         assert!(recorder.got().is_empty());
         drop(w);
         wait("released on drop", || second.inhibitor_released(0));
+    }
+
+    /// Review P1-D wiring, L1: a refused re-take after an owner change is retried.
+    #[test]
+    fn a_refused_inhibitor_is_asked_again_with_back_off() {
+        let Some(bus) = private_bus() else {
+            eprintln!("dbus-daemon not available: skipped");
+            return;
+        };
+        let first = FakeLogind::start(&bus.address);
+        let recorder = Arc::new(Recorder::default());
+        let w = watcher(
+            &bus,
+            SessionChoice::Path(OUR_SESSION.into()),
+            recorder.clone(),
+        );
+        zbus::block_on(first.conn.release_name(LOGIND)).unwrap();
+        wait("delay flag cleared", || !w.holds_sleep_delay());
+        let second = FakeLogind::start_refusing(&bus.address, 3);
+        wait("inhibitor taken after the refusals", || {
+            second.inhibit_calls() == 1
+        });
+        wait("delay flag set", || w.holds_sleep_delay());
+        std::thread::sleep(Duration::from_millis(600));
+        assert_eq!(second.inhibit_calls(), 1, "no request once one is held");
+        assert!(recorder.got().is_empty());
+        drop(w);
     }
 
     #[test]

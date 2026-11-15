@@ -29,7 +29,9 @@ print_stderr = "warn"
 ninesql-core = { path = "crates/ninesql-core" }
 ninesql-driver-api = { path = "crates/ninesql-driver-api" }
 ninesql-storage = { path = "crates/ninesql-storage" }
-ninesql-secrets = { path = "crates/ninesql-secrets" }
+# No default features: `ninesql-core` owns `desktop-lock` (on in its defaults), so
+# `ninesql-core --no-default-features` builds without zbus (review P1-D wiring, L6).
+ninesql-secrets = { path = "crates/ninesql-secrets", default-features = false }
 ninesql-ssh = { path = "crates/ninesql-ssh" }
 ninesql-transfer = { path = "crates/ninesql-transfer" }
 ninesql-dbeaver = { path = "crates/ninesql-dbeaver" }
