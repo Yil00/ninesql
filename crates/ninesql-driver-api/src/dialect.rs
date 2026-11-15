@@ -34,6 +34,14 @@
 //!
 //! PostgreSQL Unicode-escaped names (`U&"d\0061ta"`, `U&'…'`) are decoded before matching;
 //! a malformed escape or a `UESCAPE` clause makes the statement [`StatementClass::Unknown`].
+//!
+//! # Statements that run another statement
+//! An `EXPLAIN` / `DESCRIBE` / `DESC` that runs its statement (a parenthesised option list, or
+//! `ANALYZE` / `ANALYSE` in any form: bare, quoted, backquoted, `U&`-escaped) is classified as
+//! the statement it runs, never lower; a plain `EXPLAIN` is a read. A statement starting with
+//! `ANALYZE` (MariaDB `ANALYZE <statement>` runs it) is [`StatementClass::Unknown`].
+//! `CREATE OR REPLACE` overwrites an existing object and is [`StatementClass::Destructive`]
+//! (P1-E review M1, L1).
 
 use crate::capabilities::ExplainFormat;
 use crate::error::{DriverError, DriverResult};
@@ -184,13 +192,13 @@ pub enum StatementClass {
     Transaction,
     /// Data modification with a filter (`INSERT`, `UPDATE … WHERE`, `DELETE … WHERE`, `MERGE`).
     Write,
-    /// Non-destructive schema change (`CREATE`).
+    /// Non-destructive schema change (`CREATE`, but not `CREATE OR REPLACE`).
     Ddl,
     /// A session statement that may lift read-only mode (`SET … READ WRITE`,
     /// `PRAGMA query_only = OFF`). Refused in read-only sessions (I3).
     ChangesAccessMode,
-    /// Destructive (`DROP`, `TRUNCATE`, `ALTER`, `GRANT`, `REVOKE`, `UPDATE` / `DELETE` without
-    /// `WHERE`).
+    /// Destructive (`DROP`, `TRUNCATE`, `ALTER`, `GRANT`, `REVOKE`, `CREATE OR REPLACE`,
+    /// `UPDATE` / `DELETE` without `WHERE`).
     Destructive,
     /// Not recognised. Treated as destructive (ADR-0007 §3).
     Unknown,
@@ -951,20 +959,13 @@ fn classify_by_keyword(first: &str, items: &[Located]) -> StatementClass {
                 StatementClass::Read
             }
         }
-        "SHOW" | "DESCRIBE" | "DESC" => StatementClass::Read,
-        "EXPLAIN" => {
-            let analyze = items
-                .iter()
-                .position(|l| matches!(word(l), Some("ANALYZE" | "ANALYSE")));
-            match analyze {
-                // EXPLAIN ANALYZE runs the statement: classify what it runs.
-                Some(p) if p + 1 < items.len() => {
-                    classify_items(&items[p + 1..]).max(StatementClass::Read)
-                }
-                Some(_) => StatementClass::Unknown,
-                None => StatementClass::Read,
-            }
-        }
+        "SHOW" => StatementClass::Read,
+        // MySQL / MariaDB `DESCRIBE` / `DESC` are synonyms of `EXPLAIN` (`DESC ANALYZE
+        // DELETE …`); `DESCRIBE t` stays a read.
+        "EXPLAIN" | "DESCRIBE" | "DESC" => classify_explain(items),
+        // MariaDB `ANALYZE [FORMAT=JSON] <statement>` runs the statement; PostgreSQL / MySQL /
+        // SQLite `ANALYZE [TABLE] t` writes statistics. Never below what it may run.
+        "ANALYZE" | "ANALYSE" => StatementClass::Unknown,
         "WITH" => {
             if !with_main_statement_found(items) {
                 // Unbalanced or unterminated text, or a main statement the classifier cannot
@@ -990,7 +991,14 @@ fn classify_by_keyword(first: &str, items: &[Located]) -> StatementClass {
                 StatementClass::Destructive
             }
         }
-        "CREATE" => StatementClass::Ddl,
+        "CREATE" => {
+            if is_create_or_replace(items) {
+                // Silently overwrites an existing object (P1-E review L1).
+                StatementClass::Destructive
+            } else {
+                StatementClass::Ddl
+            }
+        }
         "DROP" | "TRUNCATE" | "ALTER" | "GRANT" | "REVOKE" | "RENAME" => {
             StatementClass::Destructive
         }
@@ -1010,6 +1018,103 @@ fn classify_by_keyword(first: &str, items: &[Located]) -> StatementClass {
         "USE" => StatementClass::Session,
         _ => StatementClass::Unknown,
     }
+}
+
+/// Keywords that can start the statement wrapped by `EXPLAIN` / `DESCRIBE`: PostgreSQL's
+/// explainable statements (`SELECT`, `VALUES`, `TABLE`, `WITH`, DML, `CREATE TABLE … AS`,
+/// `CREATE MATERIALIZED VIEW`, `REFRESH`, `DECLARE`, `EXECUTE`) and MySQL / MariaDB's
+/// (`SELECT`, `TABLE`, `WITH`, `INSERT`, `REPLACE`, `UPDATE`, `DELETE`).
+const EXPLAINABLE_KEYWORDS: &[&str] = &[
+    "SELECT", "VALUES", "TABLE", "WITH", "INSERT", "UPDATE", "DELETE", "MERGE", "REPLACE",
+    "UPSERT", "CREATE", "REFRESH", "DECLARE", "EXECUTE",
+];
+
+/// Option words that may precede the wrapped statement outside a parenthesised list:
+/// PostgreSQL `ANALYZE` / `ANALYSE` / `VERBOSE`, MySQL / MariaDB `ANALYZE`, `FORMAT = x`,
+/// `EXTENDED`, `PARTITIONS`, `INTO @var`, SQLite `QUERY PLAN`.
+const EXPLAIN_OPTION_WORDS: &[&str] = &[
+    "analyze",
+    "analyse",
+    "verbose",
+    "format",
+    "extended",
+    "partitions",
+    "into",
+    "query",
+    "plan",
+];
+
+/// `EXPLAIN` / `DESCRIBE` / `DESC` (P1-E review M1).
+///
+/// The wrapped statement *runs* when the option list is parenthesised (PostgreSQL
+/// `EXPLAIN (…)`, whose option names may be quoted or `U&`-escaped: `EXPLAIN ("analyze")`,
+/// `EXPLAIN (U&"analyze")`) or when `ANALYZE` / `ANALYSE` appears in any form (bare, quoted,
+/// backquoted, `U&`-escaped) anywhere in the statement (PostgreSQL, MySQL `EXPLAIN ANALYZE`,
+/// MariaDB `EXPLAIN ANALYZE` / `DESC ANALYZE`). Then the class is the riskiest of the
+/// statements starting at every explainable keyword (so a misread option prefix cannot hide the
+/// real start), at least [`StatementClass::Read`], and [`StatementClass::Unknown`] when the
+/// text after the options does not start with an explainable keyword. Otherwise (plain
+/// `EXPLAIN SELECT …`, SQLite `EXPLAIN [QUERY PLAN]`, `DESCRIBE t`) nothing runs: a read.
+fn classify_explain(items: &[Located]) -> StatementClass {
+    let rest = &items[1..];
+    let parenthesised = rest.first().map(|l| &l.item) == Some(&Item::Punct(b'('));
+    let analyze = rest
+        .iter()
+        .any(|l| name(l).is_some_and(|n| n == "analyze" || n == "analyse"));
+    if !parenthesised && !analyze {
+        return StatementClass::Read;
+    }
+    // Skip the option prefix: a parenthesised list, then option words, `=` and `@`, and the
+    // value after `=` / `@`.
+    let mut i = 0;
+    if parenthesised {
+        let base = rest[0].depth;
+        i = 1;
+        while i < rest.len() && !(rest[i].depth == base && rest[i].item == Item::Punct(b')')) {
+            i += 1;
+        }
+        if i == rest.len() {
+            // Unbalanced option list.
+            return StatementClass::Unknown;
+        }
+        i += 1;
+    }
+    let mut value_next = false;
+    while let Some(l) = rest.get(i) {
+        let is_option = name(l).is_some_and(|n| EXPLAIN_OPTION_WORDS.contains(&n.as_str()));
+        let is_link = matches!(l.item, Item::Punct(b'=' | b'@'));
+        if !(value_next || is_option || is_link) {
+            break;
+        }
+        value_next = is_link;
+        i += 1;
+    }
+    let starts_statement = rest.get(i).is_some_and(|l| {
+        l.item == Item::Punct(b'(') || word(l).is_some_and(|w| EXPLAINABLE_KEYWORDS.contains(&w))
+    });
+    if !starts_statement {
+        return StatementClass::Unknown;
+    }
+    rest.iter()
+        .enumerate()
+        .filter(|(_, l)| word(l).is_some_and(|w| EXPLAINABLE_KEYWORDS.contains(&w)))
+        .map(|(p, _)| classify_items(&rest[p..]))
+        .fold(StatementClass::Read, StatementClass::max)
+        // A parenthesised statement start is looked into by `classify_items` itself.
+        .max(classify_items(&rest[i..]))
+}
+
+/// `CREATE OR REPLACE …` (PostgreSQL, MySQL / MariaDB, also after an executable comment): the
+/// words `OR REPLACE` at the top level of the statement, `REPLACE` not being a function call.
+fn is_create_or_replace(items: &[Located]) -> bool {
+    items.windows(3).any(|w| {
+        w[0].depth == 0
+            && word(&w[0]) == Some("OR")
+            && word(&w[1]) == Some("REPLACE")
+            && w[2].item != Item::Punct(b'(')
+    }) || items.len() >= 2
+        && word(&items[items.len() - 2]) == Some("OR")
+        && word(&items[items.len() - 1]) == Some("REPLACE")
 }
 
 /// Keywords that start the main statement of a `WITH`.
@@ -2111,6 +2216,259 @@ mod tests {
             let end = 4 + cut.index(main - 4);
             let truncated = &sql[..end];
             prop_assert_ne!(AnsiDialect.classify(truncated), StatementClass::Read, "{}", truncated);
+        }
+    }
+
+    /// P1-E review M1: `EXPLAIN` forms that run the wrapped statement are classified as the
+    /// statement itself; plain `EXPLAIN` / `DESCRIBE` stay reads.
+    #[test]
+    fn explain_that_runs_is_classified_as_what_it_runs() {
+        use StatementClass as C;
+        let pg = LexicalRules::POSTGRES;
+        let my = LexicalRules::MYSQL;
+        let lite = LexicalRules::SQLITE;
+        for (rules, sql, want) in [
+            // PostgreSQL: quoted and Unicode-escaped option names.
+            (pg, "EXPLAIN (\"analyze\") DELETE FROM t", C::Destructive),
+            (
+                pg,
+                "EXPLAIN (FORMAT JSON, \"analyze\" on) DELETE FROM t",
+                C::Destructive,
+            ),
+            (pg, "EXPLAIN (U&\"analyze\") DELETE FROM t", C::Destructive),
+            (
+                pg,
+                "EXPLAIN (U&\"\\0061nalyze\") DELETE FROM t",
+                C::Destructive,
+            ),
+            (
+                pg,
+                "EXPLAIN (\"analyse\", BUFFERS) UPDATE t SET a = 1",
+                C::Destructive,
+            ),
+            (pg, "EXPLAIN (ANALYZE) DELETE FROM t WHERE a = 1", C::Write),
+            (
+                pg,
+                "explain (analyze true, verbose) insert into t values (1)",
+                C::Write,
+            ),
+            (pg, "EXPLAIN ANALYZE VERBOSE DELETE FROM t", C::Destructive),
+            (pg, "EXPLAIN ANALYSE DELETE FROM t", C::Destructive),
+            (pg, "EXPLAIN \"analyze\" DELETE FROM t", C::Destructive),
+            (pg, "EXPLAIN ANALYZE CREATE TABLE t2 AS SELECT 1", C::Ddl),
+            (pg, "EXPLAIN ANALYZE EXECUTE prepared_stmt", C::Unknown),
+            (
+                pg,
+                "EXPLAIN ANALYZE REFRESH MATERIALIZED VIEW m",
+                C::Unknown,
+            ),
+            (pg, "EXPLAIN (ANALYZE) (SELECT 1)", C::Read),
+            (pg, "EXPLAIN ANALYZE SELECT nextval('s')", C::Unknown),
+            // A strict reading: any parenthesised option list is treated as running.
+            (pg, "EXPLAIN (FORMAT JSON) DELETE FROM t", C::Destructive),
+            (pg, "EXPLAIN (FORMAT JSON) SELECT 1", C::Read),
+            (pg, "EXPLAIN (ANALYZE) SELECT * FROM t", C::Read),
+            // Fail closed: an unbalanced list, nothing explainable after the options.
+            (pg, "EXPLAIN (ANALYZE DELETE FROM t", C::Unknown),
+            (pg, "EXPLAIN (ANALYZE)", C::Unknown),
+            (pg, "EXPLAIN ANALYZE", C::Unknown),
+            (pg, "EXPLAIN ANALYZE frobnicate", C::Unknown),
+            // Plain EXPLAIN does not run the statement.
+            (pg, "EXPLAIN DELETE FROM t", C::Read),
+            (pg, "EXPLAIN VERBOSE DELETE FROM t", C::Read),
+            // MySQL / MariaDB.
+            (my, "EXPLAIN ANALYZE DELETE FROM t", C::Destructive),
+            (
+                my,
+                "EXPLAIN ANALYZE FORMAT=TREE DELETE FROM t",
+                C::Destructive,
+            ),
+            (
+                my,
+                "EXPLAIN FORMAT = JSON ANALYZE UPDATE t SET a = 1",
+                C::Destructive,
+            ),
+            (my, "EXPLAIN `analyze` DELETE FROM t", C::Destructive),
+            (my, "DESC ANALYZE DELETE FROM t", C::Destructive),
+            (my, "DESCRIBE ANALYZE DELETE FROM t WHERE a = 1", C::Write),
+            (my, "ANALYZE DELETE FROM t", C::Unknown),
+            (
+                my,
+                "ANALYZE FORMAT=JSON DELETE FROM t WHERE a = 1",
+                C::Unknown,
+            ),
+            (my, "ANALYZE SELECT 1", C::Unknown),
+            (my, "ANALYZE TABLE t", C::Unknown),
+            (my, "/*!50000 ANALYZE */ DELETE FROM t", C::Unknown),
+            (my, "EXPLAIN /*! ANALYZE */ DELETE FROM t", C::Destructive),
+            (my, "EXPLAIN DELETE FROM t", C::Read),
+            (my, "EXPLAIN FORMAT=JSON DELETE FROM t", C::Read),
+            (my, "EXPLAIN EXTENDED SELECT 1", C::Read),
+            (my, "EXPLAIN ANALYZE SELECT * FROM t", C::Read),
+            (my, "DESCRIBE t", C::Read),
+            (my, "DESC t c", C::Read),
+            // SQLite: EXPLAIN never runs the statement.
+            (lite, "EXPLAIN DELETE FROM t", C::Read),
+            (lite, "EXPLAIN QUERY PLAN DELETE FROM t", C::Read),
+        ] {
+            assert_eq!(classify_with_rules(sql, rules), want, "{sql}");
+        }
+    }
+
+    /// P1-E review L1: `CREATE OR REPLACE` overwrites an existing object.
+    #[test]
+    fn create_or_replace_is_destructive() {
+        use StatementClass as C;
+        for (rules, sql) in [
+            (
+                LexicalRules::POSTGRES,
+                "CREATE OR REPLACE FUNCTION f() RETURNS int LANGUAGE sql AS $$ SELECT 1 $$",
+            ),
+            (
+                LexicalRules::POSTGRES,
+                "create or replace view v as select 1",
+            ),
+            (
+                LexicalRules::POSTGRES,
+                "CREATE OR REPLACE TEMP VIEW v AS SELECT 1",
+            ),
+            (
+                LexicalRules::POSTGRES,
+                "CREATE OR REPLACE PROCEDURE p() LANGUAGE sql AS $$ SELECT 1 $$",
+            ),
+            (
+                LexicalRules::POSTGRES,
+                "CREATE OR REPLACE TRIGGER tr AFTER INSERT ON t EXECUTE FUNCTION f()",
+            ),
+            (
+                LexicalRules::POSTGRES,
+                "CREATE OR REPLACE RULE r AS ON INSERT TO t DO NOTHING",
+            ),
+            (
+                LexicalRules::POSTGRES,
+                "CREATE /* c */ OR\nREPLACE VIEW v AS SELECT 1",
+            ),
+            (
+                LexicalRules::MYSQL,
+                "CREATE OR REPLACE ALGORITHM = MERGE VIEW v AS SELECT 1",
+            ),
+            (LexicalRules::MYSQL, "CREATE OR REPLACE TABLE t (a INT)"),
+            (LexicalRules::MYSQL, "CREATE OR REPLACE SEQUENCE s"),
+            (
+                LexicalRules::MYSQL,
+                "CREATE /*!50001 OR REPLACE */ VIEW v AS SELECT 1",
+            ),
+            (
+                LexicalRules::POSTGRES,
+                "EXPLAIN ANALYZE CREATE OR REPLACE VIEW v AS SELECT 1",
+            ),
+        ] {
+            let c = classify_with_rules(sql, rules);
+            assert!(c >= C::Destructive, "{sql}: {c:?}");
+            assert!(c.needs_confirmation(), "{sql}");
+        }
+        for sql in [
+            "CREATE TABLE t (a INT)",
+            "CREATE VIEW v AS SELECT a OR b FROM t",
+            "CREATE VIEW v AS SELECT a OR replace(b, 'x', 'y') FROM t",
+            "CREATE TABLE IF NOT EXISTS t (a INT)",
+        ] {
+            assert_eq!(
+                classify_with_rules(sql, LexicalRules::POSTGRES),
+                C::Ddl,
+                "{sql}"
+            );
+        }
+    }
+
+    /// Wrapped statements for the wrapper property test: one per class and shape.
+    const WRAPPED: &[&str] = &[
+        "SELECT * FROM t",
+        "SELECT * FROM t WHERE a IN (SELECT b FROM u)",
+        "SELECT nextval('s')",
+        "SELECT set_config('default_transaction_read_only', 'off', false)",
+        "SELECT * INTO t2 FROM t",
+        "VALUES (1)",
+        "TABLE t",
+        "INSERT INTO t VALUES (1)",
+        "INSERT INTO t SELECT * FROM u",
+        "REPLACE INTO t VALUES (1)",
+        "UPDATE t SET a = 1 WHERE b = 2",
+        "UPDATE t SET a = 1",
+        "UPDATE t SET a = (SELECT 1 WHERE true)",
+        "DELETE FROM t WHERE a = 1",
+        "DELETE FROM t",
+        "DELETE FROM t WHERE a IN (SELECT b FROM u)",
+        "MERGE INTO t USING u ON t.a = u.a WHEN MATCHED THEN DELETE",
+        "WITH c AS (SELECT 1) SELECT * FROM c",
+        "WITH c AS (DELETE FROM t RETURNING *) SELECT * FROM c",
+        "WITH c AS (SELECT 1) DELETE FROM t",
+        "CREATE TABLE t2 AS SELECT * FROM t",
+        "CREATE OR REPLACE VIEW v AS SELECT 1",
+        "(SELECT 1)",
+        "EXECUTE p",
+        "DECLARE c CURSOR FOR SELECT 1",
+    ];
+
+    /// Wrappers that run the wrapped statement on at least one engine.
+    const RUNNING_WRAPPERS: &[&str] = &[
+        "EXPLAIN ANALYZE ",
+        "EXPLAIN ANALYSE ",
+        "EXPLAIN ANALYZE VERBOSE ",
+        "EXPLAIN (\"analyze\") ",
+        "EXPLAIN (FORMAT JSON, \"analyze\" on) ",
+        "EXPLAIN (U&\"analyze\") ",
+        "EXPLAIN (U&\"\\0061naly\\0073e\" true, BUFFERS) ",
+        "EXPLAIN (ANALYZE, FORMAT YAML) ",
+        "EXPLAIN (FORMAT JSON) ",
+        "explain analyze format = tree ",
+        "EXPLAIN FORMAT=JSON ANALYZE ",
+        "EXPLAIN `analyze` ",
+        "DESC ANALYZE ",
+        "DESCRIBE ANALYZE FORMAT=JSON ",
+        "ANALYZE ",
+        "ANALYZE FORMAT=JSON ",
+        "EXPLAIN /* c */ ANALYZE -- x\n",
+    ];
+
+    proptest! {
+        /// P1-E review M1: an `EXPLAIN` / `ANALYZE` wrapper that runs its statement never
+        /// lowers the class of the wrapped statement, in any dialect.
+        #[test]
+        fn running_explain_wrappers_never_lower_the_class(
+            stmt in prop::sample::select(WRAPPED),
+            wrapper in prop::sample::select(RUNNING_WRAPPERS),
+            rules in prop::sample::select(vec![
+                LexicalRules::ANSI,
+                LexicalRules::POSTGRES,
+                LexicalRules::MYSQL,
+                LexicalRules::SQLITE,
+            ]),
+            case in any::<bool>(),
+        ) {
+            let wrapper = if case { wrapper.to_lowercase() } else { wrapper.to_uppercase() };
+            // Upper-casing a `U&` escape changes nothing: hex digits are case-insensitive.
+            let sql = format!("{wrapper}{stmt}");
+            let alone = classify_with_rules(stmt, rules);
+            let wrapped = classify_with_rules(&sql, rules);
+            prop_assert!(wrapped >= alone, "{} -> {:?} < {:?}", sql, wrapped, alone);
+            prop_assert!(wrapped >= StatementClass::Read);
+        }
+
+        /// The same with random filler around a destructive statement: the wrapper keeps it at
+        /// least destructive.
+        #[test]
+        fn running_explain_of_a_destructive_statement_needs_confirmation(
+            wrapper in prop::sample::select(RUNNING_WRAPPERS),
+            table in "[a-z_]{1,12}",
+            column in "[a-z_]{1,12}",
+        ) {
+            for stmt in [format!("DELETE FROM {table}"), format!("UPDATE {table} SET {column} = 1")] {
+                let sql = format!("{wrapper}{stmt}");
+                for rules in [LexicalRules::POSTGRES, LexicalRules::MYSQL] {
+                    prop_assert!(classify_with_rules(&sql, rules).needs_confirmation(), "{}", sql);
+                }
+            }
         }
     }
 }

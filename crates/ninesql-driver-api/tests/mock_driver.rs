@@ -534,6 +534,8 @@ async fn conformance_suite_passes_on_the_mock() {
     writes.extend(conformance::POSTGRES_ACCESS_MODE_WRITES);
     writes.extend(conformance::MYSQL_ACCESS_MODE_WRITES);
     writes.extend(conformance::SQLITE_ACCESS_MODE_WRITES);
+    writes.extend(conformance::POSTGRES_EXPLAIN_WRITES);
+    writes.extend(conformance::MYSQL_EXPLAIN_WRITES);
     conformance::assert_read_only_refuses_writes(&driver, params(), &writes).await;
     conformance::assert_multiple_statements_refused(&driver, params()).await;
     conformance::assert_access_mode_change_detected(
@@ -818,6 +820,22 @@ fn writes_lists_are_per_dialect() {
             );
         }
     }
+    // P1-E review M1 / L1: running `EXPLAIN` forms of a `DELETE` without `WHERE` and
+    // `CREATE OR REPLACE` need the production confirmation.
+    for (list, rules) in [
+        (conformance::POSTGRES_EXPLAIN_WRITES, LexicalRules::POSTGRES),
+        (conformance::MYSQL_EXPLAIN_WRITES, LexicalRules::MYSQL),
+    ] {
+        for w in list {
+            assert!(classify_with_rules(w, rules).needs_confirmation(), "{w}");
+        }
+    }
+    let replace = "CREATE OR REPLACE VIEW ninesql_conformance_view AS SELECT 1 AS a";
+    assert!(conformance::WRITES.contains(&replace));
+    assert_eq!(
+        classify_with_rules(replace, LexicalRules::POSTGRES),
+        StatementClass::Destructive
+    );
 }
 
 /// M6: a cancelled statement keeps the session busy until the server confirmed its end.

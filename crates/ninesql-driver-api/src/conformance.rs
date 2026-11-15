@@ -76,6 +76,27 @@ pub const WRITES: &[&str] = &[
     "DELETE FROM ninesql_conformance",
     "CREATE TABLE ninesql_conformance_new (a INT)",
     "DROP TABLE ninesql_conformance",
+    "CREATE OR REPLACE VIEW ninesql_conformance_view AS SELECT 1 AS a",
+];
+
+/// PostgreSQL-family `EXPLAIN` forms that run the explained statement (P1-E review M1): the
+/// `ANALYZE` option written quoted or `U&`-escaped. The classifier must see them as what they
+/// run (destructive here), never as reads.
+pub const POSTGRES_EXPLAIN_WRITES: &[&str] = &[
+    "EXPLAIN (\"analyze\") DELETE FROM ninesql_conformance",
+    "EXPLAIN (FORMAT JSON, \"analyze\" on) DELETE FROM ninesql_conformance",
+    "EXPLAIN (U&\"analyze\") DELETE FROM ninesql_conformance",
+    "EXPLAIN ANALYZE DELETE FROM ninesql_conformance",
+];
+
+/// MySQL-family statements that run a wrapped write (P1-E review M1): MariaDB
+/// `ANALYZE <statement>` executes it, MySQL `EXPLAIN ANALYZE` executes it, and `DESC` /
+/// `DESCRIBE` are synonyms of `EXPLAIN`.
+pub const MYSQL_EXPLAIN_WRITES: &[&str] = &[
+    "ANALYZE DELETE FROM ninesql_conformance",
+    "ANALYZE FORMAT=JSON DELETE FROM ninesql_conformance",
+    "EXPLAIN ANALYZE DELETE FROM ninesql_conformance",
+    "DESC ANALYZE DELETE FROM ninesql_conformance",
 ];
 
 /// PostgreSQL-family statements that try to lift a read-only session.
@@ -113,17 +134,24 @@ pub const SQLITE_ACCESS_MODE_WRITES: &[&str] = &[
     "ATTACH DATABASE 'ninesql_conformance.db' AS other",
 ];
 
-/// [`WRITES`] plus the access-mode statements of `engine`'s family (PostgreSQL family, MySQL
-/// family, SQLite); other engines get [`WRITES`] only and add their own.
+/// [`WRITES`] plus the access-mode and running-`EXPLAIN` statements of `engine`'s family
+/// (PostgreSQL family, MySQL family, SQLite); other engines get [`WRITES`] only and add their
+/// own.
 #[must_use]
 pub fn writes_for(engine: &EngineId) -> Vec<&'static str> {
-    let family: &[&str] = match engine.as_str() {
-        "postgresql" | "timescaledb" | "yugabytedb" | "questdb" => POSTGRES_ACCESS_MODE_WRITES,
-        "mysql" | "mariadb" | "tidb" => MYSQL_ACCESS_MODE_WRITES,
-        "sqlite" => SQLITE_ACCESS_MODE_WRITES,
+    let family: &[&[&str]] = match engine.as_str() {
+        "postgresql" | "timescaledb" | "yugabytedb" | "questdb" => {
+            &[POSTGRES_ACCESS_MODE_WRITES, POSTGRES_EXPLAIN_WRITES]
+        }
+        "mysql" | "mariadb" | "tidb" => &[MYSQL_ACCESS_MODE_WRITES, MYSQL_EXPLAIN_WRITES],
+        "sqlite" => &[SQLITE_ACCESS_MODE_WRITES],
         _ => &[],
     };
-    WRITES.iter().chain(family).copied().collect()
+    WRITES
+        .iter()
+        .chain(family.iter().flat_map(|l| l.iter()))
+        .copied()
+        .collect()
 }
 
 fn clone_params(p: &ConnectParams) -> ConnectParams {
