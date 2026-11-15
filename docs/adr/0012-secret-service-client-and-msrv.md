@@ -1,6 +1,6 @@
 # ADR-0012: Secret Service client crate and minimum Rust version
 
-- **Status**: Accepted (maintainer, 2026-11-14). Partially supersedes [ADR-0005](0005-secrets-storage.md): only the choice of the Rust crate that talks to the Secret Service; every other point of ADR-0005 stands. Item attributes (§4) partially amended by [ADR-0017](0017-workspace-lock-rewrite-on-load-and-project-identity.md): items also carry `xdg:schema = org.ninesql.Secret` and `project` = the project UUID from `project.json`.
+- **Status**: Accepted (maintainer, 2026-11-14). Partially supersedes [ADR-0005](0005-secrets-storage.md): only the choice of the Rust crate that talks to the Secret Service; every other point of ADR-0005 stands. Item attributes (§4) partially amended by [ADR-0017](0017-workspace-lock-rewrite-on-load-and-project-identity.md): items also carry `xdg:schema = org.ninesql.Secret` and `project` = the project UUID from `project.json`. Note (P1-D wiring, 2026-11-15): the `secret-service` feature now implies the separate, default-on `desktop-lock` feature (sleep and screen-lock locking through logind, zbus 6 only); `secret-service` itself stays off by default as decided here. See the [amendment of ADR-0005](0005-secrets-storage.md#amendment-p1-d-wiring-2026-11-15).
 - **Date**: 2026-11-14
 
 ## Context

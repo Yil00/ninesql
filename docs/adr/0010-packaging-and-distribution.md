@@ -1,6 +1,6 @@
 # ADR-0010: Packaging and distribution
 
-- **Status**: Accepted
+- **Status**: Accepted. Note (P1-D wiring, 2026-11-15): the Flatpak permissions of §3 also include `--system-talk-name=org.freedesktop.login1` (logind on the system bus, to lock secrets on sleep and screen lock), and "network" is `--share=network`, which Flatpak grants all-or-nothing: NineSQL itself limits network use to the user's connections and their SSH / proxy hops (I2). See the [amendment of ADR-0005](0005-secrets-storage.md#amendment-p1-d-wiring-2026-11-15) and [docs/10](../10-supported-platforms.md#flatpak-permissions).
 - **Date**: 2026-11-14
 
 ## Context

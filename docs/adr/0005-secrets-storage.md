@@ -1,6 +1,6 @@
 # ADR-0005: Secrets storage
 
-- **Status**: Accepted. Partially superseded by [ADR-0012](0012-secret-service-client-and-msrv.md) for the client crate (`secret-service` 6 instead of `keyring`) and the Secret Service item attributes; everything else stands. Note (P1-D, 2026-11-14): the vault of §2 is implemented as format v1; its bounds and known limits are documented in the rustdoc of `ninesql_secrets::vault` and in [docs/05](../05-security.md#vault-format-v1).
+- **Status**: Accepted. Partially superseded by [ADR-0012](0012-secret-service-client-and-msrv.md) for the client crate (`secret-service` 6 instead of `keyring`) and the Secret Service item attributes; everything else stands. Note (P1-D, 2026-11-14): the vault of §2 is implemented as format v1; its bounds and known limits are documented in the rustdoc of `ninesql_secrets::vault` and in [docs/05](../05-security.md#vault-format-v1). Amended (P1-D wiring, 2026-11-15) by the [section at the end](#amendment-p1-d-wiring-2026-11-15): locking on sleep and screen lock in default builds, and the Flatpak permissions it needs; the decision above is unchanged.
 - **Date**: 2026-11-14
 
 ## Context
@@ -23,3 +23,26 @@ A database client holds the keys to production. DBeaver Community stores saved p
 - **A fixed or machine-derived key** (DBeaver's approach): obfuscation, not protection.
 - **Plaintext with `0600` permissions**: readable by any process of the user and by backups.
 - **`libsecret` through C bindings**: works, but adds a C dependency and `unsafe` where a pure-Rust D-Bus client exists.
+
+## Amendment (P1-D wiring, 2026-11-15)
+Approved by the maintainer. It adds to the decision above and changes none of its points. Behaviour as implemented: `crates/ninesql-secrets/Cargo.toml`, `crates/ninesql-secrets/src/lock_signals.rs`, [docs/02](../02-architecture.md#secrets-adr-0005-p1-d), [docs/05](../05-security.md#vault-format-v1) and [docs/10](../10-supported-platforms.md#flatpak-permissions).
+
+**Context.** The vault of point 2 and the "ask every time" cache of point 3 hold decrypted secrets in memory. Locking them when the machine sleeps or the screen locks first sat behind the `secret-service` feature, which stays off by default under [ADR-0012](0012-secret-service-client-and-msrv.md). Default builds therefore had only the idle lock.
+
+**Decision.**
+1. Locking secrets on sleep and screen lock (`DesktopLockWatcher`, logind on the system bus) sits behind its own Cargo feature, `desktop-lock`, in `ninesql-secrets` and `ninesql-core`. It is **on by default**. It depends on zbus 6 only: the same zbus as the Secret Service client, with no Secret Service code and no crypto.
+2. The `secret-service` feature implies `desktop-lock`. It stays off by default, per ADR-0012.
+3. On sleep (`PrepareForSleep(true)`) and on screen lock of the current logind session (its `Lock` signal, or its `LockedHint` property turning true), the vault is locked and the "ask every time" cache cleared.
+4. On its own system-bus connection, the watcher talks only to `org.freedesktop.login1` (session lookup, `Inhibit`) and to the bus daemon (`GetNameOwner`, `NameOwnerChanged`). It holds a logind sleep **delay inhibitor**, so the suspend waits (up to logind's `InhibitDelayMaxSec`) until the lock has run. It accepts only broadcast signals (no destination header) whose sender is the current unique owner of `org.freedesktop.login1`. When it loses the bus connection, it locks once and stops (fail-closed). It is not restarted.
+5. A failure to start the watcher (no system bus, or no permission to reach logind) is not fatal. The idle lock still applies: vault idle timeout 15 min by default, checked every 30 s (`CoreConfig`). `CoreServices::lock_watcher_status` reports whether sleep and screen lock are watched.
+6. **Flatpak** (completes point 5 above and [ADR-0010](0010-packaging-and-distribution.md) §3): besides `--talk-name=org.freedesktop.secrets`, the manifest declares `--system-talk-name=org.freedesktop.login1` for the watcher. It also declares `--share=network`. That permission is all-or-nothing in Flatpak, so the limit to the user's connections and their SSH / proxy hops (I2) is enforced by NineSQL itself, not by the sandbox.
+
+**Consequences.**
+- Default builds lock secrets on sleep and screen lock without enabling the Secret Service backend, which is not validated yet (ADR-0012).
+- Default builds open a system-bus connection to logind. That is local D-Bus traffic, not network traffic, so I2 is unaffected.
+- On a system without logind, or in a Flatpak without the logind permission, only the idle lock and the explicit `CoreServices::lock_now` apply. The UI can tell from `lock_watcher_status`.
+- A watcher that lost the bus is not restarted until the next start of the application (ROADMAP follow-up).
+
+**Rejected alternatives.**
+- **Keep the watcher behind `secret-service`**: default builds would get no sleep or screen-lock locking until the Secret Service backend is validated.
+- **Make `secret-service` default-on to get the watcher**: contradicts ADR-0012, which keeps the release-candidate client off until the desktop round trip and the stable 6.x.
