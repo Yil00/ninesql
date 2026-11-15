@@ -144,240 +144,9 @@ pub struct MySqlWireDriver {
 const ENGINES: &[EngineId] = &[EngineId::MYSQL, EngineId::MARIADB];
 
 impl MySqlWireDriver {
-    /// The driver.
-    #[must_use]
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    /// See [`EXTRA_RESERVED_PROPERTIES`].
-    #[must_use]
-    pub fn extra_reserved_properties() -> &'static [&'static str] {
-        EXTRA_RESERVED_PROPERTIES
-    }
-
-    fn check_engine(engine: &EngineId) -> DriverResult<()> {
-        if ENGINES.contains(engine) {
-            Ok(())
-        } else {
-            Err(DriverError::InvalidParams(format!(
-                "engine `{engine}` is not served by the mysqlwire driver"
-            )))
-        }
-    }
-}
-
-/// Capabilities of MySQL or MariaDB through this driver (mirrored in docs/08).
-fn capabilities_for(engine: &EngineId, server_version: Option<&str>) -> Capabilities {
-    let mut c = Capabilities::minimal(engine.clone());
-    c.server_version = server_version.map(str::to_owned);
-    let mut metadata = MetadataCapabilities::default();
-    metadata.kinds = BTreeSet::from([
-        ObjectKind::Schema,
-        ObjectKind::Table,
-        ObjectKind::View,
-        ObjectKind::Column,
-        ObjectKind::Routine,
-    ]);
-    c.metadata = metadata;
-    let mut editing = EditingCapabilities::default();
-    editing.insert = true;
-    editing.update = true;
-    editing.delete = true;
-    editing.requires_unique_key = true;
-    c.editing = editing;
-    let mut tx = TransactionCapabilities::default();
-    tx.manual_commit = true;
-    tx.savepoints = true;
-    tx.isolation_levels = BTreeSet::from([
-        IsolationLevel::ReadUncommitted,
-        IsolationLevel::ReadCommitted,
-        IsolationLevel::RepeatableRead,
-        IsolationLevel::Serializable,
-    ]);
-    c.transactions = tx;
-    c.read_only = ReadOnlyMechanism::SessionSetting { liftable: true };
-    c.cancel = CancelSupport::ServerSide;
-    c.explain = if *engine == EngineId::MYSQL {
-        BTreeSet::from([
-            ExplainFormat::Text,
-            ExplainFormat::Json,
-            ExplainFormat::Analyze,
-        ])
-    } else {
-        BTreeSet::from([ExplainFormat::Text, ExplainFormat::Json])
-    };
-    c.multiple_result_sets = true;
-    c.server_side_timeout = false;
-    c.tls = BTreeSet::from([
-        TlsMode::Disable,
-        TlsMode::Require,
-        TlsMode::VerifyCa,
-        TlsMode::VerifyFull,
-    ]);
-    c.parameters = true;
-    c.extra_reserved_properties = EXTRA_RESERVED_PROPERTIES
-        .iter()
-        .map(|k| (*k).to_owned())
-        .collect();
-    c.retains_secret_after_connect = false;
-    let mut connect = ConnectCapabilities::default();
-    connect.accepted_properties = Some(
-        ACCEPTED_PROPERTIES
-            .iter()
-            .filter(|(_, var)| prop_engine_ok(var, engine))
-            .map(|(_, var)| (*var).to_owned())
-            .collect(),
-    );
-    connect.auth = BTreeSet::from([AuthKind::Password]);
-    // No exchange of the MySQL protocol proves that the server knows the password verifier
-    // (`caching_sha2_password` is not SCRAM): `ScramOnly` is not offered.
-    connect.password_exchanges = BTreeSet::from([PasswordExchange::Any]);
-    connect.verify_ca_requires_ca_file = true;
-    connect.client_certificates = true;
-    connect.encrypted_client_keys = false;
-    c.connect = connect;
-    c
-}
-
-fn normalize(key: &str) -> String {
-    key.chars()
-        .filter(char::is_ascii_alphanumeric)
-        .map(|c| c.to_ascii_lowercase())
-        .collect()
-}
-
-/// Maps accepted properties to `SET SESSION` statements; refuses unknown keys and malformed
-/// values (never echoing them).
-fn accepted_properties(
-    engine: &EngineId,
-    properties: &BTreeMap<String, PropertyValue>,
-) -> DriverResult<Vec<String>> {
-    let mut out = Vec::new();
-    for (key, value) in properties {
-        let norm = normalize(key);
-        let Some((_, var)) = ACCEPTED_PROPERTIES
-            .iter()
-            .find(|(k, v)| *k == norm && prop_engine_ok(v, engine))
-        else {
-            return Err(DriverError::InvalidParams(format!(
-                "property `{key}` is not supported by the {engine} driver; accepted: time_zone, \
-                 lock_wait_timeout, innodb_lock_wait_timeout, group_concat_max_len, {}",
-                if *engine == EngineId::MYSQL {
-                    "max_execution_time"
-                } else {
-                    "max_statement_time"
-                }
-            )));
-        };
-        let v = value.expose().trim();
-        let lit = match prop_kind(var) {
-            PropKind::Unsigned
-                if !v.is_empty() && v.len() <= 20 && v.bytes().all(|b| b.is_ascii_digit()) =>
-            {
-                v.to_owned()
-            }
-            PropKind::Decimal
-                if !v.is_empty()
-                    && v.len() <= 32
-                    && v.bytes().all(|b| b.is_ascii_digit() || b == b'.')
-                    && v.bytes().filter(|b| *b == b'.').count() <= 1 =>
-            {
-                v.to_owned()
-            }
-            PropKind::Text if !v.contains('\0') => dialect::literal(&Param::Text(v.to_owned()))?,
-            _ => {
-                return Err(DriverError::InvalidParams(format!(
-                    "property `{key}` has an invalid value"
-                )));
-            }
-        };
-        out.push(format!("SET SESSION {var} = {lit}"));
-    }
-    Ok(out)
-}
-
-/// `localhost` or a loopback IP address (the local end of an SSH tunnel).
-fn is_loopback_host(host: &str) -> bool {
-    host.eq_ignore_ascii_case("localhost")
-        || host
-            .trim_matches(|c| c == '[' || c == ']')
-            .parse::<std::net::IpAddr>()
-            .is_ok_and(|ip| ip.is_loopback())
-}
-
-/// `(major, minor)` of a version string (`"8.4.13"`, `"5.5.5-11.8.9-MariaDB-…"`).
-fn version_of(v: &str) -> (u32, u32) {
-    let v = v.strip_prefix("5.5.5-").unwrap_or(v);
-    let mut it = v.split(|c: char| !c.is_ascii_digit());
-    let major = it.next().and_then(|x| x.parse().ok()).unwrap_or(0);
-    let minor = it.next().and_then(|x| x.parse().ok()).unwrap_or(0);
-    (major, minor)
-}
-
-/// The server version as shown to users (MariaDB's `5.5.5-` replication prefix removed).
-fn display_version(v: &str) -> &str {
-    v.strip_prefix("5.5.5-").unwrap_or(v)
-}
-
-/// Checks that the server is the engine the connection was declared for (capabilities differ),
-/// and returns the name of the access-mode variable.
-fn check_server(engine: &EngineId, version: &str) -> DriverResult<&'static str> {
-    let is_mariadb = version.contains("MariaDB");
-    if version.contains("TiDB") {
-        return Err(DriverError::Connect(
-            "this server is TiDB, which the mysqlwire driver does not serve yet".into(),
-        ));
-    }
-    if is_mariadb != (*engine == EngineId::MARIADB) {
-        return Err(DriverError::Connect(format!(
-            "this server reports version {}, which is not {engine}; choose the matching engine",
-            display_version(version)
-        )));
-    }
-    let (major, minor) = version_of(version);
-    let modern = if is_mariadb {
-        (major, minor) >= (11, 1)
-    } else {
-        (major, minor) >= (8, 0)
-    };
-    Ok(if modern {
-        "transaction_read_only"
-    } else {
-        "tx_read_only"
-    })
-}
-
-#[async_trait::async_trait]
-impl Driver for MySqlWireDriver {
-    fn family(&self) -> &'static str {
-        FAMILY
-    }
-
-    fn engines(&self) -> &[EngineId] {
-        ENGINES
-    }
-
-    fn capabilities(
-        &self,
-        engine: &EngineId,
-        server_version: Option<&str>,
-    ) -> DriverResult<Capabilities> {
-        Self::check_engine(engine)?;
-        Ok(capabilities_for(engine, server_version))
-    }
-
-    fn dialect(&self, engine: &EngineId) -> DriverResult<Arc<dyn Dialect>> {
-        Self::check_engine(engine)?;
-        Ok(Arc::new(if *engine == EngineId::MYSQL {
-            MyDialect::mysql()
-        } else {
-            MyDialect::mariadb()
-        }))
-    }
-
     #[allow(clippy::too_many_lines)]
-    async fn connect(&self, params: ConnectParams) -> DriverResult<Box<dyn Session>> {
+    /// `Driver::connect` with the concrete session type (crate-internal tests use it).
+    async fn open(&self, params: ConnectParams) -> DriverResult<MySession> {
         Self::check_engine(&params.engine)?;
         // Before any network traffic: properties, endpoint, credentials, TLS files.
         let declared = capabilities_for(&params.engine, None);
@@ -615,7 +384,243 @@ impl Driver for MySqlWireDriver {
                 ));
             }
         }
-        Ok(Box::new(session))
+        Ok(session)
+    }
+
+    /// The driver.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// See [`EXTRA_RESERVED_PROPERTIES`].
+    #[must_use]
+    pub fn extra_reserved_properties() -> &'static [&'static str] {
+        EXTRA_RESERVED_PROPERTIES
+    }
+
+    fn check_engine(engine: &EngineId) -> DriverResult<()> {
+        if ENGINES.contains(engine) {
+            Ok(())
+        } else {
+            Err(DriverError::InvalidParams(format!(
+                "engine `{engine}` is not served by the mysqlwire driver"
+            )))
+        }
+    }
+}
+
+/// Capabilities of MySQL or MariaDB through this driver (mirrored in docs/08).
+fn capabilities_for(engine: &EngineId, server_version: Option<&str>) -> Capabilities {
+    let mut c = Capabilities::minimal(engine.clone());
+    c.server_version = server_version.map(str::to_owned);
+    let mut metadata = MetadataCapabilities::default();
+    metadata.kinds = BTreeSet::from([
+        ObjectKind::Schema,
+        ObjectKind::Table,
+        ObjectKind::View,
+        ObjectKind::Column,
+        ObjectKind::Routine,
+    ]);
+    c.metadata = metadata;
+    let mut editing = EditingCapabilities::default();
+    editing.insert = true;
+    editing.update = true;
+    editing.delete = true;
+    editing.requires_unique_key = true;
+    c.editing = editing;
+    let mut tx = TransactionCapabilities::default();
+    tx.manual_commit = true;
+    tx.savepoints = true;
+    tx.isolation_levels = BTreeSet::from([
+        IsolationLevel::ReadUncommitted,
+        IsolationLevel::ReadCommitted,
+        IsolationLevel::RepeatableRead,
+        IsolationLevel::Serializable,
+    ]);
+    c.transactions = tx;
+    c.read_only = ReadOnlyMechanism::SessionSetting { liftable: true };
+    c.cancel = CancelSupport::ServerSide;
+    c.explain = if *engine == EngineId::MYSQL {
+        BTreeSet::from([
+            ExplainFormat::Text,
+            ExplainFormat::Json,
+            ExplainFormat::Analyze,
+        ])
+    } else {
+        BTreeSet::from([ExplainFormat::Text, ExplainFormat::Json])
+    };
+    c.multiple_result_sets = true;
+    c.server_side_timeout = false;
+    c.tls = BTreeSet::from([
+        TlsMode::Disable,
+        TlsMode::Require,
+        TlsMode::VerifyCa,
+        TlsMode::VerifyFull,
+    ]);
+    c.parameters = true;
+    c.extra_reserved_properties = EXTRA_RESERVED_PROPERTIES
+        .iter()
+        .map(|k| (*k).to_owned())
+        .collect();
+    c.retains_secret_after_connect = false;
+    let mut connect = ConnectCapabilities::default();
+    connect.accepted_properties = Some(
+        ACCEPTED_PROPERTIES
+            .iter()
+            .filter(|(_, var)| prop_engine_ok(var, engine))
+            .map(|(_, var)| (*var).to_owned())
+            .collect(),
+    );
+    connect.auth = BTreeSet::from([AuthKind::Password]);
+    // No exchange of the MySQL protocol proves that the server knows the password verifier
+    // (`caching_sha2_password` is not SCRAM): `ScramOnly` is not offered.
+    connect.password_exchanges = BTreeSet::from([PasswordExchange::Any]);
+    connect.verify_ca_requires_ca_file = true;
+    connect.client_certificates = true;
+    connect.encrypted_client_keys = false;
+    c.connect = connect;
+    c
+}
+
+fn normalize(key: &str) -> String {
+    key.chars()
+        .filter(char::is_ascii_alphanumeric)
+        .map(|c| c.to_ascii_lowercase())
+        .collect()
+}
+
+/// Maps accepted properties to `SET SESSION` statements; refuses unknown keys and malformed
+/// values (never echoing them).
+fn accepted_properties(
+    engine: &EngineId,
+    properties: &BTreeMap<String, PropertyValue>,
+) -> DriverResult<Vec<String>> {
+    let mut out = Vec::new();
+    for (key, value) in properties {
+        let norm = normalize(key);
+        let Some((_, var)) = ACCEPTED_PROPERTIES
+            .iter()
+            .find(|(k, v)| *k == norm && prop_engine_ok(v, engine))
+        else {
+            return Err(DriverError::InvalidParams(format!(
+                "property `{key}` is not supported by the {engine} driver; accepted: time_zone, \
+                 lock_wait_timeout, innodb_lock_wait_timeout, group_concat_max_len, {}",
+                if *engine == EngineId::MYSQL {
+                    "max_execution_time"
+                } else {
+                    "max_statement_time"
+                }
+            )));
+        };
+        let v = value.expose().trim();
+        let lit = match prop_kind(var) {
+            PropKind::Unsigned
+                if !v.is_empty() && v.len() <= 20 && v.bytes().all(|b| b.is_ascii_digit()) =>
+            {
+                v.to_owned()
+            }
+            PropKind::Decimal
+                if !v.is_empty()
+                    && v.len() <= 32
+                    && v.bytes().all(|b| b.is_ascii_digit() || b == b'.')
+                    && v.bytes().filter(|b| *b == b'.').count() <= 1 =>
+            {
+                v.to_owned()
+            }
+            PropKind::Text if !v.contains('\0') => dialect::literal(&Param::Text(v.to_owned()))?,
+            _ => {
+                return Err(DriverError::InvalidParams(format!(
+                    "property `{key}` has an invalid value"
+                )));
+            }
+        };
+        out.push(format!("SET SESSION {var} = {lit}"));
+    }
+    Ok(out)
+}
+
+/// `localhost` or a loopback IP address (the local end of an SSH tunnel).
+fn is_loopback_host(host: &str) -> bool {
+    host.eq_ignore_ascii_case("localhost")
+        || host
+            .trim_matches(|c| c == '[' || c == ']')
+            .parse::<std::net::IpAddr>()
+            .is_ok_and(|ip| ip.is_loopback())
+}
+
+/// `(major, minor)` of a version string (`"8.4.13"`, `"5.5.5-11.8.9-MariaDB-…"`).
+fn version_of(v: &str) -> (u32, u32) {
+    let v = v.strip_prefix("5.5.5-").unwrap_or(v);
+    let mut it = v.split(|c: char| !c.is_ascii_digit());
+    let major = it.next().and_then(|x| x.parse().ok()).unwrap_or(0);
+    let minor = it.next().and_then(|x| x.parse().ok()).unwrap_or(0);
+    (major, minor)
+}
+
+/// The server version as shown to users (MariaDB's `5.5.5-` replication prefix removed).
+fn display_version(v: &str) -> &str {
+    v.strip_prefix("5.5.5-").unwrap_or(v)
+}
+
+/// Checks that the server is the engine the connection was declared for (capabilities differ),
+/// and returns the name of the access-mode variable.
+fn check_server(engine: &EngineId, version: &str) -> DriverResult<&'static str> {
+    let is_mariadb = version.contains("MariaDB");
+    if version.contains("TiDB") {
+        return Err(DriverError::Connect(
+            "this server is TiDB, which the mysqlwire driver does not serve yet".into(),
+        ));
+    }
+    if is_mariadb != (*engine == EngineId::MARIADB) {
+        return Err(DriverError::Connect(format!(
+            "this server reports version {}, which is not {engine}; choose the matching engine",
+            display_version(version)
+        )));
+    }
+    let (major, minor) = version_of(version);
+    let modern = if is_mariadb {
+        (major, minor) >= (11, 1)
+    } else {
+        (major, minor) >= (8, 0)
+    };
+    Ok(if modern {
+        "transaction_read_only"
+    } else {
+        "tx_read_only"
+    })
+}
+
+#[async_trait::async_trait]
+impl Driver for MySqlWireDriver {
+    fn family(&self) -> &'static str {
+        FAMILY
+    }
+
+    fn engines(&self) -> &[EngineId] {
+        ENGINES
+    }
+
+    fn capabilities(
+        &self,
+        engine: &EngineId,
+        server_version: Option<&str>,
+    ) -> DriverResult<Capabilities> {
+        Self::check_engine(engine)?;
+        Ok(capabilities_for(engine, server_version))
+    }
+
+    fn dialect(&self, engine: &EngineId) -> DriverResult<Arc<dyn Dialect>> {
+        Self::check_engine(engine)?;
+        Ok(Arc::new(if *engine == EngineId::MYSQL {
+            MyDialect::mysql()
+        } else {
+            MyDialect::mariadb()
+        }))
+    }
+
+    async fn connect(&self, params: ConnectParams) -> DriverResult<Box<dyn Session>> {
+        Ok(Box::new(self.open(params).await?))
     }
 }
 

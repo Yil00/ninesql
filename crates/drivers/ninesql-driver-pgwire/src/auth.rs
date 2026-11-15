@@ -31,6 +31,9 @@ pub(crate) const SCRAM_SHA_256: &str = "SCRAM-SHA-256";
 /// default): a hostile server cannot make the client spin for minutes.
 const MAX_ITERATIONS: u32 = 1_000_000;
 
+/// PostgreSQL's default SCRAM iteration count; a lower count is logged as a warning.
+const MIN_RECOMMENDED_ITERATIONS: u32 = 4096;
+
 /// Authentication failure reason; never contains the password.
 #[derive(Debug)]
 pub(crate) struct AuthError(pub(crate) String);
@@ -159,6 +162,14 @@ impl Scram {
             return Err(AuthError(format!(
                 "SCRAM iteration count {iterations} is out of range"
             )));
+        }
+        if iterations < MIN_RECOMMENDED_ITERATIONS {
+            // A weak verifier (or a server lowering the cost on purpose): the exchange still
+            // runs, flagged in the log (the count only, nothing derived from the password).
+            tracing::warn!(
+                iterations,
+                "the server's SCRAM iteration count is below 4096 (PostgreSQL's default)"
+            );
         }
         let mut salted = Zeroizing::new([0u8; 32]);
         pbkdf2::derive(

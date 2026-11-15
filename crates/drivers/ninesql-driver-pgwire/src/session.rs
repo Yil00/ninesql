@@ -87,6 +87,50 @@ fn is_call(text: &str) -> bool {
 }
 
 impl PgSession {
+    /// Sends a statement that passed the classify gate of `Session::execute` (this crate's
+    /// tests also use it to skip the gate). Private: `class` is the dialect's classification.
+    async fn dispatch(
+        &mut self,
+        statement: Statement,
+        options: ExecOptions,
+        class: StatementClass,
+    ) -> DriverResult<ResultStream> {
+        let shared = &self.link.shared;
+        if self.log_statements {
+            tracing::trace!(statement = %statement.text, "pgwire execute");
+        }
+        let guard = self.link.tracker.begin()?;
+        let id = guard.id();
+        let exec = Arc::new(ExecCancel::default());
+        *self
+            .current_exec
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Arc::clone(&exec);
+        let canceller = self
+            .link
+            .tracker
+            .cancel_handle(id, self.engine_cancel(Arc::clone(&exec)));
+        let (demand_tx, demand_rx) = mpsc::channel(1);
+        let request = ExecRequest {
+            is_call: is_call(&statement.text),
+            auto_begin: !self.auto_commit && class != StatementClass::Transaction,
+            text: statement.text,
+            params: statement.params,
+            budget: options.budget,
+            class,
+            guard,
+            cancel: exec,
+            demands: demand_rx,
+        };
+        self.link
+            .tx
+            .send(Command::Execute(Box::new(request)))
+            .await
+            .map_err(|_| shared.closed_error())?;
+        let raw = Self::raw_stream(demand_tx, Arc::clone(shared));
+        Ok(ResultStream::new(raw, &options, canceller).with_execution(id))
+    }
+
     fn engine_cancel(&self, exec: Arc<ExecCancel>) -> Arc<dyn CancelHandle> {
         Arc::new(PgCancel {
             target: Arc::clone(&self.cancel_target),
@@ -225,39 +269,7 @@ impl Session for PgSession {
                 "statement refused: the session is read-only".into(),
             ));
         }
-        if self.log_statements {
-            tracing::trace!(statement = %statement.text, "pgwire execute");
-        }
-        let guard = self.link.tracker.begin()?;
-        let id = guard.id();
-        let exec = Arc::new(ExecCancel::default());
-        *self
-            .current_exec
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = Arc::clone(&exec);
-        let canceller = self
-            .link
-            .tracker
-            .cancel_handle(id, self.engine_cancel(Arc::clone(&exec)));
-        let (demand_tx, demand_rx) = mpsc::channel(1);
-        let request = ExecRequest {
-            is_call: is_call(&statement.text),
-            auto_begin: !self.auto_commit && class != StatementClass::Transaction,
-            text: statement.text,
-            params: statement.params,
-            budget: options.budget,
-            class,
-            guard,
-            cancel: exec,
-            demands: demand_rx,
-        };
-        self.link
-            .tx
-            .send(Command::Execute(Box::new(request)))
-            .await
-            .map_err(|_| shared.closed_error())?;
-        let raw = Self::raw_stream(demand_tx, Arc::clone(shared));
-        Ok(ResultStream::new(raw, &options, canceller).with_execution(id))
+        self.dispatch(statement, options, class).await
     }
 
     fn cancel_handle(&self) -> Arc<dyn CancelHandle> {
@@ -620,5 +632,165 @@ mod tests {
         assert!(!is_call("callme()"));
         assert!(!is_call("SELECT 1"));
         assert!(!is_call("cal"));
+    }
+}
+
+/// Security review follow-up: the driver's `SET TRANSACTION READ ONLY` re-assert, tested past
+/// the classifier. The one-shot `READ WRITE` comma form is sent through `dispatch` with a
+/// forged `Session` class, as a classifier gap would let it through; a following write must
+/// still fail engine-side. Skipped when the dev PostgreSQL is unreachable, unless
+/// `NINESQL_REQUIRE_ENGINES` lists `postgresql`.
+#[cfg(test)]
+mod read_only_reassert {
+    use std::time::Duration;
+
+    use ninesql_driver_api::{
+        Auth, ConnectParams, Endpoint, EngineId, ExecOptions, Secret, Session, Statement,
+        StatementClass, TlsMode,
+    };
+
+    use super::PgSession;
+    use crate::PgWireDriver;
+
+    const ONE_SHOT: &str = "SET TRANSACTION ISOLATION LEVEL READ COMMITTED, READ WRITE";
+    const WRITE: &str = "SELECT ninesql_test.reassert_write()";
+
+    fn dev_params() -> Option<ConnectParams> {
+        let path =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../../dev/engines.json");
+        let doc: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
+        let e = doc["engines"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|e| e["id"] == "postgresql")
+            .unwrap();
+        let host = e["host"].as_str().unwrap();
+        let port = u16::try_from(e["port"].as_u64().unwrap()).unwrap();
+        let addr = format!("{host}:{port}");
+        let reachable = addr
+            .parse()
+            .ok()
+            .and_then(|a| std::net::TcpStream::connect_timeout(&a, Duration::from_secs(2)).ok())
+            .is_some();
+        if !reachable {
+            let required = std::env::var("NINESQL_REQUIRE_ENGINES")
+                .unwrap_or_default()
+                .split(',')
+                .any(|s| s.trim() == "postgresql");
+            assert!(
+                !required,
+                "postgresql is required but unreachable at {addr}"
+            );
+            return None;
+        }
+        let mut p = ConnectParams::new(EngineId::POSTGRESQL, Endpoint::tcp(host, port));
+        p.auth = Auth::password(
+            e["user"].as_str().unwrap(),
+            Some(Secret::new(e["password"].as_str().unwrap().to_owned())),
+        );
+        p.database = Some(e["database"].as_str().unwrap().to_owned());
+        p.tls.mode = TlsMode::Disable;
+        p.application_name = "ninesql-pgwire-reassert".into();
+        Some(p)
+    }
+
+    async fn drain(
+        s: &mut PgSession,
+        sql: &str,
+        class: Option<StatementClass>,
+    ) -> Result<(), ninesql_driver_api::DriverError> {
+        let st = Statement::sql(sql);
+        let mut stream = match class {
+            // Past the classify gate of `Session::execute`.
+            Some(c) => s.dispatch(st, ExecOptions::default(), c).await?,
+            None => s.execute(st, ExecOptions::default()).await?,
+        };
+        while let Some(item) = stream.next().await {
+            item?;
+        }
+        Ok(())
+    }
+
+    async fn count(s: &mut PgSession) -> i64 {
+        let mut stream = s
+            .execute(
+                Statement::sql("SELECT count(*)::int8 FROM ninesql_test.reassert_written"),
+                ExecOptions::default(),
+            )
+            .await
+            .unwrap();
+        let mut n = None;
+        while let Some(item) = stream.next().await {
+            if let ninesql_driver_api::ResultItem::Rows(b) = item.unwrap() {
+                use ninesql_driver_api::arrow_array::cast::AsArray;
+                n = Some(
+                    b.column(0)
+                        .as_primitive::<ninesql_driver_api::arrow_array::types::Int64Type>()
+                        .value(0),
+                );
+            }
+        }
+        n.unwrap()
+    }
+
+    fn assert_refused(r: Result<(), ninesql_driver_api::DriverError>, case: &str) {
+        assert!(
+            matches!(r, Err(ninesql_driver_api::DriverError::ReadOnly(_))),
+            "{case}: write after a one-shot READ WRITE sent past the classifier: {r:?}"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn one_shot_read_write_past_the_classifier_cannot_write() {
+        let Some(params) = dev_params() else { return };
+        let driver = PgWireDriver::new();
+        let mut w = driver.open(dev_params().unwrap()).await.unwrap();
+        for sql in [
+            "CREATE SCHEMA IF NOT EXISTS ninesql_test",
+            "CREATE TABLE IF NOT EXISTS ninesql_test.reassert_written (a int)",
+            "CREATE OR REPLACE FUNCTION ninesql_test.reassert_write() RETURNS int LANGUAGE sql \
+             AS $$ INSERT INTO ninesql_test.reassert_written VALUES (1) RETURNING 1 $$",
+        ] {
+            drain(&mut w, sql, None).await.unwrap();
+        }
+        Box::new(w).close().await.unwrap();
+
+        let mut p = params;
+        p.read_only = true;
+        let mut s = driver.open(p).await.unwrap();
+        let before = count(&mut s).await;
+        for mode in ["autocommit", "manual", "explicit"] {
+            match mode {
+                "manual" => s.set_auto_commit(false).await.unwrap(),
+                "explicit" => {
+                    s.set_auto_commit(true).await.unwrap();
+                    s.begin().await.unwrap();
+                }
+                _ => {}
+            }
+            // Outside a transaction block PostgreSQL only warns; inside one it is accepted.
+            let _ = drain(&mut s, ONE_SHOT, Some(StatementClass::Session)).await;
+            assert_refused(drain(&mut s, WRITE, None).await, mode);
+            if s.in_transaction() {
+                s.rollback().await.unwrap();
+            }
+            assert!(s.is_read_only());
+        }
+        s.set_auto_commit(true).await.unwrap();
+        // Savepoints: the one-shot, then SAVEPOINT, a write, ROLLBACK TO, a write.
+        s.begin().await.unwrap();
+        drain(&mut s, ONE_SHOT, Some(StatementClass::Session))
+            .await
+            .unwrap();
+        s.savepoint("sp").await.unwrap();
+        assert_refused(drain(&mut s, WRITE, None).await, "after SAVEPOINT");
+        s.rollback_to_savepoint("sp").await.unwrap();
+        assert_refused(drain(&mut s, WRITE, None).await, "after ROLLBACK TO");
+        s.rollback().await.unwrap();
+        assert!(s.is_read_only());
+        assert_eq!(count(&mut s).await, before, "rows were written");
+        Box::new(s).close().await.unwrap();
     }
 }

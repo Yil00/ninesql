@@ -10,7 +10,7 @@ use ninesql_driver_api::{
     CancelHandle, Capabilities, ColumnInfo, Dialect, DriverError, DriverResult, ExecOptions,
     ExecutionTracker, Feature, IsolationLevel, Metadata, ObjectDetails, ObjectInfo, ObjectKind,
     ObjectPath, Page, PageRequest, QueryLanguage, ResultItem, ResultStream, Session, Statement,
-    TableInfo, ensure_single_statement, escape_like,
+    StatementClass, TableInfo, ensure_single_statement, escape_like,
 };
 use tokio::sync::{mpsc, oneshot};
 
@@ -79,6 +79,48 @@ impl std::fmt::Debug for MySession {
 }
 
 impl MySession {
+    /// Sends a statement that passed the classify gate of `Session::execute` (this crate's
+    /// tests also use it to skip the gate). Private: `class` is the dialect's classification.
+    async fn dispatch(
+        &mut self,
+        statement: Statement,
+        options: ExecOptions,
+        class: StatementClass,
+    ) -> DriverResult<ResultStream> {
+        let shared = &self.link.shared;
+        let text = self.dialect.bind(&statement.text, &statement.params)?;
+        if self.log_statements {
+            tracing::trace!(statement = %statement.text, "mysqlwire execute");
+        }
+        let guard = self.link.tracker.begin()?;
+        let id = guard.id();
+        let exec = Arc::new(ExecCancel::default());
+        *self
+            .current_exec
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Arc::clone(&exec);
+        let canceller = self
+            .link
+            .tracker
+            .cancel_handle(id, self.engine_cancel(Arc::clone(&exec)));
+        let (demand_tx, demand_rx) = mpsc::channel(1);
+        let request = ExecRequest {
+            text,
+            budget: options.budget,
+            class,
+            guard,
+            cancel: exec,
+            demands: demand_rx,
+        };
+        self.link
+            .tx
+            .send(Command::Execute(Box::new(request)))
+            .await
+            .map_err(|_| shared.closed_error())?;
+        let raw = Self::raw_stream(demand_tx, Arc::clone(shared));
+        Ok(ResultStream::new(raw, &options, canceller).with_execution(id))
+    }
+
     fn engine_cancel(&self, exec: Arc<ExecCancel>) -> Arc<dyn CancelHandle> {
         Arc::new(MyCancel {
             control: Arc::clone(&self.control),
@@ -233,37 +275,7 @@ impl Session for MySession {
                 "statement refused: the session is read-only".into(),
             ));
         }
-        let text = self.dialect.bind(&statement.text, &statement.params)?;
-        if self.log_statements {
-            tracing::trace!(statement = %statement.text, "mysqlwire execute");
-        }
-        let guard = self.link.tracker.begin()?;
-        let id = guard.id();
-        let exec = Arc::new(ExecCancel::default());
-        *self
-            .current_exec
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = Arc::clone(&exec);
-        let canceller = self
-            .link
-            .tracker
-            .cancel_handle(id, self.engine_cancel(Arc::clone(&exec)));
-        let (demand_tx, demand_rx) = mpsc::channel(1);
-        let request = ExecRequest {
-            text,
-            budget: options.budget,
-            class,
-            guard,
-            cancel: exec,
-            demands: demand_rx,
-        };
-        self.link
-            .tx
-            .send(Command::Execute(Box::new(request)))
-            .await
-            .map_err(|_| shared.closed_error())?;
-        let raw = Self::raw_stream(demand_tx, Arc::clone(shared));
-        Ok(ResultStream::new(raw, &options, canceller).with_execution(id))
+        self.dispatch(statement, options, class).await
     }
 
     fn cancel_handle(&self) -> Arc<dyn CancelHandle> {
@@ -594,5 +606,168 @@ mod tests {
             " AND CAST(TABLE_NAME AS BINARY) LIKE X'2561215F21252725' ESCAPE '!'"
         );
         assert!(cursor_clause("k", None).is_empty());
+    }
+}
+
+/// Security review follow-up: the driver's `SET SESSION TRANSACTION READ ONLY` re-assert,
+/// tested past the classifier. The one-shot `READ WRITE` comma form is sent through `dispatch`
+/// with a forged `Session` class, as a classifier gap would let it through; a following write
+/// must still fail engine-side. Each engine is skipped when unreachable, unless
+/// `NINESQL_REQUIRE_ENGINES` lists it.
+#[cfg(test)]
+mod read_only_reassert {
+    use std::time::Duration;
+
+    use ninesql_driver_api::{
+        Auth, ConnectParams, DriverError, Endpoint, EngineId, ExecOptions, Secret, Session,
+        Statement, StatementClass, TlsMode,
+    };
+
+    use super::MySession;
+    use crate::MySqlWireDriver;
+
+    const ONE_SHOT: &str = "SET TRANSACTION ISOLATION LEVEL READ COMMITTED, READ WRITE";
+    const WRITE: &str = "SELECT ninesql_reassert_write()";
+
+    fn dev_params(id: &str, engine: EngineId) -> Option<ConnectParams> {
+        let path =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../../dev/engines.json");
+        let doc: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
+        let e = doc["engines"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|e| e["id"] == id)
+            .unwrap();
+        let host = e["host"].as_str().unwrap();
+        let port = u16::try_from(e["port"].as_u64().unwrap()).unwrap();
+        let addr = format!("{host}:{port}");
+        let reachable = addr
+            .parse()
+            .ok()
+            .and_then(|a| std::net::TcpStream::connect_timeout(&a, Duration::from_secs(2)).ok())
+            .is_some();
+        if !reachable {
+            let required = std::env::var("NINESQL_REQUIRE_ENGINES")
+                .unwrap_or_default()
+                .split(',')
+                .any(|s| s.trim() == id);
+            assert!(!required, "{id} is required but unreachable at {addr}");
+            return None;
+        }
+        let mut p = ConnectParams::new(engine, Endpoint::tcp(host, port));
+        p.auth = Auth::password(
+            e["user"].as_str().unwrap(),
+            Some(Secret::new(e["password"].as_str().unwrap().to_owned())),
+        );
+        p.database = Some(e["database"].as_str().unwrap().to_owned());
+        p.tls.mode = TlsMode::Disable;
+        p.application_name = "ninesql-mysqlwire-reassert".into();
+        Some(p)
+    }
+
+    async fn drain(
+        s: &mut MySession,
+        sql: &str,
+        class: Option<StatementClass>,
+    ) -> Result<(), DriverError> {
+        let st = Statement::sql(sql);
+        let mut stream = match class {
+            // Past the classify gate of `Session::execute`.
+            Some(c) => s.dispatch(st, ExecOptions::default(), c).await?,
+            None => s.execute(st, ExecOptions::default()).await?,
+        };
+        while let Some(item) = stream.next().await {
+            item?;
+        }
+        Ok(())
+    }
+
+    async fn count(s: &mut MySession) -> String {
+        let mut stream = s
+            .execute(
+                Statement::sql("SELECT CAST(COUNT(*) AS CHAR) FROM ninesql_reassert_written"),
+                ExecOptions::default(),
+            )
+            .await
+            .unwrap();
+        let mut n = None;
+        while let Some(item) = stream.next().await {
+            if let ninesql_driver_api::ResultItem::Rows(b) = item.unwrap() {
+                use ninesql_driver_api::arrow_array::cast::AsArray;
+                n = Some(b.column(0).as_string::<i32>().value(0).to_owned());
+            }
+        }
+        n.unwrap()
+    }
+
+    fn assert_refused(r: Result<(), DriverError>, case: &str) {
+        assert!(
+            matches!(r, Err(DriverError::ReadOnly(_))),
+            "{case}: write after a one-shot READ WRITE sent past the classifier: {r:?}"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn one_shot_read_write_past_the_classifier_cannot_write() {
+        let driver = MySqlWireDriver::new();
+        for (id, engine) in [("mysql", EngineId::MYSQL), ("mariadb", EngineId::MARIADB)] {
+            let Some(params) = dev_params(id, engine.clone()) else {
+                continue;
+            };
+            let mut w = driver.open(dev_params(id, engine).unwrap()).await.unwrap();
+            for sql in [
+                "CREATE TABLE IF NOT EXISTS ninesql_reassert_written (a INT)",
+                "DROP FUNCTION IF EXISTS ninesql_reassert_write",
+                "CREATE FUNCTION ninesql_reassert_write() RETURNS INT DETERMINISTIC MODIFIES \
+                 SQL DATA BEGIN INSERT INTO ninesql_reassert_written VALUES (1); RETURN 1; END",
+            ] {
+                drain(&mut w, sql, None).await.unwrap();
+            }
+            Box::new(w).close().await.unwrap();
+
+            let mut p = params;
+            p.read_only = true;
+            let mut s = driver.open(p).await.unwrap();
+            let before = count(&mut s).await;
+            // MySQL refuses transaction characteristics inside a transaction (1568): the
+            // one-shot is sent between transactions and applies to the next one.
+            for mode in ["autocommit", "manual", "explicit"] {
+                s.set_auto_commit(mode != "manual").await.unwrap();
+                drain(&mut s, ONE_SHOT, Some(StatementClass::Session))
+                    .await
+                    .unwrap();
+                if mode == "explicit" {
+                    s.begin().await.unwrap();
+                }
+                assert_refused(drain(&mut s, WRITE, None).await, &format!("{id} {mode}"));
+                if mode != "autocommit" {
+                    s.rollback().await.unwrap();
+                }
+                assert!(s.is_read_only());
+            }
+            s.set_auto_commit(true).await.unwrap();
+            // Savepoints: the one-shot, a new transaction, SAVEPOINT, a write, ROLLBACK TO, a
+            // write.
+            drain(&mut s, ONE_SHOT, Some(StatementClass::Session))
+                .await
+                .unwrap();
+            s.begin().await.unwrap();
+            s.savepoint("sp").await.unwrap();
+            assert_refused(
+                drain(&mut s, WRITE, None).await,
+                &format!("{id} after SAVEPOINT"),
+            );
+            s.rollback_to_savepoint("sp").await.unwrap();
+            assert_refused(
+                drain(&mut s, WRITE, None).await,
+                &format!("{id} after ROLLBACK TO"),
+            );
+            s.rollback().await.unwrap();
+            assert!(s.is_read_only());
+            assert_eq!(count(&mut s).await, before, "{id}: rows were written");
+            Box::new(s).close().await.unwrap();
+        }
     }
 }

@@ -610,11 +610,11 @@ impl Actor {
                     .into(),
             ));
         }
-        // `SET TRANSACTION … READ WRITE` (also its comma form `SET TRANSACTION ISOLATION LEVEL
-        // READ COMMITTED, READ WRITE`, which the shared classifier sees as `Session`) makes the
-        // open transaction writable without touching `default_transaction_read_only`, so the
-        // check above cannot see it. Inside a transaction block, re-assert read-only for the
-        // transaction (always allowed: only going read-write is restricted).
+        // `SET TRANSACTION … READ WRITE` makes the open transaction writable without touching
+        // `default_transaction_read_only`, so the check above cannot see it. The classifier
+        // refuses its known forms (the comma form included) client-side; this re-assert is
+        // defence in depth against classifier gaps. Inside a transaction block, re-assert
+        // read-only for the transaction (always allowed: only going read-write is restricted).
         if self.conn.txn_status == b'T'
             && let Err(e) = self.internal("SET TRANSACTION READ ONLY", &[], 0).await
         {

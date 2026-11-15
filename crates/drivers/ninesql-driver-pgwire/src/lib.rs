@@ -106,6 +106,179 @@ pub struct PgWireDriver {
 const ENGINES: &[EngineId] = &[EngineId::POSTGRESQL];
 
 impl PgWireDriver {
+    /// `Driver::connect` with the concrete session type (crate-internal tests use it).
+    async fn open(&self, params: ConnectParams) -> DriverResult<PgSession> {
+        Self::check_engine(&params.engine)?;
+        // Before any network traffic: properties, endpoint, credentials, TLS files.
+        let declared = postgres_capabilities(None);
+        declared.check_properties(&params.properties)?;
+        declared.connect.check_connect_params(&params)?;
+        let extra = accepted_properties(&params.properties)?;
+        let log_statements = params.may_log_statements();
+        let scram_only = params.password_exchange == PasswordExchange::ScramOnly;
+        let ConnectParams {
+            endpoint,
+            auth,
+            database,
+            tls,
+            tunnel,
+            read_only,
+            auto_commit,
+            connect_timeout,
+            init_statements,
+            application_name,
+            ..
+        } = params;
+        let Endpoint::Tcp { host, port } = endpoint else {
+            return Err(DriverError::InvalidParams(
+                "PostgreSQL needs a host and a port".into(),
+            ));
+        };
+        let (user, password) = match auth {
+            Auth::Password { user, password, .. } => (user, password),
+            Auth::None => {
+                return Err(DriverError::InvalidParams(
+                    "PostgreSQL needs a user name".into(),
+                ));
+            }
+            _ => {
+                return Err(DriverError::InvalidParams(
+                    "PostgreSQL authenticates with a user name and a password".into(),
+                ));
+            }
+        };
+        if application_name.contains('\0') || user.contains('\0') {
+            return Err(DriverError::InvalidParams(
+                "the user or application name holds a NUL character".into(),
+            ));
+        }
+        let tls_setup = tls::setup(&tls, &host)?;
+        if tls.mode.is_downgrade() {
+            tracing::warn!(mode = ?tls.mode, "TLS below verify-full for this connection");
+        }
+        let scs = Arc::new(AtomicBool::new(true));
+        let verified_tls = matches!(tls.mode, TlsMode::VerifyCa | TlsMode::VerifyFull);
+        let strict_tunnel = tunnel
+            .as_ref()
+            .is_some_and(|t| t.weakest_host_key() == HostKeyVerification::Strict)
+            && is_loopback_host(&host);
+        let handshake = async {
+            let (io, peer) = open_transport(&host, port, tls_setup.as_ref()).await?;
+            // Protected: verified TLS, or an SSH tunnel with verified host keys whose local end
+            // really is on this machine. `require` (unverified TLS) is not protected.
+            let startup = Startup {
+                user: &user,
+                database: database.as_deref(),
+                application_name: &application_name,
+                extra: &extra,
+                protected_transport: verified_tls || (strict_tunnel && peer.ip().is_loopback()),
+                scram_only,
+            };
+            let conn = Conn::startup(io, Arc::clone(&scs), &startup, password.as_ref()).await?;
+            DriverResult::Ok((conn, peer))
+        };
+        let outcome = tokio::time::timeout(connect_timeout, handshake).await;
+        // Errors may echo what the client sent: mask the password before it is dropped.
+        let redact = |e: DriverError| -> DriverError {
+            let clean = |m: String| {
+                let m = match &password {
+                    Some(p) => redact_secret(&m, p),
+                    None => m,
+                };
+                redact_connection_string(&m)
+            };
+            match e {
+                DriverError::Connect(m) => DriverError::Connect(clean(m)),
+                DriverError::Auth(m) => DriverError::Auth(clean(m)),
+                DriverError::Tls(m) => DriverError::Tls(clean(m)),
+                DriverError::Protocol(m) => DriverError::Connect(clean(m)),
+                DriverError::Closed(m) => DriverError::Connect(clean(m)),
+                other => other,
+            }
+        };
+        let outcome = match outcome {
+            Ok(Ok(v)) => Ok(v),
+            Ok(Err(e)) => Err(redact(e)),
+            Err(_) => Err(DriverError::Connect(format!(
+                "no answer from {host}:{port} within {connect_timeout:?}"
+            ))),
+        };
+        // The password is not needed any more (`retains_secret_after_connect = false`).
+        drop(password);
+        let (conn, peer) = outcome?;
+        if conn
+            .server
+            .get("client_encoding")
+            .is_some_and(|e| !e.eq_ignore_ascii_case("UTF8"))
+        {
+            return Err(DriverError::Connect(
+                "the server did not accept the UTF8 client encoding".into(),
+            ));
+        }
+        let version = conn.server.get("server_version").map(str::to_owned);
+        let shared = Arc::new(Shared::new(conn.server.major_version(), conn.txn_status));
+        let cancel_target = Arc::new(CancelTarget {
+            addr: peer,
+            tls: tls_setup,
+            process_id: conn.process_id,
+            secret_key: conn.secret_key,
+        });
+        let (tx, rx) = mpsc::channel(8);
+        let actor = Actor::new(conn, Arc::clone(&shared), Arc::clone(&cancel_target));
+        tokio::spawn(actor.run(rx));
+        let mut session = PgSession {
+            link: session::Link {
+                tx,
+                shared,
+                tracker: ninesql_driver_api::ExecutionTracker::new(),
+            },
+            capabilities: postgres_capabilities(version.as_deref()),
+            dialect: Arc::new(PgDialect::tracking(scs)),
+            cancel_target,
+            auto_commit,
+            log_statements,
+            current_exec: std::sync::Mutex::new(Arc::default()),
+        };
+        tracing::debug!(
+            server_version = version.as_deref().unwrap_or("unknown"),
+            read_only,
+            "pgwire session opened"
+        );
+        // Read-only before anything else, init statements after it (I3).
+        let setup = async {
+            if read_only {
+                session.apply_read_only(true).await?;
+            }
+            for sql in &init_statements {
+                let mut stream = session
+                    .execute(Statement::sql(sql.as_str()), ExecOptions::default())
+                    .await?;
+                while let Some(item) = stream.next().await {
+                    item?;
+                }
+            }
+            DriverResult::Ok(())
+        };
+        match tokio::time::timeout(connect_timeout, setup).await {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => {
+                let _ = Box::new(session).close().await;
+                return Err(e);
+            }
+            Err(_) => {
+                let _ = Box::new(session).close().await;
+                return Err(DriverError::Connect(
+                    "session setup did not finish within the connect timeout".into(),
+                ));
+            }
+        }
+        debug_assert_eq!(
+            session.link.shared.read_only.load(Ordering::SeqCst),
+            read_only
+        );
+        Ok(session)
+    }
+
     /// The driver.
     #[must_use]
     pub fn new() -> Self {
@@ -290,175 +463,7 @@ impl Driver for PgWireDriver {
     }
 
     async fn connect(&self, params: ConnectParams) -> DriverResult<Box<dyn Session>> {
-        Self::check_engine(&params.engine)?;
-        // Before any network traffic: properties, endpoint, credentials, TLS files.
-        let declared = postgres_capabilities(None);
-        declared.check_properties(&params.properties)?;
-        declared.connect.check_connect_params(&params)?;
-        let extra = accepted_properties(&params.properties)?;
-        let log_statements = params.may_log_statements();
-        let scram_only = params.password_exchange == PasswordExchange::ScramOnly;
-        let ConnectParams {
-            endpoint,
-            auth,
-            database,
-            tls,
-            tunnel,
-            read_only,
-            auto_commit,
-            connect_timeout,
-            init_statements,
-            application_name,
-            ..
-        } = params;
-        let Endpoint::Tcp { host, port } = endpoint else {
-            return Err(DriverError::InvalidParams(
-                "PostgreSQL needs a host and a port".into(),
-            ));
-        };
-        let (user, password) = match auth {
-            Auth::Password { user, password, .. } => (user, password),
-            Auth::None => {
-                return Err(DriverError::InvalidParams(
-                    "PostgreSQL needs a user name".into(),
-                ));
-            }
-            _ => {
-                return Err(DriverError::InvalidParams(
-                    "PostgreSQL authenticates with a user name and a password".into(),
-                ));
-            }
-        };
-        if application_name.contains('\0') || user.contains('\0') {
-            return Err(DriverError::InvalidParams(
-                "the user or application name holds a NUL character".into(),
-            ));
-        }
-        let tls_setup = tls::setup(&tls, &host)?;
-        if tls.mode.is_downgrade() {
-            tracing::warn!(mode = ?tls.mode, "TLS below verify-full for this connection");
-        }
-        let scs = Arc::new(AtomicBool::new(true));
-        let verified_tls = matches!(tls.mode, TlsMode::VerifyCa | TlsMode::VerifyFull);
-        let strict_tunnel = tunnel
-            .as_ref()
-            .is_some_and(|t| t.weakest_host_key() == HostKeyVerification::Strict)
-            && is_loopback_host(&host);
-        let handshake = async {
-            let (io, peer) = open_transport(&host, port, tls_setup.as_ref()).await?;
-            // Protected: verified TLS, or an SSH tunnel with verified host keys whose local end
-            // really is on this machine. `require` (unverified TLS) is not protected.
-            let startup = Startup {
-                user: &user,
-                database: database.as_deref(),
-                application_name: &application_name,
-                extra: &extra,
-                protected_transport: verified_tls || (strict_tunnel && peer.ip().is_loopback()),
-                scram_only,
-            };
-            let conn = Conn::startup(io, Arc::clone(&scs), &startup, password.as_ref()).await?;
-            DriverResult::Ok((conn, peer))
-        };
-        let outcome = tokio::time::timeout(connect_timeout, handshake).await;
-        // Errors may echo what the client sent: mask the password before it is dropped.
-        let redact = |e: DriverError| -> DriverError {
-            let clean = |m: String| {
-                let m = match &password {
-                    Some(p) => redact_secret(&m, p),
-                    None => m,
-                };
-                redact_connection_string(&m)
-            };
-            match e {
-                DriverError::Connect(m) => DriverError::Connect(clean(m)),
-                DriverError::Auth(m) => DriverError::Auth(clean(m)),
-                DriverError::Tls(m) => DriverError::Tls(clean(m)),
-                DriverError::Protocol(m) => DriverError::Connect(clean(m)),
-                DriverError::Closed(m) => DriverError::Connect(clean(m)),
-                other => other,
-            }
-        };
-        let outcome = match outcome {
-            Ok(Ok(v)) => Ok(v),
-            Ok(Err(e)) => Err(redact(e)),
-            Err(_) => Err(DriverError::Connect(format!(
-                "no answer from {host}:{port} within {connect_timeout:?}"
-            ))),
-        };
-        // The password is not needed any more (`retains_secret_after_connect = false`).
-        drop(password);
-        let (conn, peer) = outcome?;
-        if conn
-            .server
-            .get("client_encoding")
-            .is_some_and(|e| !e.eq_ignore_ascii_case("UTF8"))
-        {
-            return Err(DriverError::Connect(
-                "the server did not accept the UTF8 client encoding".into(),
-            ));
-        }
-        let version = conn.server.get("server_version").map(str::to_owned);
-        let shared = Arc::new(Shared::new(conn.server.major_version(), conn.txn_status));
-        let cancel_target = Arc::new(CancelTarget {
-            addr: peer,
-            tls: tls_setup,
-            process_id: conn.process_id,
-            secret_key: conn.secret_key,
-        });
-        let (tx, rx) = mpsc::channel(8);
-        let actor = Actor::new(conn, Arc::clone(&shared), Arc::clone(&cancel_target));
-        tokio::spawn(actor.run(rx));
-        let mut session = PgSession {
-            link: session::Link {
-                tx,
-                shared,
-                tracker: ninesql_driver_api::ExecutionTracker::new(),
-            },
-            capabilities: postgres_capabilities(version.as_deref()),
-            dialect: Arc::new(PgDialect::tracking(scs)),
-            cancel_target,
-            auto_commit,
-            log_statements,
-            current_exec: std::sync::Mutex::new(Arc::default()),
-        };
-        tracing::debug!(
-            server_version = version.as_deref().unwrap_or("unknown"),
-            read_only,
-            "pgwire session opened"
-        );
-        // Read-only before anything else, init statements after it (I3).
-        let setup = async {
-            if read_only {
-                session.apply_read_only(true).await?;
-            }
-            for sql in &init_statements {
-                let mut stream = session
-                    .execute(Statement::sql(sql.as_str()), ExecOptions::default())
-                    .await?;
-                while let Some(item) = stream.next().await {
-                    item?;
-                }
-            }
-            DriverResult::Ok(())
-        };
-        match tokio::time::timeout(connect_timeout, setup).await {
-            Ok(Ok(())) => {}
-            Ok(Err(e)) => {
-                let _ = Box::new(session).close().await;
-                return Err(e);
-            }
-            Err(_) => {
-                let _ = Box::new(session).close().await;
-                return Err(DriverError::Connect(
-                    "session setup did not finish within the connect timeout".into(),
-                ));
-            }
-        }
-        debug_assert_eq!(
-            session.link.shared.read_only.load(Ordering::SeqCst),
-            read_only
-        );
-        Ok(Box::new(session))
+        Ok(Box::new(self.open(params).await?))
     }
 }
 
