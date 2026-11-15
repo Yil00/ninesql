@@ -1,0 +1,838 @@
+//! The SQL editor view: gpui-component's code editor (`EditorState`, tree-sitter SQL
+//! highlighting, search / replace, multi-cursor, folding, completion menu, diagnostics) wrapped
+//! with NineSQL's commit-path hygiene, execution requests, parameters prompt, error positions
+//! and bidirectional-control warnings.
+
+use std::ops::Range;
+use std::rc::Rc;
+
+use gpui_kit::component::button::{Button, ButtonVariants as _};
+use gpui_kit::component::highlighter::{Diagnostic, DiagnosticSeverity};
+use gpui_kit::component::input::{
+    Editor, EditorState, Input, InputEditsEvent, InputState, Paste, Replace, RopeExt as _, Search,
+    ShowCompletions,
+};
+use gpui_kit::component::{ActiveTheme as _, Selectable as _, Sizable as _, h_flex, v_flex};
+use gpui_kit::prelude::FluentBuilder as _;
+use gpui_kit::*;
+use ninesql_core::ConnectionId;
+
+use crate::actions::{
+    CancelExecution, EDITOR_CONTEXT, ExecuteScript, ExecuteSelection, ExecuteStatement, Find,
+    FindReplace, GoToError, SelectBidiControls, SelectNextOccurrence, ToggleComment,
+    TriggerCompletion,
+};
+use crate::completion::{CompletionEngine, MetadataProvider, NoMetadata, SqlCompletionProvider};
+use crate::edit_ops::{next_occurrence, toggle_line_comment, word_at};
+use crate::execution::{
+    ExecutionKind, ExecutionPlan, ExecutionRequest, ExecutionSink, PlacedError, RequestId,
+    StatementError, place_error,
+};
+use crate::hygiene::{self, BidiControl};
+use crate::params::{ParameterPrompt, ParameterStyle};
+use crate::script::ScriptPath;
+use crate::split::StatementSplitter;
+
+/// What the editor needs from its connection: the dialect's splitter, parameter style and
+/// completion settings, and the metadata cache.
+#[derive(Clone)]
+pub struct EditorSetup {
+    /// The dialect's splitting.
+    pub splitter: Rc<dyn StatementSplitter>,
+    /// Placeholder syntax of the dialect.
+    pub parameter_style: ParameterStyle,
+    /// Keywords and quoting for completion.
+    pub completion: CompletionEngine,
+    /// The core's metadata cache for the connection.
+    pub metadata: Rc<dyn MetadataProvider>,
+}
+
+impl EditorSetup {
+    /// Setup over a splitter, with ANSI parameters, keywords and no metadata.
+    #[must_use]
+    pub fn new(splitter: Rc<dyn StatementSplitter>) -> Self {
+        Self {
+            splitter,
+            parameter_style: ParameterStyle::ANSI,
+            completion: CompletionEngine::new(crate::completion::KeywordSet::Ansi),
+            metadata: Rc::new(NoMetadata),
+        }
+    }
+}
+
+/// An error shown in the editor.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ShownError {
+    /// Display-only engine message.
+    pub message: String,
+    /// Where it is in the document, when known and the statement was not edited since.
+    pub placed: Option<PlacedError>,
+}
+
+struct PendingRun {
+    plan: ExecutionPlan,
+    prompt: ParameterPrompt,
+    inputs: Vec<Entity<InputState>>,
+    nulls: Vec<bool>,
+}
+
+/// The SQL editor view.
+pub struct SqlEditor {
+    editor: Entity<EditorState>,
+    setup: EditorSetup,
+    sink: Option<Rc<dyn ExecutionSink>>,
+    connection: Option<ConnectionId>,
+    script: Option<ScriptPath>,
+    next_request: u64,
+    /// The last request, **without its parameter values** (I1: not kept after execution).
+    last_request: Option<ExecutionRequest>,
+    running: Option<RequestId>,
+    pending: Option<PendingRun>,
+    error: Option<ShownError>,
+    notice: Option<SharedString>,
+    bidi: Vec<BidiControl>,
+    removed_controls: usize,
+    occurrences: Vec<Range<usize>>,
+    _subscriptions: Vec<Subscription>,
+}
+
+impl SqlEditor {
+    /// An empty editor.
+    pub fn new(setup: EditorSetup, window: &mut Window, cx: &mut Context<Self>) -> Self {
+        let editor = cx.new(|cx| {
+            EditorState::new(window, cx)
+                .language("sql")
+                .line_number(true)
+                .folding(true)
+        });
+        let provider = SqlCompletionProvider::new(
+            setup.completion.clone(),
+            setup.splitter.clone(),
+            setup.metadata.clone(),
+        );
+        editor.update(cx, |state, _| {
+            state.lsp_mut().completion_provider = Some(Rc::new(provider));
+        });
+        let subscriptions = vec![cx.subscribe_in(&editor, window, Self::on_edits)];
+        Self {
+            editor,
+            setup,
+            sink: None,
+            connection: None,
+            script: None,
+            next_request: 1,
+            last_request: None,
+            running: None,
+            pending: None,
+            error: None,
+            notice: None,
+            bidi: Vec::new(),
+            removed_controls: 0,
+            occurrences: Vec::new(),
+            _subscriptions: subscriptions,
+        }
+    }
+
+    /// The underlying gpui-component editor state.
+    #[must_use]
+    pub fn editor(&self) -> &Entity<EditorState> {
+        &self.editor
+    }
+
+    /// The document text.
+    #[must_use]
+    pub fn text(&self, cx: &App) -> String {
+        self.editor.read(cx).value().to_string()
+    }
+
+    /// Replaces the document (a script just read by the storage layer), sanitized like typed
+    /// text. Returns the number of characters removed or changed.
+    pub fn set_text(&mut self, text: &str, window: &mut Window, cx: &mut Context<Self>) -> usize {
+        let fixes = hygiene::fixes(text);
+        let clean = hygiene::apply_fixes(text, &fixes);
+        self.editor
+            .update(cx, |s, cx| s.set_value(clean.clone(), window, cx));
+        self.removed_controls = fixes.len();
+        self.error = None;
+        self.last_request = None;
+        self.refresh_bidi(&clean, cx);
+        cx.notify();
+        fixes.len()
+    }
+
+    /// Sends execution requests to `sink` (the core's execution service).
+    pub fn set_sink(&mut self, sink: Rc<dyn ExecutionSink>) {
+        self.sink = Some(sink);
+    }
+
+    /// The connection runs go to.
+    pub fn set_connection(&mut self, connection: Option<ConnectionId>, cx: &mut Context<Self>) {
+        self.connection = connection;
+        cx.notify();
+    }
+
+    /// The editor's connection.
+    #[must_use]
+    pub fn connection(&self) -> Option<ConnectionId> {
+        self.connection
+    }
+
+    /// The script file shown, if saved.
+    pub fn set_script(&mut self, script: Option<ScriptPath>, cx: &mut Context<Self>) {
+        self.script = script;
+        cx.notify();
+    }
+
+    /// The script file shown.
+    #[must_use]
+    pub fn script(&self) -> Option<&ScriptPath> {
+        self.script.as_ref()
+    }
+
+    /// The current error, if any.
+    #[must_use]
+    pub fn error(&self) -> Option<&ShownError> {
+        self.error.as_ref()
+    }
+
+    /// The last info message ("nothing to run here"…).
+    #[must_use]
+    pub fn notice(&self) -> Option<&SharedString> {
+        self.notice.as_ref()
+    }
+
+    /// Bidirectional control characters in the document.
+    #[must_use]
+    pub fn bidi_controls(&self) -> &[BidiControl] {
+        &self.bidi
+    }
+
+    /// Control characters removed from typed, committed or pasted text since the editor opened.
+    #[must_use]
+    pub fn removed_controls(&self) -> usize {
+        self.removed_controls
+    }
+
+    /// Whether the parameters prompt is open.
+    #[must_use]
+    pub fn is_prompting(&self) -> bool {
+        self.pending.is_some()
+    }
+
+    /// Labels of the open prompt's entries.
+    #[must_use]
+    pub fn prompt_labels(&self) -> Vec<String> {
+        self.pending.as_ref().map_or_else(Vec::new, |p| {
+            p.prompt.entries().iter().map(|e| e.label()).collect()
+        })
+    }
+
+    /// The request running, if any.
+    #[must_use]
+    pub fn running(&self) -> Option<RequestId> {
+        self.running
+    }
+
+    // --- commit-path hygiene -----------------------------------------------------------------
+
+    fn on_edits(
+        &mut self,
+        state: &Entity<EditorState>,
+        event: &InputEditsEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let mut dirty = false;
+        let mut bidi_touched = !self.bidi.is_empty();
+        for (edit, rope) in event.edits() {
+            let end = edit.new_end_byte.min(rope.len());
+            let start = edit.start_byte.min(end);
+            let inserted = rope.slice(start..end).to_string();
+            dirty |= hygiene::needs_sanitizing(&inserted);
+            bidi_touched |= !hygiene::find_bidi_controls(&inserted).is_empty();
+        }
+        // Never rewrite text under an open IME composition: the commit comes back here.
+        let composing = state.update(cx, |s, cx| {
+            use gpui_kit::EntityInputHandler as _;
+            s.marked_text_range(window, cx).is_some()
+        });
+        if dirty && !composing {
+            self.scrub(window, cx);
+        }
+        if bidi_touched {
+            let text = self.text(cx);
+            self.refresh_bidi(&text, cx);
+        }
+        self.occurrences.clear();
+    }
+
+    /// Repairs the document in place: the minimal edits of [`hygiene::fixes`], cursor kept.
+    fn scrub(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let text = self.text(cx);
+        let fixes = hygiene::fixes(&text);
+        if fixes.is_empty() {
+            return;
+        }
+        self.removed_controls += fixes.len();
+        let cursor = self.editor.read(cx).cursor();
+        let shift: isize = fixes
+            .iter()
+            .filter(|(r, _)| r.end <= cursor)
+            .map(|(r, rep)| rep.len() as isize - r.len() as isize)
+            .sum();
+        let new_cursor = cursor.saturating_add_signed(shift);
+        self.editor.update(cx, |s, cx| {
+            for (range, rep) in fixes.iter().rev() {
+                s.set_selected_range(range.clone(), cx);
+                s.replace(*rep, window, cx);
+            }
+            s.set_selected_range(new_cursor..new_cursor, cx);
+        });
+        self.notice = Some(SharedString::from(format!(
+            "{} control character(s) removed from the inserted text",
+            fixes.len()
+        )));
+        cx.notify();
+    }
+
+    /// Paste: sanitized before it reaches the editor when the clipboard holds control
+    /// characters (otherwise gpui-component's own paste runs, with its multi-cursor handling).
+    fn on_paste(&mut self, _: &Paste, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(text) = cx.read_from_clipboard().and_then(|c| c.text()) else {
+            return;
+        };
+        if !hygiene::needs_sanitizing(&text) {
+            return;
+        }
+        cx.stop_propagation();
+        let fixes = hygiene::fixes(&text);
+        let clean = hygiene::apply_fixes(&text, &fixes);
+        self.removed_controls += fixes.len();
+        self.editor
+            .update(cx, |s, cx| s.replace(clean.clone(), window, cx));
+        self.notice = Some(SharedString::from(format!(
+            "{} control character(s) removed from the pasted text",
+            fixes.len()
+        )));
+        cx.notify();
+    }
+
+    fn refresh_bidi(&mut self, text: &str, cx: &mut Context<Self>) {
+        self.bidi = hygiene::find_bidi_controls(text);
+        self.refresh_diagnostics(cx);
+    }
+
+    /// Rebuilds the editor's diagnostics: the error (if placed) and one warning per
+    /// bidirectional control, so each is underlined and listed in the gutter.
+    fn refresh_diagnostics(&mut self, cx: &mut Context<Self>) {
+        let text = self.text(cx);
+        let error = self.error.clone();
+        let bidi = self.bidi.clone();
+        self.editor.update(cx, |s, cx| {
+            let rope = s.text().clone();
+            let Some(set) = s.diagnostics_mut() else {
+                return;
+            };
+            set.reset(&rope);
+            if let Some(ShownError {
+                message,
+                placed: Some(placed),
+            }) = &error
+            {
+                let range = if placed.range.is_empty() {
+                    placed.range.start..placed.range.start
+                } else {
+                    placed.range.clone()
+                };
+                set.push(
+                    Diagnostic::new(
+                        rope.offset_to_position(range.start)..rope.offset_to_position(range.end),
+                        message.clone(),
+                    )
+                    .with_severity(DiagnosticSeverity::Error),
+                );
+            }
+            for b in &bidi {
+                let range = b.highlight_range(&text);
+                set.push(
+                    Diagnostic::new(
+                        rope.offset_to_position(range.start)..rope.offset_to_position(range.end),
+                        format!(
+                            "Invisible bidirectional control {}: the text may run differently from how it reads",
+                            b.label()
+                        ),
+                    )
+                    .with_severity(DiagnosticSeverity::Warning),
+                );
+            }
+            cx.notify();
+        });
+    }
+
+    // --- execution ---------------------------------------------------------------------------
+
+    /// Plans and submits a run of `kind`; opens the parameters prompt when a statement has
+    /// placeholders.
+    pub fn execute(&mut self, kind: ExecutionKind, window: &mut Window, cx: &mut Context<Self>) {
+        if self.pending.is_some() {
+            return;
+        }
+        let (text, selection, cursor) = {
+            let s = self.editor.read(cx);
+            (s.value().to_string(), s.selected_range(), s.cursor())
+        };
+        let plan = match ExecutionPlan::build(
+            &text,
+            selection,
+            cursor,
+            kind,
+            self.setup.splitter.as_ref(),
+            self.setup.parameter_style,
+        ) {
+            Ok(plan) => plan,
+            Err(e) => {
+                self.notice = Some(SharedString::from(e.to_string()));
+                cx.notify();
+                return;
+            }
+        };
+        self.notice = None;
+        if !plan.needs_parameters() {
+            self.submit(plan, None, cx);
+            return;
+        }
+        match ParameterPrompt::new(plan.parameter_refs()) {
+            Ok(Some(prompt)) => {
+                let inputs: Vec<Entity<InputState>> = prompt
+                    .entries()
+                    .iter()
+                    .map(|_| cx.new(|cx| InputState::new(window, cx).placeholder("value")))
+                    .collect();
+                if let Some(first) = inputs.first() {
+                    first.update(cx, |s, cx| s.focus(window, cx));
+                }
+                let nulls = vec![false; inputs.len()];
+                self.pending = Some(PendingRun {
+                    plan,
+                    prompt,
+                    inputs,
+                    nulls,
+                });
+            }
+            Ok(None) => self.submit(plan, None, cx),
+            Err(e) => self.notice = Some(SharedString::from(e.to_string())),
+        }
+        cx.notify();
+    }
+
+    /// Sets prompt entry `index` to `value` (tests and the prompt's inputs).
+    pub fn set_prompt_value(
+        &mut self,
+        index: usize,
+        value: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(input) = self.pending.as_ref().and_then(|p| p.inputs.get(index)) {
+            input.update(cx, |s, cx| s.set_value(value.to_owned(), window, cx));
+        }
+        if let Some(p) = self.pending.as_mut()
+            && let Some(n) = p.nulls.get_mut(index)
+        {
+            *n = false;
+        }
+    }
+
+    /// Toggles NULL for prompt entry `index`.
+    pub fn toggle_prompt_null(&mut self, index: usize, cx: &mut Context<Self>) {
+        if let Some(p) = self.pending.as_mut()
+            && let Some(n) = p.nulls.get_mut(index)
+        {
+            *n = !*n;
+        }
+        cx.notify();
+    }
+
+    /// Runs with the prompted values; the prompt and its inputs are dropped either way.
+    pub fn confirm_prompt(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(mut pending) = self.pending.take() else {
+            return;
+        };
+        for (i, input) in pending.inputs.iter().enumerate() {
+            if pending.nulls.get(i).copied().unwrap_or(false) {
+                pending.prompt.set_null(i);
+            } else {
+                let value = input.read(cx).value();
+                pending.prompt.set_text(i, &value);
+            }
+        }
+        // Drop the typed values from the inputs before they go.
+        for input in &pending.inputs {
+            input.update(cx, |s, cx| s.set_value("", window, cx));
+        }
+        let texts: Vec<String> = pending
+            .plan
+            .texts()
+            .into_iter()
+            .map(str::to_owned)
+            .collect();
+        let refs: Vec<&str> = texts.iter().map(String::as_str).collect();
+        match pending.prompt.submit(&refs, self.setup.parameter_style) {
+            Ok(bound) => self.submit(pending.plan, Some(bound), cx),
+            Err(e) => self.notice = Some(SharedString::from(e.to_string())),
+        }
+        self.editor.update(cx, |s, cx| s.focus(window, cx));
+        cx.notify();
+    }
+
+    /// Closes the prompt without running.
+    pub fn cancel_prompt(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(pending) = self.pending.take() {
+            for input in &pending.inputs {
+                input.update(cx, |s, cx| s.set_value("", window, cx));
+            }
+        }
+        self.editor.update(cx, |s, cx| s.focus(window, cx));
+        cx.notify();
+    }
+
+    fn submit(
+        &mut self,
+        plan: ExecutionPlan,
+        bound: Option<Vec<crate::params::BoundStatement>>,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(sink) = self.sink.clone() else {
+            self.notice = Some("No connection: choose one for this editor first".into());
+            return;
+        };
+        let id = RequestId(self.next_request);
+        self.next_request += 1;
+        let request = plan.into_request(id, self.connection, bound, self.bidi.len());
+        // Keep the mapping for error positions, not the values (I1).
+        let mut kept = request.clone();
+        for item in &mut kept.items {
+            item.params.clear();
+        }
+        self.last_request = Some(kept);
+        self.running = Some(id);
+        self.error = None;
+        self.refresh_diagnostics(cx);
+        sink.submit(request);
+    }
+
+    /// The core reports an error for an item of a run. Answers to an older run are ignored.
+    pub fn report_error(&mut self, error: &StatementError, cx: &mut Context<Self>) {
+        let Some(request) = self.last_request.as_ref().filter(|r| r.id == error.request) else {
+            return;
+        };
+        let text = self.text(cx);
+        let placed = place_error(&text, request, error);
+        self.error = Some(ShownError {
+            message: error.message.clone(),
+            placed,
+        });
+        self.refresh_diagnostics(cx);
+        cx.notify();
+    }
+
+    /// The core reports that run `id` ended (success, error or cancel).
+    pub fn finish_run(&mut self, id: RequestId, cx: &mut Context<Self>) {
+        if self.running == Some(id) {
+            self.running = None;
+            cx.notify();
+        }
+    }
+
+    // --- actions -----------------------------------------------------------------------------
+
+    fn on_execute_statement(
+        &mut self,
+        _: &ExecuteStatement,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.execute(ExecutionKind::Statement, window, cx);
+    }
+
+    fn on_execute_selection(
+        &mut self,
+        _: &ExecuteSelection,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.execute(ExecutionKind::Selection, window, cx);
+    }
+
+    fn on_execute_script(
+        &mut self,
+        _: &ExecuteScript,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.execute(ExecutionKind::Script, window, cx);
+    }
+
+    fn on_cancel(&mut self, _: &CancelExecution, window: &mut Window, cx: &mut Context<Self>) {
+        if self.pending.is_some() {
+            self.cancel_prompt(window, cx);
+            return;
+        }
+        if let (Some(id), Some(sink)) = (self.running, self.sink.as_ref()) {
+            sink.cancel(id);
+        }
+    }
+
+    fn on_trigger_completion(
+        &mut self,
+        _: &TriggerCompletion,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let focus = self.editor.read(cx).focus_handle(cx);
+        window.focus(&focus, cx);
+        window.dispatch_action(Box::new(ShowCompletions), cx);
+    }
+
+    fn on_find(&mut self, _: &Find, window: &mut Window, cx: &mut Context<Self>) {
+        window.dispatch_action(Box::new(Search), cx);
+    }
+
+    fn on_find_replace(&mut self, _: &FindReplace, window: &mut Window, cx: &mut Context<Self>) {
+        window.dispatch_action(Box::new(Replace), cx);
+    }
+
+    /// Toggles `--` comments on the selected lines.
+    pub fn toggle_comment(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let (text, selection) = {
+            let s = self.editor.read(cx);
+            (s.value().to_string(), s.selected_range())
+        };
+        let Some(edit) = toggle_line_comment(&text, selection) else {
+            return;
+        };
+        self.editor.update(cx, |s, cx| {
+            s.set_selected_range(edit.range.clone(), cx);
+            s.replace(edit.text.clone(), window, cx);
+            s.set_selected_range(edit.selection.clone(), cx);
+        });
+    }
+
+    fn on_toggle_comment(
+        &mut self,
+        _: &ToggleComment,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.toggle_comment(window, cx);
+    }
+
+    /// Adds the next occurrence of the selection as another cursor (selects the word under the
+    /// cursor first when nothing is selected).
+    pub fn select_next_occurrence(&mut self, cx: &mut Context<Self>) {
+        let (text, active) = {
+            let s = self.editor.read(cx);
+            (s.value().to_string(), s.selected_range())
+        };
+        if active.is_empty() {
+            if let Some(word) = word_at(&text, active.start) {
+                self.editor
+                    .update(cx, |s, cx| s.set_selected_range(word.clone(), cx));
+                self.occurrences = vec![word];
+            }
+            return;
+        }
+        // gpui-component keeps the first selection active while cursors are added.
+        if !self.occurrences.contains(&active) {
+            self.occurrences = vec![active.clone()];
+        }
+        let needle = text[self.occurrences[0].clone()].to_owned();
+        let from = self.occurrences.last().map_or(active.end, |r| r.end);
+        if let Some(next) = next_occurrence(&text, &needle, from, &self.occurrences) {
+            self.editor
+                .update(cx, |s, cx| s.add_selection(next.clone(), cx));
+            self.occurrences.push(next);
+        }
+    }
+
+    fn on_select_next_occurrence(
+        &mut self,
+        _: &SelectNextOccurrence,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.select_next_occurrence(cx);
+    }
+
+    /// Moves the cursor to the placed error.
+    pub fn go_to_error(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(placed) = self.error.as_ref().and_then(|e| e.placed.clone()) else {
+            return;
+        };
+        self.editor.update(cx, |s, cx| {
+            s.set_selected_range(placed.range.start..placed.range.start, cx);
+            s.focus(window, cx);
+        });
+    }
+
+    fn on_go_to_error(&mut self, _: &GoToError, window: &mut Window, cx: &mut Context<Self>) {
+        self.go_to_error(window, cx);
+    }
+
+    /// Selects every bidirectional control character (one cursor each).
+    pub fn select_bidi_controls(&mut self, cx: &mut Context<Self>) {
+        let ranges: Vec<Range<usize>> = self.bidi.iter().map(|b| b.range.clone()).collect();
+        let Some((first, rest)) = ranges.split_first() else {
+            self.notice = Some("No bidirectional control characters".into());
+            cx.notify();
+            return;
+        };
+        self.editor.update(cx, |s, cx| {
+            s.set_selected_range(first.clone(), cx);
+            for r in rest {
+                s.add_selection(r.clone(), cx);
+            }
+        });
+    }
+
+    fn on_select_bidi(&mut self, _: &SelectBidiControls, _: &mut Window, cx: &mut Context<Self>) {
+        self.select_bidi_controls(cx);
+    }
+
+    fn render_prompt(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let pending = self.pending.as_ref()?;
+        let rows = pending
+            .prompt
+            .entries()
+            .iter()
+            .zip(&pending.inputs)
+            .enumerate()
+            .map(|(i, (entry, input))| {
+                let null = pending.nulls.get(i).copied().unwrap_or(false);
+                h_flex()
+                    .gap_2()
+                    .child(div().w(px(180.)).child(entry.label()))
+                    .child(
+                        div()
+                            .flex_1()
+                            .when(!null, |d| d.child(Input::new(input)))
+                            .when(null, |d| d.child("NULL")),
+                    )
+                    .child(
+                        Button::new(("param-null", i))
+                            .small()
+                            .outline()
+                            .label("NULL")
+                            .selected(null)
+                            .on_click(
+                                cx.listener(move |this, _, _, cx| this.toggle_prompt_null(i, cx)),
+                            ),
+                    )
+            });
+        Some(
+            v_flex()
+                .id("sql-editor-parameters")
+                .gap_2()
+                .p_2()
+                .border_b_1()
+                .border_color(cx.theme().border)
+                .child("Parameters (values are not saved)")
+                .children(rows)
+                .child(
+                    h_flex()
+                        .gap_2()
+                        .child(
+                            Button::new("param-run")
+                                .primary()
+                                .small()
+                                .label("Run")
+                                .on_click(cx.listener(|this, _, window, cx| {
+                                    this.confirm_prompt(window, cx)
+                                })),
+                        )
+                        .child(
+                            Button::new("param-cancel")
+                                .small()
+                                .label("Cancel")
+                                .on_click(cx.listener(|this, _, window, cx| {
+                                    this.cancel_prompt(window, cx)
+                                })),
+                        ),
+                )
+                .into_any_element(),
+        )
+    }
+}
+
+impl Focusable for SqlEditor {
+    fn focus_handle(&self, cx: &App) -> FocusHandle {
+        self.editor.focus_handle(cx)
+    }
+}
+
+impl Render for SqlEditor {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = cx.theme().clone();
+        let bidi = (!self.bidi.is_empty()).then(|| {
+            let first = self.bidi.first().map(BidiControl::label).unwrap_or_default();
+            div()
+                .px_2()
+                .py_1()
+                .bg(theme.warning)
+                .text_color(theme.warning_foreground)
+                .child(format!(
+                    "{} bidirectional control character(s) in this script (first: {first}). Alt+F8 selects them.",
+                    self.bidi.len()
+                ))
+        });
+        let error = self.error.as_ref().map(|e| {
+            let at = e.placed.as_ref().map_or_else(String::new, |p| {
+                format!(
+                    " (line {}, column {})",
+                    p.position.line + 1,
+                    p.position.column + 1
+                )
+            });
+            div()
+                .px_2()
+                .py_1()
+                .bg(theme.danger)
+                .text_color(theme.danger_foreground)
+                .child(format!("{}{at}", e.message))
+        });
+        let notice = self.notice.clone().map(|n| {
+            div()
+                .px_2()
+                .py_1()
+                .text_color(theme.muted_foreground)
+                .child(n)
+        });
+        let prompt = self.render_prompt(cx);
+        v_flex()
+            .key_context(EDITOR_CONTEXT)
+            .size_full()
+            .capture_action(cx.listener(Self::on_paste))
+            .on_action(cx.listener(Self::on_execute_statement))
+            .on_action(cx.listener(Self::on_execute_selection))
+            .on_action(cx.listener(Self::on_execute_script))
+            .on_action(cx.listener(Self::on_cancel))
+            .on_action(cx.listener(Self::on_trigger_completion))
+            .on_action(cx.listener(Self::on_find))
+            .on_action(cx.listener(Self::on_find_replace))
+            .on_action(cx.listener(Self::on_toggle_comment))
+            .on_action(cx.listener(Self::on_select_next_occurrence))
+            .on_action(cx.listener(Self::on_go_to_error))
+            .on_action(cx.listener(Self::on_select_bidi))
+            .children(bidi)
+            .children(prompt)
+            .child(
+                Editor::new(&self.editor)
+                    .bordered(false)
+                    .flex_1()
+                    .font_family(theme.mono_font_family.clone())
+                    .text_size(theme.mono_font_size),
+            )
+            .children(error)
+            .children(notice)
+    }
+}
