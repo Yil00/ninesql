@@ -405,8 +405,12 @@ pub struct ImportOutcome {
     pub secrets_moved: usize,
     /// Connection types created or tightened.
     pub types_changed: usize,
-    /// The import report saved in the project.
-    pub report_file: PathBuf,
+    /// The import report saved in the project; `None` when it could not be written (see
+    /// `report_error`). The import itself is applied either way (P2-D review, L1).
+    pub report_file: Option<PathBuf>,
+    /// Why the report could not be saved ("report not saved: <reason>"), for the outcome
+    /// screen. Never holds a secret: the reason is a storage error (path and OS error).
+    pub report_error: Option<String>,
     /// The connections of the project as written (reload the UI list from it).
     pub connections: Connections,
 }
@@ -678,7 +682,20 @@ impl Importer {
             issues: fresh.issues.iter().map(ReportIssue::from).collect(),
             projects: entries,
         };
-        let report_file = self.save_report(&report)?;
+        // connections.json is written and replaced secrets are deleted: failing here would leave
+        // the caller with a stale list, whose next save would drop the imported connections. The
+        // report is best effort (P2-D review, L1).
+        let (report_file, report_error) = match self.save_report(&report) {
+            Ok(path) => (Some(path), None),
+            Err(e) => {
+                tracing::warn!(
+                    project = %self.workspace.project(),
+                    error = %e,
+                    "the DBeaver import report could not be saved; the import is applied"
+                );
+                (None, Some(format!("report not saved: {e}")))
+            }
+        };
         tracing::info!(
             project = %self.workspace.project(),
             created,
@@ -698,6 +715,7 @@ impl Importer {
             secrets_moved: moved,
             types_changed,
             report_file,
+            report_error,
             connections: written,
         })
     }
@@ -1202,19 +1220,31 @@ impl Importer {
                 &format!("removed: {problem}"),
             ));
         }
-        // The parser reports the bootstrap values it could not hand over; the core keeps them.
+        // The parser reports the bootstrap values as `Unsupported` warnings, matched here by key
+        // (never by message); the core keeps them, so they become information.
         for i in issues.iter_mut() {
             let kept = match i.key.as_deref() {
-                Some("configuration.bootstrap.defaultSchema") => c.default_schema.is_some(),
-                Some("configuration.bootstrap.defaultCatalog") => c.default_catalog.is_some(),
-                Some("configuration.bootstrap.autocommit") => c.auto_commit.is_some(),
-                _ => false,
+                Some("configuration.bootstrap.defaultSchema") => c
+                    .default_schema
+                    .is_some()
+                    .then_some("kept in the connection settings (not applied by the drivers yet)"),
+                Some("configuration.bootstrap.defaultCatalog") => c
+                    .default_catalog
+                    .is_some()
+                    .then_some("kept in the connection settings (not applied by the drivers yet)"),
+                Some("configuration.bootstrap.autocommit") => c.auto_commit.is_some().then_some(
+                    "kept as the connection's auto-commit override (a production type keeps \
+                     manual commit)",
+                ),
+                _ => None,
             };
-            if kept && i.kind == IssueKind::Unsupported {
-                // Still `Unsupported` at connect: no driver applies it yet.
+            if let Some(message) = kept
+                && i.kind == IssueKind::Unsupported
+            {
+                // Kind kept: a default schema / catalog is not applied at connect yet, and the
+                // auto-commit override never relaxes a production type.
                 i.severity = Severity::Info;
-                "kept in the connection settings (not applied by the drivers yet)"
-                    .clone_into(&mut i.message);
+                message.clone_into(&mut i.message);
             }
         }
         if !c.init_sql.is_empty() {

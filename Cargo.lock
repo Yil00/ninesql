@@ -4554,6 +4554,7 @@ dependencies = [
  "ninesql-storage",
  "ninesql-transfer",
  "proptest",
+ "rusqlite",
  "secrecy",
  "serde",
  "serde_json",

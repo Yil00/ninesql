@@ -7,8 +7,11 @@
 //!   [`ImportedConnection::secrets`]; `Prompt`: nothing saved) instead of a `SecretSource`, since
 //!   secrets are not in a store yet; P2-C moves each secret and sets the reference;
 //! - [`ImportedConnection::default_schema`], [`ImportedConnection::default_catalog`] and
-//!   [`ImportedConnection::auto_commit`] carry DBeaver's `bootstrap` settings, which the core
-//!   model has no field for yet (each also has a report entry until the core persists them);
+//!   [`ImportedConnection::auto_commit`] carry DBeaver's `bootstrap` settings; the core keeps
+//!   them in its `default_schema`, `default_catalog` and `auto_commit` fields. No driver applies
+//!   the default schema / catalog yet, and the auto-commit override never relaxes a production
+//!   type, so each still has an `Unsupported` report entry (the core downgrades it to
+//!   information by key once the value is kept);
 //! - [`ImportedConnection::properties`] holds NineSQL driver property names for the engines a
 //!   NineSQL driver family serves (JDBC properties are converted or dropped, see
 //!   [`ImportedConnection::dropped_properties`] and docs/06 "Driver properties");
@@ -403,15 +406,18 @@ pub struct ImportedConnection {
     /// Init statements (`bootstrap.query`).
     pub init_sql: Vec<String>,
     /// Default schema DBeaver selects after connecting (`bootstrap.defaultSchema`, trimmed;
-    /// `None` when absent or blank). No core field yet (P2-C).
+    /// `None` when absent or blank). Kept in the core's `Connection::default_schema`; not
+    /// applied by the drivers yet.
     pub default_schema: Option<String>,
     /// Default catalog (database) DBeaver selects after connecting (`bootstrap.defaultCatalog`,
-    /// trimmed; `None` when absent or blank). No core field yet (P2-C).
+    /// trimmed; `None` when absent or blank). Kept in the core's `Connection::default_catalog`;
+    /// not applied by the drivers yet.
     pub default_catalog: Option<String>,
     /// Per-connection auto-commit (`bootstrap.autocommit`) exactly as DBeaver stored it:
     /// `Some(false)` for manual commit, `Some(true)` for auto-commit, `None` when DBeaver
     /// stored nothing (the connection type's `auto_commit` applies). Kept even when it equals
-    /// the type's default. No per-connection core field yet (P2-C).
+    /// the type's default. Kept in the core's `Connection::auto_commit`, which the core's
+    /// safety policy applies at connect (it never turns a production type's manual commit off).
     pub auto_commit: Option<bool>,
     /// `false` for disabled connections.
     pub enabled: bool,
@@ -1497,14 +1503,14 @@ fn map_connection(
         st.issues.warn(
             IssueKind::Unsupported,
             Some("configuration.bootstrap.defaultSchema".to_owned()),
-            "not applied yet: the NineSQL connection model has no default schema setting",
+            "kept as the connection's default schema; not applied by the NineSQL drivers yet",
         );
     }
     if default_catalog.is_some() {
         st.issues.warn(
             IssueKind::Unsupported,
             Some("configuration.bootstrap.defaultCatalog".to_owned()),
-            "not applied yet: the NineSQL connection model has no default catalog setting",
+            "kept as the connection's default catalog; not applied by the NineSQL drivers yet",
         );
     }
     if let Some(auto) = boot.autocommit
@@ -1514,8 +1520,8 @@ fn map_connection(
             IssueKind::Unsupported,
             Some("configuration.bootstrap.autocommit".to_owned()),
             format!(
-                "not applied yet: per-connection auto-commit is not supported; the connection \
-                 type's default applies (DBeaver had auto-commit {})",
+                "kept as the connection's auto-commit override (DBeaver had auto-commit {}); \
+                 a production connection type keeps manual commit",
                 if auto { "on" } else { "off" }
             ),
         );

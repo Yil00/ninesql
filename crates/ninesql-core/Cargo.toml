@@ -48,6 +48,8 @@ ninesql-driver-pgwire = { path = "../drivers/ninesql-driver-pgwire" }
 # DBeaver import tests (tests/import.rs): the drivers NineSQL ships decide what is imported enabled.
 ninesql-driver-mysqlwire = { path = "../drivers/ninesql-driver-mysqlwire" }
 ninesql-driver-sqlite = { path = "../drivers/ninesql-driver-sqlite" }
+# End-to-end I4 test (tests/import.rs): writes a WAL database inside a copied DBeaver workspace.
+rusqlite.workspace = true
 async-trait.workspace = true
 ninesql-secrets = { workspace = true, features = ["memory-store"] }
 proptest.workspace = true

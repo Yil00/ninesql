@@ -52,6 +52,22 @@ fn registry() -> DriverRegistry {
     r
 }
 
+/// `CoreServices` configuration under `root`: the shipped drivers, no Secret Service, no lock
+/// watcher, no DBeaver workspace known before a preview.
+fn core_config(root: &Path) -> CoreConfig {
+    let p = paths(&root.join("ninesql"));
+    let mut config = CoreConfig::new(p.clone(), ProjectName::default_project(), registry());
+    config.manager.known_hosts = KnownHostsFiles {
+        own: p.data_dir().join("known_hosts"),
+        user: None,
+    };
+    config.manager.workers = 2;
+    config.manager.dbeaver_roots = DbeaverRoots::none().with_home(root.join("home"));
+    config.use_secret_service = false;
+    config.watch_desktop_lock = false;
+    config
+}
+
 struct Env {
     _tmp: tempfile::TempDir,
     root: PathBuf,
@@ -107,29 +123,67 @@ fn copy_dir(src: &Path, dst: &Path) {
     }
 }
 
-/// Every file under `dir` with its bytes and modification time.
-fn tree(dir: &Path) -> BTreeMap<PathBuf, (Vec<u8>, SystemTime)> {
+/// One entry of a [`tree`] snapshot. Symbolic links are recorded, never followed.
+#[derive(Debug, PartialEq, Eq)]
+enum Node {
+    /// A directory: its permission bits and the sorted names of its entries.
+    Dir {
+        mode: u32,
+        entries: Vec<std::ffi::OsString>,
+    },
+    /// A regular file: its bytes, modification time and permission bits.
+    File {
+        bytes: Vec<u8>,
+        modified: SystemTime,
+        mode: u32,
+    },
+    /// A symbolic link: its target.
+    Symlink(PathBuf),
+    /// Anything else (socket, FIFO, device): its file type bits.
+    Other(u32),
+}
+
+/// Every entry under `dir` (itself included): directories with their mode and entry names,
+/// regular files with their bytes, modification time and mode, symbolic links with their
+/// target. Comparing two snapshots catches a file created, removed, renamed, rewritten,
+/// touched or re-permissioned (I4; P2-D review, L7).
+fn tree(dir: &Path) -> BTreeMap<PathBuf, Node> {
+    use std::os::unix::fs::MetadataExt as _;
     let mut out = BTreeMap::new();
     let mut stack = vec![dir.to_path_buf()];
-    while let Some(d) = stack.pop() {
-        for entry in std::fs::read_dir(&d).unwrap() {
-            let path = entry.unwrap().path();
-            if path.is_dir() {
-                stack.push(path);
-            } else {
-                let meta = std::fs::metadata(&path).unwrap();
-                out.insert(
-                    path.clone(),
-                    (std::fs::read(&path).unwrap(), meta.modified().unwrap()),
-                );
+    while let Some(path) = stack.pop() {
+        let meta = std::fs::symlink_metadata(&path).unwrap();
+        let mode = meta.mode() & 0o7777;
+        let ft = meta.file_type();
+        let node = if ft.is_dir() {
+            let mut entries: Vec<_> = std::fs::read_dir(&path)
+                .unwrap()
+                .map(|e| e.unwrap().file_name())
+                .collect();
+            entries.sort();
+            stack.extend(entries.iter().map(|name| path.join(name)));
+            Node::Dir { mode, entries }
+        } else if ft.is_file() {
+            Node::File {
+                bytes: std::fs::read(&path).unwrap(),
+                modified: meta.modified().unwrap(),
+                mode,
             }
-        }
+        } else if ft.is_symlink() {
+            Node::Symlink(std::fs::read_link(&path).unwrap())
+        } else {
+            Node::Other(meta.mode() & 0o170_000)
+        };
+        out.insert(path, node);
     }
     out
 }
 
 fn assert_not_in_files(dir: &Path, needles: &[&str]) {
-    for (path, (bytes, _)) in tree(dir) {
+    for (path, node) in tree(dir) {
+        let Node::File { bytes, .. } = node else {
+            continue;
+        };
         for needle in needles {
             assert!(
                 !bytes.windows(needle.len()).any(|w| w == needle.as_bytes()),
@@ -345,13 +399,11 @@ fn fixture_workspaces_import_with_snapshots_and_untouched_files() {
                 "{version}: a secret reached the logs"
             );
         }
-        assert!(
-            outcome
-                .report_file
-                .starts_with(e.workspace.project_paths().dir())
-        );
+        assert!(outcome.report_error.is_none(), "{:?}", outcome.report_error);
+        let report_file = outcome.report_file.clone().unwrap();
+        assert!(report_file.starts_with(e.workspace.project_paths().dir()));
         let report =
-            ninesql_storage::document::load::<ninesql_core::ImportReportFile>(&outcome.report_file)
+            ninesql_storage::document::load::<ninesql_core::ImportReportFile>(&report_file)
                 .unwrap()
                 .unwrap();
         assert!(
@@ -423,6 +475,72 @@ fn preview_and_apply_on_the_repository_fixture_leave_it_byte_identical() {
     assert_eq!(tree(&source), before);
 }
 
+/// P2-D review, L1: the report is written after `connections.json` (and after replaced secrets
+/// are deleted), so failing to save it must not fail the apply, or the UI would keep a stale list
+/// whose next save drops the imported connections. `imports` is a regular file, then a symlink to
+/// a directory: `ensure_private_dir` refuses both, the apply still returns the outcome with the
+/// written connections and a "report not saved" note.
+#[test]
+fn a_report_that_cannot_be_saved_does_not_fail_the_apply() {
+    for kind in ["file", "symlink"] {
+        let e = env();
+        let source = crafted(
+            &e.root,
+            &format!(
+                r#"{{ "connections": {{ {} }} }}"#,
+                pg(
+                    "postgres-jdbc-report",
+                    "report",
+                    &format!(r#", "password": "{CRAFTED_PASSWORD}""#)
+                )
+            ),
+        );
+        let imports = e.workspace.project_paths().dir().join("imports");
+        std::fs::create_dir_all(e.workspace.project_paths().dir()).unwrap();
+        match kind {
+            "file" => std::fs::write(&imports, b"not a directory").unwrap(),
+            _ => {
+                let target = e.root.join("elsewhere");
+                std::fs::create_dir_all(&target).unwrap();
+                std::os::unix::fs::symlink(&target, &imports).unwrap();
+            }
+        }
+        let capture = Capture::default();
+        let _guard = tracing::subscriber::set_default(capture.clone());
+        let preview = e
+            .importer
+            .preview(&ImportSource::Folder(source.clone()))
+            .unwrap();
+        let outcome = e
+            .importer
+            .apply(&preview, &ImportChoices::all(Some(StoreKind::Vault)))
+            .unwrap();
+        assert_eq!((outcome.created, outcome.secrets_moved), (1, 1), "{kind}");
+        assert!(outcome.report_file.is_none(), "{kind}");
+        let note = outcome.report_error.clone().unwrap();
+        assert!(note.starts_with("report not saved: "), "{kind}: {note}");
+        assert!(!note.contains(CRAFTED_PASSWORD));
+        // The connections are on disk and match the outcome's list.
+        let on_disk = saved(&e.workspace);
+        assert_eq!(on_disk.len(), 1, "{kind}");
+        assert_eq!(on_disk, outcome.connections, "{kind}");
+        assert_eq!(e.store.len(), 1, "{kind}");
+        // Nothing was written through the refused path.
+        if kind == "symlink" {
+            assert_eq!(
+                std::fs::read_dir(e.root.join("elsewhere")).unwrap().count(),
+                0
+            );
+        } else {
+            assert_eq!(std::fs::read(&imports).unwrap(), b"not a directory");
+        }
+        let logs = capture.0.lock().unwrap().clone();
+        assert!(logs.contains("import report could not be saved"), "{kind}");
+        assert!(!logs.contains(CRAFTED_PASSWORD), "{kind}");
+        assert_not_in_files(&e.root.join("ninesql"), &[CRAFTED_PASSWORD]);
+    }
+}
+
 // ---------------------------------------------------------------------------------------------
 // Marker
 
@@ -447,16 +565,7 @@ fn an_imported_dev_connection_with_init_sql_needs_confirmation_end_to_end() {
             )
         ),
     );
-    let p = paths(&root.join("ninesql"));
-    let mut config = CoreConfig::new(p.clone(), ProjectName::default_project(), registry());
-    config.manager.known_hosts = KnownHostsFiles {
-        own: p.data_dir().join("known_hosts"),
-        user: None,
-    };
-    config.manager.workers = 2;
-    config.manager.dbeaver_roots = DbeaverRoots::none().with_home(root.join("home"));
-    config.use_secret_service = false;
-    config.watch_desktop_lock = false;
+    let config = core_config(&root);
     let capture = Capture::default();
     let _guard = tracing::subscriber::set_default(capture.clone());
     ui(async move {
@@ -829,6 +938,98 @@ fn a_sqlite_file_inside_the_dbeaver_workspace_is_read_only() {
     assert!(c.enabled);
     assert!(e.roots.contains(&db));
     assert!(e.roots.roots().contains(&source));
+}
+
+/// P2-D review, L6, end to end (I4): a SQLite database in WAL mode inside a copy of a P0-E
+/// fixture workspace goes through the preview, `connection_for_test` and a real open / close
+/// through `CoreServices` with the sqlite driver. The session is read-only (a write fails
+/// engine-side) and the file is opened immutable: the whole workspace tree (entries, bytes,
+/// modification times, modes) is identical afterwards, with no `-wal`, `-shm` or journal file.
+#[test]
+fn a_sqlite_file_in_a_fixture_workspace_opens_read_only_and_leaves_the_tree_untouched() {
+    const SQLITE_ID: &str = "sqlite_jdbc-1a1dae67cb5-584ea3480250859e";
+    let tmp = tempfile::tempdir().unwrap();
+    let root = std::fs::canonicalize(tmp.path()).unwrap();
+    let ws = root.join("dbeaver").join("workspace6");
+    copy_dir(&fixture("26.2.4"), &ws);
+    let db = ws.join("General").join("fixture.sqlite");
+    {
+        let conn = rusqlite::Connection::open(&db).unwrap();
+        let mode: String = conn
+            .query_row("PRAGMA journal_mode = WAL", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(mode, "wal");
+        conn.execute_batch("CREATE TABLE t (x INTEGER); INSERT INTO t VALUES (1), (2);")
+            .unwrap();
+    }
+    for suffix in ["-wal", "-shm", "-journal"] {
+        let mut side = db.clone().into_os_string();
+        side.push(suffix);
+        assert!(!Path::new(&side).exists(), "{suffix} left by the setup");
+    }
+    let sources = ws
+        .join("General")
+        .join(".dbeaver")
+        .join("data-sources.json");
+    let text = std::fs::read_to_string(&sources).unwrap();
+    assert!(text.contains("/home/nine_user/data/fixture.sqlite"));
+    std::fs::write(
+        &sources,
+        text.replace("/home/nine_user/data/fixture.sqlite", db.to_str().unwrap()),
+    )
+    .unwrap();
+    let before = tree(&ws);
+
+    let config = core_config(&root);
+    ui(async {
+        let services = tokio::time::timeout(Duration::from_secs(20), CoreServices::start(config))
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        let preview = services
+            .preview_import(ImportSource::Folder(ws.clone()))
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(services.sessions().dbeaver_roots().contains(&db));
+        let types = services.workspace().load_connection_types().unwrap();
+        let types = preview.types_after(&types);
+        let candidate = preview.connection_for_test(SQLITE_ID).unwrap();
+        assert_eq!(candidate.read_only, Some(true));
+        assert!(candidate.enabled);
+
+        let outcome = support::open(services.sessions(), OpenRequest::new(candidate, &types))
+            .await
+            .unwrap();
+        let OpenOutcome::Opened(h) = outcome else {
+            panic!("{outcome:?}");
+        };
+        assert!(h.info().read_only);
+        assert!(h.info().inside_dbeaver_workspace);
+        let ev = support::run(&h, "SELECT count(*) FROM t").await;
+        assert!(
+            matches!(
+                support::terminal(&ev),
+                ninesql_core::ExecEvent::Finished { rows: 1, .. }
+            ),
+            "{ev:?}"
+        );
+        let ev = support::run(&h, "INSERT INTO t VALUES (3)").await;
+        assert!(
+            matches!(support::terminal(&ev), ninesql_core::ExecEvent::Failed(_)),
+            "{ev:?}"
+        );
+        tokio::time::timeout(Duration::from_secs(20), h.close())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        services
+    })
+    .shutdown(Duration::from_secs(5));
+
+    assert_eq!(tree(&ws), before, "the DBeaver workspace changed");
 }
 
 /// The source changed between preview and apply: nothing is written.
