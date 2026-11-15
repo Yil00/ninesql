@@ -237,7 +237,7 @@ pub fn vault_error_text(e: &CoreError) -> String {
             "A vault already exists: unlock it instead.".to_owned()
         }
         CoreError::Vault(VaultError::EmptyPassword) => {
-            "The master password must not be empty.".to_owned()
+            "The master password must not be empty or only spaces.".to_owned()
         }
         CoreError::Vault(VaultError::PasswordTooShort { min }) => {
             format!("The master password must be at least {min} characters long.")

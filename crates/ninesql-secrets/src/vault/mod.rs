@@ -115,8 +115,9 @@ pub const MIN_MASTER_PASSWORD_CHARS: usize = 12;
 
 /// Checks a new master password against the minimum length.
 fn check_new_master(master: &SecretString) -> Result<(), VaultError> {
-    let chars = master.expose_secret().chars().count();
-    if chars == 0 {
+    let master = master.expose_secret();
+    let chars = master.chars().count();
+    if master.chars().all(char::is_whitespace) {
         Err(VaultError::EmptyPassword)
     } else if chars < MIN_MASTER_PASSWORD_CHARS {
         Err(VaultError::PasswordTooShort {
@@ -175,8 +176,9 @@ pub enum VaultError {
     /// Argon2id parameters outside the accepted range.
     #[error("invalid key derivation parameters: {0}")]
     InvalidKdfParams(&'static str),
-    /// An empty master password was given to create or change the vault.
-    #[error("the master password must not be empty")]
+    /// An empty master password, or one made only of whitespace, was given to create or
+    /// change the vault.
+    #[error("the master password must not be empty or only spaces")]
     EmptyPassword,
     /// A new master password shorter than [`MIN_MASTER_PASSWORD_CHARS`] (vault creation or
     /// password change; an existing vault still unlocks with its password, whatever its length).

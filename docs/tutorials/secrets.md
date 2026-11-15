@@ -17,7 +17,7 @@ At startup NineSQL picks the store in this order: keyring if a Secret Service an
 ## 2. Create the vault
 The vault is created the first time you save a password with "Save in vault":
 1. A "Create the vault" prompt opens: "Passwords are saved in an encrypted vault on this computer. Choose its master password: it is never saved, and without it the saved passwords cannot be recovered."
-2. Type the master password twice ("The two passwords differ: type them again." if they do not match) and press "Create vault". It must be at least 12 characters long; the prompt shows the rule, and a shorter password is refused with "The master password must be at least 12 characters long." A vault created earlier with a shorter password still unlocks with it.
+2. Type the master password twice ("The two passwords differ: type them again." if they do not match) and press "Create vault". It must be at least 12 characters long; the prompt shows the rule, and a shorter password is refused with "The master password must be at least 12 characters long." (one made only of spaces with "The master password must not be empty or only spaces.") A vault created earlier with a shorter password still unlocks with it.
 3. The connection is then saved, with the password in the vault.
 
 Choose a strong master password: someone who copies `vault.bin` can try to guess it offline, slowed only by the key derivation (Argon2id). There is no recovery if you forget it.

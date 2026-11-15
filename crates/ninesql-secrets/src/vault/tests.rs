@@ -664,6 +664,13 @@ fn a_new_master_password_needs_twelve_characters() {
             "the master password must be at least 12 characters long"
         );
     }
+    // L5: long enough, but only whitespace.
+    for blank in ["            ", "\t\t\t\t\t\t \n\n\n\n\n\n"] {
+        assert!(matches!(
+            f.vault.create(&s(blank), KdfParams::insecure_for_tests()),
+            Err(VaultError::EmptyPassword)
+        ));
+    }
     assert!(!f.path().exists(), "nothing written");
     f.vault
         .create(&s("twelve chars"), KdfParams::insecure_for_tests())
