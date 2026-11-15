@@ -41,6 +41,43 @@ jobs:
       - run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
       - run: cargo test --workspace --locked
 
+  # Driver integration tests against the dev containers (ADR-0009, AGENTS.md): the `core` profile
+  # of dev/compose.yaml (PostgreSQL, MySQL, MariaDB; SQLite needs no container), and the OpenSSH
+  # containers that the ninesql-core and ninesql-ssh tests start themselves with `docker run`.
+  # NINESQL_REQUIRE_ENGINES turns a skipped test into a failure when an engine is unreachable.
+  driver-integration:
+    name: Driver integration tests (dev containers)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    env:
+      # Own compose project, so this job never stops or reuses the containers of another run
+      # on the same Docker daemon (the dev-env workflow and local runs use `ninesql-dev`).
+      # The published ports are still the fixed ones of dev/compose.yaml.
+      COMPOSE_PROJECT_NAME: ninesql-ci-drivers
+      NINESQL_REQUIRE_ENGINES: postgresql,mysql,mariadb,ssh
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      # No GPUI system packages: none of the tested crates depends on GPUI.
+      - name: Pull images
+        run: timeout 900 docker compose -f dev/compose.yaml --profile core pull --quiet
+      - name: Start and wait for readiness
+        run: python3 dev/ready.py up core --timeout 900
+      - name: Integration tests
+        run: >-
+          cargo test --locked
+          -p ninesql-driver-pgwire -p ninesql-driver-mysqlwire -p ninesql-driver-sqlite
+          -p ninesql-core -p ninesql-ssh
+      - name: Show state
+        if: always()
+        run: docker compose -f dev/compose.yaml --profile all ps --all
+      - name: Stop
+        if: always()
+        run: python3 dev/ready.py down
+
   deny:
     name: cargo-deny (licenses, bans, sources, advisories)
     runs-on: ubuntu-24.04
@@ -77,7 +114,7 @@ jobs:
   ci-result:
     name: CI result
     if: always()
-    needs: [rust, deny, docs]
+    needs: [rust, driver-integration, deny, docs]
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     steps:
