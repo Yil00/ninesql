@@ -115,7 +115,7 @@ pub(crate) fn read_counted(
 ) -> (Result<Zeroizing<Vec<u8>>, DbeaverError>, u64) {
     if canonicalize(path).is_some_and(|c| SPECIAL_ROOTS.iter().any(|r| c.starts_with(r))) {
         return (
-            Err(DbeaverError::NotAFile {
+            Err(DbeaverError::SpecialFilesystem {
                 path: path.to_path_buf(),
             }),
             0,
@@ -359,7 +359,12 @@ mod tests {
     fn special_filesystems_are_not_read() {
         for p in ["/proc/self/status", "/proc/self/pagemap", "/dev/zero"] {
             let (res, charged) = read_counted(Path::new(p), 1 << 20);
-            assert!(matches!(res, Err(DbeaverError::NotAFile { .. })), "{p}");
+            assert!(
+                matches!(res, Err(DbeaverError::SpecialFilesystem { .. })),
+                "{p}"
+            );
+            let message = res.err().map(|e| e.to_string()).unwrap_or_default();
+            assert!(message.contains("special filesystem"), "{message}");
             assert_eq!(charged, 0);
         }
     }

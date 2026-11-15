@@ -123,11 +123,15 @@ fn more_than_256_projects_cut_the_listing_and_it_is_reported() {
     let s = import_source(vec![workspace], &CancelFlag::new()).unwrap_or_else(|e| panic!("{e}"));
     assert!(s.truncated);
     assert_eq!(s.projects.len(), MAX_SOURCE_PROJECTS);
-    assert!(
-        s.issues
-            .iter()
-            .any(|i| i.kind == IssueKind::Truncated && i.message.contains("was cut"))
-    );
+    let cut = s
+        .issues
+        .iter()
+        .find(|i| i.kind == IssueKind::Truncated && i.message.contains("was cut"))
+        .unwrap_or_else(|| panic!("the cut listing is reported"));
+    assert!(!cut.message.contains("  "), "{}", cut.message);
+    for issue in &s.issues {
+        assert!(!issue.message.contains("  "), "{}", issue.message);
+    }
 }
 
 #[test]
@@ -226,7 +230,7 @@ fn pseudo_files_are_not_read_and_exhaust_the_byte_budget() {
         files
             .issues
             .iter()
-            .filter(|i| i.kind == IssueKind::File && i.message.contains("not a regular file"))
+            .filter(|i| i.kind == IssueKind::File && i.message.contains("special filesystem"))
             .count(),
         61
     );

@@ -250,7 +250,9 @@ pub fn import_source_with_limits(
                 IssueKind::Truncated,
                 None,
                 format!(
-                    "the listing of {} was cut (more than {MAX_SOURCE_PROJECTS} project folders,                      or a directory or detection limit was reached): the projects past the cut                      are not read",
+                    "the listing of {} was cut (more than {MAX_SOURCE_PROJECTS} project folders, \
+                     or a directory or detection limit was reached): the projects past the cut \
+                     are not read",
                     shown_path(&workspace.path)
                 ),
             ));

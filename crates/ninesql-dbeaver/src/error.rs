@@ -30,6 +30,13 @@ pub enum DbeaverError {
         /// Size limit in bytes.
         limit: u64,
     },
+    /// The file is on a special filesystem (`/proc`, `/sys` or `/dev`, `/dev/shm` included):
+    /// it is not opened.
+    #[error("{path} is on a special filesystem (/proc, /sys or /dev); not read")]
+    SpecialFilesystem {
+        /// Path concerned.
+        path: PathBuf,
+    },
     /// The file changed size while it was read (it grew): it is not used.
     #[error("{path} changed while it was read and was not used")]
     Changed {
