@@ -87,10 +87,12 @@ There is deliberately no `curl … | bash` installer ([ADR-0010](docs/adr/0010-p
 ## Development
 ```bash
 # Rust stable, 1.89 or newer (see rust-toolchain.toml)
-cargo build --workspace
-cargo test --workspace
+make help                 # list the targets of the root Makefile
+make build                # = cargo build --workspace --locked
+make run                  # start the ninesql window
+make check                # what CI checks, without database engines
 ```
-The test databases run in containers: see [dev/README.md](dev/README.md). AI coding agents (Claude Code, Codex…) start with [AGENTS.md](AGENTS.md) and [CONTEXT.md](CONTEXT.md).
+Step-by-step guides are in [docs/tutorials/](docs/tutorials/README.md): build and run from source (Linux, and macOS for UI work), start the dev databases, create a first connection, secrets, and the checks to run before a PR. The test databases run in containers: see [dev/README.md](dev/README.md). AI coding agents (Claude Code, Codex…) start with [AGENTS.md](AGENTS.md) and [CONTEXT.md](CONTEXT.md).
 
 ## Contributing
 Contributions are welcome: see [CONTRIBUTING.md](CONTRIBUTING.md). PRs target the `dev` branch.

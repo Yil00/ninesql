@@ -53,6 +53,7 @@ An agent does **not** modify files belonging to another owner, unless the task e
 - Integration tests run against the containers of `dev/` and are skipped (not failed) when the engine is not reachable, unless `NINESQL_REQUIRE_ENGINES` lists it (the `driver-integration` job of `.github/workflows/ci.yml` sets it to `postgresql,mysql,mariadb,ssh`). A run that brings up its own containers sets its own `COMPOSE_PROJECT_NAME`, so it never stops another run's containers; the host ports are fixed, so runs on one Docker host are serialised.
 
 ## Useful commands (root)
+- `make help`: the root `Makefile` wraps the commands below and the dev-engine scripts (`make check`, `make test-engines`, `make dev-up`…)
 - `cargo build --workspace` / `cargo test --workspace`
 - `cargo deny check`
 - `python3 scripts/check-md-links.py`: internal documentation links
@@ -90,6 +91,7 @@ An agent does **not** modify files belonging to another owner, unless the task e
 - [ ] Capability matrix updated if a driver changed ([docs/08-engine-capabilities.md](docs/08-engine-capabilities.md))
 - [ ] Feature parity inventory updated if a DBeaver feature landed ([docs/07-feature-parity.md](docs/07-feature-parity.md))
 - [ ] Documentation updated if visible behavior changes; ROADMAP updated
+- [ ] Tutorials in [docs/tutorials/](docs/tutorials/README.md) updated when user-visible behavior or commands change; new user-facing features get a tutorial section
 
 ## Git
 - Branches, tags and releases: [RELEASE.md](RELEASE.md). Never commit directly to `main` or `dev`; never create a release tag.

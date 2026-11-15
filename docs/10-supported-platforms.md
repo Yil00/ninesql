@@ -31,4 +31,7 @@ sudo apt install build-essential pkg-config clang cmake libvulkan-dev libwayland
 
 ## Development only
 - **macOS** (Apple Silicon and Intel): builds are kept compiling so contributors on Macs can iterate on the UI (GPUI renders with Metal). Not a release target; Linux-specific parts (Secret Service, Flatpak, `.deb`) are tested on Linux only.
+  - Build requirements: Rust 1.89 or newer through `rustup`; the Xcode Command Line Tools (`xcode-select --install`), or the full Xcode if the Metal shader step of the GPUI build needs it; Docker Desktop or OrbStack for the dev databases. `make deps-macos` prints this list, `make deps-debian` the Debian / Ubuntu one above.
+  - Status: not verified yet. The `macos` CI job builds and tests `ninesql-ui` on an Apple Silicon runner but is not required to pass until it has been green; cross-compiling from Linux does not work without the Apple SDK (`ring` needs it). `deny.toml` checks Linux targets only, so macOS-only dependencies are not license-checked ([ROADMAP](ROADMAP.md#phase-1-follow-ups)).
+  - Behaviour: saved passwords go to the encrypted vault (the Secret Service is Linux-only); sleep and screen-lock locking does not run (no logind) and the connection problems list says so; default key bindings use Ctrl as on Linux ([tutorial](tutorials/build-and-run.md#macos-what-behaves-differently)).
 - **Windows**: not supported.

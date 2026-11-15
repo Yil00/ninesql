@@ -19,5 +19,6 @@
 - [ ] fmt, clippy, tests and `cargo deny` green
 - [ ] Capability matrix / feature parity inventory updated if relevant
 - [ ] Documentation and ROADMAP up to date
+- [ ] Tutorials in `docs/tutorials/` updated if user-visible behavior or commands changed; a new user-facing feature has a tutorial section
 - [ ] Screenshots attached for visible UI changes (local run)
 - [ ] DCO-signed commits (`git commit -s`)

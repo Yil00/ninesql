@@ -53,5 +53,6 @@ NineSQL is an open-source (Apache 2.0) native database client for Debian and Ubu
 - Per-engine capabilities: [docs/08-engine-capabilities.md](docs/08-engine-capabilities.md)
 - Working with AI agents (local and cloud): [docs/09-agent-workflow.md](docs/09-agent-workflow.md)
 - Supported platforms: [docs/10-supported-platforms.md](docs/10-supported-platforms.md)
+- Step-by-step tutorials (build and run, dev databases, first connection, secrets, checks before a PR): [docs/tutorials/](docs/tutorials/README.md)
 - Settled decisions: [docs/adr/](docs/adr/README.md)
 - Plan: [docs/ROADMAP.md](docs/ROADMAP.md); releases: [RELEASE.md](RELEASE.md)
