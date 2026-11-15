@@ -8,9 +8,9 @@ use std::collections::BTreeMap;
 use std::fmt;
 use std::sync::Arc;
 
-use ninesql_driver_api::{Capabilities, Dialect, Driver};
+use ninesql_driver_api::{AuthKind, Capabilities, Dialect, Driver};
 
-use crate::connection::{Connection, EngineId};
+use crate::connection::{Auth, Connection, EngineId, TlsMode};
 use crate::error::{ConnectionError, CoreError};
 
 /// Engine id of the driver API for an engine id of the model (both are plain strings; the model
@@ -110,21 +110,73 @@ impl DriverRegistry {
 }
 
 impl Connection {
-    /// [`Connection::validate`] plus the driver-specific property rule: a property whose key
-    /// `capabilities` reserves ([`Capabilities::is_reserved_property`], i.e. the shared rule or
-    /// one of the driver's `extra_reserved_properties`) is refused with
-    /// [`ConnectionError::ReservedProperty`]. The value is never echoed.
+    /// [`Connection::validate`] plus the driver-specific rules, so a connection the driver
+    /// would refuse at connect is refused when it is saved or imported (M2):
+    /// - a property whose key `capabilities` reserves ([`Capabilities::is_reserved_property`],
+    ///   i.e. the shared rule or one of the driver's `extra_reserved_properties`) is refused
+    ///   with [`ConnectionError::ReservedProperty`];
+    /// - a property off the driver's allowlist
+    ///   ([`ConnectCapabilities::accepted_properties`](ninesql_driver_api::ConnectCapabilities::accepted_properties)),
+    ///   an authentication method the driver does not list, and on network endpoints
+    ///   `verify-ca` without a CA file (ADR-0019), a client certificate or an encrypted client
+    ///   key the driver does not support, are refused with [`ConnectionError::InvalidField`].
+    ///
+    /// Values are never echoed.
     ///
     /// # Errors
     /// The first problem found.
     pub fn validate_for_driver(&self, capabilities: &Capabilities) -> Result<(), ConnectionError> {
         self.validate()?;
+        let accepts = &capabilities.connect;
         for key in self.properties.keys() {
             if capabilities.is_reserved_property(key) {
                 return Err(ConnectionError::ReservedProperty {
                     key: key.clone(),
                     use_instead: "the driver of this engine reserves it; use the typed connection settings",
                 });
+            }
+            if !accepts.accepts_property(key) {
+                return Err(ConnectionError::InvalidField {
+                    field: format!("properties.{key}"),
+                    reason: "is not a driver property the driver of this engine accepts",
+                });
+            }
+        }
+        let auth = match &self.auth {
+            Auth::None => AuthKind::None,
+            // A user name without a saved password connects with an empty password.
+            Auth::Username { .. } | Auth::Password { .. } => AuthKind::Password,
+            Auth::Token { .. } => AuthKind::Token,
+        };
+        if !accepts.auth.contains(&auth) {
+            return Err(ConnectionError::InvalidField {
+                field: "auth".to_owned(),
+                reason: "uses an authentication method the driver of this engine does not support",
+            });
+        }
+        if self.endpoint.is_network() && self.tls.mode != TlsMode::Disable {
+            if self.tls.mode == TlsMode::VerifyCa
+                && self.tls.ca_file.is_none()
+                && accepts.verify_ca_requires_ca_file
+            {
+                return Err(ConnectionError::InvalidField {
+                    field: "tls.ca_file".to_owned(),
+                    reason: "is required by verify-ca (it trusts only that file); use verify-full to rely on the system trust store",
+                });
+            }
+            if let Some(cert) = &self.tls.client_certificate {
+                if !accepts.client_certificates {
+                    return Err(ConnectionError::InvalidField {
+                        field: "tls.client_certificate".to_owned(),
+                        reason: "is not supported by the driver of this engine",
+                    });
+                }
+                if cert.passphrase.is_some() && !accepts.encrypted_client_keys {
+                    return Err(ConnectionError::InvalidField {
+                        field: "tls.client_certificate.passphrase".to_owned(),
+                        reason: "is set, but the driver of this engine does not support encrypted client keys; use an unencrypted key file readable only by you",
+                    });
+                }
             }
         }
         Ok(())

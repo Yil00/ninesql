@@ -714,8 +714,8 @@ impl fmt::Debug for Tunnel {
     }
 }
 
-/// The route entry reported for one hop: its own policy, with `AcceptNew` reported as
-/// `Disabled` (ADR-0016, [`HostKeyPolicy::to_verification`]).
+/// The route entry reported for one hop: its own policy (ADR-0016,
+/// [`HostKeyPolicy::to_verification`]).
 fn route_hop(hop: &HopSpec) -> SshHop {
     SshHop::new(
         hop.host.clone(),
@@ -725,8 +725,9 @@ fn route_hop(hop: &HopSpec) -> SshHop {
 }
 
 /// The driver-facing description of an open tunnel: every hop with its own policy, so
-/// `ConnectParams::security_warnings` names each unverified hop
-/// (`SecurityWarning::SshHopHostKeyNotVerified`), plus the weakest-policy summary.
+/// `ConnectParams::security_warnings` names each hop that does not verify its host key
+/// (`SecurityWarning::SshHopHostKeyNotVerified`) or accepts new keys
+/// (`SecurityWarning::SshHopHostKeyAcceptNew`), plus the weakest-policy summary.
 fn tunnel_info(
     ssh_host: String,
     ssh_port: u16,
@@ -1215,16 +1216,30 @@ mod tests {
         let policies: Vec<_> = info.hops.iter().map(|h| h.host_key).collect();
         let names: Vec<_> = info.hops.iter().map(|h| h.host.as_str()).collect();
         assert_eq!(names, ["j1", "j2", "s"]);
-        // AcceptNew is reported as Disabled (ADR-0016).
-        assert_eq!(policies, [V::Strict, V::Disabled, V::Disabled]);
+        // AcceptNew is reported as such (ADR-0016 §2.5).
+        assert_eq!(policies, [V::Strict, V::AcceptNew, V::Disabled]);
 
         let mut params = ConnectParams::new(EngineId::POSTGRESQL, Endpoint::tcp("127.0.0.1", 5432));
         params.tunnel = Some(info);
         let w = params.security_warnings();
         assert!(w.contains(&SecurityWarning::SshHostKeyNotVerified));
         assert!(!w.contains(&SecurityWarning::SshHopHostKeyNotVerified { hop: 0 }));
-        assert!(w.contains(&SecurityWarning::SshHopHostKeyNotVerified { hop: 1 }));
+        assert!(w.contains(&SecurityWarning::SshHopHostKeyAcceptNew { hop: 1 }));
+        assert!(!w.contains(&SecurityWarning::SshHopHostKeyNotVerified { hop: 1 }));
         assert!(w.contains(&SecurityWarning::SshHopHostKeyNotVerified { hop: 2 }));
+
+        // AcceptNew as the weakest hop: its own summary warning, not "not verified".
+        let spec = TunnelSpec::new(hop("s"), "db", 5432)
+            .via(hop("j").with_host_key_policy(HostKeyPolicy::AcceptNew));
+        let route = vec![route_hop(&spec.jump_hosts[0]), route_hop(&spec.server)];
+        let info = tunnel_info("s".into(), 22, route, HostKeyPolicy::AcceptNew);
+        assert_eq!(info.host_key, V::AcceptNew);
+        let mut params = ConnectParams::new(EngineId::POSTGRESQL, Endpoint::tcp("127.0.0.1", 5432));
+        params.tunnel = Some(info);
+        let w = params.security_warnings();
+        assert!(w.contains(&SecurityWarning::SshHostKeyAcceptNew));
+        assert!(!w.contains(&SecurityWarning::SshHostKeyNotVerified));
+        assert!(w.contains(&SecurityWarning::SshHopHostKeyAcceptNew { hop: 0 }));
 
         // All strict: summary strict, no per-hop warning.
         let info = tunnel_info(

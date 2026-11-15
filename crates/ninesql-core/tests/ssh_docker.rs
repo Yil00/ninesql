@@ -124,7 +124,12 @@ fn ssh_tunnel_through_the_core_connect_flow() {
             panic!("not opened");
         };
         let w = &h.info().warnings;
+        // ADR-0016: AcceptNew is reported as such, not as "not verified".
+        assert!(w.contains(&SessionWarning::Connection(ApiWarning::SshHostKeyAcceptNew)));
         assert!(w.contains(&SessionWarning::Connection(
+            ApiWarning::SshHopHostKeyAcceptNew { hop: 0 }
+        )));
+        assert!(!w.contains(&SessionWarning::Connection(
             ApiWarning::SshHostKeyNotVerified
         )));
         assert!(w.iter().any(|w| matches!(

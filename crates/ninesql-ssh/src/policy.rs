@@ -32,15 +32,15 @@ impl HostKeyPolicy {
         self != Self::Strict
     }
 
-    /// Mapping to the frozen driver API enum, which only knows `Strict` and `Disabled`.
-    /// `AcceptNew` maps to `Disabled` on purpose: a first-use key is accepted without the user
-    /// seeing it, so the driver API's warning ([`ninesql_driver_api::SecurityWarning::SshHostKeyNotVerified`])
-    /// must fire rather than stay silent.
+    /// Mapping to the driver API enum, one to one (ADR-0016 §2.5): `AcceptNew` is reported as
+    /// [`HostKeyVerification::AcceptNew`], with its own security warning
+    /// ([`ninesql_driver_api::SecurityWarning::SshHostKeyAcceptNew`]).
     #[must_use]
     pub fn to_verification(self) -> HostKeyVerification {
         match self {
             Self::Strict => HostKeyVerification::Strict,
-            Self::AcceptNew | Self::Disabled => HostKeyVerification::Disabled,
+            Self::AcceptNew => HostKeyVerification::AcceptNew,
+            Self::Disabled => HostKeyVerification::Disabled,
         }
     }
 
@@ -225,7 +225,7 @@ mod tests {
         assert_eq!(P::Strict.to_verification(), HostKeyVerification::Strict);
         assert_eq!(
             P::AcceptNew.to_verification(),
-            HostKeyVerification::Disabled
+            HostKeyVerification::AcceptNew
         );
         assert_eq!(P::Disabled.to_verification(), HostKeyVerification::Disabled);
     }

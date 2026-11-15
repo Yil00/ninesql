@@ -674,7 +674,8 @@ const fn api_tls_mode(mode: TlsMode) -> api::TlsMode {
 /// - endpoint: the tunnel's local end when `tunnel` is set, the real host otherwise; with a
 ///   tunnel, `tls.server_name` is the real database host, so `verify-full` still checks the
 ///   server's name (ADR-0011);
-/// - read-only, auto-commit and production come from `policy` (I3, ADR-0007);
+/// - read-only, auto-commit, production and statement logging (`log_query_text`) come from
+///   `policy` (I3, ADR-0007);
 /// - init SQL and driver properties as saved (validated by
 ///   [`Connection::validate_for_driver`] before).
 ///
@@ -728,6 +729,8 @@ pub fn connect_params(
     params.read_only = policy.read_only;
     params.auto_commit = policy.auto_commit;
     params.production = policy.production;
+    // L1: a custom type's `log_query_text = false` reaches the driver, not only `production`.
+    params.log_statements = policy.log_query_text;
     params.connect_timeout = connect_timeout;
     params.init_statements.clone_from(&connection.init_sql);
     params.properties = connection
@@ -864,6 +867,30 @@ mod tests {
         ));
     }
 
+    /// L1: a custom, non-production type with `log_query_text = false` turns statement
+    /// logging off in the driver; the development type keeps it on.
+    #[test]
+    fn statement_logging_follows_the_connection_type() {
+        use crate::connection_type::ConnectionType;
+        let mut types = ConnectionTypes::default();
+        let mut quiet = ConnectionType::development();
+        quiet.id = ConnectionTypeId::new("quiet").unwrap();
+        quiet.log_query_text = false;
+        types.upsert(quiet);
+        for (id, logs) in [("dev", true), ("quiet", false)] {
+            let mut c = conn();
+            c.connection_type = ConnectionTypeId::new(id).unwrap();
+            let policy = c.policy(&types);
+            assert!(!policy.production, "{id}");
+            let mut bag =
+                resolve_secrets(&c, &SecretStores::new(), vec![(SecretSlot::Auth, s("pw"))])
+                    .unwrap();
+            let p = connect_params(&c, &policy, &mut bag, None, Duration::from_secs(3)).unwrap();
+            assert_eq!(p.log_statements, logs, "{id}");
+            assert_eq!(p.may_log_statements(), logs, "{id}");
+        }
+    }
+
     #[test]
     fn params_follow_policy_and_take_the_secrets() {
         let types = ConnectionTypes::default();
@@ -876,6 +903,7 @@ mod tests {
         let p = connect_params(&c, &policy, &mut bag, None, Duration::from_secs(3)).unwrap();
         assert!(bag.is_empty(), "the secret was moved into the params");
         assert!(p.production);
+        assert!(!p.log_statements && !p.may_log_statements());
         assert!(!p.auto_commit);
         assert_eq!(
             p.endpoint,

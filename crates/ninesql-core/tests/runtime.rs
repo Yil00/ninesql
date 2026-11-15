@@ -606,6 +606,93 @@ fn reserved_properties_are_refused_before_save_and_before_connect() {
     });
 }
 
+/// M2: settings the driver declares it refuses are refused when the connection is saved, and
+/// again before any connect.
+#[test]
+fn settings_the_driver_refuses_fail_validation() {
+    use ninesql_core::driver_api::mock::full_capabilities;
+    use ninesql_core::driver_api::{AuthKind, ConnectCapabilities};
+    use ninesql_core::{ClientCertificate, TlsMode};
+    let tmp = tempfile::tempdir().unwrap();
+    let mut caps = full_capabilities();
+    let mut connect = ConnectCapabilities::default();
+    connect.accepted_properties = Some(["application_name".to_owned()].into());
+    connect.auth = [AuthKind::Password].into();
+    connect.client_certificates = true;
+    connect.encrypted_client_keys = false;
+    caps.connect = connect;
+    let mock = MockDriver::new().with_capabilities(caps);
+    let stats = mock.stats();
+    let (manager, _) = manager(Arc::new(mock), tmp.path());
+    let types = ConnectionTypes::default();
+    let valid = || {
+        let mut c = mock_connection(ConnectionTypeId::dev());
+        c.auth = Auth::Username {
+            username: "nine".into(),
+        };
+        c.properties.insert("Application-Name".into(), "x".into());
+        c
+    };
+    manager.registry().validate_connection(&valid()).unwrap();
+
+    let field_of = |c: &ninesql_core::Connection| match manager.registry().validate_connection(c) {
+        Err(CoreError::InvalidConnection(ConnectionError::InvalidField { field, .. })) => field,
+        other => panic!("expected an invalid field, got {other:?}"),
+    };
+    // A property off the allowlist; its value is never echoed.
+    let mut c = valid();
+    c.properties.insert("fetch_size".into(), "value-xyz".into());
+    assert_eq!(field_of(&c), "properties.fetch_size");
+    assert!(
+        !manager
+            .registry()
+            .validate_connection(&c)
+            .unwrap_err()
+            .to_string()
+            .contains("value-xyz")
+    );
+    // An authentication kind the driver does not list.
+    let mut c = valid();
+    c.auth = Auth::Token {
+        username: None,
+        secret: SecretSource::Prompt,
+    };
+    assert_eq!(field_of(&c), "auth");
+    let mut c = valid();
+    c.auth = Auth::None;
+    assert_eq!(field_of(&c), "auth");
+    // verify-ca without a CA file (ADR-0019).
+    let mut c = valid();
+    c.tls.mode = TlsMode::VerifyCa;
+    assert_eq!(field_of(&c), "tls.ca_file");
+    c.tls.ca_file = Some("/etc/ninesql/ca.pem".into());
+    manager.registry().validate_connection(&c).unwrap();
+    // An encrypted client key.
+    let mut c = valid();
+    c.tls.client_certificate = Some(ClientCertificate {
+        cert_file: "/c.pem".into(),
+        key_file: "/k.pem".into(),
+        passphrase: Some(SecretSource::Prompt),
+    });
+    assert_eq!(field_of(&c), "tls.client_certificate.passphrase");
+    // TLS disabled: TLS files are not looked at.
+    c.tls.mode = TlsMode::Disable;
+    manager.registry().validate_connection(&c).unwrap();
+
+    // The connect flow refuses before reaching the driver.
+    let mut c = valid();
+    c.properties.insert("fetch_size".into(), "1".into());
+    ui(async {
+        assert!(matches!(
+            open(&manager, OpenRequest::new(c, &types)).await,
+            Err(CoreError::InvalidConnection(
+                ConnectionError::InvalidField { .. }
+            ))
+        ));
+    });
+    assert_eq!(stats.connects(), 0);
+}
+
 fn ssh_connection(port: u16) -> ninesql_core::Connection {
     let mut c = mock_connection(ConnectionTypeId::dev());
     let mut server = SshHop::new(
