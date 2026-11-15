@@ -746,8 +746,11 @@ impl Selection {
 pub struct OutcomeView {
     /// "3 created, 1 updated…" lines.
     pub lines: Vec<String>,
-    /// The report saved in the project.
-    pub report_file: String,
+    /// The report saved in the project; `None` when it could not be written.
+    pub report_file: Option<String>,
+    /// Why the report could not be saved ("report not saved: <reason>"); the import itself
+    /// was applied. Never holds a secret (a storage error).
+    pub report_error: Option<String>,
     /// The ADR-0006 §4 advice, when saved passwords were moved or found.
     pub advice: Option<&'static str>,
 }
@@ -779,7 +782,11 @@ impl OutcomeView {
         }
         Self {
             lines,
-            report_file: outcome.report_file.display().to_string(),
+            report_file: outcome
+                .report_file
+                .as_ref()
+                .map(|p| p.display().to_string()),
+            report_error: outcome.report_error.clone(),
             advice: (had_saved_passwords || outcome.secrets_moved > 0)
                 .then_some(DELETE_DBEAVER_PASSWORDS_ADVICE),
         }

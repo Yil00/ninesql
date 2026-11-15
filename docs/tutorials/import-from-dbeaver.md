@@ -54,7 +54,7 @@ Press "Import N connection(s)". NineSQL reads the DBeaver workspace again and wr
 - **The vault is locked**: the "Unlock the vault" prompt opens, then the import runs again.
 - **The DBeaver workspace or your saved connections changed since the preview**: nothing is written, the preview is computed again and the screen says "The DBeaver workspace or the saved connections changed since the preview: it was computed again. Review it, then import again."
 
-Then the screen shows "Imported": how many connections were created, updated, disabled, left out and not imported, how many saved passwords moved, how many connection types changed, and "Report saved to …": the report in your project, `imports/dbeaver-<date>.json`. It holds names, statuses, reasons and counts, never a password.
+Then the screen shows "Imported": how many connections were created, updated, disabled, left out and not imported, how many saved passwords moved, how many connection types changed, and "Report saved to …": the report in your project, `imports/dbeaver-<date>.json`. It holds names, statuses, reasons and counts, never a password. If the report cannot be written (for example a full disk or a permission problem in the project folder), the import is still applied and the screen says "Import report not saved: <reason>. The connections were imported." instead, in the warning colour.
 
 If DBeaver had saved passwords, the screen also advises: "DBeaver still keeps the passwords it saved, in a file that is only obfuscated. Once you have switched to NineSQL, consider deleting them in DBeaver …". NineSQL never does it for you ([ADR-0006](../adr/0006-dbeaver-interoperability.md) §4); the report says so too.
 

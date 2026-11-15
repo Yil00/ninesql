@@ -659,7 +659,10 @@ fn preview_vault_creation_apply_reload_report_and_advice(cx: &mut TestAppContext
         "{:?}",
         outcome.lines
     );
-    let report = PathBuf::from(&outcome.report_file);
+    assert_eq!(outcome.report_error, None);
+    let Some(report) = outcome.report_file.as_deref().map(PathBuf::from) else {
+        panic!("no report file")
+    };
     assert!(report.is_file(), "{}", report.display());
     assert!(report.starts_with(&base), "{}", report.display());
 
@@ -1276,4 +1279,41 @@ fn cancel_while_previewing_returns_to_idle_and_ignores_the_answer(cx: &mut TestA
     assert_eq!(stage(&flow, &vcx), Stage::Preview);
     flow.update(&mut vcx, |f, cx| f.cancel_preview(cx));
     assert_eq!(stage(&flow, &vcx), Stage::Preview);
+}
+
+#[gpui::test]
+fn a_report_that_cannot_be_saved_does_not_fail_the_import(cx: &mut TestAppContext) {
+    let tmp = tempfile::tempdir().unwrap_or_else(|e| panic!("{e}"));
+    let base = std::fs::canonicalize(tmp.path()).unwrap_or_else(|e| panic!("{e}"));
+    let source = crafted(&base, &[pg("pg-a", "A")]);
+    let (hub, core) = core_hub(cx, &base);
+    // A file where the reports folder goes: the report cannot be written.
+    let imports = core.workspace().project_paths().dir().join("imports");
+    std::fs::create_dir_all(core.workspace().project_paths().dir())
+        .unwrap_or_else(|e| panic!("{e}"));
+    std::fs::write(&imports, b"not a folder").unwrap_or_else(|e| panic!("{e}"));
+    let (ws, mut vcx) = open(cx);
+    let flow = import_flow(&ws, &mut vcx);
+    preview(&flow, &source, &mut vcx);
+    flow.update_in(&mut vcx, |f, window, cx| f.apply(window, cx));
+    wait_until(&mut vcx, |vcx| {
+        matches!(stage(&flow, vcx), Stage::Done(_) | Stage::Preview)
+    });
+    let Stage::Done(outcome) = stage(&flow, &vcx) else {
+        panic!(
+            "not imported: {:?}",
+            flow.read_with(&vcx, |f, _| f.notice().map(str::to_owned))
+        )
+    };
+    assert_eq!(outcome.report_file, None);
+    assert!(
+        outcome
+            .report_error
+            .as_deref()
+            .is_some_and(|e| e.starts_with("report not saved: ")),
+        "{:?}",
+        outcome.report_error
+    );
+    assert_eq!(hub.read_with(&vcx, |h, _| h.connections().len()), 1);
+    assert!(!hub.read_with(&vcx, |h, _| h.is_importing()));
 }

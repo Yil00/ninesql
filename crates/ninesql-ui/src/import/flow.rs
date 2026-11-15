@@ -817,12 +817,20 @@ impl Render for ImportFlow {
                             .enumerate()
                             .map(|(i, l)| div().id(("import-outcome", i)).child(l.clone())),
                     )
-                    .child(
-                        div()
+                    .child(match (&outcome.report_file, &outcome.report_error) {
+                        (Some(file), _) => div()
                             .id("import-report-file")
                             .text_xs()
-                            .child(format!("Report saved to {}", outcome.report_file)),
-                    )
+                            .child(format!("Report saved to {file}")),
+                        (None, error) => div()
+                            .id("import-report-error")
+                            .text_xs()
+                            .text_color(warning)
+                            .child(format!(
+                                "Import {}. The connections were imported.",
+                                error.as_deref().unwrap_or("report not saved")
+                            )),
+                    })
                     .when_some(outcome.advice, |el, advice| {
                         el.child(div().id("import-advice").text_color(warning).child(advice))
                     }),
