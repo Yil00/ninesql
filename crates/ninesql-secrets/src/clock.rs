@@ -43,13 +43,21 @@ pub(crate) trait Clock: Send + Sync + fmt::Debug {
     fn now(&self) -> BootInstant;
 }
 
-/// The system's `CLOCK_BOOTTIME`.
+/// A clock that keeps counting while the machine sleeps: `CLOCK_BOOTTIME` on Linux
+/// (the shipped targets). macOS, kept compiling only for UI iteration (docs/10), has no
+/// `CLOCK_BOOTTIME`; there `CLOCK_MONOTONIC` is used, which macOS documents as
+/// continuing to increment while the system is asleep.
 #[derive(Debug, Default, Clone, Copy)]
 pub(crate) struct BootClock;
 
+#[cfg(any(target_os = "linux", target_os = "android"))]
+const SLEEP_COUNTING_CLOCK: rustix::time::ClockId = rustix::time::ClockId::Boottime;
+#[cfg(not(any(target_os = "linux", target_os = "android")))]
+const SLEEP_COUNTING_CLOCK: rustix::time::ClockId = rustix::time::ClockId::Monotonic;
+
 impl Clock for BootClock {
     fn now(&self) -> BootInstant {
-        let ts = rustix::time::clock_gettime(rustix::time::ClockId::Boottime);
+        let ts = rustix::time::clock_gettime(SLEEP_COUNTING_CLOCK);
         // The kernel returns tv_sec >= 0 and 0 <= tv_nsec < 1e9 for this clock.
         let secs = u64::try_from(ts.tv_sec).unwrap_or(0);
         let nanos = u32::try_from(ts.tv_nsec).unwrap_or(0).min(999_999_999);
