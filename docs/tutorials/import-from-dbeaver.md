@@ -17,10 +17,14 @@ Three ways:
 
 All three are in the command palette (`Ctrl+Shift+P`, type "dbeaver").
 
-Finding the workspace only lists folders. Reading it (and decrypting DBeaver's saved passwords in memory) happens when the preview runs, off the interface thread. While it runs, the screen says "Reading the DBeaver workspace…"; "Cancel" returns to the folder field. The read itself is not interrupted: it finishes in the background (it only reads) and its result is ignored.
+Finding the workspace only lists folders. Reading it (and decrypting DBeaver's saved passwords in memory) happens when the preview runs, off the interface thread. While it runs, the screen says "Reading the DBeaver workspace…". "Cancel" stops the read (between two files, or every 64 connections) and the screen says "Import preview cancelled: nothing was imported." Nothing is written either way. A read stuck on a network or FUSE file that does not answer cannot be interrupted until that file answers.
+
+The read is bounded for one source (every workspace found, or the folder you picked): at most 256 projects, 10 000 connections, 64 MiB read and 50 000 report entries, and looking for workspaces lists at most 2 048 folders and 200 000 entries. A project reached twice (for example through a symbolic link) is read once. Files under `/proc`, `/sys` and `/dev` are never read. When a folder holds so many entries that no project could be found before the limit, the screen says "Cannot preview: the folder holds too many entries to look for DBeaver projects in it; pick the DBeaver workspace folder or a project folder directly."
 
 ## 2. Read the preview
 The "Import from DBeaver" screen lists, from top to bottom:
+- **"Incomplete preview"** (only when a limit was reached): "Incomplete preview: a limit was reached while reading the DBeaver workspace, so some projects or connections are not listed and will not be imported. Pick a smaller folder (one project) to import the rest."
+- **"Source issues"** (only when there are some): the limits reached and the folders read once because they were reached twice, one line each.
 - **"Source"**: the workspaces read, with how DBeaver was installed and its version.
 - **"Saved passwords"**: how many secrets DBeaver saved and where they go ("… saved secret(s) move to the encrypted vault. Values are never shown."). Untick "Import saved passwords" to leave them behind: NineSQL then asks for them at each connect. The screen never shows a password, not even masked: only counts and fields such as "Password (database)" or "SSH key passphrase (SSH server)".
 - **"Connection types"**: types the import creates, and existing types it makes stricter. An import never weakens a type. When a built-in type such as Test or Production gains rules (for example "asks before destructive statements"), the line is highlighted and says how many of your saved connections it changes: "The built-in type "Test" becomes stricter: asks before destructive statements. This changes 2 saved connection(s) of this type".

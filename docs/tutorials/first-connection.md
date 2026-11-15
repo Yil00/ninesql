@@ -89,7 +89,7 @@ Select the connection in the navigator (`Ctrl+K` then `Ctrl+N` moves the focus t
 - On success: "Connected to "nine-pg"." If the session has weakened settings, a "Security warnings" notification lists them; it stays until you close it.
 - The status bar always shows the connection type, and a read-only badge when the session is read-only. For a **production** connection, a frame in the type color surrounds the editor area of the window while that connection is the window's active one. The navigator shows each connection's type color stripe and badges. These come from the open session, so an edit you save applies at the next connect, and the dialog says so ("This connection is open: its sessions keep their current settings until you reconnect.").
 
-The statement confirmation dialog of production connections ("Run on production?") exists, but it appears only once the SQL editor can run statements (phase 3).
+To run statements on the connection, open an SQL editor (`Ctrl+T`): see [Run SQL and read results](run-sql.md). On a production connection, destructive statements open the "Run on production?" confirmation first.
 
 ## Manage connections
 | Action | Keys |
@@ -104,5 +104,6 @@ The statement confirmation dialog of production connections ("Run on production?
 "Show connection problems" lists what NineSQL found when loading `connections.json` (for example a key that looked like a secret and was removed), saved connections that their driver refuses, and whether sleep and screen lock are watched.
 
 ## Next
+- [Run SQL and read results](run-sql.md).
 - [Secrets: keyring, vault and locking](secrets.md).
 - Per-engine details (TLS, read-only mechanism, properties): [docs/08](../08-engine-capabilities.md).

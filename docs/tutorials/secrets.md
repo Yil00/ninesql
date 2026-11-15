@@ -45,12 +45,13 @@ The vault locks itself, and the passwords typed for "Ask every time" are forgott
 
 After a lock, a "Secrets locked" notification explains why ("the computer went to sleep", "the screen was locked", "the vault was not used for a while", "you asked for it") and the status bar shows "Secrets locked (…)". The next connect that needs a vault password asks for the master password again.
 
-Locking does not close open sessions: the drivers keep no password once connected, so a session goes on until you disconnect, and only the next connect needs the vault.
+Locking does not close open sessions: the drivers keep no password once connected, so a session goes on until you disconnect (a running statement or an open transaction included), and only the next connect needs the vault. A lock also stops a reconnect of the core that is still trying, and forgets the passwords typed for it; the interface does not start reconnects yet ([Run SQL](run-sql.md#10-preferences-in-settingstoml)).
 
 **When sleep and screen lock are not watched**: on macOS, in a Flatpak without the `org.freedesktop.login1` system-bus permission ([docs/10](../10-supported-platforms.md#flatpak-permissions)), or on a Linux system without logind. Only the idle lock and "Lock secrets now" apply then, and "Show connection problems" (`Ctrl+K` then `Ctrl+L`) says so: "Sleep and screen lock are not watched…: use "Lock secrets now" before leaving the computer."
 
 ## 5. What never reaches the disk
 - Passwords, passphrases and the master password are never written to NineSQL's files: not `settings.toml`, not `connections.json` (it holds only a reference to the stored secret), not logs, history or exports. Tests check that no password reaches any file under the workspace directories after create, connect, execute and close.
+- The query history (`history.sqlite`) never stores parameter values, nothing at all for production connections, and no statement holding a credential word such as `PASSWORD` or `IDENTIFIED`, or a URL with a password ([Run SQL](run-sql.md#9-history)). The drivers' logs skip the same statements.
 - The dialog never displays a saved password, not even masked; secret fields have no reveal button and cannot be copied.
 - If NineSQL finds something that looks like a secret in `connections.json` (for example added by hand), it removes it, rewrites the file and lists it in "Show connection problems".
 - A URL pasted in the dialog that holds a password is refused.

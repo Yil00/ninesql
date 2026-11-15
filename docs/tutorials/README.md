@@ -2,13 +2,14 @@
 
 Step-by-step guides for people who build, try or contribute to NineSQL. They describe what the code on the `dev` branch does today, and they are updated when a user-visible behaviour or a command changes ([AGENTS.md](../../AGENTS.md#definition-of-done)).
 
-NineSQL is **pre-alpha**: nothing is released, and you run it from source. What exists today is the application shell, the connection dialog and the PostgreSQL, MySQL, MariaDB and SQLite drivers. There is **no SQL editor that runs statements and no results grid until phase 3** ([ROADMAP](../ROADMAP.md)). The DBeaver import screen exists (phase 2, P2-B); its visual pass is deferred to the end of the MVP (P6-F).
+NineSQL is **pre-alpha**: nothing is released, and you run it from source. What exists today is the application shell, the connection dialog, the PostgreSQL, MySQL, MariaDB and SQLite drivers, the DBeaver import (phase 2) and the SQL editor with its results grid (phase 3, pending its phase-end review). Not built yet: the navigator's schema tree and object completion (phase 4), data editing and export (phase 5), script files and session restore ([ROADMAP](../ROADMAP.md)). The screens were written without a display; their visual pass is deferred to the end of the MVP (P6-F).
 
 | Tutorial | For | You will |
 |---|---|---|
 | [Build and run NineSQL from source](build-and-run.md) | Everyone | Install the toolchain, build, start the `ninesql` window on Linux (and on macOS for UI work) |
 | [Start the dev databases](dev-databases.md) | Contributors, testers | Run PostgreSQL, MySQL, MariaDB and the other engines in containers with the "nine" dataset |
 | [Create your first connection](first-connection.md) | Everyone | Create, test and open a PostgreSQL, MySQL, MariaDB or SQLite connection: TLS, SSH, connection types |
+| [Run SQL and read results](run-sql.md) | Everyone | Open an SQL editor on a connection, run statements, selections and scripts with parameters, confirm on production, cancel, commit or roll back, page through and copy results, set timeouts and history retention |
 | [Import from DBeaver](import-from-dbeaver.md) | DBeaver users | Preview and import your DBeaver connections, move their saved passwords to the vault or keyring, enable connections imported disabled |
 | [Secrets: keyring, vault and locking](secrets.md) | Everyone | Understand where passwords go, create and unlock the vault, lock it, and what never reaches the disk |
 | [Run the checks before a PR](checks-before-a-pr.md) | Contributors | Run what CI runs, with and without database engines |

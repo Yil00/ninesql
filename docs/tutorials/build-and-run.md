@@ -48,7 +48,8 @@ Only one NineSQL process can use the workspace at a time: a second one is refuse
 | Import from DBeaver | `Ctrl+K` then `Ctrl+I` |
 | Show or hide the database navigator | `Ctrl+B` |
 | Move focus to the navigator | `Ctrl+K` then `Ctrl+N` |
-| New editor tab (empty: statements cannot be run yet) | `Ctrl+T` |
+| New SQL editor ([run SQL](run-sql.md)) | `Ctrl+T` |
+| Choose the editor's connection | `Ctrl+K` then `Ctrl+P` |
 | Close the editor tab | `Ctrl+W` |
 | Split right / split down | `Ctrl+\` / `Ctrl+K` then `Ctrl+\` |
 | Toggle light / dark theme | `Ctrl+K` then `Ctrl+T` |
@@ -56,7 +57,7 @@ Only one NineSQL process can use the workspace at a time: a second one is refuse
 | Show settings problems | `Ctrl+K` then `Ctrl+E` |
 | New window / close window / quit | `Ctrl+Shift+N` / `Ctrl+Shift+W` / `Ctrl+Q` |
 
-The connection actions are in [Create your first connection](first-connection.md), the secret actions in [Secrets](secrets.md).
+The connection actions are in [Create your first connection](first-connection.md), the editor and results grid actions in [Run SQL and read results](run-sql.md), the secret actions in [Secrets](secrets.md).
 
 On macOS the default bindings use **Ctrl** too, not Cmd: the defaults are the Linux ones on every platform.
 
@@ -78,17 +79,19 @@ ToggleNavigator = []                            # unbinds
 [import]
 first_run_prompt = false        # do not offer the DBeaver import at startup
 ```
+Editor and grid actions are named in full under `[keybindings]` (`"ninesql_editor::ExecuteStatement" = "f5"`, `"ninesql_grid::FetchAllRows" = "alt-end"`); short names work for the shell's own actions only. The `[execution]`, `[history]` and `[confirmations]` sections (timeouts, fetch size, memory budget, history retention, close confirmation) are described in [Run SQL and read results](run-sql.md#10-preferences-in-settingstoml).
 An invalid value or binding never stops NineSQL: the default is used and the problem is listed by "Show settings problems" (`Ctrl+K` then `Ctrl+E`).
 
 ## Where NineSQL keeps its files
 | Path (defaults) | Content |
 |---|---|
-| `~/.config/ninesql/settings.toml` | Appearance and key bindings |
+| `~/.config/ninesql/settings.toml` | Appearance, key bindings, execution, history and confirmation preferences |
 | `~/.local/share/ninesql/workspace/<project>/` | `connections.json`, `connection-types.json`, `project.json`, and `imports/dbeaver-<date>.json` after a [DBeaver import](import-from-dbeaver.md) |
 | `~/.local/share/ninesql/vault.bin` | The encrypted vault, if you created one ([Secrets](secrets.md)) |
 | `~/.local/share/ninesql/known_hosts` | SSH host keys you trusted in NineSQL |
+| `~/.local/state/ninesql/history.sqlite` | Query history, readable by you only, never with parameter values ([what is recorded](run-sql.md#9-history)) |
 
-None of these files ever holds a password ([invariant I1](../../CONTEXT.md#invariants-non-negotiable)). The `XDG_CONFIG_HOME` and `XDG_DATA_HOME` variables move them.
+None of these files ever holds a password ([invariant I1](../../CONTEXT.md#invariants-non-negotiable)). The `XDG_CONFIG_HOME`, `XDG_DATA_HOME` and `XDG_STATE_HOME` variables move them.
 
 ## macOS: what behaves differently
 - **Passwords go to the vault.** The keyring backend is the Linux Secret Service, which macOS does not have (and the backend is off by default on Linux too for now). NineSQL saves passwords in its encrypted vault, protected by a master password ([Secrets](secrets.md)).

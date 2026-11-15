@@ -37,14 +37,14 @@
   </p>
 </div>
 
-> ⚠️ **Pre-alpha.** Nothing is released yet. A development build can create, test and open connections to PostgreSQL, MySQL, MariaDB and SQLite (directly, over TLS and over SSH) from the connection dialog, and import connections from a DBeaver workspace from the UI (preview, saved passwords moved to the vault, re-import; [tutorial](docs/tutorials/import-from-dbeaver.md)), but there is no SQL editor or results grid yet, and the interface, import screens included, awaits its visual check on real desktops, planned with the final MVP tests (P6-F). Saved passwords go to the encrypted vault: the keyring backend is off by default until it is validated on GNOME and KDE. See the [roadmap](docs/ROADMAP.md) for the MVP plan.
+> ⚠️ **Pre-alpha.** Nothing is released yet. A development build can create, test and open connections to PostgreSQL, MySQL, MariaDB and SQLite (directly, over TLS and over SSH) from the connection dialog, and import connections from a DBeaver workspace from the UI (preview, saved passwords moved to the vault, re-import; [tutorial](docs/tutorials/import-from-dbeaver.md)), and run SQL in an editor with a results grid (statements, selections and scripts, parameters, production confirmations, cancel, commit and roll back; [tutorial](docs/tutorials/run-sql.md)). There is no schema browser, data editing or export yet, and the interface, editor and grid included, awaits its visual check and its performance measurements on real desktops, planned with the final MVP tests (P6-F). Saved passwords go to the encrypted vault: the keyring backend is off by default until it is validated on GNOME and KDE. See the [roadmap](docs/ROADMAP.md) for the MVP plan.
 
 ## Why NineSQL
 DBeaver is the de facto universal database client, but it runs on the JVM and Eclipse RCP: high memory use, slow cold start, and uneven HiDPI / Wayland behavior on Linux.
 
 NineSQL keeps the **feature set** DBeaver users rely on and rebuilds it as a **native Rust application** rendered on the GPU with [GPUI](https://github.com/zed-industries/zed/tree/main/crates/gpui):
 - **Native and lean**: no JVM, no webview. Startup time and memory use will be measured and published with the method, not promised; no numbers exist yet ([docs/04-mvp-scope.md](docs/04-mvp-scope.md#exit-criterion)).
-- **Large results stay fluid**: a virtualized, GPU-rendered grid streams results in bounded memory.
+- **Large results in bounded memory**: a virtualized, GPU-rendered grid streams results under a memory budget and builds only the visible rows; its frame times will be measured on real hardware and published with the method, not promised.
 - **Secure by default**: passwords live in the desktop keyring (Secret Service) or an encrypted local vault, never in config files; TLS verified by default; production connections guarded by a real read-only mode, not just a red banner ([docs/05-security.md](docs/05-security.md)).
 - **Offline-first**: no telemetry, no account, no network traffic except to the databases you declare.
 - **Switch in one click**: imports DBeaver connections, folders, connection types, SSH tunnels and saved passwords ([docs/06-dbeaver-interop.md](docs/06-dbeaver-interop.md)).
@@ -54,10 +54,10 @@ The 20 most used **open-source, self-hostable** engines. Cloud-only services (Sn
 
 | Engine | Family | Planned in | Status |
 |:--|:--|:--|:--|
-| **PostgreSQL** | SQL · pg-wire | MVP (v0.1) | 🚧 Driver landed (P1-B); connect from the connection dialog (P1-C) or import from DBeaver (P2), no editor or grid yet |
-| **MySQL** | SQL · mysql-wire | MVP (v0.1) | 🚧 Driver landed (P1-B); connect from the connection dialog (P1-C) or import from DBeaver (P2), no editor or grid yet |
-| **MariaDB** | SQL · mysql-wire | MVP (v0.1) | 🚧 Driver landed (P1-B); connect from the connection dialog (P1-C) or import from DBeaver (P2), no editor or grid yet |
-| **SQLite** | SQL · embedded | MVP (v0.1) | 🚧 Driver landed (P1-B); connect from the connection dialog (P1-C) or import from DBeaver (P2), no editor or grid yet |
+| **PostgreSQL** | SQL · pg-wire | MVP (v0.1) | 🚧 Driver landed (P1-B); connect from the connection dialog (P1-C) or import from DBeaver (P2); run SQL in the editor and read results in the grid (P3); no schema browser yet (P4) |
+| **MySQL** | SQL · mysql-wire | MVP (v0.1) | 🚧 Driver landed (P1-B); connect from the connection dialog (P1-C) or import from DBeaver (P2); run SQL in the editor and read results in the grid (P3); no schema browser yet (P4) |
+| **MariaDB** | SQL · mysql-wire | MVP (v0.1) | 🚧 Driver landed (P1-B); connect from the connection dialog (P1-C) or import from DBeaver (P2); run SQL in the editor and read results in the grid (P3); no schema browser yet (P4) |
+| **SQLite** | SQL · embedded | MVP (v0.1) | 🚧 Driver landed (P1-B); connect from the connection dialog (P1-C) or import from DBeaver (P2); run SQL in the editor and read results in the grid (P3); no schema browser yet (P4) |
 | **TimescaleDB** | SQL · pg-wire | MVP (v0.1) | 🗓 Planned |
 | **YugabyteDB** (YSQL) | SQL · pg-wire | MVP (v0.1) | 🗓 Planned |
 | **QuestDB** | SQL · pg-wire | MVP (v0.1) | 🗓 Planned |
@@ -92,7 +92,7 @@ make build                # = cargo build --workspace --locked
 make run                  # start the ninesql window
 make check                # what CI checks, without database engines
 ```
-Step-by-step guides are in [docs/tutorials/](docs/tutorials/README.md): build and run from source (Linux, and macOS for UI work), start the dev databases, create a first connection, secrets, and the checks to run before a PR. The test databases run in containers: see [dev/README.md](dev/README.md). AI coding agents (Claude Code, Codex…) start with [AGENTS.md](AGENTS.md) and [CONTEXT.md](CONTEXT.md).
+Step-by-step guides are in [docs/tutorials/](docs/tutorials/README.md): build and run from source (Linux, and macOS for UI work), start the dev databases, create a first connection, run SQL and read results, import from DBeaver, secrets, and the checks to run before a PR. The test databases run in containers: see [dev/README.md](dev/README.md). AI coding agents (Claude Code, Codex…) start with [AGENTS.md](AGENTS.md) and [CONTEXT.md](CONTEXT.md).
 
 ## Contributing
 Contributions are welcome: see [CONTRIBUTING.md](CONTRIBUTING.md). PRs target the `dev` branch.

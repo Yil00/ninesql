@@ -6,7 +6,7 @@ Starting choices. Driver client crates are confirmed (or replaced) by their driv
 |---|---|---|
 | Language | Rust stable, edition 2024, minimum 1.89 | `rust-toolchain.toml`; `rust-version` in the root `Cargo.toml` ([ADR-0012](adr/0012-secret-service-client-and-msrv.md)) |
 | UI | GPUI and `gpui-component` from crates.io through `gpui-kit` (exact pin; GPUI is the `gpui-pre` snapshot of `zed-industries/zed`) | ADR-0001, [ADR-0013](adr/0013-gpui-source-and-supply-chain.md) (supply-chain controls); never Zed's GPL crates |
-| Syntax | `tree-sitter` + SQL grammars per dialect | Completion from our own metadata cache |
+| Syntax | `tree-sitter` through gpui-component's code editor, with one SQL grammar (MIT `tree-sitter-sequel`) for every dialect so far; `lsp-types` and `anyhow` only at gpui-component's completion-provider boundary ([ADR-0025](adr/0025-phase-3-dialect-and-editor-decisions.md) §6, Proposed) | Splitting, parameters and completion keywords follow the session dialect; object completion from our own metadata cache (phase 4) |
 | Async runtime | `tokio` (multi-thread, bounded workers) for driver and network I/O | ADR-0004 |
 | Results | `arrow-array`, `arrow-schema` (not the full `arrow` crate) | Tabular batches; documents as an ordered value tree |
 | TLS | `rustls` 0.23 with the `ring` crypto provider, `tokio-rustls`, `rustls-native-certs` for the platform trust store | No OpenSSL, no `aws-lc-rs` (ADR-0011). `rustls-native-certs` pulls `openssl-probe`, which only locates the system CA files |
