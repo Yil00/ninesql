@@ -11,6 +11,7 @@ pub mod connection;
 pub mod connection_type;
 pub mod dbeaver_roots;
 mod error;
+pub mod import;
 pub mod properties;
 pub mod registry;
 pub mod runtime;
@@ -20,14 +21,20 @@ pub mod workspace;
 
 pub use connect::{FlaggedInitStatement, SecretPrompt};
 pub use connection::{
-    Auth, ClientCertificate, Connection, ConnectionId, Endpoint, EngineId, HostKeyPolicy, Origin,
-    PasswordExchange, SecretSlot, SecretSource, SecurityWarning, SshAuth, SshHop, SshTunnel,
-    TlsConfig, TlsMode,
+    Auth, ClientCertificate, Connection, ConnectionId, DisabledKind, DisabledReason, Endpoint,
+    EngineId, HostKeyPolicy, Origin, PasswordExchange, SecretSlot, SecretSource, SecurityWarning,
+    SshAuth, SshHop, SshTunnel, TlsConfig, TlsMode,
 };
 pub use connection_type::{Color, ConnectionType, ConnectionTypeId, ConnectionTypes, SafetyPolicy};
 pub use dbeaver_roots::{DbeaverRoots, FileCheck};
 pub use error::{ConnectionError, CoreError, WorkspaceError};
-pub use registry::DriverRegistry;
+pub use import::{
+    Change, ConnectionPlan, FolderPlan, ImportChoices, ImportError, ImportOutcome, ImportPreview,
+    ImportReportFile, ImportSource, ImportStatus, Importer, PlanAction, PreviewWorkspace,
+    ProjectPreview, SecretChange, SecretChangeKind, SecretToMove, TlsChange, TypeAction, TypePlan,
+    UpdateDiff,
+};
+pub use registry::{DriverRegistry, EnableError};
 pub use runtime::DriverRuntime;
 pub use services::{
     CoreConfig, CoreServices, DEFAULT_LOCK_CHECK_INTERVAL, DEFAULT_VAULT_IDLE_TIMEOUT,

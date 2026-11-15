@@ -45,6 +45,9 @@ tokio = { workspace = true, features = ["rt", "rt-multi-thread", "sync", "time",
 ninesql-driver-api = { workspace = true, features = ["mock"] }
 # Core + pgwire integration test (tests/pgwire_tunnel.rs): a real driver behind the connect flow.
 ninesql-driver-pgwire = { path = "../drivers/ninesql-driver-pgwire" }
+# DBeaver import tests (tests/import.rs): the drivers NineSQL ships decide what is imported enabled.
+ninesql-driver-mysqlwire = { path = "../drivers/ninesql-driver-mysqlwire" }
+ninesql-driver-sqlite = { path = "../drivers/ninesql-driver-sqlite" }
 async-trait.workspace = true
 ninesql-secrets = { workspace = true, features = ["memory-store"] }
 proptest.workspace = true

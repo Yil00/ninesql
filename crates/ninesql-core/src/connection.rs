@@ -459,7 +459,91 @@ pub enum Origin {
         /// DBeaver project the connection came from.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         project: Option<String>,
+        /// Canonical path of the DBeaver workspace the connection came from
+        /// (`connections.json` schema 5). A re-import matches on the DBeaver id, the project
+        /// **and** this path, so another workspace reusing the id never updates this connection
+        /// (P2-C review, H1). `None` for connections imported before schema 5: they never match.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        source_workspace: Option<PathBuf>,
     },
+}
+
+/// What kind of cause disabled a connection ([`DisabledReason`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+#[non_exhaustive]
+pub enum DisabledKind {
+    /// The engine has no NineSQL driver in this build (outside the v1 set, ADR-0003 / ADR-0006
+    /// §5, or not shipped yet). Enabling needs a registered driver that accepts the connection.
+    NoDriver,
+    /// The imported route could not be reproduced (a DBeaver network profile, an unknown network
+    /// handler such as a proxy, an SSH forwarding target other than the connection's own host):
+    /// connecting without that hop would reach the server another way than DBeaver did (I2).
+    /// Enabling needs the user to confirm the route was set up again in NineSQL.
+    Route,
+    /// The driver of the engine refuses the imported settings
+    /// ([`crate::DriverRegistry::validate_connection`]). Enabling needs settings it accepts.
+    Invalid,
+}
+
+/// Why NineSQL disabled a connection (`connections.json` schema 5). Never holds a value from
+/// the imported file other than DBeaver identifiers and static explanations (I1).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DisabledReason {
+    /// Category, which decides what [`Connection::try_enable`](crate::Connection::try_enable)
+    /// checks.
+    pub kind: DisabledKind,
+    /// User-presentable explanation (at most 1024 bytes, no control characters).
+    pub message: String,
+}
+
+/// Longest [`DisabledReason::message`], in bytes.
+pub const MAX_DISABLED_REASON: usize = 1024;
+
+impl DisabledReason {
+    /// A reason, with the message cleaned to the rules of [`DisabledReason::validate`]: control
+    /// characters become spaces, the text is cut at [`MAX_DISABLED_REASON`] bytes, and an empty
+    /// message gets a generic one.
+    #[must_use]
+    pub fn new(kind: DisabledKind, message: impl Into<String>) -> Self {
+        let message: String = message
+            .into()
+            .chars()
+            .map(|c| if c.is_control() { ' ' } else { c })
+            .collect();
+        let mut end = message.len().min(MAX_DISABLED_REASON);
+        while !message.is_char_boundary(end) {
+            end -= 1;
+        }
+        let mut message = message[..end].trim().to_owned();
+        if message.is_empty() {
+            message = "disabled by NineSQL".to_owned();
+        }
+        Self { kind, message }
+    }
+
+    /// Checks the message rules.
+    ///
+    /// # Errors
+    /// [`ConnectionError::InvalidField`].
+    pub fn validate(&self) -> Result<(), ConnectionError> {
+        let reason = if self.message.trim().is_empty() {
+            Some("cannot be empty")
+        } else if self.message.len() > MAX_DISABLED_REASON {
+            Some("is too long (1024 bytes at most)")
+        } else if self.message.chars().any(char::is_control) {
+            Some("cannot contain control characters")
+        } else {
+            None
+        };
+        match reason {
+            Some(reason) => Err(ConnectionError::InvalidField {
+                field: "disabled_reason.message".to_owned(),
+                reason,
+            }),
+            None => Ok(()),
+        }
+    }
 }
 
 /// A weakened security setting, shown on the connection and its tabs (ADR-0011 §2, I5).
@@ -593,10 +677,40 @@ pub struct Connection {
     /// (`connections.json` schema 4).
     #[serde(default, skip_serializing_if = "is_false")]
     pub init_sql_needs_confirmation: bool,
+    /// Default schema (or search path entry) to select after connecting, when the engine has
+    /// the notion. Imported from DBeaver's `bootstrap.defaultSchema` (P2-C) so the value is not
+    /// lost; not passed to drivers yet (the driver API has no field for it). `connections.json`
+    /// schema 5.
+    ///
+    /// **For the driver that applies it** (P2-C review, L3): the value comes from an imported
+    /// file and may hold any printable character. It must be bound as a parameter or quoted as
+    /// an identifier with the engine's dialect, never interpolated into SQL (`SET search_path`,
+    /// `USE`…). The same holds for [`Connection::default_catalog`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_schema: Option<String>,
+    /// Default catalog to select after connecting, when the engine has the notion. Imported from
+    /// DBeaver's `bootstrap.defaultCatalog`; not passed to drivers yet. `connections.json`
+    /// schema 5.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_catalog: Option<String>,
+    /// Overrides the type's auto-commit default for new sessions (DBeaver's
+    /// `bootstrap.autocommit`). On a production type it can only tighten: `Some(true)` never
+    /// turns auto-commit on there ([`Connection::policy`], ADR-0007 §5). `connections.json`
+    /// schema 5.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auto_commit: Option<bool>,
     /// Disabled connections are listed but cannot be opened (for example engines outside the v1
     /// set imported from DBeaver, ADR-0006 §5).
     #[serde(default = "default_true", skip_serializing_if = "is_true")]
     pub enabled: bool,
+    /// Why the connection is disabled, when NineSQL disabled it (a DBeaver import that could not
+    /// reproduce its route, an engine without a driver, settings a driver refuses). While set,
+    /// `enabled` must be `false` ([`Connection::validate`]); only
+    /// [`Connection::try_enable`](crate::Connection::try_enable) (through
+    /// [`crate::Workspace::enable_connection`]) clears it, after checking the cause is gone.
+    /// `connections.json` schema 5.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub disabled_reason: Option<DisabledReason>,
     /// Where the connection comes from.
     #[serde(default)]
     pub origin: Origin,
@@ -631,7 +745,11 @@ impl Connection {
             properties: BTreeMap::new(),
             init_sql: Vec::new(),
             init_sql_needs_confirmation: false,
+            default_schema: None,
+            default_catalog: None,
+            auto_commit: None,
             enabled: true,
+            disabled_reason: None,
             origin: Origin::Native,
         }
     }
@@ -697,8 +815,31 @@ impl Connection {
                 return Err(ConnectionError::SecretInInitSql { index });
             }
         }
-        if let Origin::Dbeaver { dbeaver_id, .. } = &self.origin {
+        if let Origin::Dbeaver {
+            dbeaver_id,
+            source_workspace,
+            ..
+        } = &self.origin
+        {
             short_text("origin.dbeaver_id", dbeaver_id, false)?;
+            if let Some(path) = source_workspace {
+                non_empty_path("origin.source_workspace", path)?;
+            }
+        }
+        if let Some(schema) = &self.default_schema {
+            short_text("default_schema", schema, false)?;
+        }
+        if let Some(catalog) = &self.default_catalog {
+            short_text("default_catalog", catalog, false)?;
+        }
+        if let Some(reason) = &self.disabled_reason {
+            if self.enabled {
+                return Err(self.invalid(
+                    "disabled_reason",
+                    "is set on an enabled connection: fix the cause and enable it through `try_enable`",
+                ));
+            }
+            reason.validate()?;
         }
         Ok(())
     }
@@ -790,6 +931,13 @@ impl Connection {
             Some(true) => true,
             Some(false) if !policy.production => false,
             Some(false) | None => policy.read_only,
+        };
+        // Same rule for auto-commit: manual commit can always be asked for; auto-commit never
+        // replaces the manual commit of a production type.
+        policy.auto_commit = match self.auto_commit {
+            Some(false) => false,
+            Some(true) if !policy.production => true,
+            Some(true) | None => policy.auto_commit,
         };
         policy
     }

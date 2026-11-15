@@ -10,6 +10,7 @@ loading it through the migration chain.
 | `connections/v2.json` | `connections.json` | 2 (adds the per-hop SSH `host_key_policy`, ADR-0016) |
 | `connections/v3.json` | `connections.json` | 3 (adds the connection's `password_exchange`) |
 | `connections/v4.json` | `connections.json` | 4 (adds the `init_sql_needs_confirmation` marker of imported init SQL) |
+| `connections/v5.json` | `connections.json` | 5 (adds `default_schema`, `default_catalog`, the `auto_commit` override and `disabled_reason`, P2-C) |
 | `connection-types/v1.json` | `connection-types.json` | 1 |
 | `project/v1.json` | `project.json` | 1 (current: 2, adds `id`) |
 
