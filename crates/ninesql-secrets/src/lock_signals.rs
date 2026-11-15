@@ -1,12 +1,13 @@
-//! logind listener for [`crate::lock_events`] (feature `secret-service`, same zbus 6 as the
-//! Secret Service backend: no new dependency).
+//! logind listener for [`crate::lock_events`] (feature `desktop-lock`, on by default and implied
+//! by `secret-service`; zbus 6 only, the same zbus as the Secret Service backend).
 //!
 //! [`DesktopLockWatcher::start`] opens its own system-bus connection on a thread of its own and
 //! calls a [`LockHook`] on:
 //! - `org.freedesktop.login1.Manager.PrepareForSleep(true)` (suspend or hibernate about to
 //!   start). The watcher holds a logind **delay inhibitor** for sleep (`Inhibit("sleep", …,
 //!   "delay")`), so logind waits (up to its `InhibitDelayMaxSec`) until the hook has run; the
-//!   inhibitor is released right after the hook, and taken again on `PrepareForSleep(false)`;
+//!   inhibitor is released right after the hook, and taken again on `PrepareForSleep(false)`
+//!   and whenever logind (re)appears on the bus with a new owner;
 //! - the screen lock of the session this process belongs to: the session's `Lock` signal, and
 //!   its `LockedHint` property turning `true` (`PropertiesChanged`; GNOME and KDE lockers set the
 //!   hint rather than emit `Lock`). The session is found with `GetSessionByPID`, else
@@ -463,8 +464,15 @@ async fn watch(
             #[cfg(test)]
             SessionChoice::Path(p) => Some(p),
         };
-        let mut streams =
-            vec![subscribe(&conn, signal_rule(MANAGER, "PrepareForSleep", LOGIND_PATH)).await?];
+        // The owner stream comes first and is always polled first: after a logind restart, the
+        // `NameOwnerChanged` naming the new owner is handled before any signal the new owner
+        // sends, so its first real signal is not dropped as coming from an unknown sender.
+        // Subscribed before the owner lookup below, so an owner change in between is not
+        // missed.
+        let mut streams = vec![
+            subscribe(&conn, owner_rule()).await?,
+            subscribe(&conn, signal_rule(MANAGER, "PrepareForSleep", LOGIND_PATH)).await?,
+        ];
         if let Some(p) = &session_path {
             streams.push(subscribe(&conn, signal_rule(SESSION, "Lock", p)).await?);
             let props = MatchRule::builder()
@@ -478,8 +486,6 @@ async fn watch(
                 .map(|r| r.to_owned());
             streams.push(subscribe(&conn, props).await?);
         }
-        // Subscribed before the lookup, so an owner change in between is not missed.
-        streams.push(subscribe(&conn, owner_rule()).await?);
         let owner = logind_owner(&conn).await;
         let inhibitor = take_sleep_delay(&conn).await;
         let unique = conn
@@ -556,6 +562,17 @@ async fn watch(
                     Some(Event::SessionLocked) => run_hook(&*hook, LockTrigger::SessionLock),
                     Some(Event::LogindOwner(new)) => {
                         tracing::info!(present = new.is_some(), "logind owner changed");
+                        if new != owner {
+                            // An inhibitor taken from the previous owner protects nothing any
+                            // more: drop it, and take one from the new logind when it appears.
+                            retake = None;
+                            inhibitor = None;
+                            status.sleep_delay.store(false, Ordering::SeqCst);
+                            if new.is_some() {
+                                let c = conn.clone();
+                                retake = Some(Box::pin(async move { take_sleep_delay(&c).await }));
+                            }
+                        }
                         owner = new;
                     }
                     None => {}
@@ -918,6 +935,73 @@ mod tests {
         second.emit(OUR_SESSION, SESSION, "Lock", None);
         assert_eq!(recorder.wait_for(1), [LockTrigger::SessionLock]);
         drop(w);
+    }
+
+    /// ROADMAP P1-D review (lock signals, Low): after a logind restart, the delay inhibitor is
+    /// taken again from the new logind, and the new owner's first signal, sent right after it
+    /// took the name, is honoured. The drop this guards against (the signal polled before the
+    /// `NameOwnerChanged`, fixed by polling the owner stream first) needs both messages queued
+    /// before the watcher wakes up, which this test cannot force: it does not fail on the old
+    /// polling order, it only checks the behaviour end to end.
+    #[test]
+    fn a_restarted_logind_gets_a_new_inhibitor_and_its_first_signal_counts() {
+        let Some(bus) = private_bus() else {
+            eprintln!("dbus-daemon not available: skipped");
+            return;
+        };
+        let first = FakeLogind::start(&bus.address);
+        let recorder = Arc::new(Recorder::default());
+        let w = watcher(
+            &bus,
+            SessionChoice::Path(OUR_SESSION.into()),
+            recorder.clone(),
+        );
+        assert_eq!(first.inhibit_calls(), 1);
+        assert!(w.holds_sleep_delay());
+
+        // logind goes away: the inhibitor it handed out protects nothing any more.
+        zbus::block_on(first.conn.release_name(LOGIND)).unwrap();
+        wait("delay flag cleared", || !w.holds_sleep_delay());
+        wait("old inhibitor dropped", || first.inhibitor_released(0));
+
+        // A new logind takes the name and at once announces a suspend.
+        let second = FakeLogind::start(&bus.address);
+        second.emit(LOGIND_PATH, MANAGER, "PrepareForSleep", Some(true));
+        assert_eq!(recorder.wait_for(1), [LockTrigger::Sleep]);
+        // Resume: an inhibitor is (re)taken from the new logind.
+        second.emit(LOGIND_PATH, MANAGER, "PrepareForSleep", Some(false));
+        wait("inhibitor taken from the new logind", || {
+            second.inhibit_calls() >= 1
+        });
+        wait("delay flag set", || w.holds_sleep_delay());
+        assert_eq!(first.inhibit_calls(), 1);
+        drop(w);
+    }
+
+    /// A logind that reappears without any sleep cycle still gets asked for an inhibitor.
+    #[test]
+    fn a_reappearing_logind_is_asked_for_an_inhibitor() {
+        let Some(bus) = private_bus() else {
+            eprintln!("dbus-daemon not available: skipped");
+            return;
+        };
+        let first = FakeLogind::start(&bus.address);
+        let recorder = Arc::new(Recorder::default());
+        let w = watcher(
+            &bus,
+            SessionChoice::Path(OUR_SESSION.into()),
+            recorder.clone(),
+        );
+        zbus::block_on(first.conn.release_name(LOGIND)).unwrap();
+        wait("delay flag cleared", || !w.holds_sleep_delay());
+        let second = FakeLogind::start(&bus.address);
+        wait("inhibitor taken from the new logind", || {
+            second.inhibit_calls() == 1
+        });
+        wait("delay flag set", || w.holds_sleep_delay());
+        assert!(recorder.got().is_empty());
+        drop(w);
+        wait("released on drop", || second.inhibitor_released(0));
     }
 
     #[test]
