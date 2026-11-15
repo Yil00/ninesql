@@ -1288,7 +1288,19 @@ struct ConnState {
     cj_time_zone: Option<(String, String)>,
     /// Connector/J `forceConnectionTimeZoneToSession` (path, value).
     cj_force_time_zone: Option<(String, bool)>,
+    /// Driver property keys (ASCII lower case) and values, read before the URL parameters so
+    /// that a URL parameter the JDBC driver would override is skipped.
+    property_values: BTreeMap<String, String>,
+    /// URL parameter keys (ASCII lower case) and values already applied.
+    url_values: BTreeMap<String, String>,
+    /// Dropped properties past [`MAX_DROPPED_PROPERTIES`] (counted, not listed).
+    dropped_overflow: usize,
 }
+
+/// Most entries of [`ImportedConnection::dropped_properties`] per connection.
+const MAX_DROPPED_PROPERTIES: usize = 1000;
+/// Key path prefix of JDBC URL parameters.
+const URL_PREFIX: &str = "configuration.url";
 
 fn failed(dbeaver_id: &str, name: String, reason: &str, mut issues: Issues) -> ConnectionImport {
     issues.error(
@@ -1324,6 +1336,9 @@ fn map_connection(
         dropped: Vec::new(),
         cj_time_zone: None,
         cj_force_time_zone: None,
+        property_values: BTreeMap::new(),
+        url_values: BTreeMap::new(),
+        dropped_overflow: 0,
     };
     let id = def.id.as_str();
 
@@ -1403,6 +1418,12 @@ fn map_connection(
     st.rules = properties::Rules::for_connection(&engine, &driver);
 
     // Endpoint (and URL parameters, which go through the property rules).
+    st.property_values = cfg
+        .properties
+        .entries
+        .iter()
+        .map(|(k, v)| (k.to_ascii_lowercase(), v.as_text().into_owned()))
+        .collect();
     let endpoint = match map_endpoint(def, file_engine, &mut st) {
         Ok(e) => e,
         Err(reason) => return failed(id, name, reason, st.issues),
@@ -1968,6 +1989,9 @@ fn apply_property(prefix: &str, key: &str, value: &str, st: &mut ConnState) {
         st.secret_removed(path);
         return;
     }
+    if st.rules != properties::Rules::Keep && same_key_overridden(prefix, key, value, st) {
+        return;
+    }
     if is_reserved_property(key) && !properties::handles_reserved(st.rules, key) {
         st.issues.warn(
             IssueKind::ReservedProperty,
@@ -1997,9 +2021,56 @@ fn apply_property(prefix: &str, key: &str, value: &str, st: &mut ConnState) {
     }
 }
 
+/// The same JDBC key set both as a URL parameter and as a driver property: the one the JDBC
+/// driver ignores is dropped here, entirely (also for `options` / `sessionVariables`). Returns
+/// `true` when `key` from `prefix` is the ignored one.
+fn same_key_overridden(prefix: &str, key: &str, value: &str, st: &mut ConnState) -> bool {
+    let lower = key.to_ascii_lowercase();
+    let from_url = prefix == URL_PREFIX;
+    let url_wins = st.rules.url_wins();
+    let other = if from_url {
+        st.url_values.insert(lower.clone(), value.to_owned());
+        if url_wins {
+            return false;
+        }
+        st.property_values.get(&lower)
+    } else {
+        if !url_wins {
+            return false;
+        }
+        st.url_values.get(&lower)
+    };
+    let Some(other) = other else {
+        return false;
+    };
+    let differs = other != value;
+    let (winner, jdbc) = (
+        if url_wins {
+            "the URL parameter"
+        } else {
+            "the driver property"
+        },
+        st.rules.jdbc_driver(),
+    );
+    let message = if differs {
+        format!(
+            "not imported: set to a different value in the URL and in the driver properties; \
+             {winner} is kept, as {jdbc} does"
+        )
+    } else {
+        format!("not imported: also set as {winner}, which {jdbc} uses")
+    };
+    st.dropped_property(join(prefix, key), properties::Drop::NoEquivalent, message);
+    true
+}
+
 impl ConnState {
     fn drop_property(&mut self, key: String, reason: PropertyDropReason) {
-        self.dropped.push(DroppedProperty { key, reason });
+        if self.dropped.len() < MAX_DROPPED_PROPERTIES {
+            self.dropped.push(DroppedProperty { key, reason });
+        } else {
+            self.dropped_overflow += 1;
+        }
     }
 
     fn secret_removed(&mut self, path: String) {
@@ -2059,8 +2130,24 @@ impl ConnState {
             }
             Action::ForceTimeZone { path, on } => {
                 if let Some((old, _)) = self.cj_force_time_zone.replace((path, on)) {
-                    self.drop_property(old, PropertyDropReason::NoEquivalent);
+                    self.dropped_property(
+                        old,
+                        properties::Drop::NoEquivalent,
+                        "not imported: forceConnectionTimeZoneToSession is set more than once; \
+                         the last one is kept"
+                            .to_owned(),
+                    );
                 }
+            }
+            Action::ReadOnlyUnclear { path } => {
+                self.read_only = Some(true);
+                self.issues.warn(
+                    IssueKind::PropertyMapped,
+                    Some(path),
+                    "an entry that may make the session read-only could not be read: the \
+                     connection is imported read-only (the safe direction); check it before \
+                     clearing the flag",
+                );
             }
         }
     }
@@ -2072,10 +2159,22 @@ impl ConnState {
         value: String,
         priority: properties::Priority,
     ) {
-        if let Some((old_priority, _, old_path)) = self.mapped.get(target) {
-            if *old_priority > priority {
+        // Precedence: a dedicated property over an embedded setting, then the source the JDBC
+        // driver lets win (URL or driver property), then the later one.
+        let url_wins = self.rules.url_wins();
+        let rank = |p: &str| priority_of(p, url_wins);
+        if let Some((old_priority, old_value, old_path)) = self.mapped.get(target) {
+            let different_sources =
+                old_path.starts_with(URL_PREFIX) != path.starts_with(URL_PREFIX);
+            let conflict = if different_sources && *old_value != value {
+                " (the URL and the driver properties set different values)"
+            } else {
+                ""
+            };
+            if (*old_priority, rank(old_path)) > (priority, rank(&path)) {
                 let message = format!(
-                    "not imported: `{target}` is already set by `{}`, which takes precedence",
+                    "not imported: `{target}` is already set by `{}`, which takes \
+                     precedence{conflict}",
                     ident(old_path, MAX_IDENT)
                 );
                 self.dropped_property(path, properties::Drop::NoEquivalent, message);
@@ -2084,7 +2183,8 @@ impl ConnState {
             let (old_path, message) = (
                 old_path.clone(),
                 format!(
-                    "not imported: `{target}` is set again by `{}`, which takes precedence",
+                    "not imported: `{target}` is set again by `{}`, which takes \
+                     precedence{conflict}",
                     ident(&path, MAX_IDENT)
                 ),
             );
@@ -2097,6 +2197,11 @@ impl ConnState {
         );
         self.mapped.insert(target, (priority, value, path));
     }
+}
+
+/// 1 for the source the JDBC driver lets win (URL parameter or driver property), 0 otherwise.
+fn priority_of(path: &str, url_wins: bool) -> u8 {
+    u8::from(path.starts_with(URL_PREFIX) == url_wins)
 }
 
 /// Resolves the properties that depend on each other and moves the converted ones into
@@ -2139,6 +2244,17 @@ fn finish_properties(st: &mut ConnState) {
     }
     for (target, (_, value, _)) in std::mem::take(&mut st.mapped) {
         st.properties.insert(target.to_owned(), value);
+    }
+    if st.dropped_overflow > 0 {
+        st.issues.warn(
+            IssueKind::Truncated,
+            Some("configuration.properties".to_owned()),
+            format!(
+                "{} more dropped properties are not listed (at most {MAX_DROPPED_PROPERTIES} \
+                 per connection)",
+                st.dropped_overflow
+            ),
+        );
     }
 }
 

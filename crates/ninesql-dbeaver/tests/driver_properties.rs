@@ -63,7 +63,7 @@ fn pgjdbc_properties() {
         props(c),
         [
             ("lock_timeout", "5s"),
-            ("search_path", "app,public"),
+            ("search_path", "from_url"),
             ("statement_timeout", "30000"),
         ]
     );
@@ -76,8 +76,8 @@ fn pgjdbc_properties() {
         ("configuration.properties.options.geqo", NoEquivalent),
         // `-c search_path` in options loses to currentSchema (startup parameters win).
         ("configuration.properties.options.search_path", NoEquivalent),
-        // URL parameters lose to driver properties.
-        ("configuration.url.currentSchema", NoEquivalent),
+        // pgjdbc lets URL parameters win over driver properties of the same name.
+        ("configuration.properties.currentSchema", NoEquivalent),
         ("configuration.url.prepareThreshold", NoEquivalent),
     ] {
         assert!(d.contains(&expected), "{expected:?} not in {d:?}");
@@ -85,8 +85,12 @@ fn pgjdbc_properties() {
     assert!(has_issue(
         &p,
         IssueKind::PropertyMapped,
-        "configuration.properties.currentSchema"
+        "configuration.url.currentSchema"
     ));
+    assert!(p.connections[0].issues.iter().any(|i| {
+        i.key.as_deref() == Some("configuration.properties.currentSchema")
+            && i.message.contains("different value")
+    }));
     assert!(has_issue(
         &p,
         IssueKind::PropertyDropped,
@@ -442,4 +446,177 @@ fn produced_names_are_on_the_driver_allowlists() {
         caps.check_properties(&values)
             .unwrap_or_else(|e| panic!("{engine}: {e}"));
     }
+}
+
+/// Which source wins when a URL parameter and a driver property have the same key, per JDBC
+/// driver (pgjdbc and MariaDB Connector/J: the URL; MySQL Connector/J and sqlite-jdbc: the
+/// property).
+#[test]
+fn url_versus_property_precedence_follows_the_jdbc_driver() {
+    let cases = [
+        (
+            "mysql",
+            "mysql8",
+            r#"{"url":"jdbc:mysql://db.example.test/nine?sessionVariables=lock_wait_timeout%3D1",
+            "properties":{"sessionVariables":"lock_wait_timeout=2"}}"#,
+            ("lock_wait_timeout", "2"),
+            "configuration.url.sessionVariables",
+        ),
+        (
+            "mysql",
+            "mariaDB",
+            r#"{"url":"jdbc:mariadb://db.example.test/nine?sessionVariables=lock_wait_timeout%3D1",
+            "properties":{"sessionVariables":"lock_wait_timeout=2"}}"#,
+            ("lock_wait_timeout", "1"),
+            "configuration.properties.sessionVariables",
+        ),
+        (
+            "sqlite",
+            "sqlite_jdbc",
+            r#"{"url":"jdbc:sqlite:/home/nine_user/data/fixture.sqlite?busy_timeout=1",
+            "properties":{"busy_timeout":"2"}}"#,
+            ("busy_timeout", "2"),
+            "configuration.url.busy_timeout",
+        ),
+    ];
+    for (provider, driver, cfg, kept, loser) in cases {
+        let p = map(&one(provider, driver, cfg));
+        let c = only(&p);
+        assert_eq!(props(c), [kept], "{driver}");
+        assert!(
+            dropped(c).contains(&(loser, NoEquivalent)),
+            "{driver}: {:?}",
+            dropped(c)
+        );
+        assert!(
+            p.connections[0].issues.iter().any(|i| {
+                i.key.as_deref() == Some(loser) && i.message.contains("different value")
+            }),
+            "{driver}"
+        );
+    }
+    // Different keys, same NineSQL property, different sources: pgjdbc's URL `currentSchema`
+    // beats `options` in the properties anyway (dedicated property), with a conflict note.
+    let cfg = r#"{"url":"jdbc:postgresql://db.example.test/nine?options=-c%20search_path%3Durl_schema",
+        "properties":{"currentSchema":"prop_schema"}}"#;
+    let p = map(&one("postgresql", "postgres-jdbc", cfg));
+    assert_eq!(props(only(&p)), [("search_path", "prop_schema")]);
+    assert!(p.connections[0].issues.iter().any(|i| {
+        i.key.as_deref() == Some("configuration.url.options.search_path")
+            && i.message.contains("different values")
+    }));
+}
+
+fn read_only_of(provider: &str, driver: &str, props_json: &str) -> Option<bool> {
+    let cfg = format!(r#"{{"host":"db.example.test","properties":{props_json}}}"#);
+    only(&map(&one(provider, driver, &cfg))).read_only
+}
+
+/// A read-only intent is never lost: PostgreSQL boolean prefixes, `-` in long names, combined
+/// switches, values other than an explicit false, unreadable or late entries.
+#[test]
+fn read_only_intent_is_never_lost() {
+    let pg = |options: &str| {
+        read_only_of(
+            "postgresql",
+            "postgres-jdbc",
+            &format!(r#"{{"options":"{options}"}}"#),
+        )
+    };
+    for on in [
+        "-c default_transaction_read_only=t",
+        "-c default_transaction_read_only=TR",
+        "-c default_transaction_read_only=ye",
+        "-c default_transaction_read_only=1",
+        "-c default_transaction_read_only=o",
+        "-c default_transaction_read_only=maybe",
+        "--default-transaction-read-only=on",
+        "-c default-transaction-read-only=on",
+        "-ec default_transaction_read_only=on",
+        "-ecdefault_transaction_read_only=on",
+        "-c transaction_read_only=on",
+        // No value: unreadable, but it names read-only.
+        "-c default_transaction_read_only",
+        "-c default_transaction_read_only=",
+    ] {
+        assert_eq!(pg(on), Some(true), "{on}");
+    }
+    for off in [
+        "-c default_transaction_read_only=of",
+        "-c default_transaction_read_only=f",
+        "-c default_transaction_read_only=No",
+        "-c default_transaction_read_only=0",
+    ] {
+        assert_eq!(pg(off), None, "{off}");
+    }
+    // Past the entry limit.
+    let many = format!(
+        "{} -c default_transaction_read_only=on",
+        "-c geqo=off ".repeat(70)
+    );
+    assert_eq!(pg(&many), Some(true));
+    let my = |vars: &str| {
+        read_only_of(
+            "mysql",
+            "mysql8",
+            &format!(r#"{{"sessionVariables":"{vars}"}}"#),
+        )
+    };
+    assert_eq!(my("tx_read_only=1"), Some(true));
+    assert_eq!(my("transaction_read_only=yes_please"), Some(true));
+    assert_eq!(my("innodb_read_only=1"), Some(true));
+    assert_eq!(my("transaction_read_only"), Some(true));
+    assert_eq!(my("transaction_read_only=OFF"), None);
+    assert_eq!(my("tx_read_only='0'"), None);
+}
+
+/// Token-shaped strings are never echoed as setting names (L2).
+#[test]
+fn token_like_names_are_not_echoed() {
+    let tokens = ["c2VjcmV0VG9rZW4xMjM0NTY3OA", "dGhpc2lzYXNlY3JldDEyMzQ"];
+    for (provider, driver, props_json) in [
+        (
+            "postgresql",
+            "postgres-jdbc",
+            format!(r#"{{"options":"-c {}== -c {}=x"}}"#, tokens[0], tokens[1]),
+        ),
+        (
+            "mysql",
+            "mysql8",
+            format!(
+                r#"{{"sessionVariables":"{}==,{}=x"}}"#,
+                tokens[0], tokens[1]
+            ),
+        ),
+    ] {
+        let cfg = format!(r#"{{"host":"db.example.test","properties":{props_json}}}"#);
+        let p = map(&one(provider, driver, &cfg));
+        let c = only(&p);
+        assert!(!c.dropped_properties.is_empty(), "{driver}");
+        let shown = format!("{p:?}")
+            + &p.connections[0]
+                .issues
+                .iter()
+                .map(ToString::to_string)
+                .collect::<String>();
+        for t in tokens {
+            assert!(!shown.contains(t), "{driver}: {t} echoed");
+        }
+    }
+}
+
+/// The list of dropped properties is bounded per connection (L3).
+#[test]
+fn dropped_properties_are_capped() {
+    let props_json = (0..1100)
+        .map(|i| format!(r#""fixtureProp{i}":"v""#))
+        .collect::<Vec<_>>()
+        .join(",");
+    let cfg = format!(r#"{{"host":"db.example.test","properties":{{{props_json}}}}}"#);
+    let p = map(&one("postgresql", "postgres-jdbc", &cfg));
+    let c = only(&p);
+    assert_eq!(c.dropped_properties.len(), 1000);
+    assert!(p.connections[0].issues.iter().any(|i| {
+        i.kind == IssueKind::Truncated && i.message.starts_with("100 more dropped properties")
+    }));
 }

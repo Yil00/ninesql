@@ -87,7 +87,18 @@ impl Rules {
         }
     }
 
-    fn jdbc_driver(self) -> &'static str {
+    /// Whether a JDBC URL parameter wins over a driver property of the same name, as the JDBC
+    /// driver resolves them (checked in the public sources, docs/06 "Driver properties"):
+    /// pgjdbc (`Driver.parseURL`: URL values first) and MariaDB Connector/J
+    /// (`Configuration.processUrlParameters` writes over the properties) let the URL win;
+    /// MySQL Connector/J (`ConnectionUrl.collectProperties` puts the properties last) and
+    /// sqlite-jdbc (`extractPragmasFromFilename` keeps a property already set) let the
+    /// property win. For engines without a NineSQL driver the property wins.
+    pub(crate) fn url_wins(self) -> bool {
+        matches!(self, Self::PgJdbc | Self::MariaDbJ { .. })
+    }
+
+    pub(crate) fn jdbc_driver(self) -> &'static str {
         match self {
             Self::PgJdbc => "pgjdbc",
             Self::ConnectorJ { .. } => "MySQL Connector/J",
@@ -193,6 +204,10 @@ pub(crate) enum Action {
     Secret { path: String },
     /// A setting that makes the session read-only: honoured as the read-only flag.
     ReadOnly { path: String },
+    /// An entry that may make the session read-only but cannot be read (unparsable, past the
+    /// entry limit, or an unknown read-only setting): the read-only flag is set anyway (the safe
+    /// direction) and the caller warns.
+    ReadOnlyUnclear { path: String },
     /// Connector/J `connectionTimeZone` / `serverTimezone`: maps only with
     /// `forceConnectionTimeZoneToSession=true` (resolved once every property is read).
     ConnectionTimeZone { path: String, value: String },
@@ -373,6 +388,36 @@ fn pg_search_path(value: &str) -> Option<String> {
     }
 }
 
+/// A boolean as PostgreSQL's `parse_bool` reads it: case-insensitive unique prefixes of
+/// `true`, `false`, `yes`, `no`, then `on`, `off` (at least `of`), `1`, `0`.
+fn pg_bool(value: &str) -> Option<bool> {
+    let v = value.trim().to_ascii_lowercase();
+    if v.is_empty() {
+        return None;
+    }
+    let prefix_of = |word: &str| word.starts_with(v.as_str());
+    if prefix_of("true") || prefix_of("yes") || v == "on" || v == "1" {
+        Some(true)
+    } else if prefix_of("false")
+        || prefix_of("no")
+        || (v.len() >= 2 && prefix_of("off"))
+        || v == "0"
+    {
+        Some(false)
+    } else {
+        None
+    }
+}
+
+/// An explicit "off" for a MySQL boolean variable (`0`, `OFF`, `FALSE`, any case, quotes
+/// removed). Anything else counts as on for read-only settings (fail safe).
+fn mysql_explicit_false(value: &str) -> bool {
+    matches!(
+        unquote(value.trim()).trim().to_ascii_lowercase().as_str(),
+        "0" | "off" | "false"
+    )
+}
+
 fn parse_bool(value: &str) -> Option<bool> {
     match value.trim().to_ascii_lowercase().as_str() {
         "true" | "on" | "1" | "yes" => Some(true),
@@ -418,33 +463,67 @@ fn split_pg_options(value: &str) -> Vec<String> {
     out
 }
 
+/// PostgreSQL server switches that take an argument (`postmaster.c` getopt string
+/// `B:bC:c:D:d:EeFf:h:ijk:lN:nOPp:r:S:sTt:W:-:`).
+const PG_ARG_SWITCHES: &str = "BCcDdfhkNprStW-";
+
+/// Reads `options` words like the server's getopt: combined flags (`-ec name=value`), an
+/// argument attached or in the next word. `-c x` and `--x` give settings (`-` in the name read
+/// as `_`, as the server does); every other switch or word is `None` (not a setting) and keeps
+/// its text for the read-only check.
+fn pg_option_settings(words: &[String]) -> Vec<Setting> {
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < words.len() {
+        let w = &words[i];
+        i += 1;
+        let Some(flags) = w.strip_prefix('-').filter(|f| !f.is_empty()) else {
+            out.push(Setting::Unreadable(w.clone()));
+            continue;
+        };
+        for (pos, ch) in flags.char_indices() {
+            if PG_ARG_SWITCHES.contains(ch) {
+                let rest = &flags[pos + ch.len_utf8()..];
+                let arg = if rest.is_empty() {
+                    let next = words.get(i).cloned();
+                    if next.is_some() {
+                        i += 1;
+                    }
+                    next
+                } else {
+                    Some(rest.to_owned())
+                };
+                match (ch, arg) {
+                    ('c' | '-', Some(arg)) => out.push(Setting::Entry(dashes_in_name(&arg))),
+                    (_, arg) => out.push(Setting::Unreadable(arg.unwrap_or_default())),
+                }
+                break;
+            }
+            // A flag without an argument: a server setting NineSQL does not import.
+            out.push(Setting::Unreadable(String::new()));
+        }
+    }
+    out
+}
+
+/// `name=value` with `-` in the name read as `_` (PostgreSQL's `ParseLongOption`).
+fn dashes_in_name(arg: &str) -> String {
+    match arg.split_once('=') {
+        Some((name, value)) => format!("{}={value}", name.replace('-', "_")),
+        None => arg.replace('-', "_"),
+    }
+}
+
 /// pgjdbc `options`: `-c name=value`, `-cname=value` and `--name=value` settings. Allowlisted
 /// settings are mapped; `default_transaction_read_only=on` becomes the read-only flag; anything
 /// else is dropped entry by entry.
 fn pg_options(rules: Rules, path: &str, value: &str) -> Vec<Action> {
-    let words = split_pg_options(value);
-    let mut settings: Vec<Option<String>> = Vec::new();
-    let mut i = 0;
-    while i < words.len() {
-        let w = &words[i];
-        if w == "-c" {
-            settings.push(words.get(i + 1).cloned());
-            i += 2;
-        } else if let Some(rest) = w.strip_prefix("--") {
-            settings.push(Some(rest.to_owned()));
-            i += 1;
-        } else if let Some(rest) = w.strip_prefix("-c") {
-            settings.push(Some(rest.to_owned()));
-            i += 1;
-        } else {
-            settings.push(None);
-            i += 1;
-        }
-    }
+    let settings = pg_option_settings(&split_pg_options(value));
     embedded_settings(rules, path, settings, |name, v| {
         let norm = normalize(name);
-        if norm == "defaulttransactionreadonly" {
-            return Some(Embedded::ReadOnly(parse_bool(v) == Some(true)));
+        if norm == "defaulttransactionreadonly" || norm == "transactionreadonly" {
+            // Read-only unless explicitly false (fail safe, I3).
+            return Some(Embedded::ReadOnly(pg_bool(v) != Some(false)));
         }
         let target = PG_TARGETS.iter().find(|(n, _)| *n == norm)?.1;
         if v.contains('\0') {
@@ -524,14 +603,15 @@ fn session_variables(rules: Rules, path: &str, value: &str) -> Vec<Action> {
             } else {
                 s
             };
-            Some(s.to_owned())
+            Setting::Entry(s.to_owned())
         })
         .collect();
     let targets = rules.targets();
     embedded_settings(rules, path, settings, |name, v| {
         let norm = normalize(name);
         if norm == "transactionreadonly" || norm == "txreadonly" {
-            return Some(Embedded::ReadOnly(parse_bool(unquote(v)) == Some(true)));
+            // Read-only unless explicitly false (fail safe, I3).
+            return Some(Embedded::ReadOnly(!mysql_explicit_false(v)));
         }
         let target = targets.iter().find(|(n, _)| *n == norm)?.1;
         let v = v.trim();
@@ -576,27 +656,65 @@ enum Embedded {
     Invalid,
 }
 
-/// Turns the `name=value` settings of `options` / `sessionVariables` into actions. `None`
-/// entries are not settings at all. `classify` returns `None` for a setting with no equivalent.
+/// One entry of `options` / `sessionVariables`.
+enum Setting {
+    /// A `name=value` candidate.
+    Entry(String),
+    /// Not a setting (another server switch, a stray word); its text is kept only for the
+    /// read-only check, never shown.
+    Unreadable(String),
+}
+
+/// Whether a name looks like a token rather than a setting name: long, mixing upper case, lower
+/// case and digits, with no `_`. Such names are never echoed (they may be misplaced secrets).
+fn is_token_like(name: &str) -> bool {
+    name.len() >= 16
+        && !name.contains('_')
+        && name.bytes().any(|b| b.is_ascii_uppercase())
+        && name.bytes().any(|b| b.is_ascii_lowercase())
+        && name.bytes().any(|b| b.is_ascii_digit())
+}
+
+/// Turns the settings of `options` / `sessionVariables` into actions. `classify` returns `None`
+/// for a setting with no equivalent. Any entry that cannot be read or is past the entry limit,
+/// and any unknown setting whose name contains "read only", sets the read-only flag (the safe
+/// direction) with a warning.
 fn embedded_settings(
     rules: Rules,
     path: &str,
-    settings: Vec<Option<String>>,
+    settings: Vec<Setting>,
     classify: impl Fn(&str, &str) -> Option<Embedded>,
 ) -> Vec<Action> {
     let mut out = Vec::new();
     let mut unreadable = 0usize;
+    let mut unclear_read_only = false;
     let total = settings.len();
-    for setting in settings.into_iter().take(MAX_ENTRIES) {
-        let Some((name, v)) = setting.as_deref().and_then(|s| s.split_once('=')) else {
-            unreadable += 1;
-            continue;
+    for (index, setting) in settings.into_iter().enumerate() {
+        let text = match &setting {
+            Setting::Entry(t) | Setting::Unreadable(t) => t,
         };
-        let name = name.trim();
-        if !is_plain_name(name) {
-            unreadable += 1;
+        let mentions_read_only = normalize(text).contains("readonly");
+        if index >= MAX_ENTRIES {
+            unclear_read_only |= mentions_read_only;
             continue;
         }
+        let parsed = match &setting {
+            Setting::Entry(t) => t
+                .split_once('=')
+                .map(|(n, v)| (n.trim(), v))
+                .filter(|(n, v)| {
+                    !v.trim().is_empty()
+                        && !v.starts_with('=')
+                        && is_plain_name(n)
+                        && !is_token_like(n)
+                }),
+            Setting::Unreadable(_) => None,
+        };
+        let Some((name, v)) = parsed else {
+            unreadable += 1;
+            unclear_read_only |= mentions_read_only;
+            continue;
+        };
         let sub = format!("{path}.{name}");
         if is_secret_like_key(name) {
             out.push(Action::Secret { path: sub });
@@ -613,13 +731,18 @@ fn embedded_settings(
             Some(Embedded::ReadOnly(false)) => out.push(Action::Drop {
                 path: sub,
                 reason: Drop::NoEquivalent,
-                message: "not imported: the read-only mode is a typed NineSQL setting".to_owned(),
+                message: "not imported: it explicitly turns read-only off; the read-only mode \
+                          is a typed NineSQL setting of the connection"
+                    .to_owned(),
             }),
             Some(Embedded::Invalid) => out.push(Action::Drop {
                 path: sub,
                 reason: Drop::InvalidValue,
                 message: "not imported: the value is not one the NineSQL driver accepts".to_owned(),
             }),
+            None if normalize(name).contains("readonly") => {
+                out.push(Action::ReadOnlyUnclear { path: sub });
+            }
             None => out.push(Action::Drop {
                 path: sub,
                 reason: Drop::NoEquivalent,
@@ -632,23 +755,21 @@ fn embedded_settings(
     }
     let skipped = total.saturating_sub(MAX_ENTRIES);
     if unreadable + skipped > 0 {
+        let n = unreadable + skipped;
         out.push(Action::Drop {
             path: path.to_owned(),
             reason: Drop::InvalidValue,
             message: format!(
-                "{} entr{} that {} not a plain `name=value` setting not imported",
-                unreadable + skipped,
-                if unreadable + skipped == 1 {
-                    "y"
-                } else {
-                    "ies"
-                },
-                if unreadable + skipped == 1 {
-                    "is"
-                } else {
-                    "are"
-                },
+                "{n} entr{} that {} not a plain `name=value` setting (or past the first \
+                 {MAX_ENTRIES}) not imported",
+                if n == 1 { "y" } else { "ies" },
+                if n == 1 { "is" } else { "are" },
             ),
+        });
+    }
+    if unclear_read_only {
+        out.push(Action::ReadOnlyUnclear {
+            path: path.to_owned(),
         });
     }
     if out.is_empty() {
@@ -728,6 +849,41 @@ mod tests {
         assert!(matches!(a[1], Action::Secret { .. }));
         // Nothing usable.
         assert_eq!(dropped(&pg_options(Rules::PgJdbc, "p", "  ")), ["p"]);
+    }
+
+    #[test]
+    fn pg_booleans_and_switches() {
+        for (v, want) in [
+            ("t", Some(true)),
+            ("TRU", Some(true)),
+            ("y", Some(true)),
+            ("on", Some(true)),
+            ("1", Some(true)),
+            ("f", Some(false)),
+            ("n", Some(false)),
+            ("of", Some(false)),
+            ("0", Some(false)),
+            ("o", None),
+            ("", None),
+            ("truex", None),
+        ] {
+            assert_eq!(pg_bool(v), want, "{v}");
+        }
+        let words: Vec<String> = ["-ec", "a-b=1", "-B", "8", "--c-d=2", "x", "-Ecname=3"]
+            .iter()
+            .map(|w| (*w).to_owned())
+            .collect();
+        let entries: Vec<String> = pg_option_settings(&words)
+            .into_iter()
+            .filter_map(|s| match s {
+                Setting::Entry(e) => Some(e),
+                Setting::Unreadable(_) => None,
+            })
+            .collect();
+        assert_eq!(entries, ["a_b=1", "c_d=2", "name=3"]);
+        assert!(is_token_like("c2VjcmV0VG9rZW4xMjM0NTY3OA"));
+        assert!(!is_token_like("default_transaction_read_only"));
+        assert!(!is_token_like("innodbLockWaitTimeout"));
     }
 
     #[test]
