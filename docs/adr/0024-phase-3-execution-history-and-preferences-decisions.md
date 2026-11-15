@@ -1,6 +1,6 @@
 # ADR-0024: Phase 3 execution, history, preferences and results decisions
 
-- **Status**: Proposed. Once accepted, it amends [ADR-0004](0004-driver-api-runtime-and-results.md) (result model: the memory budget is per execution, "fetch all" never goes above it; §4 below) and [ADR-0008](0008-workspace-and-config-storage.md) (§4 history: nothing for production and for statements holding a credential; §1 `settings.toml` also holds execution preferences written by the core; §1 to §3 below), and adds notes to [ADR-0004](0004-driver-api-runtime-and-results.md) (per-connection timeout, §1) and [ADR-0007](0007-production-safety-model.md) (§5 manual commit and the close confirmation, §6 below). It does not rewrite their decisions.
+- **Status**: Accepted (maintainer, 2026-11-15). It amends [ADR-0004](0004-driver-api-runtime-and-results.md) (result model: the memory budget is per execution, "fetch all" never goes above it; §4 below) and [ADR-0008](0008-workspace-and-config-storage.md) (§4 history: nothing for production and for statements holding a credential; §1 `settings.toml` also holds execution preferences written by the core; §1 to §3 below), and adds notes to [ADR-0004](0004-driver-api-runtime-and-results.md) (per-connection timeout, §1) and [ADR-0007](0007-production-safety-model.md) (§5 manual commit and the close confirmation, §6 below). It does not rewrite their decisions.
 - **Date**: 2026-11-15
 
 ## Context

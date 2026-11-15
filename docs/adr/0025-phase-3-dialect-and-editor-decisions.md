@@ -1,6 +1,6 @@
 # ADR-0025: Phase 3 dialect, editor and UI decisions
 
-- **Status**: Proposed. Once accepted, it adds to [ADR-0007](0007-production-safety-model.md) §3 and to its [classifier amendment](0007-production-safety-model.md#amendment-classifier-2026-11-15) (§1 below: conditional comments, triggers, rules and events; §1.4 records that `MERGE` and upsert forms stay `Write` as §3 says) and builds on [ADR-0004](0004-driver-api-runtime-and-results.md) (I6: a run is never awaited on the UI thread) and [ADR-0008](0008-workspace-and-config-storage.md) §1 (the session file in `$XDG_STATE_HOME/ninesql`, §4 below). It does not rewrite their decisions. The execution, history, preferences and results decisions of the phase are in [ADR-0024](0024-phase-3-execution-history-and-preferences-decisions.md).
+- **Status**: Accepted (maintainer, 2026-11-15). It adds to [ADR-0007](0007-production-safety-model.md) §3 and to its [classifier amendment](0007-production-safety-model.md#amendment-classifier-2026-11-15) (§1 below: conditional comments, triggers, rules and events; §1.4 records that `MERGE` and upsert forms stay `Write` as §3 says) and builds on [ADR-0004](0004-driver-api-runtime-and-results.md) (I6: a run is never awaited on the UI thread) and [ADR-0008](0008-workspace-and-config-storage.md) §1 (the session file in `$XDG_STATE_HOME/ninesql`, §4 below). It does not rewrite their decisions. The execution, history, preferences and results decisions of the phase are in [ADR-0024](0024-phase-3-execution-history-and-preferences-decisions.md).
 - **Date**: 2026-11-15
 
 ## Context
