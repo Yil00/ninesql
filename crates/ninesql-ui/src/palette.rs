@@ -14,7 +14,7 @@ use gpui_kit::component::command::{Command, CommandGroup, CommandItem, CommandSt
 use gpui_kit::component::{IndexPath, WindowExt as _, h_flex};
 use gpui_kit::*;
 
-use crate::actions::{ACTIONS, ActionSpec};
+use crate::actions::{ActionSpec, registry};
 use crate::keymap::EffectiveKeymap;
 use crate::workspace::Workspace;
 
@@ -31,7 +31,7 @@ pub struct PaletteEntry {
 #[must_use]
 pub fn grouped_entries(keymap: &EffectiveKeymap) -> Vec<(&'static str, Vec<PaletteEntry>)> {
     let mut groups: Vec<(&'static str, Vec<PaletteEntry>)> = Vec::new();
-    for spec in ACTIONS.iter().filter(|s| s.in_palette) {
+    for spec in registry().iter().filter(|s| s.in_palette) {
         let entry = PaletteEntry {
             spec,
             keys: keymap.display_for(spec.name()),
@@ -109,7 +109,7 @@ pub fn open(workspace: WeakEntity<Workspace>, window: &mut Window, cx: &mut App)
 #[cfg(test)]
 mod tests {
     use super::grouped_entries;
-    use crate::actions::ACTIONS;
+    use crate::actions::registry;
     use crate::keymap::{BindingOverrides, EffectiveKeymap};
 
     #[test]
@@ -117,7 +117,7 @@ mod tests {
         let keymap = EffectiveKeymap::resolve(&BindingOverrides::default());
         let groups = grouped_entries(&keymap);
         let listed: Vec<_> = groups.iter().flat_map(|(_, e)| e).collect();
-        assert_eq!(listed.len(), ACTIONS.len() - 1);
+        assert_eq!(listed.len(), registry().len() - 1);
         assert!(
             listed.iter().all(|e| e.keys.is_some()),
             "every entry shows a binding"
@@ -129,6 +129,18 @@ mod tests {
         );
         let editor = groups.iter().find(|(c, _)| *c == "Editor");
         assert!(editor.is_some_and(|(_, e)| e[0].keys.as_deref() == Some("Ctrl+T")));
+        // The SQL editor's and the grid's actions are listed with their own bindings.
+        let find = |name: &str| listed.iter().find(|e| e.spec.name() == name);
+        assert_eq!(
+            find("ninesql_editor::ExecuteStatement").and_then(|e| e.keys.as_deref()),
+            Some("Ctrl+Enter")
+        );
+        assert_eq!(
+            find("ninesql_grid::FetchAllRows").and_then(|e| e.keys.as_deref()),
+            Some("Alt+End")
+        );
+        assert!(groups.iter().any(|(c, _)| *c == "SQL editor"));
+        assert!(groups.iter().any(|(c, _)| *c == "Results"));
     }
 
     #[test]

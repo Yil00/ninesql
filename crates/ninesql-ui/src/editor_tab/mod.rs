@@ -326,7 +326,12 @@ impl SqlEditorTab {
     // --- execution ---------------------------------------------------------------------------
 
     /// Starts the run of an editor request (from the editor's sink).
-    pub fn start(&mut self, request: ExecutionRequest, window: &mut Window, cx: &mut Context<Self>) {
+    pub fn start(
+        &mut self,
+        request: ExecutionRequest,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let id = request.id;
         let refuse = |this: &mut Self, why: String, cx: &mut Context<Self>| {
             this.editor.update(cx, |e, cx| {
@@ -446,7 +451,9 @@ impl SqlEditorTab {
             RunEvent::StatementStarted { index, span, .. } => {
                 active.spans.insert(index, span);
                 self.grid(
-                    ExecutionEvent::StatementStarted { statement: n(index) },
+                    ExecutionEvent::StatementStarted {
+                        statement: n(index),
+                    },
                     window,
                     cx,
                 );
@@ -463,7 +470,9 @@ impl SqlEditorTab {
                 cx,
             ),
             RunEvent::StatementClosed { index, .. } => self.grid(
-                ExecutionEvent::StatementClosed { statement: n(index) },
+                ExecutionEvent::StatementClosed {
+                    statement: n(index),
+                },
                 window,
                 cx,
             ),
@@ -472,7 +481,9 @@ impl SqlEditorTab {
             } => {
                 self.transaction = Some(transaction);
                 self.grid(
-                    ExecutionEvent::StatementFinished { statement: n(index) },
+                    ExecutionEvent::StatementFinished {
+                        statement: n(index),
+                    },
                     window,
                     cx,
                 );
@@ -484,7 +495,13 @@ impl SqlEditorTab {
                 ..
             } => {
                 let message = run::core_error_text(&error);
-                self.report(index, message.clone(), run::error_code(&error), position, cx);
+                self.report(
+                    index,
+                    message.clone(),
+                    run::error_code(&error),
+                    position,
+                    cx,
+                );
                 self.grid(
                     ExecutionEvent::StatementFailed {
                         statement: n(index),
@@ -552,15 +569,11 @@ impl SqlEditorTab {
         let Some(active) = self.run.as_ref() else {
             return;
         };
-        let start = active
-            .spans
-            .get(&index)
-            .map(|s| s.start)
-            .or(if index == 0 {
-                active.template.resume_from
-            } else {
-                None
-            });
+        let start = active.spans.get(&index).map(|s| s.start).or(if index == 0 {
+            active.template.resume_from
+        } else {
+            None
+        });
         let (item, location) = run::locate_error(&active.request, start, position.as_ref());
         let error = StatementError {
             request: active.request.id,
@@ -758,10 +771,8 @@ impl SqlEditorTab {
                     .label(label)
                     .tooltip("Choose editor connection")
                     .on_click(move |_, window, cx| {
-                        window.dispatch_action(
-                            Box::new(crate::actions::ChooseEditorConnection),
-                            cx,
-                        );
+                        window
+                            .dispatch_action(Box::new(crate::actions::ChooseEditorConnection), cx);
                     }),
             );
         if let Some(b) = self.badges(cx) {
@@ -921,21 +932,18 @@ pub fn open_connection_picker(
                     editor.update(cx, |e, cx| e.set_session(None, cx));
                 })
         };
-        dialog
-            .title("Choose editor connection")
-            .w(px(480.))
-            .child(
-                v_flex()
-                    .gap_2()
-                    .text_sm()
-                    .when(sessions.is_empty(), |el| {
-                        el.child(div().text_color(muted).child(
-                            "No connection is open: connect from the navigator first (Connect).",
-                        ))
-                    })
-                    .children(rows)
-                    .child(none),
-            )
+        dialog.title("Choose editor connection").w(px(480.)).child(
+            v_flex()
+                .gap_2()
+                .text_sm()
+                .when(sessions.is_empty(), |el| {
+                    el.child(div().text_color(muted).child(
+                        "No connection is open: connect from the navigator first (Connect).",
+                    ))
+                })
+                .children(rows)
+                .child(none),
+        )
     });
 }
 

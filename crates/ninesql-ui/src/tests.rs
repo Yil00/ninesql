@@ -7,7 +7,7 @@ use gpui::{
 };
 use gpui_kit::component::{ActiveTheme as _, Theme, ThemeMode, WindowExt as _};
 
-use crate::actions::{self, ACTIONS, CloseWindow, NewEditorTab, NewWindow};
+use crate::actions::{self, CloseWindow, NewEditorTab, NewWindow, registry};
 use crate::app;
 use crate::appearance::{AppearanceState, contrast_ratio};
 use crate::layout::Node;
@@ -54,10 +54,10 @@ fn every_registered_action_is_known_to_gpui(cx: &mut TestAppContext) {
         cx.all_action_names()
             .iter()
             .copied()
-            .filter(|n| n.starts_with("ninesql::"))
+            .filter(|n| actions::is_ours(n))
             .collect()
     });
-    for spec in ACTIONS {
+    for spec in registry() {
         assert!(
             names.contains(&spec.name()),
             "{} not registered",
@@ -66,8 +66,8 @@ fn every_registered_action_is_known_to_gpui(cx: &mut TestAppContext) {
     }
     assert_eq!(
         names.len(),
-        ACTIONS.len(),
-        "an action is missing from the registry"
+        registry().len(),
+        "an action of the shell, the editor or the grid is missing from the registry"
     );
 }
 
@@ -77,7 +77,7 @@ fn default_bindings_are_installed(cx: &mut TestAppContext) {
     cx.update(|cx| {
         let keymap = cx.key_bindings();
         let keymap = keymap.borrow();
-        for spec in ACTIONS {
+        for spec in registry() {
             let action = (spec.build)();
             let bound = keymap.bindings_for_action(action.as_ref()).count();
             assert_eq!(bound, spec.default_keys.len(), "{}", spec.name());
@@ -270,7 +270,7 @@ fn command_palette_runs_actions(cx: &mut TestAppContext) {
 fn perform_covers_every_action(cx: &mut TestAppContext) {
     init(cx, "");
     let (_, ws, mut vcx) = open(cx);
-    for spec in ACTIONS {
+    for spec in registry() {
         let name = spec.name();
         if matches!(
             name,
@@ -386,7 +386,7 @@ fn text_contrast_meets_wcag_aa_in_both_themes(cx: &mut TestAppContext) {
 fn every_action_has_a_name_gpui_can_build(cx: &mut TestAppContext) {
     init(cx, "");
     cx.update(|cx| {
-        for spec in ACTIONS {
+        for spec in registry() {
             let built = cx.build_action(spec.name(), None);
             assert!(built.is_ok(), "{}", spec.name());
         }

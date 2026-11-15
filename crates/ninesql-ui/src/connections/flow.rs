@@ -180,8 +180,8 @@ impl InitSqlView {
 /// connection name in the type color, why it needs confirmation, and the number of bind
 /// parameters (never their values).
 ///
-/// INTEGRATION POINT (P3): statements are executed from the SQL editor in P3; the dialog
-/// (`prompts::open_statement_confirmation`) is ready for `ExecEvent::NeedsConfirmation`.
+/// Shown by the SQL editor tab on `RunEvent::NeedsConfirmation`
+/// (`connect_flow::open_statement_confirmation`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StatementConfirmView {
     /// Connection name.
@@ -194,19 +194,34 @@ pub struct StatementConfirmView {
     pub reason: String,
     /// Number of bind parameters.
     pub params: usize,
+    /// Invisible bidirectional control characters in the editor's script when the run was asked
+    /// (the text may run differently from how it reads).
+    pub bidi_controls: usize,
 }
 
 impl StatementConfirmView {
-    /// From the core's request.
+    /// From the core's request, with the editor's count of bidirectional controls.
     #[must_use]
-    pub fn new(r: &ConfirmationRequest) -> Self {
+    pub fn new(r: &ConfirmationRequest, bidi_controls: usize) -> Self {
         Self {
             connection_name: r.connection_name.clone(),
             production: r.production,
             statement: r.statement.clone(),
             reason: format!("{}: {}", class_text(r.class), reason_text(r.reason)),
             params: r.params,
+            bidi_controls,
         }
+    }
+
+    /// The warning about bidirectional controls, when there are any.
+    #[must_use]
+    pub fn bidi_warning(&self) -> Option<String> {
+        (self.bidi_controls > 0).then(|| {
+            format!(
+                "Warning: the script holds {} invisible bidirectional control character(s): the statement may run differently from how it reads. Review it with \"Select bidirectional control characters\" (Alt+F8) before running.",
+                self.bidi_controls
+            )
+        })
     }
 }
 

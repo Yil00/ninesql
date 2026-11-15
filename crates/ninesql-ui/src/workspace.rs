@@ -16,12 +16,12 @@ use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
 use crate::actions::{
-    self, CloseTab, CloseWindow, CommandPalette, ConnectConnection, DeleteConnection,
-    DisconnectConnection, DuplicateConnection, EditConnection, EnableConnection, FocusNavigator,
-    FocusNextPane, FocusPreviousPane, ImportFromDbeaver, ImportFromDbeaverFolder, LockSecrets,
-    NewConnection, NewEditorTab, NextTab, PreviousTab, Scope, ShowConnectionProblems,
-    ShowSettingsProblems, SplitDown, SplitRight, TestConnection, ToggleNavigator,
-    WORKSPACE_CONTEXT,
+    self, ChooseEditorConnection, CloseTab, CloseWindow, CommandPalette, CommitTransaction,
+    ConnectConnection, DeleteConnection, DisconnectConnection, DuplicateConnection, EditConnection,
+    EnableConnection, FocusNavigator, FocusNextPane, FocusPreviousPane, ImportFromDbeaver,
+    ImportFromDbeaverFolder, LockSecrets, NewConnection, NewEditorTab, NextTab, PreviousTab,
+    RollbackTransaction, Scope, ShowConnectionProblems, ShowSettingsProblems, SplitDown,
+    SplitRight, TestConnection, ToggleNavigator, WORKSPACE_CONTEXT,
 };
 use crate::appearance;
 use crate::connections::connect_flow::{ConnectFlow, FlowFinished, FlowResult, Purpose};
@@ -138,9 +138,25 @@ impl Workspace {
         let id = self.layout.allocate_tab();
         let title = format!("Script-{}", self.next_script);
         self.next_script += 1;
-        let editor = cx.new(|cx| SqlEditorTab::new(title, window, cx));
+        // A new editor runs on the active editor's session, else on the last connection
+        // opened in this window.
+        let session = self
+            .active_editor()
+            .and_then(|t| t.read(cx).session().cloned())
+            .or_else(|| {
+                let id = self.active_connection?;
+                self.hub.read(cx).sessions(id).last().cloned()
+            });
+        let hub = self.hub.clone();
+        let editor = cx.new(|cx| SqlEditorTab::new(title, hub, session, window, cx));
         self.tabs.insert(id, editor);
         id
+    }
+
+    /// The editor tab of the active pane.
+    #[must_use]
+    pub fn active_editor(&self) -> Option<&Entity<SqlEditorTab>> {
+        self.layout.active_tab().and_then(|t| self.tabs.get(&t))
     }
 
     /// Opens an empty SQL editor in the active pane.
@@ -151,8 +167,41 @@ impl Workspace {
         id
     }
 
-    /// Closes a tab.
+    /// Closes a tab. When its session has an open transaction that the preferences ask about
+    /// (always for production, ADR-0007 §5) and no other editor of this window uses that
+    /// session, asks first: commit, roll back, or keep the tab.
     pub fn close_tab(&mut self, tab: TabId, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(editor) = self.tabs.get(&tab).cloned() else {
+            return;
+        };
+        let session = editor.read(cx).session().cloned();
+        let shared = session.as_ref().is_some_and(|s| {
+            self.tabs
+                .iter()
+                .any(|(t, e)| *t != tab && e.read(cx).session().is_some_and(|o| o.id() == s.id()))
+        });
+        if !shared && editor.read(cx).close_needs_confirmation(cx) {
+            let this = cx.entity().downgrade();
+            let name = session
+                .as_ref()
+                .map(|s| s.info().connection_name.clone())
+                .unwrap_or_default();
+            crate::editor_tab::open_close_confirmation(
+                name,
+                Rc::new(move |end, window, cx| {
+                    editor.update(cx, |e, cx| e.end_transaction(end, cx));
+                    let _ = this.update(cx, |ws, cx| ws.close_tab_now(tab, window, cx));
+                }),
+                window,
+                cx,
+            );
+            return;
+        }
+        self.close_tab_now(tab, window, cx);
+    }
+
+    /// Closes a tab without asking.
+    pub fn close_tab_now(&mut self, tab: TabId, window: &mut Window, cx: &mut Context<Self>) {
         if self.layout.close_tab(tab) {
             self.tabs.remove(&tab);
             self.after_change(window, cx);
@@ -479,11 +528,82 @@ impl Workspace {
         let Some(id) = self.selected_connection(cx) else {
             return Self::notify_no_selection(window, cx);
         };
+        let prefs = self.hub.read(cx).preferences();
+        let asking: Vec<ninesql_core::SessionHandle> = self
+            .hub
+            .read(cx)
+            .sessions(id)
+            .iter()
+            .filter(|s| s.close_needs_confirmation(&prefs.confirmations))
+            .cloned()
+            .collect();
+        if let Some(first) = asking.first() {
+            // ADR-0007 §5: an open transaction is never ended silently.
+            let name = first.info().connection_name.clone();
+            let this = cx.entity().downgrade();
+            crate::editor_tab::open_close_confirmation(
+                name,
+                Rc::new(move |commit, window, cx| {
+                    let end = if commit {
+                        ninesql_core::TransactionEnd::Commit
+                    } else {
+                        ninesql_core::TransactionEnd::Rollback
+                    };
+                    let sessions = asking.clone();
+                    let this = this.clone();
+                    window
+                        .spawn(cx, async move |cx| {
+                            for s in &sessions {
+                                if let Err(e) = s.close_with(end).await {
+                                    let text = crate::editor_tab::run::core_error_text(&e);
+                                    let _ = cx.update(|window, cx| {
+                                        window.push_notification(
+                                            Notification::error(text).title("Not disconnected"),
+                                            cx,
+                                        );
+                                    });
+                                    return;
+                                }
+                            }
+                            let _ = this.update(cx, |ws, cx| ws.disconnect_now(id, cx));
+                        })
+                        .detach();
+                }),
+                window,
+                cx,
+            );
+            return;
+        }
+        self.disconnect_now(id, cx);
+    }
+
+    /// Closes the sessions of a connection without asking.
+    pub fn disconnect_now(&mut self, id: ConnectionId, cx: &mut Context<Self>) {
         self.hub.update(cx, |hub, cx| hub.disconnect(id, cx));
         if self.active_connection == Some(id) {
             self.active_connection = None;
         }
         cx.notify();
+    }
+
+    /// "Choose editor connection": the open sessions, for the active editor.
+    pub fn choose_editor_connection(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(editor) = self.active_editor().cloned() else {
+            return window.push_notification(Notification::info("Open an SQL editor first."), cx);
+        };
+        let sessions = self.hub.read(cx).open_sessions();
+        let current = editor
+            .read(cx)
+            .session()
+            .map(ninesql_core::SessionHandle::id);
+        crate::editor_tab::open_connection_picker(editor, sessions, current, window, cx);
+    }
+
+    /// Commits or rolls back the active editor's transaction.
+    pub fn end_transaction(&mut self, commit: bool, cx: &mut Context<Self>) {
+        if let Some(editor) = self.active_editor().cloned() {
+            editor.update(cx, |e, cx| e.end_transaction(commit, cx));
+        }
     }
 
     fn on_flow_finished(
@@ -506,6 +626,13 @@ impl Workspace {
                 warnings,
             } => {
                 self.active_connection = Some(*connection);
+                // The active editor without a connection takes the session just opened.
+                if let Some(editor) = self.active_editor().cloned()
+                    && editor.read(cx).session().is_none()
+                    && let Some(session) = self.hub.read(cx).sessions(*connection).last().cloned()
+                {
+                    editor.update(cx, |e, cx| e.set_session(Some(session), cx));
+                }
                 let name = self
                     .hub
                     .read(cx)
@@ -705,6 +832,8 @@ impl Workspace {
                 );
                 cx.notify();
             }
+            // The editor tabs follow their own session's transaction state.
+            HubEvent::TransactionChanged { .. } => cx.notify(),
         }
     }
 
@@ -812,6 +941,21 @@ impl Workspace {
         let Some(spec) = actions::spec_of(action) else {
             return false;
         };
+        if matches!(spec.scope, Scope::Editor | Scope::Grid) {
+            // The palette path of the editor's and the grid's actions: focus the active editor
+            // (or its results) and dispatch there, as the key binding would.
+            let Some(editor) = self.active_editor().cloned() else {
+                return true;
+            };
+            let focus = if spec.scope == Scope::Grid {
+                editor.read(cx).results().focus_handle(cx)
+            } else {
+                editor.focus_handle(cx)
+            };
+            focus.focus(window, cx);
+            window.dispatch_action(action.boxed_clone(), cx);
+            return true;
+        }
         if spec.scope == Scope::App {
             let action = action.boxed_clone();
             cx.defer(move |cx| {
@@ -868,6 +1012,12 @@ impl Workspace {
             self.import_from_dbeaver_folder(window, cx);
         } else if any.is::<EnableConnection>() {
             self.enable_selected(window, cx);
+        } else if any.is::<ChooseEditorConnection>() {
+            self.choose_editor_connection(window, cx);
+        } else if any.is::<CommitTransaction>() {
+            self.end_transaction(true, cx);
+        } else if any.is::<RollbackTransaction>() {
+            self.end_transaction(false, cx);
         } else if any.is::<CloseWindow>() {
             window.remove_window();
         } else {
@@ -1208,10 +1358,16 @@ impl Workspace {
         )
     }
 
-    /// The color framing the editor area (ADR-0007 §4): the type color of the active
-    /// connection when production rules apply.
+    /// The color framing the editor area (ADR-0007 §4): the type color of the active editor's
+    /// session when production rules apply; without an editor session, of the last
+    /// connection opened in this window.
     #[must_use]
     pub fn frame_color(&self, cx: &App) -> Option<Hsla> {
+        if let Some(editor) = self.active_editor()
+            && editor.read(cx).session().is_some()
+        {
+            return editor.read(cx).frame_color(cx);
+        }
         let id = self.active_connection?;
         let hub = self.hub.read(cx);
         let c = hub.connection(id)?;
@@ -1305,6 +1461,9 @@ impl Render for Workspace {
             ImportFromDbeaver,
             ImportFromDbeaverFolder,
             EnableConnection,
+            ChooseEditorConnection,
+            CommitTransaction,
+            RollbackTransaction,
         );
         let content = root
             .when(client_decorated, |el| {

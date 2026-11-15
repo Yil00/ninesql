@@ -57,14 +57,17 @@ fn open(cx: &mut TestAppContext) -> (Entity<Shell>, VisualTestContext) {
 
 /// A window for tests on a live driver runtime: its threads wake GPUI tasks (connect replies,
 /// core events) at any time, so parking is allowed before the first connect.
-fn open_live(cx: &mut TestAppContext) -> (Entity<Shell>, VisualTestContext) {
+pub(crate) fn open_live(cx: &mut TestAppContext) -> (Entity<Shell>, VisualTestContext) {
     let (ws, vcx) = open(cx);
     vcx.executor().allow_parking();
     (ws, vcx)
 }
 
 /// Runs the foreground until `done`, letting the driver runtime's threads work in between.
-fn wait_until(vcx: &mut VisualTestContext, mut done: impl FnMut(&mut VisualTestContext) -> bool) {
+pub(crate) fn wait_until(
+    vcx: &mut VisualTestContext,
+    mut done: impl FnMut(&mut VisualTestContext) -> bool,
+) {
     vcx.executor().allow_parking();
     for _ in 0..500 {
         vcx.run_until_parked();
@@ -101,7 +104,7 @@ fn mock_manager(dir: &std::path::Path) -> SessionManager {
     }
 }
 
-fn mock_connection(name: &str, ty: ConnectionTypeId, auth: Auth) -> Connection {
+pub(crate) fn mock_connection(name: &str, ty: ConnectionTypeId, auth: Auth) -> Connection {
     let engine = EngineId::new("mock").unwrap_or_else(|e| panic!("{e}"));
     let mut c = Connection::new(
         name,
@@ -119,7 +122,7 @@ fn mock_connection(name: &str, ty: ConnectionTypeId, auth: Auth) -> Connection {
     c
 }
 
-fn mock_hub(
+pub(crate) fn mock_hub(
     cx: &mut TestAppContext,
     dir: &std::path::Path,
     connections: Vec<Connection>,

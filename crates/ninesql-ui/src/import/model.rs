@@ -9,7 +9,7 @@
 use std::collections::BTreeSet;
 
 use ninesql_core::dbeaver::mapping::CredentialsStatus;
-use ninesql_core::dbeaver::{ImportIssue, InstallKind, Severity as IssueSeverity};
+use ninesql_core::dbeaver::{ImportIssue, InstallKind, IssueKind, Severity as IssueSeverity};
 use ninesql_core::secrets::{SecretKind, StoreKind};
 use ninesql_core::{
     ConnectionPlan, ConnectionType, ConnectionTypeId, ConnectionTypes, Connections, DisabledKind,
@@ -138,6 +138,8 @@ pub struct IssueRow {
     pub key: Option<String>,
     /// The core's message (no value from the file).
     pub message: String,
+    /// What kind of entry it is (`Truncated` and `Duplicate` are shown as source issues).
+    pub kind: IssueKind,
 }
 
 impl IssueRow {
@@ -146,7 +148,14 @@ impl IssueRow {
             severity: i.severity,
             key: i.key.clone(),
             message: i.message.clone(),
+            kind: i.kind,
         }
+    }
+
+    /// A source-level entry: a limit reached (the rest was not read) or a folder read once.
+    #[must_use]
+    pub fn is_source_issue(&self) -> bool {
+        matches!(self.kind, IssueKind::Truncated | IssueKind::Duplicate)
     }
 
     /// One line for the screen.
@@ -548,9 +557,21 @@ pub struct PreviewView {
     pub projects: Vec<ProjectView>,
     /// Report entries not tied to a project.
     pub issues: Vec<IssueRow>,
+    /// A limit was reached while reading the source (`ImportPreview::truncated`): the preview
+    /// is incomplete, shown prominently.
+    pub truncated: bool,
 }
 
 impl PreviewView {
+    /// Source issues of the whole preview (limits reached, folders read once), the source-level
+    /// ones first, then those of each project.
+    pub fn source_issues(&self) -> impl Iterator<Item = &IssueRow> {
+        self.issues
+            .iter()
+            .chain(self.projects.iter().flat_map(|p| p.issues.iter()))
+            .filter(|i| i.is_source_issue())
+    }
+
     /// The view of `preview` against the hub's current types and connections.
     #[must_use]
     pub fn build(preview: &ImportPreview, types: &ConnectionTypes, saved: &Connections) -> Self {
@@ -635,6 +656,7 @@ impl PreviewView {
                 })
                 .collect(),
             issues: preview.issues.iter().map(IssueRow::of).collect(),
+            truncated: preview.truncated(),
         }
     }
 

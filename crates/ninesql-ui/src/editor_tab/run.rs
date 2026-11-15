@@ -126,13 +126,15 @@ pub fn build_run_request(
         [] => return Err("Nothing to run here.".to_owned()),
         [item] => {
             refuse_item(item)?;
-            let mut run =
-                RunRequest::statement(item.text.clone()).with_params(item.params.clone());
+            let mut run = RunRequest::statement(item.text.clone()).with_params(item.params.clone());
             run.offset = item.span.start;
             run
         }
         items => {
-            if let Some(item) = items.iter().find(|i| matches!(i.kind, ItemKind::Refused(_))) {
+            if let Some(item) = items
+                .iter()
+                .find(|i| matches!(i.kind, ItemKind::Refused(_)))
+            {
                 refuse_item(item)?;
             }
             if items.iter().any(|i| !i.params.is_empty()) {
