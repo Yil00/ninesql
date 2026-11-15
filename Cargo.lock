@@ -4683,7 +4683,10 @@ dependencies = [
 name = "ninesql-grid"
 version = "0.0.0"
 dependencies = [
+ "gpui-kit",
+ "gpui-pre",
  "ninesql-core",
+ "tracing",
 ]
 
 [[package]]
