@@ -18,6 +18,9 @@ use ninesql_core::ConnectionId;
 
 use crate::connections::hub::{ConnectionHub, hub_or_install_empty};
 use crate::connections::visuals::{ConnectionBadges, badges};
+use crate::import::enable::disabled_text;
+use crate::import::model::disabled_kind_label;
+use gpui_kit::component::tooltip::Tooltip;
 
 const CONNECTION_PREFIX: &str = "connection:";
 const FOLDER_PREFIX: &str = "folder:";
@@ -61,6 +64,18 @@ impl FolderNode {
         );
         items
     }
+}
+
+/// The short label of a disabled connection in its row ("disabled: no driver") and the full
+/// text of its tooltip; `None` when enabled.
+#[must_use]
+pub fn row_disabled_label(c: &ninesql_core::Connection) -> Option<(String, SharedString)> {
+    let full = disabled_text(c.enabled, c.disabled_reason.as_ref())?;
+    let short = match &c.disabled_reason {
+        Some(r) => format!("disabled: {}", disabled_kind_label(r.kind)),
+        None => "disabled".to_owned(),
+    };
+    Some((short, full.into()))
 }
 
 fn connection_id(item_id: &str) -> Option<ConnectionId> {
@@ -197,7 +212,7 @@ impl Render for Navigator {
                     .py_2()
                     .text_sm()
                     .text_color(theme.muted_foreground)
-                    .child("No connections yet. Use \"New connection\" (Ctrl+Alt+N).")
+                    .child("No connections yet. Use \"New connection\" (Ctrl+Alt+N) or \"Import from DBeaver\" (Ctrl+K Ctrl+I).")
                     .into_any_element()
             } else {
                 div()
@@ -231,12 +246,18 @@ impl Render for Navigator {
                                             .child("connected"),
                                     )
                                 })
-                                .when(!c.enabled, |el| {
+                                .when_some(row_disabled_label(c), |el, (short, full)| {
+                                    // The reason (imported disabled, P2-B) in the row and its
+                                    // tooltip; "Enable connection" shows it in full too.
                                     el.child(
                                         div()
+                                            .id(SharedString::from(format!("disabled-{key}")))
                                             .text_xs()
                                             .text_color(cx.theme().muted_foreground)
-                                            .child("disabled"),
+                                            .tooltip(move |window, cx| {
+                                                Tooltip::new(full.clone()).build(window, cx)
+                                            })
+                                            .child(short),
                                     )
                                 })
                                 .child(badges(&key, &b, false, cx)),

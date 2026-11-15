@@ -45,6 +45,7 @@ Only one NineSQL process can use the workspace at a time: a second one is refuse
 |---|---|
 | Command palette (every action is listed there) | `Ctrl+Shift+P` or `F1` |
 | New connection | `Ctrl+Alt+N` |
+| Import from DBeaver | `Ctrl+K` then `Ctrl+I` |
 | Show or hide the database navigator | `Ctrl+B` |
 | Move focus to the navigator | `Ctrl+K` then `Ctrl+N` |
 | New editor tab (empty: statements cannot be run yet) | `Ctrl+T` |
@@ -73,6 +74,9 @@ mono_font_size = 13
 "ninesql::NewEditorTab" = "ctrl-n"              # replaces the defaults of this action
 SplitDown = ["ctrl-k ctrl-down", "alt-shift-2"] # short names work too
 ToggleNavigator = []                            # unbinds
+
+[import]
+first_run_prompt = false        # do not offer the DBeaver import at startup
 ```
 An invalid value or binding never stops NineSQL: the default is used and the problem is listed by "Show settings problems" (`Ctrl+K` then `Ctrl+E`).
 
@@ -80,7 +84,7 @@ An invalid value or binding never stops NineSQL: the default is used and the pro
 | Path (defaults) | Content |
 |---|---|
 | `~/.config/ninesql/settings.toml` | Appearance and key bindings |
-| `~/.local/share/ninesql/workspace/<project>/` | `connections.json`, `connection-types.json`, `project.json` |
+| `~/.local/share/ninesql/workspace/<project>/` | `connections.json`, `connection-types.json`, `project.json`, and `imports/dbeaver-<date>.json` after a [DBeaver import](import-from-dbeaver.md) |
 | `~/.local/share/ninesql/vault.bin` | The encrypted vault, if you created one ([Secrets](secrets.md)) |
 | `~/.local/share/ninesql/known_hosts` | SSH host keys you trusted in NineSQL |
 

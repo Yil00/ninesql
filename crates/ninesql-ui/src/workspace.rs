@@ -17,10 +17,11 @@ use gpui_kit::*;
 
 use crate::actions::{
     self, CloseTab, CloseWindow, CommandPalette, ConnectConnection, DeleteConnection,
-    DisconnectConnection, DuplicateConnection, EditConnection, FocusNavigator, FocusNextPane,
-    FocusPreviousPane, LockSecrets, NewConnection, NewEditorTab, NextTab, PreviousTab, Scope,
-    ShowConnectionProblems, ShowSettingsProblems, SplitDown, SplitRight, TestConnection,
-    ToggleNavigator, WORKSPACE_CONTEXT,
+    DisconnectConnection, DuplicateConnection, EditConnection, EnableConnection, FocusNavigator,
+    FocusNextPane, FocusPreviousPane, ImportFromDbeaver, ImportFromDbeaverFolder, LockSecrets,
+    NewConnection, NewEditorTab, NextTab, PreviousTab, Scope, ShowConnectionProblems,
+    ShowSettingsProblems, SplitDown, SplitRight, TestConnection, ToggleNavigator,
+    WORKSPACE_CONTEXT,
 };
 use crate::appearance;
 use crate::connections::connect_flow::{ConnectFlow, FlowFinished, FlowResult, Purpose};
@@ -28,9 +29,12 @@ use crate::connections::dialog::{
     ConnectionDialog, ConnectionDialogCancelled, ConnectionSaved, new_form,
 };
 use crate::connections::form::ConnectionForm;
+use crate::connections::hub::DetectedDbeaver;
 use crate::connections::hub::{ConnectionHub, HubEvent, hub_or_install_empty, lock_reason_text};
 use crate::connections::visuals::{ConnectionBadges, badges};
 use crate::editor_tab::SqlEditorTab;
+use crate::import::enable::{ConnectionEnabled, disabled_text, open_enable_prompt};
+use crate::import::flow::{ImportFlow, open_import_dialog};
 use crate::keymap::EffectiveKeymap;
 use crate::layout::{EditorLayout, Node, PaneId, SplitAxis, TabId};
 use crate::navigator::Navigator;
@@ -54,6 +58,8 @@ pub struct Workspace {
     flow: Entity<ConnectFlow>,
     active_connection: Option<ConnectionId>,
     dialog: Option<Entity<ConnectionDialog>>,
+    import: Option<Entity<ImportFlow>>,
+    first_run_hidden: bool,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -78,6 +84,8 @@ impl Workspace {
             flow,
             active_connection: None,
             dialog: None,
+            import: None,
+            first_run_hidden: false,
             _subscriptions: subscriptions,
         };
         this.new_tab(window, cx);
@@ -445,6 +453,15 @@ impl Workspace {
         let Some(c) = self.hub.read(cx).connection(id).cloned() else {
             return;
         };
+        if let Some(why) = disabled_text(c.enabled, c.disabled_reason.as_ref()) {
+            // The core refuses a disabled connection too; say why, and how to enable it.
+            window.push_notification(
+                Notification::warning(format!("{why} Use \"Enable connection\" first."))
+                    .title(format!("\"{}\" is disabled", c.name)),
+                cx,
+            );
+            return;
+        }
         if self.flow.read(cx).is_busy() {
             window.push_notification(
                 Notification::info("A connection is already being opened."),
@@ -477,7 +494,12 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) {
         // Tests run from the dialog report inside it.
-        let from_dialog = event.purpose == Purpose::Test && self.dialog.is_some();
+        let from_dialog = event.purpose == Purpose::Test
+            && (self.dialog.is_some()
+                || self
+                    .import
+                    .as_ref()
+                    .is_some_and(|f| f.read(cx).is_testing()));
         match &event.result {
             FlowResult::Opened {
                 connection,
@@ -532,6 +554,123 @@ impl Workspace {
             _ => {}
         }
         cx.notify();
+    }
+
+    /// The DBeaver import flow of this window, once opened.
+    #[must_use]
+    pub fn import_flow(&self) -> Option<&Entity<ImportFlow>> {
+        self.import.as_ref()
+    }
+
+    fn open_import(&mut self, window: &mut Window, cx: &mut Context<Self>) -> Entity<ImportFlow> {
+        let flow = match &self.import {
+            Some(f) if f.read(cx).is_busy() => f.clone(),
+            _ => {
+                let hub = self.hub.clone();
+                let connect = self.flow.clone();
+                let flow = cx.new(|cx| ImportFlow::new(hub, connect, window, cx));
+                self.import = Some(flow.clone());
+                flow
+            }
+        };
+        open_import_dialog(flow.clone(), window, cx);
+        flow
+    }
+
+    /// Opens the import screen waiting for a folder (no picker), and returns its flow.
+    pub fn open_import_screen(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Entity<ImportFlow> {
+        let flow = self.open_import(window, cx);
+        flow.update(cx, |f, cx| f.choose_folder_stage(None, cx));
+        flow
+    }
+
+    /// "Import from DBeaver": previews the workspaces of the known locations (P2-B).
+    pub fn import_from_dbeaver(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.import.as_ref().is_some_and(|f| f.read(cx).is_busy()) {
+            window.push_notification(Notification::info("An import is already running."), cx);
+            return;
+        }
+        let flow = self.open_import(window, cx);
+        flow.update(cx, |f, cx| f.start_detect(window, cx));
+    }
+
+    /// "Import from DBeaver: choose folder": the folder picker, then the preview.
+    pub fn import_from_dbeaver_folder(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.import.as_ref().is_some_and(|f| f.read(cx).is_busy()) {
+            window.push_notification(Notification::info("An import is already running."), cx);
+            return;
+        }
+        let flow = self.open_import(window, cx);
+        flow.update(cx, |f, cx| {
+            f.choose_folder_stage(None, cx);
+            f.choose_folder(window, cx);
+        });
+    }
+
+    /// The first-run import offer (P2-B): shown while the project has no connection, a DBeaver
+    /// workspace was found, `[import] first_run_prompt` is on and it was not hidden in this
+    /// window.
+    #[must_use]
+    pub fn first_run_offer(&self, cx: &App) -> Option<Vec<DetectedDbeaver>> {
+        if self.first_run_hidden {
+            return None;
+        }
+        let enabled = cx
+            .try_global::<SettingsState>()
+            .is_none_or(|s| s.settings.import.first_run_prompt);
+        let hub = self.hub.read(cx);
+        if !enabled || hub.is_starting() || !hub.connections().is_empty() {
+            return None;
+        }
+        hub.detected_dbeaver()
+            .filter(|found| !found.is_empty())
+            .map(<[DetectedDbeaver]>::to_vec)
+    }
+
+    /// Hides the first-run offer: for this window ("Not now"), or for good ("Don't show
+    /// again", saved as `[import] first_run_prompt = false` in settings.toml).
+    pub fn dismiss_first_run(&mut self, remember: bool, cx: &mut Context<Self>) {
+        self.first_run_hidden = true;
+        if remember {
+            crate::persist::record(
+                crate::persist::SettingsChange::ImportFirstRunPrompt(false),
+                cx,
+            );
+        }
+        cx.notify();
+    }
+
+    /// "Enable connection" on the navigator's selection: shows the reason and asks the core.
+    pub fn enable_selected(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(c) = self.selected(cx) else {
+            return Self::notify_no_selection(window, cx);
+        };
+        if c.enabled {
+            window.push_notification(
+                Notification::info(format!("\"{}\" is already enabled.", c.name)),
+                cx,
+            );
+            return;
+        }
+        let prompt = open_enable_prompt(self.hub.clone(), c.id, window, cx);
+        let sub = cx.subscribe_in(
+            &prompt,
+            window,
+            |this: &mut Self, _, event: &ConnectionEnabled, window, cx| {
+                let name = this
+                    .hub
+                    .read(cx)
+                    .connection(event.0)
+                    .map(|c| c.name.clone())
+                    .unwrap_or_default();
+                window.push_notification(Notification::success(format!("Enabled \"{name}\".")), cx);
+            },
+        );
+        self._subscriptions.push(sub);
     }
 
     /// "Lock secrets now": locks the vault and forgets the passwords asked this session
@@ -723,6 +862,12 @@ impl Workspace {
             self.show_connection_problems(window, cx);
         } else if any.is::<LockSecrets>() {
             self.lock_secrets(window, cx);
+        } else if any.is::<ImportFromDbeaver>() {
+            self.import_from_dbeaver(window, cx);
+        } else if any.is::<ImportFromDbeaverFolder>() {
+            self.import_from_dbeaver_folder(window, cx);
+        } else if any.is::<EnableConnection>() {
+            self.enable_selected(window, cx);
         } else if any.is::<CloseWindow>() {
             window.remove_window();
         } else {
@@ -985,6 +1130,84 @@ impl Workspace {
 }
 
 impl Workspace {
+    /// The first-run "Import from DBeaver" screen, above the editor area.
+    fn render_first_run(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let found = self.first_run_offer(cx)?;
+        let keys = cx
+            .try_global::<EffectiveKeymap>()
+            .and_then(|k| k.display_for("ninesql::ImportFromDbeaver"));
+        let this = cx.entity().downgrade();
+        let theme = cx.theme();
+        let muted = theme.muted_foreground;
+        let where_ = found
+            .iter()
+            .map(|w| {
+                format!(
+                    "{} ({}, {} project(s))",
+                    w.path.display(),
+                    crate::import::model::install_label(w.kind),
+                    w.projects
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("; ");
+        let button = |id: &'static str, label: &'static str| Button::new(id).small().label(label);
+        Some(
+            v_flex()
+                .id("first-run-import")
+                .m_2()
+                .p_3()
+                .gap_2()
+                .border_1()
+                .rounded_md()
+                .border_color(theme.border)
+                .bg(theme.secondary)
+                .text_color(theme.secondary_foreground)
+                .text_sm()
+                .child(
+                    div()
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .child("Import your DBeaver connections?"),
+                )
+                .child(format!("A DBeaver workspace was found: {where_}."))
+                .child(div().text_xs().text_color(muted).child(
+                    "You see what is imported before anything is saved. Saved passwords move to the keyring or the vault; DBeaver's files are only read, never changed.",
+                ))
+                .child(
+                    h_flex()
+                        .gap_2()
+                        .child({
+                            let this = this.clone();
+                            button("first-run-import-start", "Import from DBeaver")
+                                .primary()
+                                .when_some(keys, |b, k| b.tooltip(format!("Import from DBeaver ({k})")))
+                                .on_click(move |_, window, cx| {
+                                    let _ = this.update(cx, |ws, cx| ws.import_from_dbeaver(window, cx));
+                                })
+                        })
+                        .child({
+                            let this = this.clone();
+                            button("first-run-import-folder", "Choose folder…").on_click(move |_, window, cx| {
+                                let _ = this.update(cx, |ws, cx| ws.import_from_dbeaver_folder(window, cx));
+                            })
+                        })
+                        .child({
+                            let this = this.clone();
+                            button("first-run-import-later", "Not now").ghost().on_click(move |_, _, cx| {
+                                let _ = this.update(cx, |ws, cx| ws.dismiss_first_run(false, cx));
+                            })
+                        })
+                        .child({
+                            let this = this.clone();
+                            button("first-run-import-never", "Don't show again").ghost().on_click(move |_, _, cx| {
+                                let _ = this.update(cx, |ws, cx| ws.dismiss_first_run(true, cx));
+                            })
+                        }),
+                )
+                .into_any_element(),
+        )
+    }
+
     /// The color framing the editor area (ADR-0007 §4): the type color of the active
     /// connection when production rules apply.
     #[must_use]
@@ -1079,6 +1302,9 @@ impl Render for Workspace {
             TestConnection,
             ShowConnectionProblems,
             LockSecrets,
+            ImportFromDbeaver,
+            ImportFromDbeaverFolder,
+            EnableConnection,
         );
         let content = root
             .when(client_decorated, |el| {
@@ -1101,7 +1327,19 @@ impl Render for Workspace {
                                 .visible(self.navigator_visible)
                                 .child(self.navigator.clone()),
                         )
-                        .child(resizable_panel().child(self.frame_editor_area(editor_area, cx))),
+                        .child(
+                            resizable_panel().child(
+                                v_flex()
+                                    .size_full()
+                                    .children(self.render_first_run(cx))
+                                    .child(
+                                        div()
+                                            .flex_1()
+                                            .min_h_0()
+                                            .child(self.frame_editor_area(editor_area, cx)),
+                                    ),
+                            ),
+                        ),
                 ),
             )
             .child(status_bar);

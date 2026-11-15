@@ -61,6 +61,8 @@ pub enum SettingsChange {
     /// `[keybindings]` entry of an action (full name): `Some` overrides the defaults (an empty
     /// list unbinds the action), `None` removes the entry so the defaults apply again.
     Keybinding(&'static str, Option<Vec<String>>),
+    /// `[import] first_run_prompt`.
+    ImportFirstRunPrompt(bool),
 }
 
 impl SettingsChange {
@@ -74,6 +76,7 @@ impl SettingsChange {
             Self::MonoFontSize(_) => ("appearance", "mono_font_size"),
             Self::Zoom(_) => ("appearance", "zoom"),
             Self::Keybinding(action, _) => ("keybindings", action),
+            Self::ImportFirstRunPrompt(_) => ("import", "first_run_prompt"),
         }
     }
 
@@ -89,6 +92,7 @@ impl SettingsChange {
             Self::Zoom(z) => a.zoom = *z,
             Self::Keybinding(action, Some(keys)) => settings.keybindings.set(action, keys.clone()),
             Self::Keybinding(action, None) => settings.keybindings.remove(action),
+            Self::ImportFirstRunPrompt(on) => settings.import.first_run_prompt = *on,
         }
     }
 }
@@ -319,6 +323,9 @@ pub fn apply_changes(text: &str, changes: &[SettingsChange]) -> Result<String, D
             }
             SettingsChange::Zoom(z) => set_value(table, "zoom", number(*z)),
             SettingsChange::Keybinding(action, keys) => set_binding(table, action, keys.as_deref()),
+            SettingsChange::ImportFirstRunPrompt(on) => {
+                set_value(table, "first_run_prompt", Value::from(*on));
+            }
         }
     }
     Ok(doc.to_string())
@@ -456,6 +463,28 @@ tab_size = 4
         let (settings, _) = parse(&out);
         assert_eq!(settings.appearance.theme, ThemePreference::Light);
         assert_eq!(settings.appearance.zoom, 2.0);
+    }
+
+    #[test]
+    fn the_import_prompt_dismissal_round_trips() {
+        let Ok(out) = apply_changes(HAND_WRITTEN, &[SettingsChange::ImportFirstRunPrompt(false)])
+        else {
+            panic!("not applied");
+        };
+        assert!(out.contains("[import]\nfirst_run_prompt = false"), "{out}");
+        assert!(out.contains("[editor]\ntab_size = 4"), "{out}");
+        let (settings, diags) = parse(&out);
+        assert!(!settings.import.first_run_prompt);
+        assert!(diags.iter().all(|d| !d.message().contains("[import]")));
+        let (defaults, _) = parse("");
+        assert!(defaults.import.first_run_prompt);
+        let (bad, diags) = parse("[import]\nfirst_run_prompt = \"no\"\n");
+        assert!(bad.import.first_run_prompt);
+        assert!(
+            diags
+                .iter()
+                .any(|d| d.message().contains("first_run_prompt"))
+        );
     }
 
     #[test]

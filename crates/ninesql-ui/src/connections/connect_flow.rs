@@ -87,6 +87,9 @@ pub enum PendingPrompt {
 struct Run {
     purpose: Purpose,
     connection: Connection,
+    /// Connection types for the policy of this run instead of the hub's (the test of an import
+    /// preview runs under the types the import would save, `ImportPreview::types_after`).
+    types: Option<ninesql_core::ConnectionTypes>,
     prompted: Vec<(SecretSlot, SecretString)>,
     init_token: Option<InitSqlToken>,
 }
@@ -181,10 +184,26 @@ impl ConnectFlow {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        self.start_with_types(connection, purpose, typed, None, window, cx);
+    }
+
+    /// [`Self::start`] under `types` instead of the hub's connection types (`None`: the hub's).
+    /// The DBeaver import preview tests a connection not saved yet under the types the import
+    /// would save (`ImportPreview::types_after`), so a type the import tightens applies.
+    pub fn start_with_types(
+        &mut self,
+        connection: Connection,
+        purpose: Purpose,
+        typed: Vec<(SecretSlot, SecretString)>,
+        types: Option<ninesql_core::ConnectionTypes>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         self.waiting = None;
         self.run = Some(Run {
             purpose,
             connection,
+            types,
             prompted: typed,
             init_token: None,
         });
@@ -206,7 +225,10 @@ impl ConnectFlow {
             );
             return;
         };
-        let mut request = OpenRequest::new(run.connection.clone(), hub.types());
+        let mut request = OpenRequest::new(
+            run.connection.clone(),
+            run.types.as_ref().unwrap_or_else(|| hub.types()),
+        );
         // Answers are moved into this request only (zeroized when it is dropped).
         for (slot, secret) in run.prompted.drain(..) {
             request = request.with_secret(slot, secret);

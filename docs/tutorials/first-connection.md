@@ -9,7 +9,7 @@ What you can do once connected: see the session in the navigator and the status 
 - For PostgreSQL, MySQL or MariaDB: `make dev-up` ([Start the dev databases](dev-databases.md)).
 
 ## 1. Open the dialog
-Press `Ctrl+Alt+N` ("New connection"), or open the command palette (`Ctrl+Shift+P`) and type "connection". With no connection saved yet, the navigator also says: No connections yet. Use "New connection" (Ctrl+Alt+N).
+Press `Ctrl+Alt+N` ("New connection"), or open the command palette (`Ctrl+Shift+P`) and type "connection". With no connection saved yet, the navigator also says: No connections yet. Use "New connection" (Ctrl+Alt+N) or "Import from DBeaver" (Ctrl+K Ctrl+I). To bring your DBeaver connections over instead, see [Import from DBeaver](import-from-dbeaver.md).
 
 The dialog only offers what the drivers of your build declare: engines, TLS modes, authentication kinds and driver properties come from each driver's capabilities, and what a driver does not support is hidden or disabled, never faked ([invariant I8](../../CONTEXT.md#invariants-non-negotiable)).
 

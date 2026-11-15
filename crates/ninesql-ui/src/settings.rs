@@ -16,6 +16,9 @@
 //! "ninesql::NewEditorTab" = "ctrl-n"              # replaces the defaults
 //! SplitDown = ["ctrl-k ctrl-down", "alt-shift-2"] # short names work too
 //! ToggleNavigator = []                            # unbinds
+//!
+//! [import]
+//! first_run_prompt = false        # do not offer the DBeaver import at startup (P2-B)
 //! ```
 //!
 //! The file is hand-edited, so loading is lenient: a missing file means defaults; unknown keys
@@ -115,6 +118,22 @@ pub struct Appearance {
     pub zoom: f32,
 }
 
+/// `[import]` (P2-B).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ImportSettings {
+    /// Offer the DBeaver import when the project has no connection and a DBeaver workspace is
+    /// found (`first_run_prompt`, default `true`). Set to `false` by "Don't show again".
+    pub first_run_prompt: bool,
+}
+
+impl Default for ImportSettings {
+    fn default() -> Self {
+        Self {
+            first_run_prompt: true,
+        }
+    }
+}
+
 /// The parsed settings.
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct Settings {
@@ -122,6 +141,8 @@ pub struct Settings {
     pub appearance: Appearance,
     /// `[keybindings]`, validated.
     pub keybindings: BindingOverrides,
+    /// `[import]`.
+    pub import: ImportSettings,
 }
 
 /// Settings with the problems found while reading them, kept as a GPUI global.
@@ -201,6 +222,11 @@ fn parse_full(text: &str) -> (Settings, Vec<Diagnostic>, Option<Diagnostic>) {
         Some(Value::Table(t)) => settings.keybindings = parse_keybindings(t, &mut diags),
         Some(_) => diags.push(Diagnostic::new("[keybindings] must be a table")),
     }
+    match table.get("import") {
+        None => {}
+        Some(Value::Table(t)) => settings.import = parse_import(t, &mut diags),
+        Some(_) => diags.push(Diagnostic::new("[import] must be a table")),
+    }
     (settings, diags, None)
 }
 
@@ -237,6 +263,19 @@ fn parse_appearance(t: &Table, diags: &mut Vec<Diagnostic>) -> Appearance {
                 ZOOM_RANGE.start(),
                 ZOOM_RANGE.end()
             ))),
+        }
+    }
+    out
+}
+
+fn parse_import(t: &Table, diags: &mut Vec<Diagnostic>) -> ImportSettings {
+    let mut out = ImportSettings::default();
+    if let Some(v) = t.get("first_run_prompt") {
+        match v.as_bool() {
+            Some(b) => out.first_run_prompt = b,
+            None => diags.push(Diagnostic::new(
+                "[import] first_run_prompt must be true or false: true is used",
+            )),
         }
     }
     out

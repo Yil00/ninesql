@@ -14,12 +14,13 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use gpui_kit::{App, AppContext as _, Context, Entity, EventEmitter, Global, Task};
+use ninesql_core::dbeaver::{InstallKind, SearchRoots};
 use ninesql_core::secrets::{SecretId, SecretMeta, SecretRef, SecretStores, StoreKind};
 use ninesql_core::storage::{Paths, ProjectName};
 use ninesql_core::{
     Connection, ConnectionId, ConnectionTypes, Connections, CoreConfig, CoreEvent, CoreEvents,
-    CoreServices, DriverRegistry, SecretBackend, SecretSlot, SecretsLockReason, SessionHandle,
-    SessionManager, Workspace,
+    CoreServices, DriverRegistry, ImportChoices, ImportError, ImportOutcome, ImportPreview,
+    SecretBackend, SecretSlot, SecretsLockReason, SessionHandle, SessionManager, Workspace,
 };
 
 use super::engines::{self, EngineOffer};
@@ -196,6 +197,18 @@ pub fn install(config: HubConfig, cx: &mut App) -> Entity<ConnectionHub> {
     hub
 }
 
+/// A DBeaver workspace found in the known locations (first-run import offer, P2-B). Only the
+/// location and the number of projects: no DBeaver file content.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DetectedDbeaver {
+    /// How DBeaver was installed.
+    pub kind: InstallKind,
+    /// Workspace folder.
+    pub path: std::path::PathBuf,
+    /// Projects with a data-sources file.
+    pub projects: usize,
+}
+
 /// State of the open sessions of one connection.
 #[derive(Debug, Clone, Default)]
 pub struct OpenSessions {
@@ -221,6 +234,8 @@ pub struct ConnectionHub {
     dropped_seen: u64,
     resyncs: u64,
     saving: bool,
+    importing: bool,
+    detected: Option<Vec<DetectedDbeaver>>,
     _events: Option<Task<()>>,
 }
 
@@ -244,6 +259,8 @@ impl ConnectionHub {
             dropped_seen: 0,
             resyncs: 0,
             saving: false,
+            importing: false,
+            detected: None,
             _events: None,
         }
     }
@@ -333,6 +350,12 @@ impl ConnectionHub {
                 next.problems.append(&mut problems);
                 *self = next;
                 self.start_event_pump(cx);
+                // First-run import offer (P2-B): only looked for when there is nothing saved.
+                if self.connections.is_empty()
+                    && let Some(roots) = SearchRoots::from_env()
+                {
+                    self.detect_dbeaver(roots, cx);
+                }
             }
             Err(e) => self.problems.push(e),
         }
@@ -465,10 +488,12 @@ impl ConnectionHub {
         built: BuiltConnection,
         cx: &mut Context<Self>,
     ) -> Task<Result<ConnectionId, String>> {
-        if let Err(e) = self.validate(&built.connection) {
+        // The rule of `save_connections_checked`: the driver for an enabled connection, the
+        // model rules for a disabled one (an imported connection with no driver can be edited).
+        if let Err(e) = self.check_saved(&built.connection) {
             return Task::ready(Err(e));
         }
-        if self.saving {
+        if self.saving || self.importing {
             return Task::ready(Err("another change is being saved; try again".to_owned()));
         }
         if self.starting {
@@ -577,7 +602,7 @@ impl ConnectionHub {
     /// Deletes a connection: its sessions are closed, `connections.json` is written and its
     /// saved secrets are deleted.
     pub fn remove(&mut self, id: ConnectionId, cx: &mut Context<Self>) -> Task<Result<(), String>> {
-        if self.saving {
+        if self.saving || self.importing {
             return Task::ready(Err("another change is being saved; try again".to_owned()));
         }
         if self.starting {
@@ -608,6 +633,163 @@ impl ConnectionHub {
                         }
                     }
                 }
+            }
+            Ok(next)
+        });
+        cx.spawn(async move |this, cx| {
+            let result = task.await;
+            this.update(cx, |hub, cx| {
+                hub.saving = false;
+                let out = result.map(|next| hub.connections = next);
+                cx.notify();
+                out
+            })
+            .map_err(|_| "the application is closing".to_owned())?
+        })
+    }
+
+    /// Whether a DBeaver import is being applied (saves and deletes wait for it).
+    #[must_use]
+    pub fn is_importing(&self) -> bool {
+        self.importing
+    }
+
+    /// DBeaver workspaces found by [`Self::detect_dbeaver`]; `None` until it answered.
+    #[must_use]
+    pub fn detected_dbeaver(&self) -> Option<&[DetectedDbeaver]> {
+        self.detected.as_deref()
+    }
+
+    /// Sets what the DBeaver detection found (tests, and the answer of [`Self::detect_dbeaver`]).
+    pub fn set_detected_dbeaver(&mut self, found: Vec<DetectedDbeaver>, cx: &mut Context<Self>) {
+        self.detected = Some(found);
+        cx.notify();
+    }
+
+    /// Looks for DBeaver workspaces in the known locations under `roots` (native, Flatpak,
+    /// Snap; ADR-0006 §2), off the UI thread (I6). Only lists folders: nothing is decrypted and
+    /// nothing is written (I4). The preview reads the workspace through the core.
+    pub fn detect_dbeaver(&mut self, roots: SearchRoots, cx: &mut Context<Self>) {
+        let task = self.blocking(cx, move || {
+            Ok(ninesql_core::dbeaver::detect_workspaces(&roots)
+                .into_iter()
+                .map(|w| DetectedDbeaver {
+                    kind: w.kind,
+                    path: w.path,
+                    projects: w.projects.len(),
+                })
+                .collect::<Vec<_>>())
+        });
+        cx.spawn(async move |this, cx| {
+            let found = task.await.unwrap_or_default();
+            let _ = this.update(cx, |hub, cx| hub.set_detected_dbeaver(found, cx));
+        })
+        .detach();
+    }
+
+    /// Applies a DBeaver import preview through `CoreServices::apply_import` (blocking pool,
+    /// I6). Saves and deletes are refused while it runs; on success the hub's connections are
+    /// replaced by `ImportOutcome::connections` (the list as written) and the connection types
+    /// are read again, so the hub never keeps a stale list that a later save would write back
+    /// (P2-C review, L-d). The returned outcome's `connections` is empty (moved into the hub).
+    pub fn apply_import(
+        &mut self,
+        preview: ImportPreview,
+        choices: ImportChoices,
+        cx: &mut Context<Self>,
+    ) -> Task<Result<ImportOutcome, ImportError>> {
+        if self.saving || self.importing {
+            return Task::ready(Err(ImportError::Runtime(
+                "another change is being saved; try again".to_owned(),
+            )));
+        }
+        let Some(core) = self.core.clone() else {
+            return Task::ready(Err(ImportError::Runtime(
+                "NineSQL is still starting, or its core did not start".to_owned(),
+            )));
+        };
+        let reply = core.apply_import(preview, choices);
+        self.importing = true;
+        cx.notify();
+        cx.spawn(async move |this, cx| {
+            let result = reply
+                .await
+                .unwrap_or_else(|| Err(ImportError::Runtime("the import stopped".to_owned())));
+            let types = match &result {
+                Ok(_) => {
+                    let ws = core.workspace().clone();
+                    let task = this
+                        .update(cx, |hub, cx| {
+                            hub.blocking(cx, move || {
+                                ws.load_connection_types().map_err(|e| e.to_string())
+                            })
+                        })
+                        .ok();
+                    match task {
+                        Some(t) => Some(t.await),
+                        None => None,
+                    }
+                }
+                Err(_) => None,
+            };
+            this.update(cx, |hub, cx| {
+                hub.importing = false;
+                let out = result.map(|mut outcome| {
+                    hub.connections = std::mem::take(&mut outcome.connections);
+                    match types {
+                        Some(Ok(t)) => hub.types = t,
+                        Some(Err(e)) => hub.problems.push(format!(
+                            "Cannot read the connection types after the import ({e}): restart NineSQL to see them."
+                        )),
+                        None => {}
+                    }
+                    outcome
+                });
+                cx.notify();
+                out
+            })
+            .unwrap_or_else(|_| Err(ImportError::Runtime("the application is closing".to_owned())))
+        })
+    }
+
+    /// Enables a disabled connection through `Workspace::enable_connection` (the core clears
+    /// the disabled reason only when its cause is gone; a `Route` reason also needs
+    /// `route_fixed`, passed only after the user confirmed the route was set up again). On
+    /// success the hub's list is replaced by the one written. The error says why it was
+    /// refused.
+    pub fn enable(
+        &mut self,
+        id: ConnectionId,
+        route_fixed: bool,
+        cx: &mut Context<Self>,
+    ) -> Task<Result<(), String>> {
+        if self.saving || self.importing {
+            return Task::ready(Err("another change is being saved; try again".to_owned()));
+        }
+        if self.starting {
+            return Task::ready(Err(
+                "NineSQL is still starting; try again in a moment".to_owned()
+            ));
+        }
+        if self.connections.get(id).is_none() {
+            return Task::ready(Err("this connection no longer exists".to_owned()));
+        }
+        let registry = self.registry.clone();
+        let workspace = self.workspace.clone();
+        let current = self.connections.clone();
+        self.saving = true;
+        cx.notify();
+        let task = self.blocking(cx, move || {
+            let mut next = current;
+            match &workspace {
+                Some(ws) => ws
+                    .enable_connection(&mut next, id, route_fixed, &registry)
+                    .map_err(|e| e.to_string())?,
+                None => next
+                    .get_mut(id)
+                    .ok_or_else(|| "this connection no longer exists".to_owned())?
+                    .try_enable(&registry, route_fixed)
+                    .map_err(|e| e.to_string())?,
             }
             Ok(next)
         });

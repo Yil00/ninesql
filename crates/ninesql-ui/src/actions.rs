@@ -65,6 +65,12 @@ actions!(
         ShowConnectionProblems,
         /// Lock the vault and forget the passwords asked for this session.
         LockSecrets,
+        /// Import connections from the DBeaver workspaces found in the known locations.
+        ImportFromDbeaver,
+        /// Import connections from a DBeaver workspace or project folder chosen by the user.
+        ImportFromDbeaverFolder,
+        /// Enable the disabled connection selected in the navigator (shows why it was disabled).
+        EnableConnection,
     ]
 );
 
@@ -360,6 +366,30 @@ pub const ACTIONS: &[ActionSpec] = &[
         Workspace,
         ["ctrl-alt-l"],
         keywords = ["vault", "password", "keyring", "forget", "master"]
+    ),
+    spec!(
+        ImportFromDbeaver,
+        "Import from DBeaver",
+        "Connection",
+        Workspace,
+        ["ctrl-k ctrl-i"],
+        keywords = ["dbeaver", "workspace", "migrate", "data-sources"]
+    ),
+    spec!(
+        ImportFromDbeaverFolder,
+        "Import from DBeaver: choose folder",
+        "Connection",
+        Workspace,
+        ["ctrl-k ctrl-shift-i"],
+        keywords = ["dbeaver", "workspace", "project", "folder", "custom"]
+    ),
+    spec!(
+        EnableConnection,
+        "Enable connection",
+        "Connection",
+        Workspace,
+        ["ctrl-k ctrl-shift-e"],
+        keywords = ["disabled", "imported", "route", "activate"]
     ),
 ];
 
