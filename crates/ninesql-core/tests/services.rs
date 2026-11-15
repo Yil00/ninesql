@@ -83,7 +83,13 @@ fn all_files(root: &Path) -> Vec<PathBuf> {
 
 fn assert_not_on_disk(root: &Path, needles: &[&str]) {
     for file in all_files(root) {
-        let bytes = std::fs::read(&file).unwrap();
+        // The history writer may remove its SQLite side files (`-wal`, `-journal`) between
+        // the listing and the read: a file that is gone holds nothing.
+        let bytes = match std::fs::read(&file) {
+            Ok(bytes) => bytes,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(e) => panic!("{}: {e}", file.display()),
+        };
         for needle in needles {
             assert!(
                 !bytes.windows(needle.len()).any(|w| w == needle.as_bytes()),
