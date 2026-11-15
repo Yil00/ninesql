@@ -13,11 +13,21 @@
 //! loop { match run.next().await { … RunEvent::Done(summary) => break } }
 //! run.cancel();   // "Stop": cancels the running statement server-side, then the script ends
 //! ```
-//! - **Splitting.** A script or selection is split with the engine's dialect
-//!   ([`ninesql_driver_api::Dialect::split_statements`], registry dialect of the session's
-//!   engine). The driver re-checks each statement with its own session lexical modes and refuses
-//!   text that still holds several statements ([`DriverError::MultipleStatements`]), so a
-//!   mis-split never runs something other than what was classified.
+//! - **Splitting.** A script or selection is split with the session's dialect as an
+//!   "execute script" ([`ninesql_driver_api::Dialect::split_script`] contract, P3-D): lazily
+//!   with `split_script_ahead` and the [`ScriptState`] (the MySQL `DELIMITER` in force) kept
+//!   item by item with `script_state_after`, so the work stays linear. Client directives
+//!   (`DELIMITER`) are applied, never sent. A refused piece (`COPY … FROM STDIN`, a psql
+//!   meta-command, a mysql client command, an invalid `DELIMITER`) refuses the whole run before
+//!   anything is sent (one lazy pass up front); a refused piece that only shows up after a
+//!   re-split stops the run before its next statement. Each statement is classified with the
+//!   session's dialect just before it runs, and after **every** statement the session dialect's
+//!   `lexical_rules()` are compared with the ones the pending items were split with: when they
+//!   differ (a `SET`, but also a `ROLLBACK` undoing one), the rest is split again from the end
+//!   of that statement (review H2, P3-D L2). The driver re-checks each statement with its own
+//!   session lexical modes and refuses text that still holds several statements
+//!   ([`DriverError::MultipleStatements`]), so a mis-split never runs something other than what
+//!   was classified.
 //! - **Events.** A run starts with [`RunEvent::Started`]. Each statement (identified by its
 //!   0-based index in the text) reports [`RunEvent::StatementStarted`], its driver result items
 //!   unchanged ([`RunEvent::Item`]: result-set headers, row batches, documents, update counts,
@@ -40,7 +50,10 @@
 //!   text, [`RunRequest::resume_from`] the statement's start offset
 //!   ([`RunEvent::NeedsConfirmation::span`]) and the token ([`RunRequest::confirmed`]):
 //!   statements before it are not run again. Resuming is by byte offset, never by index:
-//!   indexes depend on the lexical modes in force when the text is split (review N1).
+//!   indexes depend on the lexical modes in force when the text is split (review N1). The
+//!   splitter state at that offset (the `DELIMITER` in force) is rebuilt from the text before
+//!   it, or taken from [`RunEvent::NeedsConfirmation::script_state`] when the request carries
+//!   it ([`RunRequest::with_script_state`], exact even when the prefix changed lexical modes).
 //! - **Timeouts.** [`TimeoutChoice::Default`] uses the connection's default from the
 //!   preferences, else the global default (none unless set, ADR-0004); a request may ask for
 //!   another one or none. The timeout covers each statement, fetch included.
@@ -53,14 +66,16 @@
 //!   not allow query text in logs. Statements sent through [`SessionHandle::execute`] directly
 //!   are not recorded.
 
+use std::collections::VecDeque;
 use std::fmt;
 use std::ops::Range;
 use std::sync::{Arc, PoisonError, RwLock};
 use std::time::{Duration, Instant, SystemTime};
 
 use ninesql_driver_api::{
-    CancelToken, DriverError, ExecutionId, FetchBudget, Param, QueryLanguage, ResultItem,
-    StatementClass, StatementSpan,
+    CancelToken, Dialect, DriverError, ExecutionId, FetchBudget, LexicalRules, Param,
+    QueryLanguage, ResultItem, ScriptItem, ScriptItemKind, ScriptState, StatementClass,
+    StatementSpan, TextPosition,
 };
 use ninesql_storage::history::EntryStatus;
 use tokio::sync::mpsc;
@@ -126,6 +141,10 @@ pub struct RunRequest {
     /// Byte offset in the editor buffer ([`Self::offset`] included) where the run starts:
     /// only `text` from there on is split and run (resuming after a confirmation).
     pub resume_from: Option<usize>,
+    /// Splitter state at [`Self::resume_from`] (the MySQL `DELIMITER` in force there), from
+    /// [`RunEvent::NeedsConfirmation::script_state`]; `None`: rebuilt from the text before the
+    /// offset with the session's current lexical modes.
+    pub script_state: Option<ScriptState>,
     /// Confirmation of the first statement of the run; used only when that statement starts
     /// exactly at [`Self::resume_from`] (or, without it, for the first statement of the text).
     pub confirmation: Option<ConfirmationToken>,
@@ -144,6 +163,7 @@ impl fmt::Debug for RunRequest {
             .field("params", &self.params.len())
             .field("timeout", &self.timeout)
             .field("resume_from", &self.resume_from)
+            .field("script_state", &self.script_state)
             .field("confirmed", &self.confirmation.is_some())
             .finish_non_exhaustive()
     }
@@ -161,6 +181,7 @@ impl RunRequest {
             budget: None,
             on_error: None,
             resume_from: None,
+            script_state: None,
             confirmation: None,
             page_rows: None,
         }
@@ -248,6 +269,17 @@ impl RunRequest {
         self
     }
 
+    /// The splitter state in force at [`Self::resume_from`]: pass
+    /// [`RunEvent::NeedsConfirmation::script_state`] back with its `span.start`. Without it, the
+    /// state is rebuilt by splitting the text before the offset (linear), which is exact unless
+    /// a statement before it changed the lexical modes in a way that splits a `DELIMITER`
+    /// directive differently.
+    #[must_use]
+    pub fn with_script_state(mut self, state: ScriptState) -> Self {
+        self.script_state = Some(state);
+        self
+    }
+
     /// Attaches the user's confirmation ([`RunEvent::NeedsConfirmation`]). It is given to the
     /// first statement of the run only, and only when that statement starts exactly at
     /// [`Self::resume_from`] (or, without it, to the first statement of the text); the session
@@ -304,8 +336,9 @@ pub enum RunEnd {
 #[derive(Clone, Debug, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct RunSummary {
-    /// Items in the text (statements and client directives), as split last: after a
-    /// statement that may change the lexical modes, the rest of the text is split again.
+    /// Items in the text from where the run started (statements, client directives and a
+    /// refused piece), as split last: after a statement that changed the lexical modes, the
+    /// rest of the text is split again.
     pub statements: usize,
     /// Statements sent.
     pub executed: usize,
@@ -323,16 +356,17 @@ pub struct RunSummary {
 
 /// Event of one run. Exactly one [`RunEvent::Done`] ends it. `index` is the 0-based index of
 /// the item in the request text as the dialect splits it (client directives, never sent, keep
-/// their index). Indexes are per run: after a `Session` or `ChangesAccessMode` statement the rest
-/// of the text is split again with the session's lexical modes as they are then (review H2), so
-/// the indexes that follow come from that split. Resume by offset
+/// their index). Indexes are per run: after a statement that changed the session's lexical
+/// modes the rest of the text is split again with the modes as they are then (review H2, P3-D
+/// L2), so the indexes that follow come from that split. Resume by offset
 /// ([`RunRequest::resume_from`]), never by index.
 #[derive(Debug)]
 #[non_exhaustive]
 pub enum RunEvent {
-    /// The run started: the text holds `statements` statements (first event).
+    /// The run started: the text holds `statements` items (first event), as split with the
+    /// lexical modes in force at the start.
     Started {
-        /// Statements in the text.
+        /// Items in the text (statements and client directives).
         statements: usize,
     },
     /// Statement `index` was sent.
@@ -426,6 +460,9 @@ pub enum RunEvent {
         span: Range<usize>,
         /// What to show.
         request: ConfirmationRequest,
+        /// Splitter state at `span.start` (the MySQL `DELIMITER` in force): pass it back with
+        /// [`RunRequest::with_script_state`] when resuming.
+        script_state: ScriptState,
     },
     /// The run ended (terminal).
     Done(RunSummary),
@@ -664,25 +701,47 @@ impl ExecutionService {
         self.inner.history.as_ref()
     }
 
-    /// The statements of `text` as the dialect of `engine` splits them (for the editor: the
-    /// statement under the cursor, statement markers). Pure, never blocks.
+    /// The items of `text` as the dialect of `engine` splits it for "execute script"
+    /// ([`Dialect::split_script`]: statements, client directives such as a MySQL `DELIMITER`,
+    /// refused pieces such as `COPY … FROM STDIN`), with their positions. Pure, never blocks.
+    /// Uses the engine's default lexical modes (no session): [`SessionHandle::dialect`] gives
+    /// the modes of an open session.
     ///
     /// # Errors
     /// [`CoreError::NoDriver`] when no driver serves `engine`.
-    /// Uses the engine's default lexical modes (no session): [`SessionHandle::dialect`] gives
-    /// the modes of an open session.
-    pub fn split(&self, engine: &EngineId, text: &str) -> Result<Vec<StatementSpan>, CoreError> {
+    pub fn split_script(
+        &self,
+        engine: &EngineId,
+        text: &str,
+    ) -> Result<Vec<ScriptItem>, CoreError> {
         Ok(self
             .inner
             .manager
             .registry()
             .dialect(engine)?
-            .split_statements(text))
+            .split_script(text))
+    }
+
+    /// The statements of `text` as the dialect of `engine` splits it for "execute script"
+    /// (for the editor: statement markers): the spans of the statement items of
+    /// [`Self::split_script`], so a statement inside a MySQL `DELIMITER` section is one span
+    /// and directives and refused pieces are left out. Pure, never blocks.
+    ///
+    /// # Errors
+    /// [`CoreError::NoDriver`] when no driver serves `engine`.
+    pub fn split(&self, engine: &EngineId, text: &str) -> Result<Vec<StatementSpan>, CoreError> {
+        Ok(self
+            .split_script(engine, text)?
+            .into_iter()
+            .filter(|i| i.kind == ScriptItemKind::Statement)
+            .map(|i| i.span)
+            .collect())
     }
 
     /// The statement at byte `cursor` of `text` ("Execute statement" with no selection): the
-    /// one containing the cursor, else the closest one before it on the same or a previous
-    /// line, else the next one. `None` when the text holds no statement.
+    /// item containing the cursor, else the closest one before it on the same or a previous
+    /// line, else the next one. Client directives are never picked; a refused piece is (running
+    /// it is refused, never something next to it). `None` when the text holds no statement.
     ///
     /// # Errors
     /// [`CoreError::NoDriver`].
@@ -692,7 +751,13 @@ impl ExecutionService {
         text: &str,
         cursor: usize,
     ) -> Result<Option<StatementSpan>, CoreError> {
-        Ok(pick_statement(&self.split(engine, text)?, cursor))
+        let spans: Vec<StatementSpan> = self
+            .split_script(engine, text)?
+            .into_iter()
+            .filter(|i| i.kind != ScriptItemKind::ClientDirective)
+            .map(|i| i.span)
+            .collect();
+        Ok(pick_statement(&spans, cursor))
     }
 
     /// Runs `request` on `session`. Never blocks: the work runs on the driver runtime.
@@ -737,86 +802,241 @@ fn is_cancel_error(error: &CoreError) -> bool {
     }
 }
 
-/// Kind of one item of a script, as the execution service runs it.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum ItemKind {
-    /// Sent with one `Session::execute` call.
-    Statement,
-    /// A client-side directive (`DELIMITER`, `\\set`…): never sent to the engine.
-    // Built once `split_script` lands (P3-D integration point in `script_items`).
-    #[allow(dead_code)]
-    ClientDirective,
-    /// Something the dialect refuses to run as part of a script: the whole script is refused
-    /// up front.
-    Refused,
+/// Checks one item of a request before it can run (review N2): a refused piece (or a kind
+/// this version does not know, fail-closed) refuses the run; "Execute statement" and bind
+/// parameters need a single statement. `statements` counts the statement items seen so far.
+fn check_item(
+    item: &ScriptItem,
+    kind: RunKind,
+    has_params: bool,
+    statements: &mut usize,
+) -> Result<(), CoreError> {
+    match item.kind {
+        ScriptItemKind::Statement => {
+            *statements += 1;
+            if *statements > 1 && kind == RunKind::Statement {
+                return Err(CoreError::InvalidRequest(
+                    "the text holds several statements: run it as a script",
+                ));
+            }
+            if *statements > 1 && has_params {
+                return Err(CoreError::InvalidRequest(
+                    "bind parameters need a single statement",
+                ));
+            }
+            Ok(())
+        }
+        ScriptItemKind::ClientDirective => Ok(()),
+        ScriptItemKind::Refused(why) => Err(CoreError::InvalidRequest(why.message())),
+        _ => Err(CoreError::InvalidRequest(
+            "the script holds a piece that cannot run as part of a script",
+        )),
+    }
 }
 
-/// One item of a script.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct ScriptItem {
-    span: StatementSpan,
-    kind: ItemKind,
+/// An item the run refuses, found while splitting.
+struct Refusal {
+    /// Its item index.
+    index: usize,
+    /// Where it starts.
+    at: TextPosition,
+    error: CoreError,
 }
 
-/// The items of `text` for `dialect`.
-///
-/// Splits `text[from..]` (`from` on a `char` boundary, the end of the statement that ran last)
-/// and returns spans absolute in `text`: the execution service splits the rest of a script
-/// again after a statement that may change the lexical modes (review H2).
-///
-/// INTEGRATION POINT (P3-D, `feat/p3-d-dialects`): replace the body with
-/// `dialect.split_script(&text[from..])` (shifting every span by `from`), mapping `ScriptItemKind::Statement` to
-/// [`ItemKind::Statement`], `ClientDirective` to [`ItemKind::ClientDirective`], `Refused(_)`
-/// and any future kind to [`ItemKind::Refused`] (fail-closed), and compute error positions with
-/// `LineIndex::new(text).position(item.span.start + offset)` in [`error_position`]. Until then
-/// every span of `split_statements` is a statement.
-fn script_items(
-    dialect: &dyn ninesql_driver_api::Dialect,
-    text: &str,
-    from: usize,
-) -> Vec<ScriptItem> {
-    let rest = text.get(from..).unwrap_or("");
-    dialect
-        .split_statements(rest)
-        .into_iter()
-        .map(|span| ScriptItem {
-            span: StatementSpan {
-                start: span.start + from,
-                end: span.end + from,
-            },
-            kind: ItemKind::Statement,
-        })
-        .collect()
+/// One item taken from a [`ScriptCursor`].
+struct Taken {
+    index: usize,
+    item: ScriptItem,
+    /// Splitter state in force at the item's start.
+    state: ScriptState,
 }
 
-/// Checks the items of a request before anything runs; answers the index of the last
-/// statement. A refused item refuses the whole script (recommended by the dialect contract, and
-/// the safe choice for production); "Execute statement" and bind parameters need a single
-/// statement.
-fn check_items(items: &[ScriptItem], kind: RunKind, has_params: bool) -> Result<usize, CoreError> {
-    if items.iter().any(|i| i.kind == ItemKind::Refused) {
-        return Err(CoreError::InvalidRequest(
-            "the script holds a statement that cannot run as part of a script",
-        ));
+/// The items of a script, split lazily and linearly as the P3-D contract asks
+/// (`conformance::script_plan` is the reference loop): windows of
+/// [`Dialect::split_script_ahead`] from the end of the last item, the [`ScriptState`] kept item
+/// by item with [`Dialect::script_state_after`], every fetched item checked
+/// ([`check_item`]), and a re-split from the end of the last item taken when the session's
+/// lexical rules changed.
+struct ScriptCursor<'a> {
+    text: &'a str,
+    dialect: &'a dyn Dialect,
+    kind: RunKind,
+    has_params: bool,
+    /// Items split but not taken yet.
+    pending: VecDeque<ScriptItem>,
+    /// Where the next window starts, and the splitter state there.
+    ahead: TextPosition,
+    ahead_state: ScriptState,
+    /// Nothing is left to split after `ahead` (or a refusal stopped the split).
+    exhausted: bool,
+    /// End of the last item taken, and the splitter state after it.
+    at: TextPosition,
+    state: ScriptState,
+    /// Lexical rules the pending items were split with.
+    rules: LexicalRules,
+    /// Items taken, and statement items among them.
+    taken: usize,
+    taken_statements: usize,
+    /// Statement items taken or pending.
+    seen_statements: usize,
+    /// The first refused item found (pending items stop before it).
+    refusal: Option<Refusal>,
+}
+
+impl<'a> ScriptCursor<'a> {
+    fn new(
+        text: &'a str,
+        dialect: &'a dyn Dialect,
+        from: TextPosition,
+        state: ScriptState,
+        kind: RunKind,
+        has_params: bool,
+    ) -> Self {
+        Self {
+            text,
+            dialect,
+            kind,
+            has_params,
+            pending: VecDeque::new(),
+            ahead: from,
+            ahead_state: state.clone(),
+            exhausted: false,
+            at: from,
+            state,
+            rules: dialect.lexical_rules(),
+            taken: 0,
+            taken_statements: 0,
+            seen_statements: 0,
+            refusal: None,
+        }
     }
-    let statements = items
-        .iter()
-        .filter(|i| i.kind == ItemKind::Statement)
-        .count();
-    if kind == RunKind::Statement && statements > 1 {
-        return Err(CoreError::InvalidRequest(
-            "the text holds several statements: run it as a script",
-        ));
+
+    /// Splits the next window; `false` when nothing was added.
+    fn fill(&mut self) -> bool {
+        if self.exhausted || self.ahead.offset >= self.text.len() {
+            self.exhausted = true;
+            return false;
+        }
+        let more = self
+            .dialect
+            .split_script_ahead(self.text, self.ahead, &self.ahead_state);
+        let mut added = false;
+        for item in more {
+            // Fail-safe: a splitter that does not move forward ends the split.
+            if item.end.offset <= self.ahead.offset {
+                break;
+            }
+            if let Err(error) =
+                check_item(&item, self.kind, self.has_params, &mut self.seen_statements)
+            {
+                self.refusal = Some(Refusal {
+                    index: self.taken + self.pending.len(),
+                    at: item.start,
+                    error,
+                });
+                self.exhausted = true;
+                return added;
+            }
+            self.ahead_state = self
+                .dialect
+                .script_state_after(self.text, &item, &self.ahead_state);
+            self.ahead = item.end;
+            self.pending.push_back(item);
+            added = true;
+        }
+        if !added {
+            self.exhausted = true;
+        }
+        added
     }
-    if has_params && statements > 1 {
-        return Err(CoreError::InvalidRequest(
-            "bind parameters need a single statement",
-        ));
+
+    /// Splits everything left (one lazy pass).
+    fn fill_all(&mut self) {
+        while self.fill() {}
     }
-    Ok(items
-        .iter()
-        .rposition(|i| i.kind == ItemKind::Statement)
-        .unwrap_or(0))
+
+    /// The next item, with the splitter state at its start.
+    fn take(&mut self) -> Option<Taken> {
+        if self.pending.is_empty() && !self.fill() {
+            return None;
+        }
+        let item = self.pending.pop_front()?;
+        let state = self.state.clone();
+        self.state = self.dialect.script_state_after(self.text, &item, &state);
+        self.at = item.end;
+        let index = self.taken;
+        self.taken += 1;
+        if item.kind == ScriptItemKind::Statement {
+            self.taken_statements += 1;
+        }
+        Some(Taken { index, item, state })
+    }
+
+    /// Whether anything but client directives is left: a statement, or a refusal (splits ahead
+    /// as needed; amortised linear, since every window it splits is taken later).
+    fn more_ahead(&mut self) -> bool {
+        loop {
+            if self
+                .pending
+                .iter()
+                .any(|i| i.kind != ScriptItemKind::ClientDirective)
+                || self.refusal.is_some()
+            {
+                return true;
+            }
+            if !self.fill() {
+                return self.refusal.is_some();
+            }
+        }
+    }
+
+    /// When the session's lexical rules differ from the ones the pending items were split
+    /// with, drops them and splits on from the end of the last item taken (P3-D L2). The new
+    /// items are checked as they are split.
+    fn resplit_if_rules_changed(&mut self) -> bool {
+        let rules = self.dialect.lexical_rules();
+        if rules == self.rules {
+            return false;
+        }
+        self.rules = rules;
+        self.pending.clear();
+        self.ahead = self.at;
+        self.ahead_state = self.state.clone();
+        self.exhausted = false;
+        self.seen_statements = self.taken_statements;
+        // The first window is split and checked now (review N2).
+        self.fill();
+        true
+    }
+
+    /// Items taken plus everything left, as split last.
+    fn total(&mut self) -> usize {
+        self.fill_all();
+        self.taken + self.pending.len() + usize::from(self.refusal.is_some())
+    }
+}
+
+/// The splitter state at byte `from` of `text` (resuming without a carried state): the text
+/// before it split lazily with `dialect`, every item that ends there applied. Linear.
+fn script_state_at(dialect: &dyn Dialect, text: &str, from: usize) -> ScriptState {
+    let mut state = ScriptState::default();
+    let mut at = TextPosition::START;
+    while at.offset < from {
+        let items = dialect.split_script_ahead(text, at, &state);
+        let mut moved = false;
+        for item in &items {
+            if item.span.start >= from || item.end.offset > from || item.end.offset <= at.offset {
+                return state;
+            }
+            state = dialect.script_state_after(text, item, &state);
+            at = item.end;
+            moved = true;
+        }
+        if !moved {
+            break;
+        }
+    }
+    state
 }
 
 /// See [`ExecutionService::statement_at`].
@@ -832,24 +1052,38 @@ fn pick_statement(spans: &[StatementSpan], cursor: usize) -> Option<StatementSpa
         .copied()
 }
 
-/// Error position of a 1-based character offset `char_pos` in the statement at `span` of
-/// `text`.
-fn error_position(text: &str, span: StatementSpan, char_pos: u32, base: usize) -> ErrorPosition {
-    let statement = span.text(text);
+/// Error position of a 1-based character offset `char_pos` in the statement `item` of `text`,
+/// counted from the item's own position (F-SQL-12): linear in the statement only.
+fn error_position(text: &str, item: &ScriptItem, char_pos: u32, base: usize) -> ErrorPosition {
+    let statement = item.text(text);
     let skip = usize::try_from(char_pos.saturating_sub(1)).unwrap_or(usize::MAX);
-    let in_statement = statement
-        .char_indices()
-        .nth(skip)
-        .map_or(statement.len(), |(i, _)| i);
-    let at = (span.start + in_statement).min(text.len());
-    let before = text.get(..at).unwrap_or("");
-    let line = before.matches('\n').count() + 1;
-    let line_start = before.rfind('\n').map_or(0, |i| i + 1);
-    let column = text.get(line_start..at).map_or(0, |s| s.chars().count()) + 1;
+    let (mut line, mut column) = (item.start.line, item.start.column);
+    let mut in_statement = statement.len();
+    for (n, (i, c)) in statement.char_indices().enumerate() {
+        if n == skip {
+            in_statement = i;
+            break;
+        }
+        if c == '\n' {
+            line += 1;
+            column = 1;
+        } else {
+            column += 1;
+        }
+    }
     ErrorPosition {
-        offset: base + at,
+        offset: base + (item.span.start + in_statement).min(text.len()),
         line: u32::try_from(line).unwrap_or(u32::MAX),
         column: u32::try_from(column).unwrap_or(u32::MAX),
+    }
+}
+
+/// The error position of a refused piece starting at `at`.
+fn refusal_position(at: TextPosition, base: usize) -> ErrorPosition {
+    ErrorPosition {
+        offset: base + at.offset,
+        line: u32::try_from(at.line).unwrap_or(u32::MAX),
+        column: u32::try_from(at.column).unwrap_or(u32::MAX),
     }
 }
 
@@ -917,12 +1151,13 @@ struct RunJob {
 }
 
 /// One statement of a run, as [`RunJob::statement`] runs it.
-#[derive(Clone, Copy)]
 struct Step {
     /// Item index.
     index: usize,
-    /// Absolute span in the request text.
-    span: StatementSpan,
+    /// The item, absolute in the request text.
+    item: ScriptItem,
+    /// Splitter state at its start (carried in [`RunEvent::NeedsConfirmation`]).
+    script_state: ScriptState,
     /// The last statement of the text (a paged result stays open).
     last: bool,
     /// Classified as a read just before it runs (only reads are paged or released).
@@ -953,27 +1188,33 @@ impl RunJob {
         }
     }
 
-    fn refuse(mut self, error: CoreError, statements: usize) {
-        let index = 0;
+    fn refuse(
+        mut self,
+        error: CoreError,
+        index: usize,
+        position: Option<ErrorPosition>,
+        statements: usize,
+    ) {
         let _ = self.out.events.try_send(RunEvent::StatementFailed {
             index,
             error,
-            position: None,
+            position,
             elapsed: Duration::ZERO,
         });
         let summary = self.summary(statements, (0, 0, 0), RunEnd::Refused);
         self.out.done(summary);
     }
 
+    #[allow(clippy::too_many_lines)] // One loop over the script; split, it would be harder to follow.
     async fn run(
         mut self,
         request: RunRequest,
-        dialect: Result<Arc<dyn ninesql_driver_api::Dialect>, CoreError>,
+        dialect: Result<Arc<dyn Dialect>, CoreError>,
         prefs: &Preferences,
     ) {
         let dialect = match dialect {
             Ok(d) => d,
-            Err(e) => return self.refuse(e, 0),
+            Err(e) => return self.refuse(e, 0, None, 0),
         };
         // Where the run starts in `text` (review N1: by offset, never by index).
         let from = match request.resume_from {
@@ -986,16 +1227,41 @@ impl RunJob {
                             "the resume offset is not a position in the text",
                         ),
                         0,
+                        None,
+                        0,
                     );
                 }
             },
         };
-        let mut items = script_items(&*dialect, &request.text, from);
-        let mut last_statement = match check_items(&items, request.kind, !request.params.is_empty())
-        {
-            Ok(last) => last,
-            Err(e) => return self.refuse(e, items.len()),
+        // The splitter state there: carried from the confirmation, else rebuilt from the text
+        // before it (linear).
+        let state = match (&request.script_state, request.resume_from) {
+            (Some(state), Some(_)) => state.clone(),
+            (_, None) => ScriptState::default(),
+            (None, Some(_)) if from == 0 => ScriptState::default(),
+            (None, Some(_)) => script_state_at(&*dialect, &request.text, from),
         };
+        let start = if from == 0 {
+            TextPosition::START
+        } else {
+            ninesql_driver_api::position_at(&request.text, from)
+        };
+        let mut cursor = ScriptCursor::new(
+            &request.text,
+            &*dialect,
+            start,
+            state,
+            request.kind,
+            !request.params.is_empty(),
+        );
+        // One lazy pass up front: a refused piece refuses the whole script before anything
+        // runs (and "Execute statement" / bind parameters need a single statement).
+        cursor.fill_all();
+        if let Some(refusal) = cursor.refusal.take() {
+            let total = cursor.pending.len() + 1;
+            let position = Some(refusal_position(refusal.at, request.offset));
+            return self.refuse(refusal.error, refusal.index, position, total);
+        }
         let info = self.session.info().clone();
         let timeout = match request.timeout {
             TimeoutChoice::Default => prefs.execution.timeout_for(info.connection),
@@ -1008,25 +1274,46 @@ impl RunJob {
         let _ = self
             .out
             .send(RunEvent::Started {
-                statements: items.len(),
+                statements: cursor.pending.len(),
             })
             .await;
         let (mut executed, mut succeeded, mut failed) = (0usize, 0usize, 0usize);
         let mut end = RunEnd::Completed;
-        let mut index = 0;
         let mut first_statement = true;
-        while let Some(item) = items.get(index).copied() {
-            let span = &item.span;
-            if item.kind != ItemKind::Statement {
-                index += 1;
-                // Client directives are never sent.
+        // The refused piece reported, counted in the summary.
+        let mut refused = 0;
+        loop {
+            // A refused piece found by a re-split (or by looking ahead) stops the run before
+            // anything more is sent (review N2).
+            if let Some(refusal) = cursor.refusal.take() {
+                let _ = self.out.events.try_send(RunEvent::StatementFailed {
+                    index: refusal.index,
+                    error: refusal.error,
+                    position: Some(refusal_position(refusal.at, request.offset)),
+                    elapsed: Duration::ZERO,
+                });
+                refused = 1;
+                end = RunEnd::Refused;
+                break;
+            }
+            let Some(Taken { index, item, state }) = cursor.take() else {
+                break;
+            };
+            if item.kind != ScriptItemKind::Statement {
+                // Client directives are applied by the splitter, never sent.
                 continue;
             }
             if self.cancel.is_cancelled() || self.out.gone() {
                 end = RunEnd::Cancelled { index };
                 break;
             }
-            let text = span.text(&request.text).to_owned();
+            // Whether it is the last statement (a paged result stays open). Looking ahead may
+            // find a refused piece: then nothing more runs.
+            let last = !cursor.more_ahead();
+            if cursor.refusal.is_some() {
+                continue;
+            }
+            let text = item.text(&request.text).to_owned();
             let mut exec_request = ExecuteRequest::sql(text.clone())
                 .with_language(request.language)
                 .with_params(request.params.clone())
@@ -1036,12 +1323,11 @@ impl RunJob {
             // exactly where the run was asked to resume.
             if first_statement
                 && let Some(token) = request.confirmation
-                && (request.resume_from.is_none() || span.start == from)
+                && (request.resume_from.is_none() || item.span.start == from)
             {
                 exec_request = exec_request.confirmed(token);
             }
             first_statement = false;
-            let last = index == last_statement;
             // Classified now, with the lexical modes in force now (review H2); the session task
             // classifies it again for the confirmation, at the moment it sends it. Only reads
             // may be paused and released: a release is a server-side cancel, which would roll
@@ -1050,7 +1336,8 @@ impl RunJob {
             let is_read = class == StatementClass::Read;
             let step = Step {
                 index,
-                span: *span,
+                item,
+                script_state: state,
                 last,
                 is_read,
             };
@@ -1086,35 +1373,14 @@ impl RunJob {
                     }
                 }
             }
-            // A session statement may have changed the lexical modes (review H2): the rest of
-            // the script is split again, from the end of this statement, with the session's
-            // dialect as it is now. Offsets stay absolute.
-            if matches!(
-                class,
-                StatementClass::Session | StatementClass::ChangesAccessMode
-            ) {
-                let rest = script_items(&*dialect, &request.text, span.end);
-                items.truncate(index + 1);
-                items.extend(rest);
-                // The merged list is checked like the first split (review N2): a refused item,
-                // or a "single statement" request that now holds several, stops the run here.
-                match check_items(&items, request.kind, !request.params.is_empty()) {
-                    Ok(last) => last_statement = last,
-                    Err(error) => {
-                        let _ = self.out.events.try_send(RunEvent::StatementFailed {
-                            index: index + 1,
-                            error,
-                            position: None,
-                            elapsed: Duration::ZERO,
-                        });
-                        end = RunEnd::Refused;
-                        break;
-                    }
-                }
-            }
-            index += 1;
+            // After every statement (P3-D L2): when the session's lexical rules changed (a
+            // `SET`, a `ROLLBACK` undoing one, a function calling `set_config`…), the rest is
+            // split again from the end of this statement with the rules as they are now.
+            // Offsets stay absolute; the new items are checked as they are split.
+            cursor.resplit_if_rules_changed();
         }
-        let summary = self.summary(items.len(), (executed, succeeded, failed), end);
+        let statements = cursor.total() + refused;
+        let summary = self.summary(statements, (executed, succeeded, failed), end);
         self.out.done(summary);
     }
 
@@ -1130,10 +1396,12 @@ impl RunJob {
     ) -> StatementEnd {
         let Step {
             index,
-            span,
+            item,
+            script_state,
             last,
             is_read,
         } = step;
+        let span = item.span;
         let params = exec_request.params.len();
         let text = exec_request.text.clone();
         let timeout = exec_request.timeout;
@@ -1300,6 +1568,7 @@ impl RunJob {
                             index,
                             span: base + span.start..base + span.end,
                             request,
+                            script_state,
                         })
                         .await;
                     return StatementEnd::NeedsConfirmation;
@@ -1377,7 +1646,7 @@ impl RunJob {
                             let position = match &error {
                                 CoreError::Driver(DriverError::Query {
                                     position: Some(p), ..
-                                }) => Some(error_position(&request.text, span, *p, base)),
+                                }) => Some(error_position(&request.text, &item, *p, base)),
                                 _ => None,
                             };
                             self.out
@@ -1406,48 +1675,82 @@ mod tests {
         StatementSpan { start, end }
     }
 
-    /// Review H2: the rest of a script is split from an offset, spans stay absolute.
+    fn texts<'a>(cursor: &mut ScriptCursor<'_>, text: &'a str) -> Vec<&'a str> {
+        let mut out = Vec::new();
+        while let Some(t) = cursor.take() {
+            out.push(t.item.text(text));
+        }
+        out
+    }
+
+    /// Review H2: the rest of a script is split lazily from a position, spans stay absolute.
     #[test]
-    fn script_items_split_the_rest_with_absolute_offsets() {
+    fn cursor_splits_from_a_position_with_absolute_offsets() {
         let d = ninesql_driver_api::AnsiDialect;
         let text = "SET x = 1;\nSELECT 1;\nSELECT 2";
-        let all = script_items(&d, text, 0);
-        assert_eq!(all.len(), 3);
-        let rest = script_items(&d, text, all[0].span.end);
-        assert_eq!(rest.len(), 2);
-        assert_eq!(rest[0].span.text(text), "SELECT 1");
-        assert_eq!(rest[1].span.text(text), "SELECT 2");
-        assert!(script_items(&d, text, text.len()).is_empty());
-        assert!(script_items(&d, text, text.len() + 5).is_empty());
+        let mut all = ScriptCursor::new(
+            text,
+            &d,
+            TextPosition::START,
+            ScriptState::default(),
+            RunKind::Script,
+            false,
+        );
+        assert_eq!(texts(&mut all, text), ["SET x = 1", "SELECT 1", "SELECT 2"]);
+        let from = ninesql_driver_api::position_at(text, 10);
+        let mut rest = ScriptCursor::new(
+            text,
+            &d,
+            from,
+            ScriptState::default(),
+            RunKind::Script,
+            false,
+        );
+        rest.fill_all();
+        assert_eq!(rest.total(), 2);
+        assert_eq!(texts(&mut rest, text), ["SELECT 1", "SELECT 2"]);
+        let end = ninesql_driver_api::position_at(text, text.len());
+        let mut none = ScriptCursor::new(
+            text,
+            &d,
+            end,
+            ScriptState::default(),
+            RunKind::Script,
+            false,
+        );
+        assert!(none.take().is_none());
+        assert!(!none.more_ahead());
     }
 
     #[test]
-    fn script_items_are_checked_before_anything_runs() {
-        let item = |kind| ScriptItem {
-            span: span(0, 1),
-            kind,
-        };
-        let (st, dir, refused) = (
-            item(ItemKind::Statement),
-            item(ItemKind::ClientDirective),
-            item(ItemKind::Refused),
+    fn items_are_checked_before_anything_runs() {
+        let d = ninesql_driver_api::AnsiDialect;
+        let items = d.split_script("SELECT 1; SELECT 2");
+        let mut n = 0;
+        assert!(check_item(&items[0], RunKind::Statement, true, &mut n).is_ok());
+        assert!(check_item(&items[1], RunKind::Statement, false, &mut n).is_err());
+        let mut n = 0;
+        check_item(&items[0], RunKind::Script, true, &mut n).unwrap();
+        assert!(check_item(&items[1], RunKind::Script, true, &mut n).is_err());
+        let mut n = 0;
+        check_item(&items[0], RunKind::Script, false, &mut n).unwrap();
+        check_item(&items[1], RunKind::Script, false, &mut n).unwrap();
+        assert_eq!(n, 2);
+        // A "single statement" request that splits into two is refused up front, at the
+        // second statement.
+        let text = "SELECT 1; SELECT 2";
+        let mut c = ScriptCursor::new(
+            text,
+            &d,
+            TextPosition::START,
+            ScriptState::default(),
+            RunKind::Statement,
+            false,
         );
-        assert_eq!(
-            check_items(&[st, dir, st, dir], RunKind::Script, false).unwrap(),
-            2
-        );
-        // A directive does not count as a statement.
-        assert_eq!(
-            check_items(&[dir, st], RunKind::Statement, true).unwrap(),
-            1
-        );
-        assert!(check_items(&[st, st], RunKind::Statement, false).is_err());
-        assert!(check_items(&[st, st], RunKind::Script, true).is_err());
-        assert!(matches!(
-            check_items(&[st, refused, st], RunKind::Script, false),
-            Err(CoreError::InvalidRequest(_))
-        ));
-        assert_eq!(check_items(&[], RunKind::Script, false).unwrap(), 0);
+        c.fill_all();
+        let refusal = c.refusal.as_ref().unwrap();
+        assert_eq!((refusal.index, refusal.at.offset), (1, 10));
+        assert_eq!(c.pending.len(), 1);
     }
 
     #[test]
@@ -1473,8 +1776,11 @@ mod tests {
 
     #[test]
     fn error_positions_point_into_the_buffer() {
+        let d = ninesql_driver_api::AnsiDialect;
         let text = "SELECT 1;\nSELECT é,\n  nope FROM t";
-        let s = span(10, text.len());
+        let items = d.split_script(text);
+        let s = &items[1];
+        assert_eq!(s.span.start, 10);
         // 1-based char 13 of the statement is `n` of `nope` (`SELECT é,\n  ` is 12 chars).
         let p = error_position(text, s, 13, 100);
         assert_eq!(&text[p.offset - 100..p.offset + 4 - 100], "nope");
@@ -1482,7 +1788,18 @@ mod tests {
         // Out of range: the end of the statement.
         let p = error_position(text, s, 10_000, 0);
         assert_eq!(p.offset, text.len());
-        let p = error_position(text, span(0, 8), 1, 0);
+        assert_eq!((p.line, p.column), (3, 14));
+        let p = error_position(text, &items[0], 1, 0);
         assert_eq!((p.offset, p.line, p.column), (0, 1, 1));
+    }
+
+    #[test]
+    fn the_script_state_at_an_offset_is_rebuilt_from_the_prefix() {
+        let d = ninesql_driver_api::AnsiDialect;
+        let text = "SELECT 1;\nSELECT 2;\nSELECT 3";
+        // ANSI has no directive: the state stays the default whatever the offset.
+        for from in [0, 10, 11, 20, text.len()] {
+            assert_eq!(script_state_at(&d, text, from), ScriptState::default());
+        }
     }
 }
