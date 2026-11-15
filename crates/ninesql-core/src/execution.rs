@@ -774,6 +774,7 @@ impl ExecutionService {
             cancel: cancel.clone(),
             control: Arc::clone(&control),
             started: Instant::now(),
+            progress: Progress::default(),
         };
         // The session's own dialect: drivers keep its lexical rules in sync with the session's
         // modes (`standard_conforming_strings`, `NO_BACKSLASH_ESCAPES`).
@@ -1093,6 +1094,8 @@ struct RunOutput {
     events: mpsc::Sender<RunEvent>,
     cancel: CancelToken,
     terminal: Option<mpsc::OwnedPermit<RunEvent>>,
+    /// [`RunEvent::Done`] was sent (or given up on because the UI is gone).
+    finished: bool,
 }
 
 impl RunOutput {
@@ -1102,6 +1105,7 @@ impl RunOutput {
             events,
             cancel,
             terminal,
+            finished: false,
         }
     }
 
@@ -1129,6 +1133,7 @@ impl RunOutput {
     }
 
     fn done(&mut self, summary: RunSummary) {
+        self.finished = true;
         let event = RunEvent::Done(summary);
         match self.terminal.take() {
             Some(permit) => {
@@ -1148,6 +1153,58 @@ struct RunJob {
     cancel: CancelToken,
     control: Arc<ControlShared>,
     started: Instant,
+    /// Where the run is, for the terminal event of a run task that dies (see `Drop`).
+    progress: Progress,
+}
+
+/// How far a run went: the item being handled and the statement counts so far.
+#[derive(Clone, Copy, Debug, Default)]
+struct Progress {
+    index: usize,
+    executed: usize,
+    succeeded: usize,
+    failed: usize,
+}
+
+/// A run task that ends without its terminal event (a panic in a splitter or anywhere in the
+/// task: the runtime drops the task's future after catching it) still sends exactly one
+/// [`RunEvent::Done`], through the slot reserved at start (security review M1).
+impl Drop for RunJob {
+    fn drop(&mut self) {
+        if self.out.finished {
+            return;
+        }
+        tracing::error!("a run ended without its terminal event; reporting it as failed");
+        let p = self.progress;
+        let summary = self.summary(
+            p.index + 1,
+            (p.executed, p.succeeded, p.failed),
+            RunEnd::Failed { index: p.index },
+        );
+        self.out.done(summary);
+    }
+}
+
+/// Refuses a [`ScriptState`] the caller passed back ([`RunRequest::with_script_state`]) when
+/// its delimiter is one the MySQL `DELIMITER` directive would refuse, or one no splitter can
+/// scan: empty, with whitespace or a control character, a quote, a backslash, `#`, `--` or
+/// `/*` (security review M1: an empty delimiter made a splitter panic).
+fn check_script_state(state: &ScriptState) -> Result<(), CoreError> {
+    let Some(delimiter) = &state.delimiter else {
+        return Ok(());
+    };
+    let refused = delimiter.is_empty()
+        || delimiter.chars().any(|c| {
+            c.is_whitespace() || c.is_control() || matches!(c, '\\' | '\'' | '"' | '`' | '#')
+        })
+        || delimiter.contains("--")
+        || delimiter.contains("/*");
+    if refused {
+        return Err(CoreError::InvalidRequest(
+            "the script state's delimiter is not one a DELIMITER directive accepts",
+        ));
+    }
+    Ok(())
 }
 
 /// One statement of a run, as [`RunJob::statement`] runs it.
@@ -1233,6 +1290,11 @@ impl RunJob {
                 }
             },
         };
+        if let Some(state) = &request.script_state
+            && let Err(e) = check_script_state(state)
+        {
+            return self.refuse(e, 0, None, 0);
+        }
         // The splitter state there: carried from the confirmation, else rebuilt from the text
         // before it (linear).
         let state = match (&request.script_state, request.resume_from) {
@@ -1297,8 +1359,14 @@ impl RunJob {
                 break;
             }
             let Some(Taken { index, item, state }) = cursor.take() else {
+                // Splitting the next window may have found a refused piece (a re-split whose
+                // first window held only directives): report it (security review L1).
+                if cursor.refusal.is_some() {
+                    continue;
+                }
                 break;
             };
+            self.progress.index = index;
             if item.kind != ScriptItemKind::Statement {
                 // Client directives are applied by the splitter, never sent.
                 continue;
@@ -1373,6 +1441,9 @@ impl RunJob {
                     }
                 }
             }
+            self.progress.executed = executed;
+            self.progress.succeeded = succeeded;
+            self.progress.failed = failed;
             // After every statement (P3-D L2): when the session's lexical rules changed (a
             // `SET`, a `ROLLBACK` undoing one, a function calling `set_config`…), the rest is
             // split again from the end of this statement with the rules as they are now.

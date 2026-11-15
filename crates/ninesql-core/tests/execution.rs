@@ -2026,3 +2026,188 @@ fn resume_by_offset_after_a_delimiter() {
     });
     manager.shutdown(Duration::from_secs(5));
 }
+
+/// A test dialect: one item per line, one item per window (`!…` a client directive, `?…` a
+/// refused piece, `boom` panics, anything else a statement; a leading `;` is skipped), with
+/// lexical rules of its own so that switching to it re-splits the rest.
+struct LineDialect;
+
+impl LineDialect {
+    fn pieces(script: &str, from: usize) -> Vec<(api::StatementSpan, api::ScriptItemKind)> {
+        let mut out = Vec::new();
+        let mut at = from;
+        for line in script[from..].split_inclusive('\n') {
+            let start = at + (line.len() - line.trim_start_matches([';', ' ', '\t', '\n']).len());
+            let piece = script[start..at + line.len()].trim_end();
+            at += line.len();
+            if piece.is_empty() {
+                continue;
+            }
+            assert_ne!(piece, "boom", "a splitter panic");
+            let kind = if piece.starts_with('!') {
+                api::ScriptItemKind::ClientDirective
+            } else if piece.starts_with('?') {
+                api::ScriptItemKind::Refused(api::ScriptRefusal::MysqlClientCommand)
+            } else {
+                api::ScriptItemKind::Statement
+            };
+            let span = api::StatementSpan {
+                start,
+                end: start + piece.len(),
+            };
+            out.push((span, kind));
+        }
+        out
+    }
+}
+
+impl Dialect for LineDialect {
+    fn lexical_rules(&self) -> api::LexicalRules {
+        let mut rules = api::AnsiDialect.lexical_rules();
+        rules.hash_comments = !rules.hash_comments;
+        rules
+    }
+    fn split_statements(&self, script: &str) -> Vec<api::StatementSpan> {
+        Self::pieces(script, 0)
+            .into_iter()
+            .map(|(s, _)| s)
+            .collect()
+    }
+    fn split_script(&self, script: &str) -> Vec<api::ScriptItem> {
+        api::script_items(script, Self::pieces(script, 0))
+    }
+    fn split_script_ahead(
+        &self,
+        script: &str,
+        from: api::TextPosition,
+        _: &api::ScriptState,
+    ) -> Vec<api::ScriptItem> {
+        api::script_items_from(
+            script,
+            from,
+            Self::pieces(script, from.offset).into_iter().take(1),
+        )
+    }
+}
+
+fn ansi_then_lines() -> (Arc<dyn Dialect>, Arc<dyn Dialect>) {
+    (Arc::new(api::AnsiDialect), Arc::new(LineDialect))
+}
+
+fn lines_only() -> (Arc<dyn Dialect>, Arc<dyn Dialect>) {
+    (Arc::new(LineDialect), Arc::new(LineDialect))
+}
+
+fn failure_of(events: &[RunEvent]) -> Option<(usize, &CoreError)> {
+    events.iter().find_map(|e| match e {
+        RunEvent::StatementFailed { index, error, .. } => Some((*index, error)),
+        _ => None,
+    })
+}
+
+/// Security review M1: a carried script state whose delimiter a `DELIMITER` directive would
+/// refuse (an empty one made the mysqlwire splitter panic) refuses the run through `Done`.
+#[test]
+fn a_carried_script_state_with_a_bad_delimiter_is_refused() {
+    let tmp = tempfile::tempdir().unwrap();
+    let driver = ScriptDriver::new(mysql_pair);
+    let (manager, _) = manager(Arc::new(driver.clone()), tmp.path());
+    let types = ConnectionTypes::default();
+    let exec = service(&manager, None);
+    ui(async {
+        let h = open_ok(&manager, mock_connection(ConnectionTypeId::dev()), &types).await;
+        let script = "SELECT 1; SELECT 2;";
+        for bad in [
+            "", " ", "/ /", "\t", "'", "\"", "`", "\\", "#", "x#", "--", "a--b", "/*", "$$/*",
+        ] {
+            for resume in [None, Some(0)] {
+                let mut request = RunRequest::script(script)
+                    .with_script_state(ScriptState::with_delimiter(Some(bad.to_owned())));
+                if let Some(at) = resume {
+                    request = request.resume_from(at);
+                }
+                let (events, summary) = collect_run(exec.run(&h, request)).await;
+                assert_eq!(summary.end, RunEnd::Refused, "{bad:?}: {events:?}");
+                assert_eq!(summary.executed, 0);
+                let (index, error) = failure_of(&events).unwrap();
+                assert_eq!(index, 0);
+                assert!(
+                    matches!(error, CoreError::InvalidRequest(m) if m.contains("delimiter")),
+                    "{error:?}"
+                );
+                assert!(
+                    driver.take_executed().is_empty(),
+                    "{bad:?}: nothing was sent"
+                );
+            }
+        }
+        // A good carried delimiter still runs.
+        let request = RunRequest::script("SELECT 1 $$\nSELECT 2 $$")
+            .resume_from(0)
+            .with_script_state(ScriptState::with_delimiter(Some("$$".to_owned())));
+        let (events, summary) = collect_run(exec.run(&h, request)).await;
+        assert_eq!(summary.end, RunEnd::Completed, "{events:?}");
+        assert_eq!(driver.take_executed(), ["SELECT 1", "SELECT 2"]);
+    });
+    manager.shutdown(Duration::from_secs(5));
+}
+
+/// Security review M1: a panic inside the run task (here in the splitter) still ends the run
+/// with exactly one `Done`.
+#[test]
+fn a_panic_in_the_run_task_still_ends_the_run() {
+    let tmp = tempfile::tempdir().unwrap();
+    let driver = ScriptDriver::new(lines_only);
+    let (manager, _) = manager(Arc::new(driver.clone()), tmp.path());
+    let types = ConnectionTypes::default();
+    let exec = service(&manager, None);
+    ui(async {
+        let h = open_ok(&manager, mock_connection(ConnectionTypeId::dev()), &types).await;
+        let mut run = exec.run(&h, RunRequest::script("SELECT 1\nboom"));
+        let mut dones = Vec::new();
+        while let Some(event) = tokio::time::timeout(Duration::from_secs(20), run.next())
+            .await
+            .expect("the run ends")
+        {
+            if let RunEvent::Done(summary) = event {
+                dones.push(summary);
+            }
+        }
+        assert_eq!(dones.len(), 1, "{dones:?}");
+        assert!(matches!(dones[0].end, RunEnd::Failed { .. }), "{dones:?}");
+        assert!(driver.take_executed().is_empty());
+        // The session is still usable.
+        let (events, summary) = collect_run(exec.run(&h, RunRequest::script("SELECT 1"))).await;
+        assert_eq!(summary.end, RunEnd::Completed, "{events:?}");
+    });
+    manager.shutdown(Duration::from_secs(5));
+}
+
+/// Security review L1: a re-split whose first window holds only client directives, the
+/// refused piece in the next window, still reports the refusal and ends `Refused`.
+#[test]
+fn a_refusal_after_a_directive_only_window_is_reported() {
+    let tmp = tempfile::tempdir().unwrap();
+    let driver = ScriptDriver::new(ansi_then_lines);
+    let (manager, _) = manager(Arc::new(driver.clone()), tmp.path());
+    let types = ConnectionTypes::default();
+    let exec = service(&manager, None);
+    ui(async {
+        let h = open_ok(&manager, mock_connection(ConnectionTypeId::dev()), &types).await;
+        // ANSI up front: two statements. After the SET the session's rules change: the rest is
+        // split again by lines, a directive alone in the first window, then a refused piece.
+        let script = "SET standard_conforming_strings = off;\n!directive\n?refused\nSELECT 2";
+        let (events, summary) = collect_run(exec.run(&h, RunRequest::script(script))).await;
+        assert_eq!(summary.end, RunEnd::Refused, "{events:?}");
+        assert_eq!(
+            driver.take_executed(),
+            ["SET standard_conforming_strings = off"]
+        );
+        let (index, error) = failure_of(&events).expect("the refusal is reported");
+        assert_eq!(index, 2);
+        assert!(matches!(error, CoreError::InvalidRequest(_)), "{error:?}");
+        // The SET, the directive and the refused piece.
+        assert_eq!((summary.statements, summary.executed), (3, 1));
+    });
+    manager.shutdown(Duration::from_secs(5));
+}
