@@ -815,8 +815,12 @@ mod read_only_reassert {
             let Some(params) = dev_params(id, engine.clone()) else {
                 continue;
             };
-            let mut w = driver.open(dev_params(id, engine).unwrap()).await.unwrap();
+            let mut w = driver
+                .open(dev_params(id, engine.clone()).unwrap())
+                .await
+                .unwrap();
             for sql in [
+                // A table of its own (no shared schema or database is created here).
                 "CREATE TABLE IF NOT EXISTS ninesql_explain_victim (a INT)",
                 "DELETE FROM ninesql_explain_victim WHERE 1 = 1",
                 "INSERT INTO ninesql_explain_victim VALUES (1), (2)",
@@ -861,6 +865,11 @@ mod read_only_reassert {
             }
             assert_eq!(victims(&mut s).await, "2", "{id}: rows were deleted");
             Box::new(s).close().await.unwrap();
+            let mut w = driver.open(dev_params(id, engine).unwrap()).await.unwrap();
+            drain(&mut w, "DROP TABLE ninesql_explain_victim", None)
+                .await
+                .unwrap();
+            Box::new(w).close().await.unwrap();
         }
     }
 }

@@ -798,19 +798,20 @@ mod read_only_reassert {
     /// `U&`-escaped forms. The classifier sees them as the destructive `DELETE` they run (the
     /// production confirmation of the core is asked for `needs_confirmation` classes), a
     /// read-only session refuses them client-side, and sent past the classifier with a forged
-    /// `Read` class they are still rejected engine-side (I3).
+    /// `Read` class they are still rejected engine-side (I3). Its own schema: `CREATE SCHEMA IF
+    /// NOT EXISTS` is not safe against the concurrent tests of this module (23505).
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn explain_analyze_forms_are_destructive_and_refused_engine_side() {
         const FORMS: &[&str] = &[
-            "EXPLAIN (\"analyze\") DELETE FROM ninesql_test.explain_victim",
-            "EXPLAIN (FORMAT JSON, \"analyze\" on) DELETE FROM ninesql_test.explain_victim",
-            "EXPLAIN (U&\"analyze\") DELETE FROM ninesql_test.explain_victim",
-            "EXPLAIN (U&\"\\0061nalyze\") DELETE FROM ninesql_test.explain_victim",
+            "EXPLAIN (\"analyze\") DELETE FROM ninesql_test_explain.victim",
+            "EXPLAIN (FORMAT JSON, \"analyze\" on) DELETE FROM ninesql_test_explain.victim",
+            "EXPLAIN (U&\"analyze\") DELETE FROM ninesql_test_explain.victim",
+            "EXPLAIN (U&\"\\0061nalyze\") DELETE FROM ninesql_test_explain.victim",
         ];
         async fn victims(s: &mut PgSession) -> i64 {
             let mut stream = s
                 .execute(
-                    Statement::sql("SELECT count(*)::int8 FROM ninesql_test.explain_victim"),
+                    Statement::sql("SELECT count(*)::int8 FROM ninesql_test_explain.victim"),
                     ExecOptions::default(),
                 )
                 .await
@@ -833,10 +834,10 @@ mod read_only_reassert {
         let driver = PgWireDriver::new();
         let mut w = driver.open(dev_params().unwrap()).await.unwrap();
         for sql in [
-            "CREATE SCHEMA IF NOT EXISTS ninesql_test",
-            "CREATE TABLE IF NOT EXISTS ninesql_test.explain_victim (a int)",
-            "TRUNCATE ninesql_test.explain_victim",
-            "INSERT INTO ninesql_test.explain_victim VALUES (1), (2)",
+            "CREATE SCHEMA IF NOT EXISTS ninesql_test_explain",
+            "CREATE TABLE IF NOT EXISTS ninesql_test_explain.victim (a int)",
+            "TRUNCATE ninesql_test_explain.victim",
+            "INSERT INTO ninesql_test_explain.victim VALUES (1), (2)",
         ] {
             drain(&mut w, sql, None).await.unwrap();
         }
@@ -876,5 +877,10 @@ mod read_only_reassert {
         }
         assert_eq!(victims(&mut s).await, 2, "rows were deleted");
         Box::new(s).close().await.unwrap();
+        let mut w = driver.open(dev_params().unwrap()).await.unwrap();
+        drain(&mut w, "DROP SCHEMA ninesql_test_explain CASCADE", None)
+            .await
+            .unwrap();
+        Box::new(w).close().await.unwrap();
     }
 }
