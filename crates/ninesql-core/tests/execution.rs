@@ -9,6 +9,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::time::Duration;
 
+use ninesql_core::driver_api::ScriptState;
 use ninesql_core::driver_api::mock::MockDriver;
 use ninesql_core::driver_api::{
     self as api, CancelHandle, Capabilities, ConnectParams, Dialect, Driver, DriverError,
@@ -16,10 +17,10 @@ use ninesql_core::driver_api::{
     Session, Statement,
 };
 use ninesql_core::{
-    CloseReason, ConfirmationPreferences, ConnectionType, ConnectionTypeId, ConnectionTypes,
-    CoreError, CoreEvent, ExecutionService, FetchMode, History, OnError, OpenOutcome, OpenRequest,
-    PreferenceChange, Preferences, ReconnectEvent, ReconnectPolicy, RunEnd, RunEvent, RunRequest,
-    RunSummary, SessionManager, TimeoutChoice, TransactionEnd,
+    CloseReason, ConfirmationPreferences, ConfirmationToken, ConnectionType, ConnectionTypeId,
+    ConnectionTypes, CoreError, CoreEvent, ExecutionService, FetchMode, History, OnError,
+    OpenOutcome, OpenRequest, PreferenceChange, Preferences, ReconnectEvent, ReconnectPolicy,
+    RunEnd, RunEvent, RunRequest, RunSummary, SessionManager, TimeoutChoice, TransactionEnd,
 };
 use ninesql_storage::HistoryDb;
 use ninesql_storage::history::{EntryStatus, HistoryQuery};
@@ -331,6 +332,7 @@ fn production_scripts_stop_for_confirmation_and_resume() {
                     index: 1,
                     span,
                     request,
+                    ..
                 } => Some((span.clone(), request.clone())),
                 _ => None,
             })
@@ -1577,6 +1579,450 @@ fn resume_by_offset_survives_a_lexical_mode_change() {
                 ..
             }
         )));
+    });
+    manager.shutdown(Duration::from_secs(5));
+}
+
+// ---------------------------------------------------------------------------------------------
+// "Execute script" over the P3-D splitter: DELIMITER, refused pieces, re-split on any change of
+// the lexical rules, resume by offset with the splitter state.
+
+/// A dialect that answers like `base`, or like `alt` once the session switched to it (a
+/// simulated `standard_conforming_strings = off`, undone by a `ROLLBACK` after `BEGIN`).
+struct SwitchDialect {
+    base: Arc<dyn Dialect>,
+    alt: Arc<dyn Dialect>,
+    use_alt: AtomicBool,
+    saved: AtomicBool,
+}
+
+impl SwitchDialect {
+    fn now(&self) -> &dyn Dialect {
+        if self.use_alt.load(Ordering::SeqCst) {
+            &*self.alt
+        } else {
+            &*self.base
+        }
+    }
+}
+
+impl Dialect for SwitchDialect {
+    fn lexical_rules(&self) -> api::LexicalRules {
+        self.now().lexical_rules()
+    }
+    fn split_statements(&self, script: &str) -> Vec<api::StatementSpan> {
+        self.now().split_statements(script)
+    }
+    fn split_script(&self, script: &str) -> Vec<api::ScriptItem> {
+        self.now().split_script(script)
+    }
+    fn split_script_ahead(
+        &self,
+        script: &str,
+        from: api::TextPosition,
+        state: &api::ScriptState,
+    ) -> Vec<api::ScriptItem> {
+        self.now().split_script_ahead(script, from, state)
+    }
+    fn script_state_after(
+        &self,
+        script: &str,
+        item: &api::ScriptItem,
+        state: &api::ScriptState,
+    ) -> api::ScriptState {
+        self.now().script_state_after(script, item, state)
+    }
+    fn split_script_from(&self, script: &str, from: usize) -> Vec<api::ScriptItem> {
+        self.now().split_script_from(script, from)
+    }
+    fn classify(&self, text: &str) -> api::StatementClass {
+        self.now().classify(text)
+    }
+}
+
+type DialectPair = fn() -> (Arc<dyn Dialect>, Arc<dyn Dialect>);
+
+/// Sessions with a [`SwitchDialect`]; every statement is checked with
+/// `ensure_single_statement`, recorded and answered locally.
+#[derive(Clone)]
+struct ScriptDriver {
+    mock: MockDriver,
+    dialects: DialectPair,
+    executed: Arc<std::sync::Mutex<Vec<String>>>,
+}
+
+impl ScriptDriver {
+    fn new(dialects: DialectPair) -> Self {
+        Self {
+            mock: mock_driver(),
+            dialects,
+            executed: Arc::default(),
+        }
+    }
+    fn dialect(&self) -> Arc<SwitchDialect> {
+        let (base, alt) = (self.dialects)();
+        Arc::new(SwitchDialect {
+            base,
+            alt,
+            use_alt: AtomicBool::new(false),
+            saved: AtomicBool::new(false),
+        })
+    }
+    fn take_executed(&self) -> Vec<String> {
+        std::mem::take(&mut *self.executed.lock().unwrap())
+    }
+}
+
+#[async_trait::async_trait]
+impl Driver for ScriptDriver {
+    fn family(&self) -> &'static str {
+        "script-mock"
+    }
+    fn engines(&self) -> &[api::EngineId] {
+        self.mock.engines()
+    }
+    fn capabilities(&self, engine: &api::EngineId, v: Option<&str>) -> DriverResult<Capabilities> {
+        self.mock.capabilities(engine, v)
+    }
+    fn dialect(&self, _: &api::EngineId) -> DriverResult<Arc<dyn Dialect>> {
+        Ok(ScriptDriver::dialect(self) as Arc<dyn Dialect>)
+    }
+    async fn connect(&self, params: ConnectParams) -> DriverResult<Box<dyn Session>> {
+        let inner = self.mock.connect(params).await?;
+        Ok(Box::new(ScriptSession {
+            inner,
+            dialect: ScriptDriver::dialect(self),
+            executed: Arc::clone(&self.executed),
+        }))
+    }
+}
+
+struct ScriptSession {
+    inner: Box<dyn Session>,
+    dialect: Arc<SwitchDialect>,
+    executed: Arc<std::sync::Mutex<Vec<String>>>,
+}
+
+#[async_trait::async_trait]
+impl Session for ScriptSession {
+    fn capabilities(&self) -> &Capabilities {
+        self.inner.capabilities()
+    }
+    fn server_version(&self) -> Option<&str> {
+        self.inner.server_version()
+    }
+    fn dialect(&self) -> Arc<dyn Dialect> {
+        Arc::clone(&self.dialect) as Arc<dyn Dialect>
+    }
+    fn metadata(&self) -> Arc<dyn Metadata> {
+        self.inner.metadata()
+    }
+    async fn execute(&mut self, s: Statement, o: ExecOptions) -> DriverResult<ResultStream> {
+        api::ensure_single_statement(&*self.dialect, &s.text)?;
+        self.executed.lock().unwrap().push(s.text.clone());
+        let upper = s.text.to_ascii_uppercase();
+        let d = &self.dialect;
+        if upper.starts_with("SET STANDARD_CONFORMING_STRINGS = OFF") {
+            d.use_alt.store(true, Ordering::SeqCst);
+        } else if upper == "BEGIN" {
+            d.saved
+                .store(d.use_alt.load(Ordering::SeqCst), Ordering::SeqCst);
+        } else if upper == "ROLLBACK" {
+            d.use_alt
+                .store(d.saved.load(Ordering::SeqCst), Ordering::SeqCst);
+        }
+        let items = if upper.starts_with("DELETE") || upper.starts_with("INSERT") {
+            vec![Ok(ResultItem::UpdateCount(Some(1)))]
+        } else {
+            Vec::new()
+        };
+        Ok(ResultStream::from_items(items, &o))
+    }
+    fn cancel_handle(&self) -> Arc<dyn CancelHandle> {
+        self.inner.cancel_handle()
+    }
+    fn auto_commit(&self) -> bool {
+        self.inner.auto_commit()
+    }
+    fn in_transaction(&self) -> bool {
+        self.inner.in_transaction()
+    }
+    async fn set_auto_commit(&mut self, on: bool) -> DriverResult<()> {
+        self.inner.set_auto_commit(on).await
+    }
+    fn is_read_only(&self) -> bool {
+        self.inner.is_read_only()
+    }
+    async fn set_read_only(&mut self, ro: bool) -> DriverResult<()> {
+        self.inner.set_read_only(ro).await
+    }
+    async fn ping(&mut self) -> DriverResult<()> {
+        self.inner.ping().await
+    }
+    async fn close(self: Box<Self>) -> DriverResult<()> {
+        self.inner.close().await
+    }
+}
+
+fn mysql_pair() -> (Arc<dyn Dialect>, Arc<dyn Dialect>) {
+    (
+        Arc::new(ninesql_driver_mysqlwire::MyDialect::mysql()),
+        Arc::new(ninesql_driver_mysqlwire::MyDialect::mysql()),
+    )
+}
+
+fn pg_pair() -> (Arc<dyn Dialect>, Arc<dyn Dialect>) {
+    (
+        Arc::new(ninesql_driver_pgwire::PgDialect::with_standard_conforming_strings(true)),
+        Arc::new(ninesql_driver_pgwire::PgDialect::with_standard_conforming_strings(false)),
+    )
+}
+
+fn confirmation_of(
+    events: &[RunEvent],
+) -> (std::ops::Range<usize>, ConfirmationToken, ScriptState) {
+    events
+        .iter()
+        .find_map(|e| match e {
+            RunEvent::NeedsConfirmation {
+                span,
+                request,
+                script_state,
+                ..
+            } => Some((span.clone(), request.token, script_state.clone())),
+            _ => None,
+        })
+        .unwrap_or_else(|| panic!("no confirmation: {events:?}"))
+}
+
+const PROCEDURE: &str = "CREATE PROCEDURE p()\nBEGIN\n  SELECT 1;\n  SELECT 2;\nEND";
+
+/// A MySQL script with `DELIMITER //` and a procedure body: the body is sent whole, the
+/// directives are applied and never sent, the statements after `DELIMITER ;` split on `;`.
+#[test]
+fn mysql_delimiter_scripts_send_procedure_bodies_whole() {
+    let tmp = tempfile::tempdir().unwrap();
+    let driver = ScriptDriver::new(mysql_pair);
+    let (manager, _) = manager(Arc::new(driver.clone()), tmp.path());
+    let types = ConnectionTypes::default();
+    let exec = service(&manager, None);
+    ui(async {
+        let h = open_ok(&manager, mock_connection(ConnectionTypeId::dev()), &types).await;
+        let script = format!(
+            "DELIMITER //\n{PROCEDURE} //\nSELECT 3; SELECT 4 //\nDELIMITER ;\nSELECT 5;\nCALL p();"
+        );
+        let (events, summary) = collect_run(exec.run(&h, RunRequest::script(script.clone()))).await;
+        assert_eq!(summary.end, RunEnd::Completed, "{events:?}");
+        assert_eq!(
+            driver.take_executed(),
+            [PROCEDURE, "SELECT 3", "SELECT 4", "SELECT 5", "CALL p()"]
+        );
+        // Two directives and five statements; directives keep their index and are never sent.
+        assert_eq!((summary.statements, summary.executed), (7, 5));
+        assert!(matches!(events[0], RunEvent::Started { statements: 7 }));
+        let started: Vec<_> = events
+            .iter()
+            .filter_map(|e| match e {
+                RunEvent::StatementStarted { index, span, .. } => {
+                    Some((*index, &script[span.clone()]))
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            started,
+            [
+                (1, PROCEDURE),
+                (2, "SELECT 3"),
+                (3, "SELECT 4"),
+                (5, "SELECT 5"),
+                (6, "CALL p()")
+            ]
+        );
+
+        // The editor helpers split the same way.
+        let engine = mock_engine();
+        let spans = exec.split(&engine, &script).unwrap();
+        assert_eq!(spans.len(), 5);
+        assert_eq!(spans[0].text(&script), PROCEDURE);
+        let inside = script.find("SELECT 2").unwrap();
+        let at = exec
+            .statement_at(&engine, &script, inside)
+            .unwrap()
+            .unwrap();
+        assert_eq!(at.text(&script), PROCEDURE);
+        // On a directive line: the statement before it.
+        let on_directive = script.find("DELIMITER ;").unwrap() + 3;
+        let at = exec
+            .statement_at(&engine, &script, on_directive)
+            .unwrap()
+            .unwrap();
+        assert_eq!(at.text(&script), "SELECT 4");
+        let items = exec.split_script(&engine, &script).unwrap();
+        assert_eq!(items.len(), 7);
+        assert_eq!(items[0].kind, api::ScriptItemKind::ClientDirective);
+    });
+    manager.shutdown(Duration::from_secs(5));
+}
+
+/// A refused piece (`COPY … FROM STDIN` with inline data) refuses the whole script before
+/// anything is sent; a refused piece that a re-split reveals stops the run before its next
+/// statement.
+#[test]
+fn refused_pieces_refuse_the_script_on_pg() {
+    let tmp = tempfile::tempdir().unwrap();
+    let driver = ScriptDriver::new(pg_pair);
+    let (manager, _) = manager(Arc::new(driver.clone()), tmp.path());
+    let types = ConnectionTypes::default();
+    let exec = service(&manager, None);
+    ui(async {
+        let h = open_ok(&manager, mock_connection(ConnectionTypeId::dev()), &types).await;
+        let script = "SELECT 1;\nCOPY t FROM STDIN;\n1\tx\n\\.\nSELECT 2;";
+        let (events, summary) = collect_run(exec.run(&h, RunRequest::script(script))).await;
+        assert_eq!(summary.end, RunEnd::Refused, "{events:?}");
+        assert_eq!(summary.executed, 0);
+        assert!(driver.take_executed().is_empty(), "nothing was sent");
+        let (index, error, position) = events
+            .iter()
+            .find_map(|e| match e {
+                RunEvent::StatementFailed {
+                    index,
+                    error,
+                    position,
+                    ..
+                } => Some((*index, error, *position)),
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(index, 1);
+        assert!(matches!(error, CoreError::InvalidRequest(m) if m.contains("COPY")));
+        let position = position.unwrap();
+        assert_eq!(
+            (position.offset, position.line, position.column),
+            (10, 2, 1)
+        );
+        // "Execute statement" on the COPY alone is refused too.
+        let (_, summary) =
+            collect_run(exec.run(&h, RunRequest::statement("COPY t FROM STDIN;\n1\tx\n\\."))).await;
+        assert_eq!(summary.end, RunEnd::Refused);
+        assert!(driver.take_executed().is_empty());
+
+        // With `standard_conforming_strings` on, the text after the SET is two SELECTs; once
+        // it is off, the re-split finds a psql meta-command at the start of a statement: the run
+        // stops there, before anything else is sent (review N2).
+        let script =
+            "SET standard_conforming_strings = off;\nSELECT 'a\\'; SELECT ';\n\\echo hi\n'";
+        let (events, summary) = collect_run(exec.run(&h, RunRequest::script(script))).await;
+        assert_eq!(summary.end, RunEnd::Refused, "{events:?}");
+        assert_eq!(
+            driver.take_executed(),
+            ["SET standard_conforming_strings = off"]
+        );
+        assert!(events.iter().any(|e| matches!(
+            e,
+            RunEvent::StatementFailed { error: CoreError::InvalidRequest(m), position: Some(_), .. }
+                if m.contains("meta-command")
+        )));
+    });
+    manager.shutdown(Duration::from_secs(5));
+}
+
+/// P3-D L2: a `ROLLBACK` that undoes `SET standard_conforming_strings = off` changes the
+/// lexical rules back, so the rest is split again; the class-based trigger missed it and sent
+/// two statements as one (which the driver refused).
+#[test]
+fn a_rollback_undoing_a_mode_change_resplits_the_rest() {
+    let tmp = tempfile::tempdir().unwrap();
+    let driver = ScriptDriver::new(pg_pair);
+    let (manager, _) = manager(Arc::new(driver.clone()), tmp.path());
+    let types = ConnectionTypes::default();
+    let exec = service(&manager, None);
+    ui(async {
+        let h = open_ok(&manager, mock_connection(ConnectionTypeId::dev()), &types).await;
+        // Off after the SET: one SELECT of a string; on again after the ROLLBACK: two SELECTs.
+        let script = "BEGIN;\nSET standard_conforming_strings = off;\nSELECT 'x\\'; SELECT 1; --';\nROLLBACK;\nSELECT 'a\\'; SELECT 2 AS v; --'";
+        let (events, summary) = collect_run(exec.run(&h, RunRequest::script(script))).await;
+        assert_eq!(summary.end, RunEnd::Completed, "{events:?}");
+        assert_eq!(
+            driver.take_executed(),
+            [
+                "BEGIN",
+                "SET standard_conforming_strings = off",
+                "SELECT 'x\\'; SELECT 1; --'",
+                "ROLLBACK",
+                "SELECT 'a\\'",
+                "SELECT 2 AS v"
+            ]
+        );
+        assert_eq!((summary.executed, summary.failed), (6, 0));
+        assert_eq!(summary.statements, 6);
+    });
+    manager.shutdown(Duration::from_secs(5));
+}
+
+/// Resume by offset after a `DELIMITER`: the delimiter in force at the offset is rebuilt from
+/// the text before it, or taken from the confirmation; either way the confirmed statement is
+/// exactly the one that runs, and the statements before it are not run again.
+#[test]
+fn resume_by_offset_after_a_delimiter() {
+    let tmp = tempfile::tempdir().unwrap();
+    let driver = ScriptDriver::new(mysql_pair);
+    let (manager, _) = manager(Arc::new(driver.clone()), tmp.path());
+    let types = ConnectionTypes::default();
+    let exec = service(&manager, None);
+    ui(async {
+        let h = open_ok(&manager, mock_connection(ConnectionTypeId::prod()), &types).await;
+        let script = format!(
+            "DELIMITER //\n{PROCEDURE} //\nDELETE FROM t //\nSELECT 3; SELECT 4 //\nDELIMITER ;\nSELECT 5;"
+        );
+        let after = ["DELETE FROM t", "SELECT 3", "SELECT 4", "SELECT 5"];
+        for carried in [false, true] {
+            let (events, summary) =
+                collect_run(exec.run(&h, RunRequest::script(script.clone()))).await;
+            assert_eq!(
+                summary.end,
+                RunEnd::NeedsConfirmation { index: 2 },
+                "{events:?}"
+            );
+            assert_eq!(driver.take_executed(), [PROCEDURE]);
+            let (span, token, state) = confirmation_of(&events);
+            assert_eq!(&script[span.clone()], "DELETE FROM t");
+            assert_eq!(state, ScriptState::with_delimiter(Some("//".to_owned())));
+            let mut request = RunRequest::script(script.clone())
+                .resume_from(span.start)
+                .confirmed(token);
+            if carried {
+                request = request.with_script_state(state);
+            }
+            let (events, summary) = collect_run(exec.run(&h, request)).await;
+            assert_eq!(summary.end, RunEnd::Completed, "{events:?}");
+            assert_eq!(driver.take_executed(), after, "carried: {carried}");
+            // From the DELETE: three statements, a directive and a statement.
+            assert_eq!((summary.statements, summary.executed), (5, 4));
+        }
+        // A wrong state reads `DELETE FROM t //\nSELECT 3` as the first statement: it is not
+        // the confirmed text, so it asks again instead of running.
+        let (events, _) = collect_run(exec.run(&h, RunRequest::script(script.clone()))).await;
+        driver.take_executed();
+        let (span, token, _) = confirmation_of(&events);
+        let (events, summary) = collect_run(
+            exec.run(
+                &h,
+                RunRequest::script(script.clone())
+                    .resume_from(span.start)
+                    .confirmed(token)
+                    .with_script_state(ScriptState::default()),
+            ),
+        )
+        .await;
+        assert_ne!(summary.end, RunEnd::Completed, "{events:?}");
+        assert!(
+            !driver
+                .take_executed()
+                .iter()
+                .any(|t| t.starts_with("DELETE")),
+            "the DELETE never ran unconfirmed"
+        );
     });
     manager.shutdown(Duration::from_secs(5));
 }
