@@ -37,3 +37,4 @@ v0.1.0 can be released when all of these hold:
 3. No password is found under any NineSQL directory after the full test scenario (I1 test).
 4. The measurements table above is filled with real numbers (whatever they are), with method and commit.
 5. The end-of-MVP security review (P6-E) says "ready".
+6. The final tests (P6-F) are done on Linux, with the tags and releases: a visual pass of the interface with screenshots on Wayland and X11, and a manual run of the exit scenarios of phases 1 to 5. Visual checks of earlier phases (P1-C) are deferred to it and do not block their phases.

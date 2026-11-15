@@ -37,7 +37,7 @@
   </p>
 </div>
 
-> ⚠️ **Pre-alpha.** Nothing is released yet. A development build can create, test and open connections to PostgreSQL, MySQL, MariaDB and SQLite (directly, over TLS and over SSH) from the connection dialog, but there is no SQL editor or results grid yet, the DBeaver import has no UI, and the connections UI still awaits a visual check on real desktops. Saved passwords go to the encrypted vault: the keyring backend is off by default until it is validated on GNOME and KDE. See the [roadmap](docs/ROADMAP.md) for the MVP plan.
+> ⚠️ **Pre-alpha.** Nothing is released yet. A development build can create, test and open connections to PostgreSQL, MySQL, MariaDB and SQLite (directly, over TLS and over SSH) from the connection dialog, but there is no SQL editor or results grid yet, the DBeaver import has no UI, and the interface awaits its visual check on real desktops, planned with the final MVP tests. Saved passwords go to the encrypted vault: the keyring backend is off by default until it is validated on GNOME and KDE. See the [roadmap](docs/ROADMAP.md) for the MVP plan.
 
 ## Why NineSQL
 DBeaver is the de facto universal database client, but it runs on the JVM and Eclipse RCP: high memory use, slow cold start, and uneven HiDPI / Wayland behavior on Linux.
