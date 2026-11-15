@@ -770,4 +770,106 @@ mod read_only_reassert {
             Box::new(s).close().await.unwrap();
         }
     }
+
+    /// P1-E review M1: MariaDB `ANALYZE <statement>` executes the statement; MySQL
+    /// `EXPLAIN ANALYZE` (and its synonym `DESC ANALYZE`) runs a multi-table `DELETE`'s plan.
+    /// The classifier never sees them below the statement they wrap (the production
+    /// confirmation of the core is asked for `needs_confirmation` classes), a read-only
+    /// session refuses them client-side, and sent past the classifier with a forged `Read`
+    /// class they are still rejected engine-side (I3).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn analyze_forms_are_destructive_and_refused_engine_side() {
+        async fn victims(s: &mut MySession) -> String {
+            let st = Statement::sql("SELECT CAST(COUNT(*) AS CHAR) FROM ninesql_explain_victim");
+            let mut stream = s.execute(st, ExecOptions::default()).await.unwrap();
+            let mut n = None;
+            while let Some(item) = stream.next().await {
+                if let ninesql_driver_api::ResultItem::Rows(b) = item.unwrap() {
+                    use ninesql_driver_api::arrow_array::cast::AsArray;
+                    n = Some(b.column(0).as_string::<i32>().value(0).to_owned());
+                }
+            }
+            n.unwrap()
+        }
+        let driver = MySqlWireDriver::new();
+        for (id, engine, forms) in [
+            (
+                "mariadb",
+                EngineId::MARIADB,
+                &[
+                    "ANALYZE DELETE FROM ninesql_explain_victim",
+                    "ANALYZE FORMAT=JSON DELETE FROM ninesql_explain_victim",
+                ][..],
+            ),
+            (
+                "mysql",
+                EngineId::MYSQL,
+                &[
+                    "EXPLAIN ANALYZE DELETE v FROM ninesql_explain_victim v \
+                     JOIN (SELECT 1 AS x) d ON v.a = d.x",
+                    "DESC ANALYZE DELETE v FROM ninesql_explain_victim v \
+                     JOIN (SELECT 1 AS x) d ON v.a = d.x",
+                ][..],
+            ),
+        ] {
+            let Some(params) = dev_params(id, engine.clone()) else {
+                continue;
+            };
+            let mut w = driver
+                .open(dev_params(id, engine.clone()).unwrap())
+                .await
+                .unwrap();
+            for sql in [
+                // A table of its own (no shared schema or database is created here).
+                "CREATE TABLE IF NOT EXISTS ninesql_explain_victim (a INT)",
+                "DELETE FROM ninesql_explain_victim WHERE 1 = 1",
+                "INSERT INTO ninesql_explain_victim VALUES (1), (2)",
+            ] {
+                drain(&mut w, sql, None).await.unwrap();
+            }
+            for sql in forms {
+                let class = w.dialect().classify(sql);
+                assert!(
+                    class >= StatementClass::Destructive,
+                    "{id} {sql}: {class:?}"
+                );
+                assert!(class.needs_confirmation() && class.is_write(), "{id} {sql}");
+            }
+            if id == "mariadb" {
+                // Why it matters: MariaDB really deletes the rows.
+                w.begin().await.unwrap();
+                drain(&mut w, forms[0], None).await.unwrap();
+                assert_eq!(victims(&mut w).await, "0", "ANALYZE DELETE did not run");
+                w.rollback().await.unwrap();
+                assert_eq!(victims(&mut w).await, "2");
+            }
+            Box::new(w).close().await.unwrap();
+
+            let mut p = params;
+            p.read_only = true;
+            let mut s = driver.open(p).await.unwrap();
+            for sql in forms {
+                assert!(
+                    matches!(
+                        drain(&mut s, sql, None).await,
+                        Err(DriverError::ReadOnly(_))
+                    ),
+                    "{id} {sql}: not refused client-side"
+                );
+                let r = drain(&mut s, sql, Some(StatementClass::Read)).await;
+                assert!(
+                    matches!(r, Err(DriverError::ReadOnly(_))),
+                    "{id} {sql}: not refused engine-side: {r:?}"
+                );
+                assert!(s.is_read_only());
+            }
+            assert_eq!(victims(&mut s).await, "2", "{id}: rows were deleted");
+            Box::new(s).close().await.unwrap();
+            let mut w = driver.open(dev_params(id, engine).unwrap()).await.unwrap();
+            drain(&mut w, "DROP TABLE ninesql_explain_victim", None)
+                .await
+                .unwrap();
+            Box::new(w).close().await.unwrap();
+        }
+    }
 }
