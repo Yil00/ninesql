@@ -37,13 +37,13 @@
   </p>
 </div>
 
-> ⚠️ **Pre-alpha.** Nothing is released yet and nothing is usable end to end: the application shell, the PostgreSQL and MySQL / MariaDB drivers, SSH tunnels, the secret stores and the DBeaver parser exist as crates, but there is no connection UI yet. See the [roadmap](docs/ROADMAP.md) for the MVP plan.
+> ⚠️ **Pre-alpha.** Nothing is released yet. A development build can create, test and open connections to PostgreSQL, MySQL, MariaDB and SQLite (directly, over TLS and over SSH) from the connection dialog, but there is no SQL editor or results grid yet, the DBeaver import has no UI, and the connections UI still awaits a visual check on real desktops. Saved passwords go to the encrypted vault: the keyring backend is off by default until it is validated on GNOME and KDE. See the [roadmap](docs/ROADMAP.md) for the MVP plan.
 
 ## Why NineSQL
 DBeaver is the de facto universal database client, but it runs on the JVM and Eclipse RCP: high memory use, slow cold start, and uneven HiDPI / Wayland behavior on Linux.
 
 NineSQL keeps the **feature set** DBeaver users rely on and rebuilds it as a **native Rust application** rendered on the GPU with [GPUI](https://github.com/zed-industries/zed/tree/main/crates/gpui):
-- **Native and lean**: no JVM, no webview. Startup time and memory use are measured in CI and published, not promised ([docs/04-mvp-scope.md](docs/04-mvp-scope.md#exit-criterion)).
+- **Native and lean**: no JVM, no webview. Startup time and memory use will be measured and published with the method, not promised; no numbers exist yet ([docs/04-mvp-scope.md](docs/04-mvp-scope.md#exit-criterion)).
 - **Large results stay fluid**: a virtualized, GPU-rendered grid streams results in bounded memory.
 - **Secure by default**: passwords live in the desktop keyring (Secret Service) or an encrypted local vault, never in config files; TLS verified by default; production connections guarded by a real read-only mode, not just a red banner ([docs/05-security.md](docs/05-security.md)).
 - **Offline-first**: no telemetry, no account, no network traffic except to the databases you declare.
@@ -54,10 +54,10 @@ The 20 most used **open-source, self-hostable** engines. Cloud-only services (Sn
 
 | Engine | Family | Planned in | Status |
 |:--|:--|:--|:--|
-| **PostgreSQL** | SQL · pg-wire | MVP (v0.1) | 🚧 Driver landed (P1-B), not usable from the UI yet |
-| **MySQL** | SQL · mysql-wire | MVP (v0.1) | 🚧 Driver landed (P1-B), not usable from the UI yet |
-| **MariaDB** | SQL · mysql-wire | MVP (v0.1) | 🚧 Driver landed (P1-B), not usable from the UI yet |
-| **SQLite** | SQL · embedded | MVP (v0.1) | 🚧 Driver landed (P1-B), not usable from the UI yet |
+| **PostgreSQL** | SQL · pg-wire | MVP (v0.1) | 🚧 Driver landed (P1-B); connect from the connection dialog (P1-C), no editor or grid yet |
+| **MySQL** | SQL · mysql-wire | MVP (v0.1) | 🚧 Driver landed (P1-B); connect from the connection dialog (P1-C), no editor or grid yet |
+| **MariaDB** | SQL · mysql-wire | MVP (v0.1) | 🚧 Driver landed (P1-B); connect from the connection dialog (P1-C), no editor or grid yet |
+| **SQLite** | SQL · embedded | MVP (v0.1) | 🚧 Driver landed (P1-B); connect from the connection dialog (P1-C), no editor or grid yet |
 | **TimescaleDB** | SQL · pg-wire | MVP (v0.1) | 🗓 Planned |
 | **YugabyteDB** (YSQL) | SQL · pg-wire | MVP (v0.1) | 🗓 Planned |
 | **QuestDB** | SQL · pg-wire | MVP (v0.1) | 🗓 Planned |
