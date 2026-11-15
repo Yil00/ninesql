@@ -16,7 +16,8 @@ Ubuntu 22.04 and Debian 12 support depends on GPUI's Vulkan and Wayland requirem
 - systemd-logind on the system bus, to lock saved secrets on sleep and screen lock ([docs/05](05-security.md#vault-format-v1)); without it only the idle lock applies.
 
 ### Flatpak permissions
-The Flatpak manifest needs these D-Bus permissions (and no network permission beyond the user's connections):
+The Flatpak manifest needs these permissions:
+- `--share=network`: network access, used only for the user's connections and their SSH / proxy hops (I2). Flatpak cannot narrow it: the permission is all-or-nothing, so the restriction is NineSQL's own;
 - `--talk-name=org.freedesktop.secrets`: the Secret Service, for saved passwords ([ADR-0005](adr/0005-secrets-storage.md));
 - `--system-talk-name=org.freedesktop.login1`: logind on the system bus, so the vault is locked and the "ask every time" cache cleared on sleep and screen lock (`DesktopLockWatcher`, default-on `desktop-lock` feature). Without it the watcher cannot start: NineSQL reports it and relies on the idle lock.
 

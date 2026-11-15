@@ -229,7 +229,8 @@ pub struct ManagerConfig {
 }
 
 impl ManagerConfig {
-    /// Defaults, with the `known_hosts` files of `paths`.
+    /// Defaults, with the `known_hosts` files of `paths`. **Blocking**: canonicalizes `$HOME`
+    /// for [`DbeaverRoots::from_env`]; build it off the UI thread.
     #[must_use]
     pub fn new(paths: &Paths) -> Self {
         Self::with_known_hosts(KnownHostsFiles::new(paths))

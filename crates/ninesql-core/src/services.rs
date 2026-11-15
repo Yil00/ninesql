@@ -103,7 +103,9 @@ pub struct CoreConfig {
 }
 
 impl CoreConfig {
-    /// Defaults for `project` under `paths`, with the drivers of `registry`.
+    /// Defaults for `project` under `paths`, with the drivers of `registry`. **Blocking**:
+    /// [`ManagerConfig::new`] canonicalizes `$HOME` (DBeaver roots); build it off the UI thread,
+    /// for example in the closure that then calls [`CoreServices::start_blocking`].
     #[must_use]
     pub fn new(paths: Paths, project: ProjectName, registry: DriverRegistry) -> Self {
         Self {

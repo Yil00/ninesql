@@ -20,8 +20,11 @@
 //!   `.metadata/dbeaver-workspace.properties`) or project (it holds a `.dbeaver` directory with
 //!   a DBeaver project file: `data-sources*.json`, `project-settings.json` or
 //!   `credentials-config.json`). The ancestor walk stops before the home directory: `$HOME`,
-//!   its ancestors and `/` are never taken for a workspace or project (a stray `~/.dbeaver` or
-//!   `/tmp/.dbeaver` does not make every file below read-only).
+//!   its ancestors and `/` are never taken for a workspace or project. A stray `~/.dbeaver`
+//!   never makes home files read-only; a stray `/tmp/.dbeaver` affects nothing only while it
+//!   holds no project file. Another local user can still create one with a project file in a
+//!   shared directory such as `/tmp` and so get files below it opened read-only: that fails
+//!   safe (nothing is written) and is visible through `SessionInfo::inside_dbeaver_workspace`.
 //!
 //! Every check is read-only (`stat`, `canonicalize`, `read_dir`, I4) and blocking: the session
 //! manager runs it on the blocking pool. **Fail closed**: a path that cannot be resolved (any
@@ -88,7 +91,7 @@ impl DbeaverRoots {
     }
 
     /// The `DBeaverData` directory of every known install location under `$HOME`; no known
-    /// root when `HOME` is unset or relative.
+    /// root when `HOME` is unset or relative. **Blocking** (canonicalizes `$HOME`).
     #[must_use]
     pub fn from_env() -> Self {
         SearchRoots::from_env().map_or_else(Self::none, |r| Self::from_search_roots(&r))
@@ -111,7 +114,9 @@ impl DbeaverRoots {
     }
 
     /// Sets the home directory: the marker walk never looks at it, its ancestors or `/`.
-    /// A relative path is ignored. **Blocking** (resolves symbolic links).
+    /// A relative path is ignored. **Blocking** (canonicalizes the home directory): so are
+    /// [`Self::from_env`] and [`Self::from_search_roots`], and with them `ManagerConfig::new`
+    /// and `CoreConfig::new`, which must be built off the UI thread.
     #[must_use]
     pub fn with_home(mut self, home: impl AsRef<Path>) -> Self {
         let home = home.as_ref();
@@ -296,32 +301,62 @@ fn normalize(path: &Path) -> PathBuf {
     out
 }
 
+/// Most symbolic links followed by hand while resolving a path whose target does not exist yet
+/// (the same bound as Linux's `MAXSYMLINKS`).
+const MAX_LINK_HOPS: usize = 40;
+
 /// The path with symbolic links resolved: the canonical file, or, when it does not exist yet,
-/// the canonical nearest existing ancestor followed by the missing names. `Err` for any other
-/// failure, and for a missing component that is not a plain name (`..`).
+/// the canonical nearest existing ancestor followed by the missing names. A **dangling symbolic
+/// link** on the way (the file, or a missing directory, is a link to something that does not
+/// exist yet) is followed to its target, at most [`MAX_LINK_HOPS`] links deep: a creating open
+/// would write there, so that is the path to check (review P1-D wiring, N1). `Err` for any other
+/// failure, for a missing component that is not a plain name (`..`), and for too many links.
 fn resolve(absolute: &Path) -> Result<PathBuf, ()> {
+    resolve_hops(absolute, MAX_LINK_HOPS)
+}
+
+fn resolve_hops(absolute: &Path, hops: usize) -> Result<PathBuf, ()> {
     match std::fs::canonicalize(absolute) {
         Ok(p) => return Ok(p),
         Err(e) if is_missing(&e) => {}
         Err(_) => return Err(()),
     }
+    let with_missing = |mut p: PathBuf, missing: &[std::ffi::OsString]| {
+        for name in missing.iter().rev() {
+            p.push(name);
+        }
+        p
+    };
     let mut missing = Vec::new();
-    let mut current = absolute;
+    let mut current = absolute.to_path_buf();
     loop {
-        // `None` for a path ending in `..`: cannot be resolved without the file system.
-        let name = current.file_name().ok_or(())?;
-        missing.push(name.to_owned());
-        let parent = current.parent().ok_or(())?;
-        match std::fs::canonicalize(parent) {
-            Ok(mut p) => {
-                for name in missing.iter().rev() {
-                    p.push(name);
-                }
-                return Ok(p);
+        // Intermediate components are followed by the kernel; only the last one of `current`
+        // can be a dangling link here.
+        match std::fs::symlink_metadata(&current) {
+            Ok(m) if m.file_type().is_symlink() => {
+                let hops = hops.checked_sub(1).ok_or(())?;
+                let target = std::fs::read_link(&current).map_err(drop)?;
+                let target = if target.is_absolute() {
+                    target
+                } else {
+                    current.parent().ok_or(())?.join(target)
+                };
+                return Ok(with_missing(resolve_hops(&target, hops)?, &missing));
             }
-            Err(e) if is_missing(&e) => current = parent,
+            Ok(_) if !missing.is_empty() => {
+                // The nearest existing ancestor (not a link).
+                let p = std::fs::canonicalize(&current).map_err(drop)?;
+                return Ok(with_missing(p, &missing));
+            }
+            // The whole path exists now, though it was not found a moment ago: fail closed.
+            Ok(_) => return Err(()),
+            Err(e) if is_missing(&e) => {}
             Err(_) => return Err(()),
         }
+        // `None` for a path ending in `..`: cannot be resolved without the file system.
+        let name = current.file_name().ok_or(())?.to_owned();
+        missing.push(name);
+        current = current.parent().ok_or(())?.to_path_buf();
     }
 }
 
@@ -472,5 +507,60 @@ mod tests {
         let check = roots.check(&base.path().join("missing/.."));
         assert!(check.inside);
         assert!(check.path.is_none());
+    }
+
+    /// Review P1-D wiring, N1: a dangling symbolic link is checked at its target, where a
+    /// creating open would write.
+    #[test]
+    fn a_dangling_link_is_checked_at_its_target() {
+        let base = tempfile::tempdir().unwrap();
+        let canonical = std::fs::canonicalize(base.path()).unwrap();
+        let home = base.path().join("home");
+        std::fs::create_dir_all(&home).unwrap();
+        let roots = DbeaverRoots::none().with_home(&home);
+
+        // `~/x.db` → a file not created yet under `DBeaverData`.
+        let target = base
+            .path()
+            .join("app/DBeaverData/workspace6/General/new.db");
+        std::os::unix::fs::symlink(&target, home.join("x.db")).unwrap();
+        let check = roots.check(&home.join("x.db"));
+        assert!(check.inside);
+        assert_eq!(
+            check.path,
+            Some(canonical.join("app/DBeaverData/workspace6/General/new.db"))
+        );
+
+        // A relative link, through a dangling link to a directory, into a root added later.
+        let ws = base.path().join("custom-ws");
+        roots.add(&ws);
+        std::os::unix::fs::symlink("../custom-ws/General", home.join("dir")).unwrap();
+        let check = roots.check(&home.join("dir/sub/y.db"));
+        assert!(check.inside, "{check:?}");
+        assert_eq!(
+            check.path,
+            Some(canonical.join("custom-ws/General/sub/y.db"))
+        );
+
+        // A dangling link outside every workspace stays outside, at its target.
+        std::os::unix::fs::symlink(base.path().join("plain/z.db"), home.join("z.db")).unwrap();
+        let check = roots.check(&home.join("z.db"));
+        assert!(!check.inside);
+        assert_eq!(check.path, Some(canonical.join("plain/z.db")));
+
+        // A chain of dangling links longer than the bound fails closed.
+        let mut next = base.path().join("chain-end/missing.db");
+        for i in 0..=MAX_LINK_HOPS {
+            let link = base.path().join(format!("chain-{i}"));
+            std::os::unix::fs::symlink(&next, &link).unwrap();
+            next = link;
+        }
+        assert_eq!(
+            roots.check(&next),
+            FileCheck {
+                path: None,
+                inside: true
+            }
+        );
     }
 }
