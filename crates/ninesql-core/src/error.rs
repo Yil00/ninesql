@@ -217,6 +217,7 @@ fn vault_error_kind(e: &ninesql_secrets::VaultError) -> &'static str {
         E::WrongPassword => "vault-wrong-password",
         E::TooManyAttempts { .. } => "vault-too-many-attempts",
         E::EmptyPassword => "vault-empty-password",
+        E::PasswordTooShort { .. } => "vault-password-too-short",
         E::Corrupted { .. } | E::NewerVersion { .. } => "vault-file",
         _ => "vault-other",
     }

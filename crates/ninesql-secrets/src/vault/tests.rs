@@ -643,3 +643,66 @@ proptest! {
         }
     }
 }
+
+/// P1-E review, L4: a new master password has at least `MIN_MASTER_PASSWORD_CHARS` characters
+/// (counted as characters, not bytes); an existing vault still unlocks with a shorter one.
+#[test]
+fn a_new_master_password_needs_twelve_characters() {
+    assert_eq!(MIN_MASTER_PASSWORD_CHARS, 12);
+    let f = Fixture::new();
+    for short in ["a", "elevenchars", "ééééééééééé"] {
+        let err = f
+            .vault
+            .create(&s(short), KdfParams::insecure_for_tests())
+            .unwrap_err();
+        assert!(
+            matches!(err, VaultError::PasswordTooShort { min: 12 }),
+            "{short}: {err:?}"
+        );
+        assert_eq!(
+            err.to_string(),
+            "the master password must be at least 12 characters long"
+        );
+    }
+    assert!(!f.path().exists(), "nothing written");
+    f.vault
+        .create(&s("twelve chars"), KdfParams::insecure_for_tests())
+        .unwrap();
+    assert!(f.vault.is_unlocked());
+
+    // A password change to a short password is refused, the file untouched.
+    let before = f.bytes();
+    assert!(matches!(
+        f.vault
+            .change_master_password(&s("twelve chars"), &s("short"), None),
+        Err(VaultError::PasswordTooShort { min: 12 })
+    ));
+    assert_eq!(f.bytes(), before);
+}
+
+#[test]
+fn an_existing_vault_with_a_short_master_password_still_unlocks() {
+    // Written as a vault created before the rule (no check on that path).
+    let f = Fixture::new();
+    let old = s("short");
+    Unlocked::fresh(
+        &old,
+        KdfParams::insecure_for_tests(),
+        BTreeMap::new(),
+        f.vault.clock.now(),
+    )
+    .unwrap()
+    .persist(&f.path())
+    .unwrap();
+    assert_eq!(f.vault.status().unwrap(), VaultStatus::Locked);
+    f.vault.unlock(&old).unwrap();
+    assert!(f.vault.is_unlocked());
+    // Moving to a long enough password works; back to a short one does not.
+    f.vault
+        .change_master_password(&old, &s(MASTER), None)
+        .unwrap();
+    assert!(matches!(
+        f.vault.change_master_password(&s(MASTER), &old, None),
+        Err(VaultError::PasswordTooShort { .. })
+    ));
+}

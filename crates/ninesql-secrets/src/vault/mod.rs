@@ -108,6 +108,25 @@ use format::{
 };
 use throttle::UnlockThrottle;
 
+/// Minimum length, in characters (Unicode scalar values), of a new master password: the vault
+/// file is protected by the master password alone once copied off the machine (docs/05,
+/// "Vault format v1"). Checked when a vault is created or its password changed, never on unlock.
+pub const MIN_MASTER_PASSWORD_CHARS: usize = 12;
+
+/// Checks a new master password against the minimum length.
+fn check_new_master(master: &SecretString) -> Result<(), VaultError> {
+    let chars = master.expose_secret().chars().count();
+    if chars == 0 {
+        Err(VaultError::EmptyPassword)
+    } else if chars < MIN_MASTER_PASSWORD_CHARS {
+        Err(VaultError::PasswordTooShort {
+            min: MIN_MASTER_PASSWORD_CHARS,
+        })
+    } else {
+        Ok(())
+    }
+}
+
 /// Error of a vault operation. Messages are user-presentable and never contain a secret, the
 /// master password, or file content.
 #[derive(Debug, thiserror::Error)]
@@ -159,6 +178,13 @@ pub enum VaultError {
     /// An empty master password was given to create or change the vault.
     #[error("the master password must not be empty")]
     EmptyPassword,
+    /// A new master password shorter than [`MIN_MASTER_PASSWORD_CHARS`] (vault creation or
+    /// password change; an existing vault still unlocks with its password, whatever its length).
+    #[error("the master password must be at least {min} characters long")]
+    PasswordTooShort {
+        /// Minimum number of characters.
+        min: usize,
+    },
     /// A secret, label, connection id or the whole vault exceeds a size limit.
     #[error("vault limit exceeded: {0}")]
     Limit(&'static str),
@@ -439,11 +465,10 @@ impl Vault {
     /// Creates an empty vault protected by `master` and leaves it unlocked.
     ///
     /// # Errors
-    /// [`VaultError::EmptyPassword`], [`VaultError::AlreadyExists`], storage errors.
+    /// [`VaultError::EmptyPassword`], [`VaultError::PasswordTooShort`] (fewer than
+    /// [`MIN_MASTER_PASSWORD_CHARS`] characters), [`VaultError::AlreadyExists`], storage errors.
     pub fn create(&self, master: &SecretString, params: KdfParams) -> Result<(), VaultError> {
-        if master.expose_secret().is_empty() {
-            return Err(VaultError::EmptyPassword);
-        }
+        check_new_master(master)?;
         let mut st = self.state();
         if self.exists()? {
             return Err(VaultError::AlreadyExists(self.path.clone()));
@@ -534,7 +559,8 @@ impl Vault {
     /// unlocked.
     ///
     /// # Errors
-    /// [`VaultError::EmptyPassword`], [`VaultError::TooManyAttempts`],
+    /// [`VaultError::EmptyPassword`], [`VaultError::PasswordTooShort`] for `new`,
+    /// [`VaultError::TooManyAttempts`],
     /// [`VaultError::WrongPassword`] for `current`, and the errors of [`Vault::unlock`].
     pub fn change_master_password(
         &self,
@@ -542,9 +568,7 @@ impl Vault {
         new: &SecretString,
         params: Option<KdfParams>,
     ) -> Result<(), VaultError> {
-        if new.expose_secret().is_empty() {
-            return Err(VaultError::EmptyPassword);
-        }
+        check_new_master(new)?;
         let mut st = self.state();
         st.throttle
             .check(self.clock.now())

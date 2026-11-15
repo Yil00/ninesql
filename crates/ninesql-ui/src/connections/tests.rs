@@ -1319,3 +1319,291 @@ fn invalid_saved_connections_are_listed_as_problems(cx: &mut TestAppContext) {
         "{problems:?}"
     );
 }
+
+// ---------------------------------------------------------------------------------------------
+// P1-E review, L4: the master password rule when the vault is created.
+
+#[gpui::test]
+fn vault_creation_shows_and_enforces_the_master_password_rule(cx: &mut TestAppContext) {
+    let tmp = tempfile::tempdir().unwrap_or_else(|e| panic!("{e}"));
+    let (hub, core) = core_hub(cx, tmp.path());
+    let (_ws, mut vcx) = open_live(cx);
+    let prompt = vcx.update(|window, cx| {
+        super::vault::open_vault_prompt(hub.clone(), super::vault::VaultMode::Create, window, cx)
+    });
+    vcx.run_until_parked();
+    assert_eq!(
+        super::vault::master_password_rule(),
+        "The master password must be at least 12 characters long."
+    );
+    // Too short (11 characters, more bytes): refused before the key derivation, inputs cleared.
+    let (master, confirm) = prompt.read_with(&vcx, |p, _| p.inputs());
+    set(Some(&master), "ééééééééééé", &mut vcx);
+    set(Some(&confirm), "ééééééééééé", &mut vcx);
+    vcx.update(|window, cx| prompt.update(cx, |p, cx| p.submit(window, cx)));
+    let error = prompt.read_with(&vcx, |p, _| p.error().map(str::to_owned));
+    assert_eq!(error, Some(super::vault::master_password_rule()));
+    assert!(!prompt.read_with(&vcx, |p, _| p.is_busy()));
+    assert!(vcx.read(|cx| super::secret_input::is_empty(&master, cx)));
+    assert!(matches!(
+        wait_reply(core.vault_status()),
+        Ok(ninesql_core::secrets::VaultStatus::NotCreated)
+    ));
+    // The core's own refusal reads the same way.
+    let text = super::vault::vault_error_text(&ninesql_core::CoreError::Vault(
+        ninesql_core::secrets::VaultError::PasswordTooShort { min: 12 },
+    ));
+    assert_eq!(text, super::vault::master_password_rule());
+
+    // Long enough: created and unlocked.
+    set(Some(&master), MASTER, &mut vcx);
+    set(Some(&confirm), MASTER, &mut vcx);
+    vcx.update(|window, cx| prompt.update(cx, |p, cx| p.submit(window, cx)));
+    wait_until(&mut vcx, |_| {
+        matches!(
+            wait_reply(core.vault_status()),
+            Ok(ninesql_core::secrets::VaultStatus::Unlocked)
+        )
+    });
+    assert_eq!(
+        prompt.read_with(&vcx, |p, _| p.error().map(str::to_owned)),
+        None
+    );
+}
+
+// ---------------------------------------------------------------------------------------------
+// P1-E review, L6 (I1): the hub flows leave no secret in any file nor in any log event.
+
+/// Every log event of the process, at every level (the global subscriber: the driver runtime's
+/// threads are captured too). Other tests of this binary log into it as well; they never use the
+/// secrets of the L6 test.
+#[derive(Clone, Default)]
+struct LogCapture(Arc<std::sync::Mutex<String>>);
+
+impl LogCapture {
+    fn text(&self) -> String {
+        self.0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
+    fn buf(&self) -> std::sync::MutexGuard<'_, String> {
+        self.0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+}
+
+struct LogVisitor<'a>(&'a mut String);
+
+impl tracing::field::Visit for LogVisitor<'_> {
+    fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+        use std::fmt::Write as _;
+        let _ = write!(self.0, " {}={:?}", field.name(), value);
+    }
+}
+
+impl tracing::Subscriber for LogCapture {
+    fn enabled(&self, _: &tracing::Metadata<'_>) -> bool {
+        true
+    }
+    fn new_span(&self, span: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+        span.record(&mut LogVisitor(&mut self.buf()));
+        tracing::span::Id::from_u64(1)
+    }
+    fn record(&self, _: &tracing::span::Id, values: &tracing::span::Record<'_>) {
+        values.record(&mut LogVisitor(&mut self.buf()));
+    }
+    fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+    fn event(&self, event: &tracing::Event<'_>) {
+        let mut buf = self.buf();
+        buf.push('\n');
+        buf.push_str(event.metadata().target());
+        event.record(&mut LogVisitor(&mut buf));
+    }
+    fn enter(&self, _: &tracing::span::Id) {}
+    fn exit(&self, _: &tracing::span::Id) {}
+}
+
+fn log_capture() -> &'static LogCapture {
+    static CAPTURE: std::sync::OnceLock<LogCapture> = std::sync::OnceLock::new();
+    CAPTURE.get_or_init(|| {
+        let capture = LogCapture::default();
+        if tracing::subscriber::set_global_default(capture.clone()).is_err() {
+            panic!("another global subscriber is installed in this test binary");
+        }
+        capture
+    })
+}
+
+/// The result of the flow's next run for `purpose` (the previous run, if any, had the other
+/// purpose).
+fn wait_flow_result(
+    vcx: &mut VisualTestContext,
+    flow: &Entity<super::connect_flow::ConnectFlow>,
+    purpose: Purpose,
+) -> FlowResult {
+    let mut out = None;
+    wait_until(vcx, |vcx| {
+        out = flow.read_with(vcx, |f, _| {
+            f.last_result()
+                .filter(|r| r.purpose == purpose)
+                .map(|r| r.result.clone())
+        });
+        out.is_some()
+    });
+    out.unwrap_or_else(|| panic!("no result"))
+}
+
+#[gpui::test]
+fn hub_flows_leave_no_secret_in_files_or_logs(cx: &mut TestAppContext) {
+    const DB_PASSWORD: &str = "L6-db-Pa55-7f3a91c2";
+    const DB_PASSWORD_EDITED: &str = "L6-db-Pa55-edited-5b8e";
+    const DB_PASSWORD_COPY: &str = "L6-db-Pa55-copy-0d4c";
+    const L6_MASTER: &str = "L6-master-Pa55-e2a7b9";
+    let secrets = [DB_PASSWORD, DB_PASSWORD_EDITED, DB_PASSWORD_COPY, L6_MASTER];
+
+    let capture = log_capture();
+    let tmp = tempfile::tempdir().unwrap_or_else(|e| panic!("{e}"));
+    let (hub, core) = core_hub(cx, tmp.path());
+    let (ws, mut vcx) = open_live(cx);
+    let flow = ws.read_with(&vcx, |ws, _| ws.flow().clone());
+
+    // Vault create, through the prompt (the default key derivation parameters).
+    let prompt = vcx.update(|window, cx| {
+        super::vault::open_vault_prompt(hub.clone(), super::vault::VaultMode::Create, window, cx)
+    });
+    let (master, confirm) = prompt.read_with(&vcx, |p, _| p.inputs());
+    set(Some(&master), L6_MASTER, &mut vcx);
+    set(Some(&confirm), L6_MASTER, &mut vcx);
+    vcx.update(|window, cx| prompt.update(cx, |p, cx| p.submit(window, cx)));
+    wait_until(&mut vcx, |_| {
+        matches!(
+            wait_reply(core.vault_status()),
+            Ok(ninesql_core::secrets::VaultStatus::Unlocked)
+        )
+    });
+
+    // Create through `hub.save`.
+    let created = mock_connection(
+        "Ledger",
+        ConnectionTypeId::dev(),
+        Auth::Password {
+            username: "app".into(),
+            secret: SecretSource::Prompt,
+        },
+    );
+    let task = hub.update(&mut vcx, |h, cx| {
+        h.save(
+            super::form::BuiltConnection {
+                connection: created,
+                to_store: vec![(ninesql_core::SecretSlot::Auth, secret(DB_PASSWORD))],
+                to_delete: Vec::new(),
+            },
+            cx,
+        )
+    });
+    let id = await_task(&mut vcx, task).unwrap_or_else(|e| panic!("{e}"));
+
+    // Edit through the dialog's form: renamed, new password.
+    let saved = hub
+        .read_with(&vcx, |h, _| h.connection(id).cloned())
+        .unwrap_or_else(|| panic!("saved"));
+    let mut form = super::form::ConnectionForm::from_connection(&saved);
+    form.name = "Ledger (edited)".into();
+    let built = hub.read_with(&vcx, |h, _| {
+        let offer = h.offer("mock").unwrap_or_else(|| panic!("mock offered"));
+        form.build(
+            offer,
+            vec![(ninesql_core::SecretSlot::Auth, secret(DB_PASSWORD_EDITED))],
+            h.types(),
+            h.store_for_new_secrets(),
+        )
+    });
+    let built = built.unwrap_or_else(|e| panic!("{}", e.message));
+    let task = hub.update(&mut vcx, |h, cx| h.save(built, cx));
+    assert_eq!(await_task(&mut vcx, task), Ok(id));
+
+    // Duplicate: a copy with its own password.
+    let edited = hub
+        .read_with(&vcx, |h, _| h.connection(id).cloned())
+        .unwrap_or_else(|| panic!("edited"));
+    let mut form = super::form::ConnectionForm::duplicate_of(&edited);
+    // Saved credentials are not copied: the user types the copy's password and saves it.
+    form.auth_secret.mode = SecretMode::Save;
+    let built = hub.read_with(&vcx, |h, _| {
+        let offer = h.offer("mock").unwrap_or_else(|| panic!("mock offered"));
+        form.build(
+            offer,
+            vec![(ninesql_core::SecretSlot::Auth, secret(DB_PASSWORD_COPY))],
+            h.types(),
+            h.store_for_new_secrets(),
+        )
+    });
+    let built = built.unwrap_or_else(|e| panic!("{}", e.message));
+    let task = hub.update(&mut vcx, |h, cx| h.save(built, cx));
+    let copy = await_task(&mut vcx, task).unwrap_or_else(|e| panic!("{e}"));
+    assert_ne!(copy, id);
+    assert_eq!(hub.read_with(&vcx, |h, _| h.connections().len()), 2);
+
+    // Test connection, with the saved (edited) password.
+    assert!(flow.read_with(&vcx, |f, _| f.last_result().is_none()));
+    ws.update_in(&mut vcx, |ws, window, cx| {
+        ws.connect(id, Purpose::Test, window, cx)
+    });
+    let result = wait_flow_result(&mut vcx, &flow, Purpose::Test);
+    assert!(matches!(result, FlowResult::TestOk { .. }), "{result:?}");
+
+    // Lock, then open: the vault unlock prompt, then the session.
+    wait_reply(core.lock_now());
+    wait_until(&mut vcx, |vcx| {
+        hub.read_with(vcx, |h, _| h.secrets_locked().is_some())
+    });
+    ws.update_in(&mut vcx, |ws, window, cx| {
+        ws.connect(copy, Purpose::Open, window, cx)
+    });
+    wait_until(&mut vcx, |vcx| {
+        flow.read_with(vcx, |f, _| f.vault_prompt().is_some())
+    });
+    let prompt = flow
+        .read_with(&vcx, |f, _| f.vault_prompt())
+        .unwrap_or_else(|| panic!("vault prompt"));
+    let (master, _) = prompt.read_with(&vcx, |p, _| p.inputs());
+    set(Some(&master), L6_MASTER, &mut vcx);
+    vcx.update(|window, cx| prompt.update(cx, |p, cx| p.submit(window, cx)));
+    let result = wait_flow_result(&mut vcx, &flow, Purpose::Open);
+    assert!(matches!(result, FlowResult::Opened { .. }), "{result:?}");
+    hub.update(&mut vcx, |h, cx| h.disconnect(copy, cx));
+    wait_reply(core.lock_now());
+    wait_until(&mut vcx, |vcx| hub.read_with(vcx, |h, _| !h.is_open(copy)));
+    wait_until(&mut vcx, |vcx| {
+        hub.read_with(vcx, |h, _| h.secrets_locked().is_some())
+    });
+
+    // No file under the workspace, config, data, state, cache or home directories holds a
+    // secret (the vault file is encrypted).
+    let files = walk(tmp.path());
+    assert!(
+        files.iter().any(|f| f.ends_with("vault.bin")),
+        "the vault was written: {files:?}"
+    );
+    assert!(
+        files.iter().any(|f| f.ends_with("connections.json")),
+        "connections were written: {files:?}"
+    );
+    for file in &files {
+        let bytes = std::fs::read(file).unwrap_or_default();
+        let text = String::from_utf8_lossy(&bytes);
+        for s in secrets {
+            assert!(!text.contains(s), "{} holds a secret", file.display());
+        }
+    }
+    // Nor any log event, at any level, on any thread. The capture saw the flow.
+    let logs = capture.text();
+    assert!(logs.contains("vault created"), "the capture is live");
+    assert!(logs.contains("session opened"), "the capture is live");
+    for s in secrets {
+        assert!(!logs.contains(s), "a log event holds a secret");
+    }
+}

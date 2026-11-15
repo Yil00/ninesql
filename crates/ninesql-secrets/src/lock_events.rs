@@ -182,7 +182,7 @@ mod tests {
             Vault::open_at(dir.path().join("vault.bin"), &dir.path().join("vault.lock")).unwrap(),
         );
         vault
-            .create(&s("master-pw"), KdfParams::insecure_for_tests())
+            .create(&s("master-pw-0123"), KdfParams::insecure_for_tests())
             .unwrap();
         assert!(vault.is_unlocked());
         let cache = Arc::new(SessionSecretCache::new());
@@ -204,7 +204,7 @@ mod tests {
 
         // Idempotent, and the vault opens again with its password.
         hooks.lock_all(LockTrigger::SessionLock);
-        vault.unlock(&s("master-pw")).unwrap();
+        vault.unlock(&s("master-pw-0123")).unwrap();
         assert!(vault.is_unlocked());
         hooks.lock_now(LockTrigger::Requested);
         assert!(!vault.is_unlocked());

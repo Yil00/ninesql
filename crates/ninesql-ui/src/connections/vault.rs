@@ -14,10 +14,17 @@ use gpui_kit::component::{ActiveTheme as _, Disableable as _, WindowExt as _, h_
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 use ninesql_core::CoreError;
-use ninesql_core::secrets::{ExposeSecret as _, VaultError};
+use ninesql_core::secrets::{ExposeSecret as _, MIN_MASTER_PASSWORD_CHARS, VaultError};
 
 use super::hub::ConnectionHub;
 use super::secret_input::{self, masked_input, read_secret, secret_field};
+
+/// The rule shown when a vault is created (P1-E review, L4). Unlocking an existing vault has no
+/// rule: it opens with whatever master password it was created with.
+#[must_use]
+pub fn master_password_rule() -> String {
+    format!("The master password must be at least {MIN_MASTER_PASSWORD_CHARS} characters long.")
+}
 
 /// What the prompt does.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -130,6 +137,14 @@ impl VaultPrompt {
             cx.notify();
             return;
         }
+        if self.mode == VaultMode::Create
+            && master.expose_secret().chars().count() < MIN_MASTER_PASSWORD_CHARS
+        {
+            // Checked again by the vault; refused here before the key derivation.
+            self.error = Some(master_password_rule());
+            cx.notify();
+            return;
+        }
         drop(confirm);
         let Some(core) = self.hub.read(cx).core().cloned() else {
             self.error = Some("The vault is not available in this session.".to_owned());
@@ -224,6 +239,9 @@ pub fn vault_error_text(e: &CoreError) -> String {
         CoreError::Vault(VaultError::EmptyPassword) => {
             "The master password must not be empty.".to_owned()
         }
+        CoreError::Vault(VaultError::PasswordTooShort { min }) => {
+            format!("The master password must be at least {min} characters long.")
+        }
         CoreError::NoVault(detail) => format!("The vault cannot be used: {detail}."),
         other => other.to_string(),
     }
@@ -248,7 +266,16 @@ impl Render for VaultPrompt {
                 "The vault is locked. Type its master password to use the passwords saved in it."
             })
             .child(secret_field(&self.master))
-            .when(create, |el| el.child(secret_field(&self.confirm)))
+            .when(create, |el| {
+                el.child(
+                    div()
+                        .id("vault-rule")
+                        .text_xs()
+                        .text_color(muted)
+                        .child(master_password_rule()),
+                )
+                .child(secret_field(&self.confirm))
+            })
             .when_some(self.error.clone(), |el, e| {
                 el.child(div().id("vault-error").text_color(danger).child(e))
             })
