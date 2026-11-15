@@ -4546,6 +4546,7 @@ dependencies = [
  "async-trait",
  "ninesql-dbeaver",
  "ninesql-driver-api",
+ "ninesql-driver-pgwire",
  "ninesql-secrets",
  "ninesql-ssh",
  "ninesql-storage",

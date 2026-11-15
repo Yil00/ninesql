@@ -19,7 +19,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use ninesql_core::driver_api::Secret;
-use ninesql_core::driver_api::mock::MockDriver;
+
 use ninesql_core::{
     Auth, ConnectionTypeId, ConnectionTypes, Connections, CoreError, ExecEvent, ExecuteRequest,
     HostKeyPolicy, OpenOutcome, OpenRequest, SecretSlot, SecretSource, SshAuth, SshHop, SshTunnel,
@@ -108,7 +108,7 @@ fn no_secret_in_workspace_files_or_logs_after_connect_flows() {
     };
     let paths = Paths::new(&xdg);
     let ws = Workspace::open(paths.clone(), ProjectName::default_project()).unwrap();
-    let wrap = Wrap::new(MockDriver::new().with_password(Secret::new(DB_PASSWORD.into())));
+    let wrap = Wrap::new(mock_driver().with_password(Secret::new(DB_PASSWORD.into())));
     // `known_hosts` under the NineSQL data directory, so the scan covers it.
     let (manager, keyring) = manager(Arc::new(wrap), paths.data_dir());
     let mut stores = SecretStores::new();

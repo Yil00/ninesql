@@ -13,7 +13,13 @@ publish.workspace = true
 workspace = true
 
 [features]
-default = []
+default = ["desktop-lock"]
+# Starts `DesktopLockWatcher` in `CoreServices`: the vault and the "ask every time" cache are
+# locked on sleep and screen lock (logind, zbus 6 only). On by default.
+desktop-lock = ["ninesql-secrets/desktop-lock"]
+# Uses the Secret Service (keyring) as the first secret backend when one answers. Off by default
+# until the desktop round trip and the stable secret-service 6.x (ADR-0012).
+secret-service = ["ninesql-secrets/secret-service", "desktop-lock"]
 # Registers nothing by itself: exposes `ninesql_driver_api::mock` (the in-memory mock driver) to
 # UI and core tests. Never enabled in release builds.
 mock = ["ninesql-driver-api/mock"]
@@ -37,6 +43,8 @@ tokio = { workspace = true, features = ["rt", "rt-multi-thread", "sync", "time",
 
 [dev-dependencies]
 ninesql-driver-api = { workspace = true, features = ["mock"] }
+# Core + pgwire integration test (tests/pgwire_tunnel.rs): a real driver behind the connect flow.
+ninesql-driver-pgwire = { path = "../drivers/ninesql-driver-pgwire" }
 async-trait.workspace = true
 ninesql-secrets = { workspace = true, features = ["memory-store"] }
 proptest.workspace = true

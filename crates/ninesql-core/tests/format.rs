@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 
 use ninesql_core::{
     Auth, ConnectionTypeId, ConnectionTypes, ConnectionTypesFile, ConnectionsFile, Endpoint,
-    HostKeyPolicy, Origin, SecretSource, SecurityWarning, SshAuth, TlsMode,
+    HostKeyPolicy, Origin, PasswordExchange, SecretSource, SecurityWarning, SshAuth, TlsMode,
 };
 use ninesql_secrets::{SecretKind, StoreKind};
 use ninesql_storage::document;
@@ -87,10 +87,11 @@ fn connections_v1_fixture_loads_with_every_field() {
 
 #[test]
 fn connections_v1_round_trip_is_stable() {
-    // Version 1 → 2 changes nothing but the version: a hop without `host_key_policy` is strict.
+    // Version 1 → 3 changes nothing but the version: a hop without `host_key_policy` is strict,
+    // a connection without `password_exchange` is `any`.
     let path = fixture("connections/v1.json");
     let mut original: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
-    original["schema_version"] = Value::from(2);
+    original["schema_version"] = Value::from(3);
     let file = decode_connections("connections/v1.json");
     let encoded: Value = serde_json::from_slice(&document::encode(&file).unwrap()).unwrap();
     assert_eq!(encoded, original);
@@ -104,7 +105,9 @@ fn connections_v1_round_trip_is_stable() {
 #[test]
 fn connections_v2_fixture_keeps_per_hop_host_key_policies() {
     let path = fixture("connections/v2.json");
-    let original: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    let mut original: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    // Version 2 → 3 changes nothing but the version.
+    original["schema_version"] = Value::from(3);
     let file = decode_connections("connections/v2.json");
     let c = &file.connections[0];
     c.validate().unwrap();
@@ -127,6 +130,64 @@ fn connections_v2_fixture_keeps_per_hop_host_key_policies() {
     );
     let encoded: Value = serde_json::from_slice(&document::encode(&file).unwrap()).unwrap();
     assert_eq!(encoded, original, "strict is not written, downgrades are");
+}
+
+#[test]
+fn connections_v3_fixture_keeps_the_password_exchange_policy() {
+    let path = fixture("connections/v3.json");
+    let original: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    let file = decode_connections("connections/v3.json");
+    let (scram, any) = (&file.connections[0], &file.connections[1]);
+    scram.validate().unwrap();
+    assert_eq!(scram.password_exchange, PasswordExchange::ScramOnly);
+    assert_eq!(any.password_exchange, PasswordExchange::Any);
+    // SCRAM below verify-ca is flagged (no channel binding), verify-full is not.
+    assert!(scram.scram_without_verified_tls());
+    assert!(!any.scram_without_verified_tls());
+    let encoded: Value = serde_json::from_slice(&document::encode(&file).unwrap()).unwrap();
+    assert_eq!(encoded, original, "`any` is not written, `scram-only` is");
+}
+
+#[test]
+fn a_password_exchange_in_a_v2_file_is_ignored() {
+    // Only a NineSQL that knows (and validates) the field writes it.
+    let json = br#"{ "schema_version": 2, "connections": [ {
+        "id": "0b0c6c0e-6f0a-4d4e-9c47-1f1e0f3a9a99", "name": "n", "engine": "postgresql",
+        "endpoint": { "kind": "tcp", "host": "h" }, "auth": { "method": "none" },
+        "connection_type": "dev", "password_exchange": "scram-only"
+    } ] }"#;
+    let loaded = document::decode::<ConnectionsFile>(Path::new("mem"), json).unwrap();
+    assert_eq!(loaded.migrated_from, Some(2));
+    assert_eq!(
+        loaded.document.connections[0].password_exchange,
+        PasswordExchange::Any
+    );
+}
+
+#[test]
+fn a_newer_connections_file_is_refused_and_left_untouched() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("connections.json");
+    let bytes = br#"{ "schema_version": 4, "connections": [] }"#;
+    std::fs::write(&path, bytes).unwrap();
+    assert!(document::load::<ConnectionsFile>(&path).is_err());
+    assert_eq!(std::fs::read(&path).unwrap(), bytes);
+}
+
+#[test]
+fn a_v2_file_on_disk_is_migrated_with_a_backup() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("connections.json");
+    let v2 = std::fs::read(fixture("connections/v2.json")).unwrap();
+    std::fs::write(&path, &v2).unwrap();
+    let loaded = document::load::<ConnectionsFile>(&path).unwrap().unwrap();
+    assert_eq!(loaded.migrated_from, Some(2));
+    let backup: Value =
+        serde_json::from_slice(&std::fs::read(dir.path().join("connections.json.bak")).unwrap())
+            .unwrap();
+    assert_eq!(backup["schema_version"], 2);
+    let migrated: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    assert_eq!(migrated["schema_version"], 3);
 }
 
 #[test]

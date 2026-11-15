@@ -141,6 +141,73 @@ pub fn start(password: &str) -> Option<Sshd> {
     Some(sshd)
 }
 
+/// Starts a server on the **host network**, listening on `127.0.0.1` only, on a free port, where
+/// [`USER`] logs in with `password`. From inside it, `localhost` is the host's loopback, so a
+/// tunnel can reach the `dev/` engines on their published ports with the host names their test
+/// certificates carry (`localhost`), and `verify-full` works through the tunnel.
+pub fn start_host_network(password: &str) -> Option<Sshd> {
+    if docker(&["info", "--format", "{{.ServerVersion}}"]).is_err() {
+        assert!(
+            !required(),
+            "Docker is required (NINESQL_REQUIRE_ENGINES) but unavailable"
+        );
+        eprintln!("skipped: Docker is not available");
+        return None;
+    }
+    let port = std::net::TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port();
+    let name = format!("ninesql-core-ssh-host-it-{}", uuid::Uuid::new_v4().simple());
+    docker(&[
+        "run",
+        "-d",
+        "--name",
+        &name,
+        "--network",
+        "host",
+        "-e",
+        "PUID=1000",
+        "-e",
+        "PGID=1000",
+        "-e",
+        &format!("USER_NAME={USER}"),
+        "-e",
+        "PASSWORD_ACCESS=true",
+        "-e",
+        &format!("USER_PASSWORD={password}"),
+        SSH_IMAGE,
+    ])
+    .unwrap_or_else(|e| panic!("docker run: {e}"));
+    let sshd = Sshd { name, port };
+    wait_log(&sshd.name, "[ls.io-init] done.");
+    // Forwarding on, and only the loopback of the host on a port of our own.
+    docker(&[
+        "exec",
+        &sshd.name,
+        "sh",
+        "-c",
+        &format!(
+            "sed -i -e 's/^AllowTcpForwarding no/AllowTcpForwarding yes/' \
+               -e 's/^Port 2222$/Port {port}\\nListenAddress 127.0.0.1/' /config/sshd/sshd_config \
+             && grep -q '^AllowTcpForwarding yes' /config/sshd/sshd_config \
+             && grep -q '^Port {port}$' /config/sshd/sshd_config \
+             && s6-svc -r /run/service/svc-openssh-server"
+        ),
+    ])
+    .unwrap();
+    let start = Instant::now();
+    while banner(&ApiEndpoint::tcp("127.0.0.1", port)).is_none_or(|b| !b.starts_with("SSH-")) {
+        assert!(
+            start.elapsed() < Duration::from_secs(60),
+            "sshd never answered"
+        );
+        std::thread::sleep(Duration::from_millis(300));
+    }
+    Some(sshd)
+}
+
 /// A dev mock connection through the server, with a prompted SSH password. The database "as
 /// seen from the SSH server" is the server's own sshd, so a test can check forwarding by reading
 /// its banner through the tunnel.

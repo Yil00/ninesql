@@ -1,0 +1,670 @@
+//! Startup assembly of the core (ROADMAP: wave 2 integration review L5, P1-C prerequisites).
+//!
+//! [`CoreServices::start`] does, off the UI thread (I6), everything the application needs before
+//! its first connection:
+//! 1. opens the project's [`Workspace`] (directories, workspace lock, `project.json`);
+//! 2. selects the secret backend, **keyring → vault → ask every time**, never plaintext
+//!    (ADR-0005, I1): the Secret Service when one answers (feature `secret-service`), the
+//!    encrypted [`Vault`] always registered (opened locked) so references saved in it keep
+//!    resolving, and the "ask every time" [`SessionSecretCache`];
+//! 3. registers the vault and the cache in one [`LockHooks`], with a hook that reports
+//!    [`CoreEvent::SecretsLocked`];
+//! 4. starts the [`SessionManager`] (driver runtime) with the drivers the application
+//!    registered in its [`DriverRegistry`];
+//! 5. starts `DesktopLockWatcher` (feature `desktop-lock`, on by default): sleep and screen lock
+//!    lock the vault and clear the cache;
+//! 6. runs the idle timer on the driver runtime: [`Vault::lock_if_idle`] and
+//!    [`SessionSecretCache::purge_expired`] every [`CoreConfig::lock_check_interval`].
+//!
+//! The UI holds the returned [`CoreServices`] (cheap to clone) and calls:
+//! - [`CoreServices::sessions`] / [`CoreServices::take_events`] to open sessions and read events;
+//! - [`CoreServices::validate_connection`] and the `*_checked` save methods of [`Workspace`];
+//! - [`CoreServices::unlock_vault`] / [`CoreServices::create_vault`] when an open answers
+//!   [`OpenOutcome::NeedsVaultUnlock`](crate::OpenOutcome::NeedsVaultUnlock), then opens again;
+//! - [`CoreServices::lock_now`] for a "lock secrets" action;
+//! - [`CoreServices::lock_watcher_status`] to say whether sleep / screen lock are watched.
+//!
+//! Every call that may block (store access, Argon2id, file I/O) runs on the runtime's blocking
+//! pool and answers through a [`Reply`]; nothing here blocks the caller, except
+//! [`CoreServices::start_blocking`] and [`CoreServices::shutdown`], meant for a background
+//! thread and for exit.
+
+use std::fmt;
+use std::sync::{Arc, Mutex, PoisonError};
+use std::time::Duration;
+
+use ninesql_secrets::{
+    KdfParams, LockHook, LockHooks, LockTrigger, SecretServiceAvailability, SecretStores,
+    SecretString, SessionSecretCache, StoreKind, Vault, VaultStatus, VaultStore,
+};
+use ninesql_storage::{Paths, ProjectName};
+use tokio::task::JoinHandle;
+
+use crate::connection::Connection;
+use crate::error::{CoreError, WorkspaceError};
+use crate::registry::DriverRegistry;
+use crate::session::{
+    CoreEvent, CoreEvents, EventSink, ManagerConfig, Reply, SecretsLockReason, SessionManager,
+};
+use crate::workspace::Workspace;
+
+/// Default idle time after which the vault locks itself.
+pub const DEFAULT_VAULT_IDLE_TIMEOUT: Duration = Duration::from_secs(15 * 60);
+
+/// Default period of the idle timer (vault idle lock, expiry of cached prompts).
+pub const DEFAULT_LOCK_CHECK_INTERVAL: Duration = Duration::from_secs(30);
+
+/// Where newly saved secrets go (ADR-0005 §1–§3). There is no plaintext option (I1).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum SecretBackend {
+    /// The desktop keyring (Secret Service).
+    Keyring,
+    /// The encrypted vault (created with a master password on first use).
+    Vault,
+    /// Neither: passwords cannot be saved; the dialog offers "ask every time" only.
+    AskEveryTime,
+}
+
+impl SecretBackend {
+    /// The store new secrets are saved to; `None` for [`SecretBackend::AskEveryTime`].
+    #[must_use]
+    pub const fn store(self) -> Option<StoreKind> {
+        match self {
+            Self::Keyring => Some(StoreKind::Keyring),
+            Self::Vault => Some(StoreKind::Vault),
+            Self::AskEveryTime => None,
+        }
+    }
+}
+
+/// Settings of [`CoreServices::start`].
+#[derive(Debug, Clone)]
+#[non_exhaustive]
+pub struct CoreConfig {
+    /// NineSQL directories.
+    pub paths: Paths,
+    /// Project to open.
+    pub project: ProjectName,
+    /// The drivers the application ships (registered by the application, docs/02).
+    pub registry: DriverRegistry,
+    /// Session manager settings. Default: [`ManagerConfig::new`] for `paths`.
+    pub manager: ManagerConfig,
+    /// Probe the Secret Service and use it for new secrets when it answers (only with the
+    /// `secret-service` feature). Default `true`.
+    pub use_secret_service: bool,
+    /// Start the logind watcher (only with the `desktop-lock` feature). Default `true`.
+    pub watch_desktop_lock: bool,
+    /// Idle time after which the vault locks itself; `None`: never. Default
+    /// [`DEFAULT_VAULT_IDLE_TIMEOUT`].
+    pub vault_idle_timeout: Option<Duration>,
+    /// Period of the idle timer. Default [`DEFAULT_LOCK_CHECK_INTERVAL`]; at least 100 ms.
+    pub lock_check_interval: Duration,
+}
+
+impl CoreConfig {
+    /// Defaults for `project` under `paths`, with the drivers of `registry`.
+    #[must_use]
+    pub fn new(paths: Paths, project: ProjectName, registry: DriverRegistry) -> Self {
+        Self {
+            manager: ManagerConfig::new(&paths),
+            paths,
+            project,
+            registry,
+            use_secret_service: true,
+            watch_desktop_lock: true,
+            vault_idle_timeout: Some(DEFAULT_VAULT_IDLE_TIMEOUT),
+            lock_check_interval: DEFAULT_LOCK_CHECK_INTERVAL,
+        }
+    }
+}
+
+/// Why the core could not start.
+#[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
+pub enum StartupError {
+    /// The workspace could not be opened (another NineSQL holds it, permissions, I/O).
+    #[error(transparent)]
+    Workspace(#[from] WorkspaceError),
+    /// The driver runtime could not start.
+    #[error(transparent)]
+    Core(#[from] CoreError),
+}
+
+/// State of the sleep / screen-lock watcher, for the UI (a status line, the settings page).
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct LockWatcherStatus {
+    /// This build has the watcher (feature `desktop-lock`).
+    pub built: bool,
+    /// The watcher listens now. `false` when it was not started, could not start (`error`) or
+    /// lost the system bus (it then locked once).
+    pub is_running: bool,
+    /// A logind sleep delay inhibitor is held: the suspend waits until the secrets are locked.
+    pub holds_sleep_delay: bool,
+    /// The screen lock of the current session is watched (not only sleep).
+    pub watches_session_lock: bool,
+    /// Why it is not running, without any secret.
+    pub error: Option<String>,
+}
+
+/// The vault open in this session, or why there is none.
+enum VaultSlot {
+    Open(Arc<Vault>),
+    Unavailable(String),
+}
+
+struct Inner {
+    workspace: Workspace,
+    manager: SessionManager,
+    stores: SecretStores,
+    backend: SecretBackend,
+    keyring: SecretServiceAvailability,
+    vault: VaultSlot,
+    cache: Arc<SessionSecretCache>,
+    hooks: Arc<LockHooks>,
+    #[cfg(feature = "desktop-lock")]
+    watcher: Mutex<Option<ninesql_secrets::DesktopLockWatcher>>,
+    watcher_error: Option<String>,
+    timer: Mutex<Option<JoinHandle<()>>>,
+}
+
+impl Drop for Inner {
+    fn drop(&mut self) {
+        if let Some(t) = self
+            .timer
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take()
+        {
+            t.abort();
+        }
+        // Secrets leave memory with the services, whatever else still holds the vault.
+        self.hooks.lock_all(LockTrigger::Requested);
+    }
+}
+
+/// The started core: workspace, secret stores, session manager, lock wiring. Cheap to clone;
+/// the last clone dropped stops the timer and the watcher and locks the secrets (call
+/// [`CoreServices::shutdown`] at exit to also close the sessions cleanly).
+#[derive(Clone)]
+pub struct CoreServices {
+    inner: Arc<Inner>,
+}
+
+impl fmt::Debug for CoreServices {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("CoreServices")
+            .field("project", self.inner.workspace.project())
+            .field("backend", &self.inner.backend)
+            .field("stores", &self.inner.stores)
+            .field("vault", &matches!(self.inner.vault, VaultSlot::Open(_)))
+            .finish_non_exhaustive()
+    }
+}
+
+/// Reports locks triggered through [`LockHooks`] (watcher, [`CoreServices::lock_now`]).
+struct EventHook(EventSink);
+
+impl LockHook for EventHook {
+    fn lock_now(&self, trigger: LockTrigger) {
+        let reason = match trigger {
+            LockTrigger::Sleep => SecretsLockReason::Sleep,
+            LockTrigger::SessionLock => SecretsLockReason::SessionLock,
+            _ => SecretsLockReason::Requested,
+        };
+        self.0.emit(CoreEvent::SecretsLocked { reason });
+    }
+}
+
+impl CoreServices {
+    /// Starts the core on a background thread: never blocks the caller (I6). Await the
+    /// [`Reply`] on any executor or poll it with [`Reply::try_take`]. Startup takes up to a few
+    /// seconds when a Secret Service or the system bus is slow to answer (each bounded to 5 s).
+    #[must_use]
+    pub fn start(config: CoreConfig) -> Reply<Result<Self, StartupError>> {
+        let (tx, reply) = Reply::channel();
+        let spawned = std::thread::Builder::new()
+            .name("ninesql-core-startup".into())
+            .spawn(move || {
+                let _ = tx.send(Self::start_blocking(config));
+            });
+        match spawned {
+            Ok(_) => reply,
+            Err(e) => Reply::ready(Err(StartupError::Core(CoreError::Runtime(format!(
+                "cannot start the startup thread: {e}"
+            ))))),
+        }
+    }
+
+    /// [`Self::start`] on the calling thread. **Blocking** (file I/O, D-Bus probes of at most
+    /// 5 s each): call it from a background thread or `main` setup, never from the UI thread.
+    ///
+    /// # Errors
+    /// [`StartupError::Workspace`] when the workspace cannot be opened,
+    /// [`StartupError::Core`] when the driver runtime cannot start. A missing keyring, a vault
+    /// that cannot be opened or a watcher that cannot start are not errors: they are reported
+    /// by [`Self::secret_backend`], [`Self::vault_error`] and [`Self::lock_watcher_status`].
+    pub fn start_blocking(config: CoreConfig) -> Result<Self, StartupError> {
+        let CoreConfig {
+            paths,
+            project,
+            registry,
+            manager: manager_config,
+            use_secret_service,
+            watch_desktop_lock,
+            vault_idle_timeout,
+            lock_check_interval,
+        } = config;
+        let workspace = Workspace::open(paths.clone(), project)?;
+        let project_id = workspace.project_id().to_string();
+        let mut stores = SecretStores::new();
+
+        // 1. Keyring, when a Secret Service answers.
+        let keyring = if use_secret_service {
+            ninesql_secrets::detect_secret_service()
+        } else {
+            SecretServiceAvailability::Unavailable {
+                detail: "not probed (disabled by configuration)".into(),
+            }
+        };
+        register_keyring(&mut stores, &keyring, &project_id);
+
+        // 2. The vault, always registered when it can be opened (starts locked).
+        let vault = match Vault::open(&paths) {
+            Ok(v) => {
+                let v = Arc::new(v);
+                v.set_idle_timeout(vault_idle_timeout);
+                match VaultStore::new(Arc::clone(&v), &project_id) {
+                    Ok(store) => {
+                        stores.register(Arc::new(store));
+                        VaultSlot::Open(v)
+                    }
+                    Err(e) => VaultSlot::Unavailable(e.to_string()),
+                }
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "the vault cannot be opened; it is not available in this session");
+                VaultSlot::Unavailable(e.to_string())
+            }
+        };
+        let backend = match stores.store_for_new_secrets() {
+            Some(StoreKind::Keyring) => SecretBackend::Keyring,
+            Some(StoreKind::Vault) => SecretBackend::Vault,
+            _ => SecretBackend::AskEveryTime,
+        };
+        tracing::info!(backend = ?backend, "secret backend selected");
+
+        // 3. The session manager.
+        let manager = SessionManager::new(manager_config, registry, stores.clone())?;
+
+        // 4. Lock hooks: the vault, the "ask every time" cache, and the UI event.
+        let cache = Arc::new(SessionSecretCache::new());
+        let hooks = Arc::new(LockHooks::new());
+        if let VaultSlot::Open(v) = &vault {
+            hooks.add(Arc::clone(v) as Arc<dyn LockHook>);
+        }
+        hooks.add(Arc::clone(&cache) as Arc<dyn LockHook>);
+        hooks.add(Arc::new(EventHook(manager.event_sink())));
+
+        // 5. Sleep and screen lock.
+        #[cfg(feature = "desktop-lock")]
+        let (watcher, watcher_error) = if watch_desktop_lock {
+            match ninesql_secrets::DesktopLockWatcher::start(Arc::clone(&hooks) as Arc<dyn LockHook>)
+            {
+                Ok(w) => {
+                    tracing::info!(
+                        session_lock = w.watches_session_lock(),
+                        sleep_delay = w.holds_sleep_delay(),
+                        "watching sleep and screen lock"
+                    );
+                    (Some(w), None)
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, "sleep and screen lock are not watched; idle timers only");
+                    (None, Some(e.to_string()))
+                }
+            }
+        } else {
+            (
+                None,
+                Some("not started (disabled by configuration)".to_owned()),
+            )
+        };
+        #[cfg(not(feature = "desktop-lock"))]
+        let watcher_error = {
+            let _ = watch_desktop_lock;
+            Some(
+                "this build does not watch sleep and screen lock (feature `desktop-lock` off)"
+                    .to_owned(),
+            )
+        };
+
+        // 6. The idle timer, on the driver runtime.
+        let timer = spawn_idle_timer(
+            &manager,
+            match &vault {
+                VaultSlot::Open(v) => Some(Arc::clone(v)),
+                VaultSlot::Unavailable(_) => None,
+            },
+            Arc::clone(&cache),
+            lock_check_interval,
+        );
+
+        Ok(Self {
+            inner: Arc::new(Inner {
+                workspace,
+                manager,
+                stores,
+                backend,
+                keyring,
+                vault,
+                cache,
+                hooks,
+                #[cfg(feature = "desktop-lock")]
+                watcher: Mutex::new(watcher),
+                watcher_error,
+                timer: Mutex::new(Some(timer)),
+            }),
+        })
+    }
+
+    /// The open project.
+    #[must_use]
+    pub fn workspace(&self) -> &Workspace {
+        &self.inner.workspace
+    }
+
+    /// The session manager (open, trust host keys, sessions).
+    #[must_use]
+    pub fn sessions(&self) -> &SessionManager {
+        &self.inner.manager
+    }
+
+    /// The session-level event channel ([`SessionManager::take_events`]): the first call takes
+    /// it. It also carries [`CoreEvent::SecretsLocked`].
+    #[must_use]
+    pub fn take_events(&self) -> Option<CoreEvents> {
+        self.inner.manager.take_events()
+    }
+
+    /// The registered drivers.
+    #[must_use]
+    pub fn registry(&self) -> &DriverRegistry {
+        self.inner.manager.registry()
+    }
+
+    /// [`DriverRegistry::validate_connection`]: the one validation entry point of the save
+    /// (P1-C) and import (P2-C) flows. Pure, never blocks.
+    ///
+    /// # Errors
+    /// [`CoreError::NoDriver`], [`CoreError::InvalidConnection`].
+    pub fn validate_connection(&self, connection: &Connection) -> Result<(), CoreError> {
+        self.registry().validate_connection(connection)
+    }
+
+    /// The secret stores (for [`Workspace::create_connection_checked`], run on a background
+    /// thread: store calls block).
+    #[must_use]
+    pub fn secret_stores(&self) -> &SecretStores {
+        &self.inner.stores
+    }
+
+    /// Where newly saved secrets go: keyring, else vault, else "ask every time" only.
+    #[must_use]
+    pub fn secret_backend(&self) -> SecretBackend {
+        self.inner.backend
+    }
+
+    /// What the Secret Service probe found at startup.
+    #[must_use]
+    pub fn keyring_availability(&self) -> &SecretServiceAvailability {
+        &self.inner.keyring
+    }
+
+    /// Why no vault is available in this session (`None` when it is).
+    #[must_use]
+    pub fn vault_error(&self) -> Option<&str> {
+        match &self.inner.vault {
+            VaultSlot::Open(_) => None,
+            VaultSlot::Unavailable(e) => Some(e),
+        }
+    }
+
+    /// The "ask every time" cache (in memory only, cleared on lock).
+    #[must_use]
+    pub fn secret_cache(&self) -> &Arc<SessionSecretCache> {
+        &self.inner.cache
+    }
+
+    /// Every lock hook of the session (the vault, the cache, the event hook).
+    #[must_use]
+    pub fn lock_hooks(&self) -> &Arc<LockHooks> {
+        &self.inner.hooks
+    }
+
+    fn vault(&self) -> Result<Arc<Vault>, CoreError> {
+        match &self.inner.vault {
+            VaultSlot::Open(v) => Ok(Arc::clone(v)),
+            VaultSlot::Unavailable(e) => Err(CoreError::NoVault(e.clone())),
+        }
+    }
+
+    /// Runs `f` with the vault on the runtime's blocking pool.
+    fn with_vault<T, F>(&self, f: F) -> Reply<Result<T, CoreError>>
+    where
+        T: Send + 'static,
+        F: FnOnce(&Vault) -> Result<T, CoreError> + Send + 'static,
+    {
+        let vault = match self.vault() {
+            Ok(v) => v,
+            Err(e) => return Reply::ready(Err(e)),
+        };
+        let (tx, reply) = Reply::channel();
+        let task = self
+            .inner
+            .manager
+            .runtime()
+            .handle()
+            .spawn_blocking(move || f(&vault));
+        self.inner.manager.runtime().spawn(async move {
+            let result = task
+                .await
+                .unwrap_or_else(|_| Err(CoreError::Runtime("the vault task failed".into())));
+            let _ = tx.send(result);
+        });
+        reply
+    }
+
+    /// State of the vault (not created, locked, unlocked).
+    pub fn vault_status(&self) -> Reply<Result<VaultStatus, CoreError>> {
+        self.with_vault(|v| Ok(v.status()?))
+    }
+
+    /// Unlocks the vault with its master password, on the blocking pool (Argon2id takes about a
+    /// second). The password is moved in and dropped (zeroized) as soon as the key is derived;
+    /// it is never logged or copied elsewhere (I1).
+    ///
+    /// # Errors
+    /// [`CoreError::Vault`] with [`VaultError::WrongPassword`](ninesql_secrets::VaultError::WrongPassword),
+    /// [`VaultError::TooManyAttempts`](ninesql_secrets::VaultError::TooManyAttempts),
+    /// [`VaultError::NotCreated`](ninesql_secrets::VaultError::NotCreated) (call
+    /// [`Self::create_vault`]) or a file error; [`CoreError::NoVault`].
+    pub fn unlock_vault(&self, master: SecretString) -> Reply<Result<(), CoreError>> {
+        self.with_vault(move |v| {
+            let result = v.unlock(&master);
+            drop(master);
+            Ok(result?)
+        })
+    }
+
+    /// Creates the vault (first use) with a master password and the default Argon2id
+    /// parameters, and leaves it unlocked. The password is zeroized when this ends.
+    ///
+    /// # Errors
+    /// [`CoreError::Vault`] with
+    /// [`VaultError::AlreadyExists`](ninesql_secrets::VaultError::AlreadyExists) or
+    /// [`VaultError::EmptyPassword`](ninesql_secrets::VaultError::EmptyPassword);
+    /// [`CoreError::NoVault`].
+    pub fn create_vault(&self, master: SecretString) -> Reply<Result<(), CoreError>> {
+        self.create_vault_with(master, KdfParams::DEFAULT)
+    }
+
+    /// [`Self::create_vault`] with explicit Argon2id parameters.
+    ///
+    /// # Errors
+    /// As [`Self::create_vault`].
+    pub fn create_vault_with(
+        &self,
+        master: SecretString,
+        params: KdfParams,
+    ) -> Reply<Result<(), CoreError>> {
+        self.with_vault(move |v| {
+            let result = v.create(&master, params);
+            drop(master);
+            Ok(result?)
+        })
+    }
+
+    /// Locks the vault and clears the "ask every time" cache now ("lock secrets" action), on
+    /// the blocking pool (the vault may be busy deriving a key). Emits
+    /// [`CoreEvent::SecretsLocked`] with [`SecretsLockReason::Requested`].
+    pub fn lock_now(&self) -> Reply<()> {
+        let hooks = Arc::clone(&self.inner.hooks);
+        let (tx, reply) = Reply::channel();
+        let task = self
+            .inner
+            .manager
+            .runtime()
+            .handle()
+            .spawn_blocking(move || hooks.lock_all(LockTrigger::Requested));
+        self.inner.manager.runtime().spawn(async move {
+            let _ = task.await;
+            let _ = tx.send(());
+        });
+        reply
+    }
+
+    /// Whether sleep and screen lock are watched. Never blocks.
+    #[must_use]
+    pub fn lock_watcher_status(&self) -> LockWatcherStatus {
+        #[cfg(feature = "desktop-lock")]
+        {
+            let watcher = self
+                .inner
+                .watcher
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            match watcher.as_ref() {
+                Some(w) => LockWatcherStatus {
+                    built: true,
+                    is_running: w.is_running(),
+                    holds_sleep_delay: w.holds_sleep_delay(),
+                    watches_session_lock: w.watches_session_lock(),
+                    error: (!w.is_running()).then(|| {
+                        "the system bus connection was lost; secrets were locked".to_owned()
+                    }),
+                },
+                None => LockWatcherStatus {
+                    built: true,
+                    is_running: false,
+                    holds_sleep_delay: false,
+                    watches_session_lock: false,
+                    error: self.inner.watcher_error.clone(),
+                },
+            }
+        }
+        #[cfg(not(feature = "desktop-lock"))]
+        {
+            LockWatcherStatus {
+                built: false,
+                is_running: false,
+                holds_sleep_delay: false,
+                watches_session_lock: false,
+                error: self.inner.watcher_error.clone(),
+            }
+        }
+    }
+
+    /// At exit: locks the secrets, stops the watcher and the timer, closes every session
+    /// (waiting at most `timeout`) and stops the runtime. **Blocking**: call it from the main
+    /// thread, never from an async context.
+    pub fn shutdown(self, timeout: Duration) {
+        self.inner.hooks.lock_all(LockTrigger::Requested);
+        #[cfg(feature = "desktop-lock")]
+        drop(
+            self.inner
+                .watcher
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .take(),
+        );
+        if let Some(t) = self
+            .inner
+            .timer
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take()
+        {
+            t.abort();
+        }
+        let manager = self.inner.manager.clone();
+        drop(self);
+        manager.shutdown(timeout);
+    }
+}
+
+#[cfg(feature = "secret-service")]
+fn register_keyring(stores: &mut SecretStores, keyring: &SecretServiceAvailability, project: &str) {
+    if keyring.is_available() {
+        match ninesql_secrets::SecretServiceStore::new(project) {
+            Ok(store) => stores.register(Arc::new(store)),
+            Err(e) => tracing::warn!(error = %e, "keyring store not registered"),
+        }
+    } else {
+        tracing::info!(availability = ?keyring, "no Secret Service: the keyring is not used");
+    }
+}
+
+#[cfg(not(feature = "secret-service"))]
+fn register_keyring(_: &mut SecretStores, keyring: &SecretServiceAvailability, _: &str) {
+    if keyring.is_available() {
+        // Another crate enabled the backend in `ninesql-secrets`, not this one: not used.
+        tracing::info!("a Secret Service answers, but this build of the core does not use it");
+    }
+}
+
+/// Every `interval`: locks the vault if idle and drops expired cached prompts, on the blocking
+/// pool (the vault mutex may be held by a key derivation). Emits [`CoreEvent::SecretsLocked`]
+/// with [`SecretsLockReason::Idle`] when the vault locked.
+fn spawn_idle_timer(
+    manager: &SessionManager,
+    vault: Option<Arc<Vault>>,
+    cache: Arc<SessionSecretCache>,
+    interval: Duration,
+) -> JoinHandle<()> {
+    let sink = manager.event_sink();
+    let interval = interval.max(Duration::from_millis(100));
+    manager.runtime().spawn(async move {
+        let mut ticks = tokio::time::interval(interval);
+        ticks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        ticks.tick().await;
+        loop {
+            ticks.tick().await;
+            let vault = vault.clone();
+            let cache = Arc::clone(&cache);
+            let locked = tokio::task::spawn_blocking(move || {
+                cache.purge_expired();
+                vault.is_some_and(|v| v.lock_if_idle())
+            })
+            .await
+            .unwrap_or(false);
+            if locked {
+                tracing::info!("vault locked after its idle timeout");
+                sink.emit(CoreEvent::SecretsLocked {
+                    reason: SecretsLockReason::Idle,
+                });
+            }
+        }
+    })
+}

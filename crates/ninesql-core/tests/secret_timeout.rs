@@ -8,7 +8,6 @@ mod support;
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
-use ninesql_core::driver_api::mock::MockDriver;
 use ninesql_core::{
     Auth, ConnectionTypeId, ConnectionTypes, CoreError, CoreEvent, HostKeyPolicy, Next,
     OpenRequest, SecretSlot, SecretSource, SshAuth, SshHop, SshTunnel,
@@ -133,7 +132,7 @@ fn stores_with(store: Arc<SlowStore>) -> SecretStores {
 #[test]
 fn an_unanswered_store_call_times_out_as_unavailable() {
     let tmp = tempfile::tempdir().unwrap();
-    let mock = MockDriver::new();
+    let mock = mock_driver();
     let stats = mock.stats();
     let store = SlowStore::new(Mode::Hang);
     let manager = manager_with_stores(
@@ -176,7 +175,7 @@ fn an_unanswered_store_call_times_out_as_unavailable() {
 #[test]
 fn a_panicking_store_is_unavailable_not_a_runtime_error() {
     let tmp = tempfile::tempdir().unwrap();
-    let mock = MockDriver::new();
+    let mock = mock_driver();
     let stats = mock.stats();
     let store = SlowStore::new(Mode::Panic);
     let manager = manager_with_stores(
@@ -214,7 +213,7 @@ fn a_panicking_store_is_unavailable_not_a_runtime_error() {
 #[test]
 fn a_dropped_reply_abandons_the_open_while_the_store_waits() {
     let tmp = tempfile::tempdir().unwrap();
-    let mock = MockDriver::new();
+    let mock = mock_driver();
     let stats = mock.stats();
     let store = SlowStore::new(Mode::Hang);
     let manager = manager_with_stores(
@@ -276,7 +275,7 @@ fn the_default_secret_timeout_is_sane() {
 #[test]
 fn opens_of_the_same_secret_join_the_read_in_flight() {
     let tmp = tempfile::tempdir().unwrap();
-    let mock = MockDriver::new();
+    let mock = mock_driver();
     let stats = mock.stats();
     let store = SlowStore::new(Mode::Hang);
     let manager = manager_with_stores(
@@ -331,7 +330,7 @@ fn opens_of_the_same_secret_join_the_read_in_flight() {
 #[test]
 fn joined_opens_get_the_value_once_the_store_answers() {
     let tmp = tempfile::tempdir().unwrap();
-    let mock = MockDriver::new();
+    let mock = mock_driver();
     let stats = mock.stats();
     let store = SlowStore::new(Mode::Hang);
     let manager = manager_with_stores(
@@ -367,7 +366,7 @@ fn joined_opens_get_the_value_once_the_store_answers() {
 #[test]
 fn pending_store_reads_are_capped() {
     let tmp = tempfile::tempdir().unwrap();
-    let mock = MockDriver::new();
+    let mock = mock_driver();
     let store = SlowStore::new(Mode::Hang);
     let manager = manager_with_stores(
         Arc::new(mock),
@@ -419,7 +418,7 @@ fn pending_store_reads_are_capped() {
 #[test]
 fn several_fields_share_one_deadline() {
     let tmp = tempfile::tempdir().unwrap();
-    let mock = MockDriver::new();
+    let mock = mock_driver();
     let stats = mock.stats();
     // Each read takes 250 ms: the first fits in the 400 ms deadline, the second does not.
     let store = SlowStore::new(Mode::Delay(Duration::from_millis(250)));
@@ -467,7 +466,7 @@ fn several_fields_share_one_deadline() {
 #[test]
 fn another_secret_resolves_while_one_hangs() {
     let tmp = tempfile::tempdir().unwrap();
-    let mock = MockDriver::new();
+    let mock = mock_driver();
     let stats = mock.stats();
     let store = SlowStore::new(Mode::Hang);
     let manager = manager_with_stores(

@@ -32,6 +32,8 @@ pub struct Seen {
     pub has_password: bool,
     pub property_keys: Vec<String>,
     pub init_statements: usize,
+    pub inside_dbeaver_workspace: bool,
+    pub password_exchange: api::PasswordExchange,
 }
 
 /// Wraps [`MockDriver`]: records connects, can strip the read-only flag (a broken driver), and
@@ -94,6 +96,8 @@ impl Driver for Wrap {
             ),
             property_keys: params.properties.keys().cloned().collect(),
             init_statements: params.init_statements.len(),
+            inside_dbeaver_workspace: params.inside_dbeaver_workspace,
+            password_exchange: params.password_exchange,
         });
         if self.ignore_read_only {
             params.read_only = false;
@@ -219,6 +223,27 @@ pub fn manager_with_stores(
     config.busy_wait = Duration::from_millis(400);
     tune(&mut config);
     SessionManager::new(config, registry, stores).unwrap()
+}
+
+/// The mock driver, declaring every TLS mode: the mock's own declaration has none (its
+/// connections are not encrypted), and `validate_for_driver` refuses a TLS mode a driver does
+/// not declare, so the model's default `verify-full` would not validate.
+pub fn mock_driver() -> MockDriver {
+    MockDriver::new().with_capabilities(mock_capabilities())
+}
+
+/// [`ninesql_core::driver_api::mock::full_capabilities`] with every TLS mode declared.
+pub fn mock_capabilities() -> Capabilities {
+    let mut caps = ninesql_core::driver_api::mock::full_capabilities();
+    caps.tls = [
+        api::TlsMode::Disable,
+        api::TlsMode::Require,
+        api::TlsMode::VerifyCa,
+        api::TlsMode::VerifyFull,
+    ]
+    .into_iter()
+    .collect();
+    caps
 }
 
 pub fn mock_engine() -> EngineId {
