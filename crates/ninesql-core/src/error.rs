@@ -159,6 +159,14 @@ pub enum CoreError {
     /// The session is closed or its task ended.
     #[error("the session is closed")]
     SessionClosed,
+    /// The request would end an open transaction implicitly (switching auto-commit on): commit
+    /// or roll back first.
+    #[error("a transaction is open: commit or roll back first")]
+    PendingTransaction,
+    /// The request is not valid (for example bind parameters with a script of several
+    /// statements).
+    #[error("invalid request: {0}")]
+    InvalidRequest(&'static str),
     /// The driver runtime is shut down or failed to start.
     #[error("driver runtime: {0}")]
     Runtime(String),
@@ -190,6 +198,8 @@ impl CoreError {
             Self::StillCancelling => "still-cancelling",
             Self::InvalidConfirmation => "invalid-confirmation",
             Self::SessionClosed => "session-closed",
+            Self::PendingTransaction => "pending-transaction",
+            Self::InvalidRequest(_) => "invalid-request",
             Self::Runtime(_) => "runtime",
             Self::Vault(e) => vault_error_kind(e),
             Self::NoVault(_) => "no-vault",

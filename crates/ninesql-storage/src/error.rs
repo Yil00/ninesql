@@ -118,6 +118,15 @@ pub enum StorageError {
         /// Step message.
         detail: String,
     },
+    /// The query history database (`history.sqlite`) failed: SQLite error, damaged file. The
+    /// detail is SQLite's message; it never contains statement text or values.
+    #[error("history database {path}: {detail}")]
+    History {
+        /// Path concerned.
+        path: PathBuf,
+        /// SQLite message.
+        detail: String,
+    },
     /// The in-memory value could not be serialized.
     #[error("cannot serialize the {document} file: {detail}")]
     Serialize {

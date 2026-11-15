@@ -447,9 +447,53 @@ pub enum ImportError {
     /// Workspace files could not be read or written.
     #[error(transparent)]
     Workspace(#[from] WorkspaceError),
+    /// The preview was cancelled ([`ImportCancel::cancel`], or its reply was dropped). Nothing
+    /// was written.
+    #[error("the import preview was cancelled")]
+    Cancelled,
     /// The blocking task failed.
     #[error("import task: {0}")]
     Runtime(String),
+}
+
+/// Cancels a running import preview (P2-D M1). Cheap to clone; every clone shares one flag.
+///
+/// The flag is an `Arc<AtomicBool>`, so the DBeaver reader's own cancel flag can share it
+/// (`ninesql_dbeaver::CancelFlag::from_shared`, see [`ImportCancel::shared`]).
+#[derive(Debug, Clone, Default)]
+pub struct ImportCancel(std::sync::Arc<std::sync::atomic::AtomicBool>);
+
+impl ImportCancel {
+    /// A flag not cancelled yet.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Asks the preview to stop. Idempotent, never blocks.
+    pub fn cancel(&self) {
+        self.0.store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// Whether [`Self::cancel`] was called.
+    #[must_use]
+    pub fn is_cancelled(&self) -> bool {
+        self.0.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// The shared flag, for the DBeaver reader's cancel hook.
+    #[must_use]
+    pub fn shared(&self) -> std::sync::Arc<std::sync::atomic::AtomicBool> {
+        std::sync::Arc::clone(&self.0)
+    }
+
+    fn check(&self) -> Result<(), ImportError> {
+        if self.is_cancelled() {
+            Err(ImportError::Cancelled)
+        } else {
+            Ok(())
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -497,8 +541,23 @@ impl Importer {
     /// # Errors
     /// [`ImportError::Source`], [`ImportError::NothingFound`], [`ImportError::Workspace`].
     pub fn preview(&self, source: &ImportSource) -> Result<ImportPreview, ImportError> {
-        let (preview, payload, _) = self.plan(source, &BTreeMap::new())?;
+        self.preview_cancellable(source, &ImportCancel::new())
+    }
+
+    /// [`Self::preview`], stopping with [`ImportError::Cancelled`] once `cancel` is set: checked
+    /// before and after reading each DBeaver project and before planning each one. Secrets
+    /// already read are dropped (zeroized) with the partial result. **Blocking.**
+    ///
+    /// # Errors
+    /// As [`Self::preview`], and [`ImportError::Cancelled`].
+    pub fn preview_cancellable(
+        &self,
+        source: &ImportSource,
+        cancel: &ImportCancel,
+    ) -> Result<ImportPreview, ImportError> {
+        let (preview, payload, _) = self.plan(source, &BTreeMap::new(), cancel)?;
         drop(payload);
+        cancel.check()?;
         Ok(preview)
     }
 
@@ -523,7 +582,8 @@ impl Importer {
             .connections()
             .filter_map(|c| Some((c.dbeaver_id.clone(), c.connection.as_ref()?.id)))
             .collect();
-        let (fresh, mut payload, existing) = self.plan(&preview.source, &ids)?;
+        let (fresh, mut payload, existing) =
+            self.plan(&preview.source, &ids, &ImportCancel::new())?;
         if fresh != *preview {
             return Err(ImportError::SourceChanged);
         }
@@ -783,7 +843,9 @@ impl Importer {
         &self,
         source: &ImportSource,
         ids: &BTreeMap<String, ConnectionId>,
+        cancel: &ImportCancel,
     ) -> Result<(ImportPreview, SecretPayload, Connections), ImportError> {
+        cancel.check()?;
         let workspaces = match source {
             ImportSource::Detect(roots) => {
                 let found = ninesql_dbeaver::detect_workspaces(roots);
@@ -805,12 +867,21 @@ impl Importer {
 
         // Every project is read first, so the connection types of all of them (all detected
         // workspaces included) are folded before any connection is planned (review, M2).
+        //
+        // INTEGRATION POINT (P2-D M1, interop-engineer's cancel hook in `ninesql-dbeaver`):
+        // replace this loop with `ninesql_dbeaver::import_source(workspaces, &flag)` (or
+        // `import_project_with(project, &flag)`), where
+        // `flag = ninesql_dbeaver::CancelFlag::from_shared(cancel.shared())`, and map
+        // `DbeaverError::Cancelled` to `ImportError::Cancelled`. Until then the core stops
+        // between projects only.
         let mut imports = Vec::new();
         for w in &workspaces {
             for project in &w.projects {
+                cancel.check()?;
                 imports.push((project, ninesql_dbeaver::import_project(project)));
             }
         }
+        cancel.check()?;
         let mut issues = Vec::new();
         let all_types: Vec<&ImportedConnectionType> = imports
             .iter()
@@ -828,6 +899,7 @@ impl Importer {
         let mut projects = Vec::new();
         let mut seen_ids = BTreeSet::new();
         for (project, import) in imports {
+            cancel.check()?;
             let (preview, secrets) =
                 self.plan_project(project, import, &existing, &types_after, ids, &mut seen_ids);
             payload.extend(secrets);

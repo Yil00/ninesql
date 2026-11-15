@@ -14,7 +14,11 @@
 //! 5. starts `DesktopLockWatcher` (feature `desktop-lock`, on by default): sleep and screen lock
 //!    lock the vault and clear the cache;
 //! 6. runs the idle timer on the driver runtime: [`Vault::lock_if_idle`] and
-//!    [`SessionSecretCache::purge_expired`] every [`CoreConfig::lock_check_interval`].
+//!    [`SessionSecretCache::purge_expired`] every [`CoreConfig::lock_check_interval`];
+//! 7. reads the execution preferences from `settings.toml` ([`crate::preferences`]), opens the
+//!    query history (`history.sqlite`, [`crate::history`]; a history that cannot be opened is
+//!    reported by [`CoreServices::history_error`], not an error) and builds the
+//!    [`ExecutionService`] (P3-C).
 //!
 //! The UI holds the returned [`CoreServices`] (cheap to clone) and calls:
 //! - [`CoreServices::sessions`] / [`CoreServices::take_events`] to open sessions and read events;
@@ -24,7 +28,9 @@
 //! - [`CoreServices::lock_now`] for a "lock secrets" action;
 //! - [`CoreServices::preview_import`] / [`CoreServices::apply_import`] for the DBeaver import
 //!   (P2-B / P2-C, [`crate::import`]);
-//! - [`CoreServices::lock_watcher_status`] to say whether sleep / screen lock are watched.
+//! - [`CoreServices::lock_watcher_status`] to say whether sleep / screen lock are watched;
+//! - [`CoreServices::execution`] to run statements and scripts, read the history and the
+//!   preferences; [`CoreServices::save_preferences`] to change them (P3-C).
 //!
 //! Every call that may block (store access, Argon2id, file I/O) runs on the runtime's blocking
 //! pool and answers through a [`Reply`]; nothing here blocks the caller, except
@@ -44,9 +50,12 @@ use tokio::task::JoinHandle;
 
 use crate::connection::Connection;
 use crate::error::{CoreError, WorkspaceError};
+use crate::execution::ExecutionService;
+use crate::history::History;
 use crate::import::{
-    ImportChoices, ImportError, ImportOutcome, ImportPreview, ImportSource, Importer,
+    ImportCancel, ImportChoices, ImportError, ImportOutcome, ImportPreview, ImportSource, Importer,
 };
+use crate::preferences::{self, PreferenceChange, PreferenceIssue, Preferences, PreferencesError};
 use crate::registry::DriverRegistry;
 use crate::session::{
     CoreEvent, CoreEvents, EventSink, ManagerConfig, Reply, SecretsLockReason, SessionManager,
@@ -105,6 +114,8 @@ pub struct CoreConfig {
     pub vault_idle_timeout: Option<Duration>,
     /// Period of the idle timer. Default [`DEFAULT_LOCK_CHECK_INTERVAL`]; at least 100 ms.
     pub lock_check_interval: Duration,
+    /// Open the query history (`history.sqlite`). Default `true`.
+    pub open_history: bool,
 }
 
 impl CoreConfig {
@@ -122,6 +133,7 @@ impl CoreConfig {
             watch_desktop_lock: true,
             vault_idle_timeout: Some(DEFAULT_VAULT_IDLE_TIMEOUT),
             lock_check_interval: DEFAULT_LOCK_CHECK_INTERVAL,
+            open_history: true,
         }
     }
 }
@@ -174,6 +186,10 @@ struct Inner {
     watcher: Mutex<Option<ninesql_secrets::DesktopLockWatcher>>,
     watcher_error: Option<String>,
     timer: Mutex<Option<JoinHandle<()>>>,
+    execution: ExecutionService,
+    history_error: Option<String>,
+    preference_issues: Vec<PreferenceIssue>,
+    paths: Paths,
 }
 
 impl Drop for Inner {
@@ -279,6 +295,7 @@ impl CoreServices {
             watch_desktop_lock,
             vault_idle_timeout,
             lock_check_interval,
+            open_history,
         } = config;
         let workspace = Workspace::open(paths.clone(), project)?;
         let project_id = workspace.project_id().to_string();
@@ -376,6 +393,18 @@ impl CoreServices {
             lock_check_interval,
         );
 
+        // 7. Preferences, history, execution service.
+        let (prefs, preference_issues) = load_preferences(&paths);
+        let (history, history_error) = if open_history {
+            open_history_db(&paths, &project_id, &prefs)
+        } else {
+            (
+                None,
+                Some("not opened (disabled by configuration)".to_owned()),
+            )
+        };
+        let execution = ExecutionService::new(manager.clone(), history, prefs);
+
         Ok(Self {
             inner: Arc::new(Inner {
                 workspace,
@@ -390,6 +419,10 @@ impl CoreServices {
                 watcher: Mutex::new(watcher),
                 watcher_error,
                 timer: Mutex::new(Some(timer)),
+                execution,
+                history_error,
+                preference_issues,
+                paths,
             }),
         })
     }
@@ -462,12 +495,55 @@ impl CoreServices {
     /// DBeaver import, step 1 (P2-B / P2-C): reads `source` read-only (I4) and answers with
     /// the [`ImportPreview`] (no secret value, I1), on the blocking pool (I6). The source
     /// workspace becomes a DBeaver root of the session: its database files open read-only.
+    ///
+    /// Dropping the [`Reply`] before the answer cancels the preview: it stops between DBeaver
+    /// projects and the partial result is dropped ([`Self::preview_import_cancellable`] adds an
+    /// explicit cancel).
     pub fn preview_import(
         &self,
         source: ImportSource,
     ) -> Reply<Result<ImportPreview, ImportError>> {
+        self.preview_import_cancellable(source).0
+    }
+
+    /// [`Self::preview_import`] with a cancel handle (P2-D M1, a "Cancel" button): after
+    /// [`ImportCancel::cancel`], or once the [`Reply`] is dropped, the preview stops at the
+    /// next check (before and after each DBeaver project) and answers
+    /// [`ImportError::Cancelled`]. Nothing is written either way.
+    pub fn preview_import_cancellable(
+        &self,
+        source: ImportSource,
+    ) -> (Reply<Result<ImportPreview, ImportError>>, ImportCancel) {
         let importer = self.importer();
-        self.blocking("import preview", move || importer.preview(&source))
+        let cancel = ImportCancel::new();
+        let flag = cancel.clone();
+        let (mut tx, reply) = Reply::channel();
+        let task = self
+            .inner
+            .manager
+            .runtime()
+            .handle()
+            .spawn_blocking(move || importer.preview_cancellable(&source, &flag));
+        let on_drop = cancel.clone();
+        self.inner.manager.runtime().spawn(async move {
+            let mut task = task;
+            let result = tokio::select! {
+                result = &mut task => result,
+                () = tx.closed() => {
+                    // Nobody waits for it any more: stop the work, drop its result.
+                    on_drop.cancel();
+                    tracing::debug!("import preview abandoned; cancelled");
+                    return;
+                }
+            };
+            let result = result.unwrap_or_else(|_| {
+                Err(ImportError::Runtime(
+                    "the import preview task failed".into(),
+                ))
+            });
+            let _ = tx.send(result);
+        });
+        (reply, cancel)
     }
 
     /// DBeaver import, step 2: applies `preview` with the user's `choices`, on the blocking
@@ -495,6 +571,75 @@ impl CoreServices {
             }
             importer.apply(&preview, &choices)
         })
+    }
+
+    /// The execution service: run statements and scripts, the query history, the preferences
+    /// in effect (P3-C).
+    #[must_use]
+    pub fn execution(&self) -> &ExecutionService {
+        &self.inner.execution
+    }
+
+    /// The query history, when it could be opened ([`Self::history_error`] says why not).
+    #[must_use]
+    pub fn history(&self) -> Option<&History> {
+        self.inner.execution.history()
+    }
+
+    /// Why the query history is not available in this session (`None` when it is).
+    #[must_use]
+    pub fn history_error(&self) -> Option<&str> {
+        self.inner.history_error.as_deref()
+    }
+
+    /// The execution preferences in effect (F-WS-04).
+    #[must_use]
+    pub fn preferences(&self) -> Preferences {
+        self.inner.execution.preferences()
+    }
+
+    /// Invalid preference entries found in `settings.toml` at startup (their defaults are
+    /// used), for the settings problems list.
+    #[must_use]
+    pub fn preference_issues(&self) -> &[PreferenceIssue] {
+        &self.inner.preference_issues
+    }
+
+    /// Validates `changes`, writes them to `settings.toml` (atomically, keeping everything
+    /// else, [`preferences::save_changes`]) on the blocking pool, then applies the preferences
+    /// now in the file. Answers them. Nothing is applied when the write fails.
+    pub fn save_preferences(
+        &self,
+        changes: Vec<PreferenceChange>,
+    ) -> Reply<Result<Preferences, PreferencesError>> {
+        // Checked first, so an invalid value fails without touching the file.
+        let mut check = self.preferences();
+        for c in &changes {
+            if let Err(e) = c.apply(&mut check) {
+                return Reply::ready(Err(e));
+            }
+        }
+        let path = settings_target(&self.inner.paths);
+        let execution = self.inner.execution.clone();
+        let (tx, reply) = Reply::channel();
+        let task = self
+            .inner
+            .manager
+            .runtime()
+            .handle()
+            .spawn_blocking(move || preferences::save_changes(&path, &changes));
+        self.inner.manager.runtime().spawn(async move {
+            let result = match task.await {
+                Ok(Ok(prefs)) => {
+                    execution.set_preferences(prefs.clone());
+                    Ok(prefs)
+                }
+                Ok(Err(e)) => Err(e),
+                Err(_) => Err(PreferencesError::Unreadable("the save task failed")),
+            };
+            let _ = tx.send(result);
+        });
+        reply
     }
 
     /// The secret stores (for [`Workspace::create_connection_checked`], run on a background
@@ -718,6 +863,51 @@ impl CoreServices {
         let manager = self.inner.manager.clone();
         drop(self);
         manager.shutdown(timeout);
+    }
+}
+
+/// `settings.toml`, or its target when it is a symbolic link to a regular file of ours
+/// (dotfile managers), as the UI resolves it.
+fn settings_target(paths: &Paths) -> std::path::PathBuf {
+    use std::os::unix::fs::MetadataExt as _;
+    let path = paths.settings_file();
+    let is_link = std::fs::symlink_metadata(&path).is_ok_and(|m| m.file_type().is_symlink());
+    if is_link
+        && let Ok(target) = std::fs::canonicalize(&path)
+        && std::fs::symlink_metadata(&target)
+            .is_ok_and(|m| m.file_type().is_file() && m.uid() == ninesql_storage::fs::current_uid())
+    {
+        return target;
+    }
+    path
+}
+
+/// The preferences of `settings.toml`; defaults (with one issue) when it cannot be read.
+fn load_preferences(paths: &Paths) -> (Preferences, Vec<PreferenceIssue>) {
+    match Preferences::load(&settings_target(paths)) {
+        Ok(loaded) => loaded,
+        Err(e) => {
+            tracing::warn!(error = %e, "settings.toml cannot be read; default execution preferences");
+            (Preferences::default(), Vec::new())
+        }
+    }
+}
+
+/// Opens `history.sqlite` and starts its writer; the reason when it cannot.
+fn open_history_db(
+    paths: &Paths,
+    project: &str,
+    prefs: &Preferences,
+) -> (Option<History>, Option<String>) {
+    let opened = ninesql_storage::HistoryDb::open(&paths.history_file())
+        .map_err(|e| e.to_string())
+        .and_then(|db| History::start(db, project, &prefs.history).map_err(|e| e.to_string()));
+    match opened {
+        Ok(h) => (Some(h), None),
+        Err(e) => {
+            tracing::warn!(error = %e, "the query history is not available in this session");
+            (None, Some(e))
+        }
     }
 }
 

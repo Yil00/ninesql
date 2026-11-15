@@ -21,6 +21,8 @@ tracing.workspace = true
 libc.workspace = true
 rustix.workspace = true
 zeroize.workspace = true
+# history.sqlite (ADR-0008 §1, P3-C): the bundled SQLite the sqlite driver already uses.
+rusqlite.workspace = true
 
 [dev-dependencies]
 proptest.workspace = true

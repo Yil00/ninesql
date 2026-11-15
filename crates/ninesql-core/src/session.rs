@@ -135,6 +135,10 @@ impl<T> Reply<T> {
         (tx, Self { rx: Some(rx) })
     }
 
+    pub(crate) fn from_receiver(rx: oneshot::Receiver<T>) -> Self {
+        Self { rx: Some(rx) }
+    }
+
     pub(crate) fn ready(value: T) -> Self {
         let (tx, reply) = Self::channel();
         let _ = tx.send(value);
@@ -226,6 +230,9 @@ pub struct ManagerConfig {
     /// DBeaver workspace roots: a file connection under one is opened read-only by its driver
     /// (`inside_dbeaver_workspace`, I4). Default: [`DbeaverRoots::from_env`].
     pub dbeaver_roots: DbeaverRoots,
+    /// Ping a session after this long without a command (F-CON-10); `None`: off (default, as
+    /// DBeaver). Changed at run time with [`SessionManager::set_keep_alive`].
+    pub keep_alive: Option<Duration>,
 }
 
 impl ManagerConfig {
@@ -249,6 +256,7 @@ impl ManagerConfig {
             event_queue: CORE_EVENT_QUEUE,
             known_hosts,
             dbeaver_roots: DbeaverRoots::from_env(),
+            keep_alive: None,
         }
     }
 }
@@ -334,6 +342,18 @@ pub enum CoreEvent {
         /// Why.
         reason: CloseReason,
     },
+    /// The transaction state of a session changed (pending-transaction indicator, F-SQL-07,
+    /// ADR-0007 §5): after a statement, a transaction command or an auto-commit switch. Emitted
+    /// only on change. When events were dropped ([`SessionManager::dropped_events`]), read
+    /// [`SessionHandle::transaction_state`] instead.
+    TransactionChanged {
+        /// Session.
+        session: SessionId,
+        /// Its connection.
+        connection: ConnectionId,
+        /// The new state.
+        state: TransactionState,
+    },
     /// Secrets left memory: the vault was locked and / or the "ask every time" cache cleared
     /// ([`crate::CoreServices`]). The UI updates its vault indicator; the next open that needs a
     /// vault secret answers [`OpenOutcome::NeedsVaultUnlock`].
@@ -418,13 +438,22 @@ pub struct SessionInfo {
     pub inside_dbeaver_workspace: bool,
 }
 
-/// Transaction state of a session after a transaction command.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Transaction state of a session (F-SQL-07).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct TransactionState {
     /// Auto-commit mode.
     pub auto_commit: bool,
     /// A transaction with uncommitted work is open.
     pub in_transaction: bool,
+}
+
+/// How to end an open transaction when closing a session ([`SessionHandle::close_with`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum TransactionEnd {
+    /// Commit, then close.
+    Commit,
+    /// Roll back (close).
+    Rollback,
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -591,6 +620,8 @@ struct Shared {
     init_sql: Mutex<Pending<InitSqlKey>>,
     /// Where a confirmed import marker is cleared ([`SessionManager::set_workspace`]).
     workspace: std::sync::OnceLock<crate::workspace::Workspace>,
+    /// Keep-alive interval in milliseconds, `0` = off; read by every session task.
+    keep_alive_ms: Arc<AtomicU64>,
 }
 
 impl Shared {
@@ -732,6 +763,7 @@ impl SessionManager {
         stores: SecretStores,
     ) -> Result<Self, CoreError> {
         let runtime = DriverRuntime::new(config.workers)?;
+        let keep_alive = keep_alive_millis(config.keep_alive);
         let (events, events_rx) = mpsc::channel(config.event_queue.max(1));
         let closed_backlog = Arc::new(Backlog::default());
         let events_rx = CoreEvents {
@@ -753,6 +785,7 @@ impl SessionManager {
                 host_keys: Mutex::new(Pending::new(MAX_PENDING_OPEN_CONFIRMATIONS)),
                 init_sql: Mutex::new(Pending::new(MAX_PENDING_OPEN_CONFIRMATIONS)),
                 workspace: std::sync::OnceLock::new(),
+                keep_alive_ms: Arc::new(AtomicU64::new(keep_alive)),
             }),
             events_rx: Arc::new(Mutex::new(Some(events_rx))),
         })
@@ -930,6 +963,73 @@ impl SessionManager {
         out
     }
 
+    /// Changes the keep-alive interval of every session, open or future (F-CON-10): an idle
+    /// session is pinged after `interval` without a command; a ping that finds the connection
+    /// dead closes the session ([`CoreEvent::SessionClosed`] with [`CloseReason::Lost`]), and
+    /// the UI may then [`Self::reconnect`]. `None` turns it off. Never blocks.
+    pub fn set_keep_alive(&self, interval: Option<Duration>) {
+        self.shared
+            .keep_alive_ms
+            .store(keep_alive_millis(interval), Ordering::Relaxed);
+    }
+
+    /// The keep-alive interval ([`Self::set_keep_alive`]).
+    #[must_use]
+    pub fn keep_alive(&self) -> Option<Duration> {
+        match self.shared.keep_alive_ms.load(Ordering::Relaxed) {
+            0 => None,
+            ms => Some(Duration::from_millis(ms)),
+        }
+    }
+
+    /// Open sessions with an open transaction ([`SessionHandle::transaction_state`]), for the
+    /// "quit with uncommitted work" confirmation (ADR-0007 §5).
+    #[must_use]
+    pub fn sessions_with_open_transaction(&self) -> Vec<SessionHandle> {
+        let mut out: Vec<_> = lock(&self.shared.sessions)
+            .values()
+            .filter(|h| h.transaction_state().in_transaction)
+            .cloned()
+            .collect();
+        out.sort_by_key(SessionHandle::id);
+        out
+    }
+
+    /// Reconnects a connection whose session was lost (F-CON-10), with exponential backoff:
+    /// up to [`ReconnectPolicy::attempts`] opens, waiting [`ReconnectPolicy::initial_delay`]
+    /// after the first failure and doubling up to [`ReconnectPolicy::max_delay`].
+    ///
+    /// Build `request` again from the saved connection and its types, as for a first open:
+    /// a reconnect is a fresh [`Self::open`], so it applies every rule of the open flow again.
+    /// In particular:
+    /// - **No statement is re-run.** The new session starts empty: statements that were running
+    ///   or queued on the lost session failed with it, and an open transaction is lost (its
+    ///   last state stays readable on the old handle, [`SessionHandle::transaction_state`], so
+    ///   the UI can say that uncommitted work was lost).
+    /// - **Init SQL runs again under its confirmation rules.** When it needs confirmation, the
+    ///   reconnect ends with [`OpenOutcome::InitSqlNeedsConfirmation`] unless `request` carries
+    ///   a token; a token is spent by the attempt that reaches the driver, so a later attempt
+    ///   goes without it and asks again rather than reusing it.
+    /// - Only transient failures are retried (the server or a hop cannot be reached, a connect
+    ///   timeout). Every other outcome ends the reconnect at once: secrets to ask for, a locked
+    ///   vault, a host key to confirm, an authentication failure, a refused TLS certificate.
+    ///
+    /// Prompted secrets in `request` stay in memory (zeroized when dropped) until the reconnect
+    /// ends, so that each attempt can use them; nothing else is kept. Dropping the
+    /// [`Reconnect`] stops it where it stands.
+    #[must_use]
+    pub fn reconnect(&self, request: OpenRequest, policy: ReconnectPolicy) -> Reconnect {
+        let (tx, events) = mpsc::channel(8);
+        let shared = Arc::clone(&self.shared);
+        let task = self.runtime.spawn(async move {
+            reconnect_loop(&shared, request, policy, &tx).await;
+        });
+        Reconnect {
+            events,
+            task: Some(task),
+        }
+    }
+
     /// Closes every open session (running statements are cancelled first).
     pub fn close_all(&self) -> Reply<()> {
         let (tx, reply) = Reply::channel();
@@ -964,6 +1064,229 @@ impl EventSink {
     pub(crate) fn emit(&self, event: CoreEvent) {
         if let Some(shared) = self.0.upgrade() {
             shared.emit(event);
+        }
+    }
+}
+
+fn keep_alive_millis(interval: Option<Duration>) -> u64 {
+    interval.map_or(0, |d| {
+        u64::try_from(d.as_millis()).unwrap_or(u64::MAX).max(1)
+    })
+}
+
+// ---------------------------------------------------------------------------------------------
+// Reconnect (F-CON-10)
+
+/// Attempts and backoff of [`SessionManager::reconnect`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct ReconnectPolicy {
+    /// Opens tried at most (at least 1).
+    pub attempts: u32,
+    /// Wait after the first failed attempt.
+    pub initial_delay: Duration,
+    /// Longest wait between two attempts (the wait doubles up to it).
+    pub max_delay: Duration,
+}
+
+impl Default for ReconnectPolicy {
+    fn default() -> Self {
+        Self {
+            attempts: 3,
+            initial_delay: Duration::from_secs(1),
+            max_delay: Duration::from_secs(30),
+        }
+    }
+}
+
+impl ReconnectPolicy {
+    /// `attempts` opens with the default delays (1 s, doubling up to 30 s).
+    #[must_use]
+    pub fn with_attempts(attempts: u32) -> Self {
+        Self {
+            attempts,
+            ..Self::default()
+        }
+    }
+
+    /// Sets the delays.
+    #[must_use]
+    pub fn with_delays(mut self, initial: Duration, max: Duration) -> Self {
+        self.initial_delay = initial;
+        self.max_delay = max.max(initial);
+        self
+    }
+
+    /// The wait after failed attempt number `failed` (1-based).
+    #[must_use]
+    pub fn delay_after(&self, failed: u32) -> Duration {
+        let factor = 2u32.saturating_pow(failed.saturating_sub(1).min(16));
+        self.initial_delay
+            .saturating_mul(factor)
+            .min(self.max_delay.max(self.initial_delay))
+    }
+}
+
+/// Progress of a [`Reconnect`]. Exactly one [`ReconnectEvent::Done`] ends it.
+#[derive(Debug)]
+#[non_exhaustive]
+pub enum ReconnectEvent {
+    /// Attempt `attempt` of `of` starts.
+    Attempt {
+        /// 1-based attempt number.
+        attempt: u32,
+        /// Attempts at most.
+        of: u32,
+    },
+    /// The attempt failed with a transient error; the next one starts after `delay`.
+    RetryIn {
+        /// Wait before the next attempt.
+        delay: Duration,
+        /// Why the attempt failed.
+        error: CoreError,
+    },
+    /// The reconnect ended (terminal): the outcome of the last open, exactly as
+    /// [`SessionManager::open`] answers it, or the last error.
+    Done(Result<OpenOutcome, CoreError>),
+}
+
+/// A running reconnect ([`SessionManager::reconnect`]). Executor-agnostic, like
+/// [`Execution`]; dropping it stops the reconnect (a session opened meanwhile is closed).
+pub struct Reconnect {
+    events: mpsc::Receiver<ReconnectEvent>,
+    task: Option<tokio::task::JoinHandle<()>>,
+}
+
+impl fmt::Debug for Reconnect {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Reconnect").finish_non_exhaustive()
+    }
+}
+
+impl Reconnect {
+    /// Next event; `None` after [`ReconnectEvent::Done`].
+    pub async fn next(&mut self) -> Option<ReconnectEvent> {
+        self.events.recv().await
+    }
+
+    /// Next event without waiting.
+    pub fn try_next(&mut self) -> Next<ReconnectEvent> {
+        match self.events.try_recv() {
+            Ok(e) => Next::Ready(e),
+            Err(mpsc::error::TryRecvError::Empty) => Next::Pending,
+            Err(mpsc::error::TryRecvError::Disconnected) => Next::Ended,
+        }
+    }
+
+    /// Stops the reconnect. Idempotent.
+    pub fn cancel(&mut self) {
+        self.events.close();
+    }
+}
+
+impl Drop for Reconnect {
+    fn drop(&mut self) {
+        // The task is detached, not aborted: it notices the closed channel at its next await
+        // point and stops there, closing a session it opened meanwhile.
+        self.events.close();
+        drop(self.task.take());
+    }
+}
+
+/// A failure worth another attempt: the server or a hop could not be reached in time.
+fn is_transient(e: &CoreError) -> bool {
+    match e {
+        CoreError::ConnectTimeout(_) => true,
+        CoreError::Driver(d) => matches!(
+            d,
+            DriverError::Connect(_)
+                | DriverError::Io(_)
+                | DriverError::Closed(_)
+                | DriverError::Timeout(_)
+        ),
+        CoreError::Ssh(s) => matches!(s, SshError::Connect { .. } | SshError::Timeout { .. }),
+        _ => false,
+    }
+}
+
+/// A copy of prompted secrets for one more attempt; each copy is zeroized when dropped.
+fn copy_prompted(prompted: &[(SecretSlot, SecretString)]) -> Vec<(SecretSlot, SecretString)> {
+    use ninesql_secrets::ExposeSecret as _;
+    prompted
+        .iter()
+        .map(|(slot, v)| (*slot, SecretString::from(v.expose_secret().to_owned())))
+        .collect()
+}
+
+async fn reconnect_loop(
+    shared: &Arc<Shared>,
+    request: OpenRequest,
+    policy: ReconnectPolicy,
+    tx: &mpsc::Sender<ReconnectEvent>,
+) {
+    let OpenRequest {
+        connection,
+        policy: safety,
+        prompted,
+        mut init_sql_confirmation,
+    } = request;
+    let attempts = policy.attempts.max(1);
+    let id = connection.id;
+    let mut attempt = 1;
+    loop {
+        if tx
+            .send(ReconnectEvent::Attempt {
+                attempt,
+                of: attempts,
+            })
+            .await
+            .is_err()
+        {
+            return;
+        }
+        tracing::info!(connection = %id, attempt, of = attempts, "reconnecting");
+        let request = OpenRequest {
+            connection: connection.clone(),
+            policy: safety,
+            prompted: copy_prompted(&prompted),
+            // Spent by the attempt that reaches the driver: later attempts ask again.
+            init_sql_confirmation: init_sql_confirmation.take(),
+        };
+        let outcome = tokio::select! {
+            biased;
+            outcome = open_session(shared, request) => outcome,
+            () = tx.closed() => return,
+        };
+        match outcome {
+            Err(e) if is_transient(&e) && attempt < attempts => {
+                let delay = policy.delay_after(attempt);
+                tracing::info!(connection = %id, error = e.kind(), delay_ms = delay.as_millis(), "reconnect attempt failed");
+                if tx
+                    .send(ReconnectEvent::RetryIn { delay, error: e })
+                    .await
+                    .is_err()
+                {
+                    return;
+                }
+                tokio::select! {
+                    () = tokio::time::sleep(delay) => {}
+                    () = tx.closed() => return,
+                }
+                attempt += 1;
+            }
+            outcome => {
+                if let Err(e) = &outcome {
+                    tracing::info!(connection = %id, error = e.kind(), "reconnect failed");
+                }
+                // Nobody listens any more: a session opened meanwhile is closed.
+                if let Err(mpsc::error::SendError(ReconnectEvent::Done(Ok(OpenOutcome::Opened(
+                    h,
+                ))))) = tx.send(ReconnectEvent::Done(outcome)).await
+                {
+                    let _ = h.close().await;
+                }
+                return;
+            }
         }
     }
 }
@@ -1253,6 +1576,10 @@ async fn open_session(
             commands: cmd_tx,
             close: Mutex::new(Some(close_tx)),
             current: Mutex::new(None),
+            tx_state: Mutex::new(TransactionState {
+                auto_commit: session.auto_commit(),
+                in_transaction: session.in_transaction(),
+            }),
             // One slot more than configured: the terminal event's reserved slot.
             result_queue: shared.config.result_queue.max(1) + 1,
         }),
@@ -1265,6 +1592,8 @@ async fn open_session(
         handle: handle.clone(),
         confirmations: Pending::new(MAX_PENDING_CONFIRMATIONS),
         busy_wait: shared.config.busy_wait,
+        events: EventSink(Arc::downgrade(shared)),
+        keep_alive_ms: Arc::clone(&shared.keep_alive_ms),
     };
     let join = tokio::spawn(task.run(cmd_rx, close_rx));
     let supervisor = Arc::clone(shared);
@@ -1602,6 +1931,8 @@ struct HandleInner {
     commands: mpsc::Sender<Command>,
     close: Mutex<Option<CloseSender>>,
     current: Mutex<Option<CancelToken>>,
+    /// Last known transaction state, updated by the session task after every command.
+    tx_state: Mutex<TransactionState>,
     result_queue: usize,
 }
 
@@ -1711,6 +2042,39 @@ impl SessionHandle {
         self.transaction(TxOp::Ping)
     }
 
+    /// The last known transaction state (F-SQL-07), updated after every statement and
+    /// transaction command; never blocks. After the session closed, the state it had last (so
+    /// the UI can tell that a lost session had uncommitted work).
+    #[must_use]
+    pub fn transaction_state(&self) -> TransactionState {
+        *lock(&self.inner.tx_state)
+    }
+
+    /// Whether closing this session must ask the user first: a transaction is open and the
+    /// preferences ask for it, which they always do for production (ADR-0007 §5).
+    #[must_use]
+    pub fn close_needs_confirmation(
+        &self,
+        confirmations: &crate::preferences::ConfirmationPreferences,
+    ) -> bool {
+        self.transaction_state().in_transaction
+            && confirmations.asks_on_close(self.info().policy.production)
+    }
+
+    /// Ends the open transaction as the user chose, then closes the session. With
+    /// [`TransactionEnd::Commit`], a commit that fails leaves the session **open** and returns
+    /// the error, so no work is lost silently; [`TransactionEnd::Rollback`] is
+    /// [`Self::close`] (the driver rolls back on close). Executor-agnostic.
+    ///
+    /// # Errors
+    /// The commit error, [`CoreError::SessionClosed`], or the close error.
+    pub async fn close_with(&self, end: TransactionEnd) -> Result<(), CoreError> {
+        if end == TransactionEnd::Commit && self.transaction_state().in_transaction {
+            self.commit().await.ok_or(CoreError::SessionClosed)??;
+        }
+        self.close().await.unwrap_or(Ok(()))
+    }
+
     /// Closes the session: cancels the running statement, closes the driver session (rolling
     /// back an open transaction) and then the SSH tunnel. Idempotent.
     pub fn close(&self) -> Reply<Result<(), CoreError>> {
@@ -1809,6 +2173,8 @@ struct SessionTask {
     handle: SessionHandle,
     confirmations: Pending<StatementKey>,
     busy_wait: Duration,
+    events: EventSink,
+    keep_alive_ms: Arc<AtomicU64>,
 }
 
 /// What the session loop does after a command.
@@ -1840,7 +2206,17 @@ impl SessionTask {
         mut commands: mpsc::Receiver<Command>,
         mut close: oneshot::Receiver<oneshot::Sender<Result<(), CoreError>>>,
     ) -> CloseReason {
+        let mut last_activity = tokio::time::Instant::now();
         let reason = loop {
+            let keep_alive = self.keep_alive_ms.load(Ordering::Relaxed);
+            let idle = async {
+                if keep_alive == 0 {
+                    std::future::pending::<()>().await;
+                } else {
+                    tokio::time::sleep_until(last_activity + Duration::from_millis(keep_alive))
+                        .await;
+                }
+            };
             tokio::select! {
                 biased;
                 request = &mut close => {
@@ -1860,13 +2236,25 @@ impl SessionTask {
                         let _ = self.shutdown().await;
                         break CloseReason::Requested;
                     };
-                    match self.handle_command(command).await {
+                    let flow = self.handle_command(command).await;
+                    self.update_transaction_state();
+                    last_activity = tokio::time::Instant::now();
+                    match flow {
                         Flow::Continue => {}
                         Flow::Lost(e) => {
                             let _ = self.shutdown().await;
                             break CloseReason::Lost(e);
                         }
                     }
+                }
+                () = idle => {
+                    last_activity = tokio::time::Instant::now();
+                    if let Flow::Lost(e) = self.keep_alive().await {
+                        tracing::warn!(session = %self.id(), error = crate::error::driver_error_kind(&e), "keep-alive found the connection lost");
+                        let _ = self.shutdown().await;
+                        break CloseReason::Lost(e);
+                    }
+                    self.update_transaction_state();
                 }
             }
         };
@@ -1883,6 +2271,50 @@ impl SessionTask {
             }
         }
         reason
+    }
+
+    /// One keep-alive ping (F-CON-10). Only a fatal error ends the session.
+    async fn keep_alive(&mut self) -> Flow {
+        let Some(session) = self.session.as_mut() else {
+            return Flow::Continue;
+        };
+        match session.ping().await {
+            Ok(()) => {
+                tracing::trace!(session = %self.handle.id(), "keep-alive");
+                Flow::Continue
+            }
+            Err(e) if e.is_fatal() => Flow::Lost(e),
+            Err(e) => {
+                tracing::debug!(session = %self.handle.id(), error = crate::error::driver_error_kind(&e), "keep-alive ping failed");
+                Flow::Continue
+            }
+        }
+    }
+
+    /// Records the session's transaction state on the handle; emits
+    /// [`CoreEvent::TransactionChanged`] when it changed.
+    fn update_transaction_state(&self) {
+        let Some(session) = self.session.as_ref() else {
+            return;
+        };
+        let state = TransactionState {
+            auto_commit: session.auto_commit(),
+            in_transaction: session.in_transaction(),
+        };
+        let changed = {
+            let mut current = lock(&self.handle.inner.tx_state);
+            let changed = *current != state;
+            *current = state;
+            changed
+        };
+        if changed {
+            let info = self.handle.info();
+            self.events.emit(CoreEvent::TransactionChanged {
+                session: info.id,
+                connection: info.connection,
+                state,
+            });
+        }
     }
 
     async fn shutdown(&mut self) -> Result<(), CoreError> {
@@ -1905,6 +2337,10 @@ impl SessionTask {
                 let mut out = Output::new(events, cancel.clone());
                 let flow = self.execute(request, &mut out, &cancel).await;
                 *lock(&self.handle.inner.current) = None;
+                // The terminal event leaves after the state is recorded, so a consumer that
+                // reads `transaction_state()` on it sees the state after the statement.
+                self.update_transaction_state();
+                drop(out);
                 flow
             }
             Command::Transaction { op, reply } => {
@@ -1912,6 +2348,15 @@ impl SessionTask {
                     let _ = reply.send(Err(CoreError::SessionClosed));
                     return Flow::Continue;
                 };
+                if matches!(op, TxOp::SetAutoCommit(true))
+                    && !session.auto_commit()
+                    && session.in_transaction()
+                {
+                    // Switching auto-commit on would end the open transaction one way or the
+                    // other, depending on the engine: the user commits or rolls back first.
+                    let _ = reply.send(Err(CoreError::PendingTransaction));
+                    return Flow::Continue;
+                }
                 let result = match op {
                     TxOp::Begin => session.begin().await,
                     TxOp::Commit => session.commit().await,
@@ -1927,6 +2372,8 @@ impl SessionTask {
                     auto_commit: session.auto_commit(),
                     in_transaction: session.in_transaction(),
                 };
+                // Recorded before the answer, so `transaction_state()` agrees with it.
+                self.update_transaction_state();
                 let _ = reply.send(result.map(|()| state).map_err(CoreError::from));
                 flow
             }
@@ -2084,6 +2531,9 @@ struct Output {
     events: mpsc::Sender<ExecEvent>,
     cancel: CancelToken,
     terminal: Option<mpsc::OwnedPermit<ExecEvent>>,
+    /// The terminal event, sent when the output is dropped (after the session task recorded
+    /// the transaction state).
+    pending: Option<ExecEvent>,
 }
 
 impl Output {
@@ -2095,6 +2545,7 @@ impl Output {
             events,
             cancel,
             terminal,
+            pending: None,
         }
     }
 
@@ -2113,8 +2564,15 @@ impl Output {
         }
     }
 
-    /// The terminal event, through the reserved slot: never waits.
+    /// The terminal event, through the reserved slot when the output is dropped: never waits.
     fn finish(&mut self, event: ExecEvent) {
+        self.pending = Some(event);
+    }
+
+    fn send_terminal(&mut self) {
+        let Some(event) = self.pending.take() else {
+            return;
+        };
         match self.terminal.take() {
             Some(permit) => {
                 let _ = permit.send(event);
@@ -2123,6 +2581,12 @@ impl Output {
                 let _ = self.events.try_send(event);
             }
         }
+    }
+}
+
+impl Drop for Output {
+    fn drop(&mut self) {
+        self.send_terminal();
     }
 }
 
