@@ -18,13 +18,20 @@
 //!   engine). The driver re-checks each statement with its own session lexical modes and refuses
 //!   text that still holds several statements ([`DriverError::MultipleStatements`]), so a
 //!   mis-split never runs something other than what was classified.
-//! - **Events.** Each statement reports [`RunEvent::StatementStarted`], its result items
-//!   ([`RunEvent::ResultSet`], [`RunEvent::Rows`], [`RunEvent::Documents`],
-//!   [`RunEvent::UpdateCount`], [`RunEvent::Notice`], [`RunEvent::Truncated`]) and exactly one
-//!   statement end: [`RunEvent::StatementFinished`], [`RunEvent::StatementFailed`] (with an
+//! - **Events.** A run starts with [`RunEvent::Started`]. Each statement (identified by its
+//!   0-based index in the text) reports [`RunEvent::StatementStarted`], its driver result items
+//!   unchanged ([`RunEvent::Item`]: result-set headers, row batches, documents, update counts,
+//!   notices, `Truncated`) and exactly one statement end: [`RunEvent::StatementFinished`],
+//!   [`RunEvent::StatementClosed`] (released early), [`RunEvent::StatementFailed`] (with an
 //!   [`ErrorPosition`] when the engine reports one), [`RunEvent::StatementCancelled`],
 //!   [`RunEvent::StatementTimedOut`] or [`RunEvent::NeedsConfirmation`]. The run ends with
 //!   exactly one [`RunEvent::Done`], which is never dropped.
+//! - **Paging (P3-B grid).** With [`RunRequest::with_paging`], the first page of every result
+//!   set is delivered without being asked, then the result pauses ([`RunEvent::PageEnd`]) with
+//!   its stream open until [`RunControl::fetch`] (a page, or all of it under the budget) or
+//!   [`RunControl::release`] (closed early: [`RunEvent::StatementClosed`]). The grid's result
+//!   source maps `fetch` / `release` onto a [`RunControl`]; the core does not depend on the
+//!   grid crate.
 //! - **Back-pressure.** Events go through a small bounded channel: a UI that reads slowly slows
 //!   the fetch down (on top of the result's own budget). After a cancel, result items still
 //!   queued are dropped; the statement end and `Done` still arrive.
@@ -49,10 +56,9 @@ use std::ops::Range;
 use std::sync::{Arc, PoisonError, RwLock};
 use std::time::{Duration, Instant, SystemTime};
 
-use ninesql_driver_api::arrow_array::RecordBatch;
 use ninesql_driver_api::{
-    CancelToken, Document, DriverError, ExecutionId, FetchBudget, Notice, Param, QueryLanguage,
-    ResultItem, ResultSetHeader, StatementSpan, Truncation,
+    CancelToken, DriverError, ExecutionId, FetchBudget, Param, QueryLanguage, ResultItem,
+    StatementSpan,
 };
 use ninesql_storage::history::EntryStatus;
 use tokio::sync::mpsc;
@@ -119,6 +125,10 @@ pub struct RunRequest {
     pub start_at: usize,
     /// Confirmation of the statement at this index.
     pub confirmation: Option<(usize, ConfirmationToken)>,
+    /// Pull-based paging: deliver this many rows after each result-set header, then pause
+    /// until [`RunControl::fetch`]; `None` (default): stream every row (still bounded by the
+    /// budget and back-pressure).
+    pub page_rows: Option<u32>,
 }
 
 impl fmt::Debug for RunRequest {
@@ -148,6 +158,7 @@ impl RunRequest {
             on_error: None,
             start_at: 0,
             confirmation: None,
+            page_rows: None,
         }
     }
 
@@ -201,6 +212,19 @@ impl RunRequest {
     #[must_use]
     pub fn with_language(mut self, language: QueryLanguage) -> Self {
         self.language = language;
+        self
+    }
+
+    /// Pull-based paging for the grid (P3-B): `rows` rows after each result-set header, then
+    /// [`RunEvent::PageEnd`] and a pause until [`RunControl::fetch`] or
+    /// [`RunControl::release`]. A paused result keeps its stream open, so the session is busy
+    /// (other statements and transaction commands wait) until the result is fetched to its end
+    /// or released. In a script, every statement but the last is released after its first page
+    /// ([`RunEvent::StatementClosed`]) so that the next one can run; the last one stays open.
+    /// Choose `FetchBudget::batch_rows` no larger than `rows`: a page ends on a batch boundary.
+    #[must_use]
+    pub fn with_paging(mut self, rows: u32) -> Self {
+        self.page_rows = Some(rows);
         self
     }
 
@@ -265,7 +289,7 @@ pub enum RunEnd {
 #[derive(Clone, Debug, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct RunSummary {
-    /// Statements in the text.
+    /// Items in the text (statements and client directives).
     pub statements: usize,
     /// Statements sent.
     pub executed: usize,
@@ -281,11 +305,17 @@ pub struct RunSummary {
     pub transaction: TransactionState,
 }
 
-/// Event of one run. Exactly one [`RunEvent::Done`] ends it. `index` is the 0-based statement
-/// index in the request text.
+/// Event of one run. Exactly one [`RunEvent::Done`] ends it. `index` is the 0-based index of
+/// the item in the request text as the dialect splits it (client directives, never sent, keep
+/// their index, so indexes are stable for [`RunRequest::resume_at`]).
 #[derive(Debug)]
 #[non_exhaustive]
 pub enum RunEvent {
+    /// The run started: the text holds `statements` statements (first event).
+    Started {
+        /// Statements in the text.
+        statements: usize,
+    },
     /// Statement `index` was sent.
     StatementStarted {
         /// Statement index.
@@ -300,47 +330,33 @@ pub enum RunEvent {
         /// Statement index.
         index: usize,
     },
-    /// A result set starts.
-    ResultSet {
+    /// One result item of statement `index`, unchanged from the driver: a result-set header,
+    /// a batch of rows, documents, an update count, a notice, or `Truncated` (the budget was
+    /// reached; the result is incomplete).
+    Item {
         /// Statement index.
         index: usize,
-        /// Header.
-        header: ResultSetHeader,
+        /// The item.
+        item: ResultItem,
     },
-    /// A batch of rows of the current result set.
-    Rows {
+    /// Paging ([`RunRequest::with_paging`]): statement `index` delivered the page it was
+    /// asked for and its result is paused, stream open. Ask for more with
+    /// [`RunControl::fetch`] or close it with [`RunControl::release`]. Not sent when the
+    /// result ended exactly at the page end ([`RunEvent::StatementFinished`] follows).
+    PageEnd {
         /// Statement index.
         index: usize,
-        /// Rows.
-        batch: RecordBatch,
+        /// Rows / documents delivered so far by this statement.
+        rows: u64,
     },
-    /// Documents of the current result set.
-    Documents {
+    /// Statement `index`'s stream was closed early: released ([`RunControl::release`]), or a
+    /// script moved on to the next statement after its first page. Its result keeps the rows
+    /// delivered. Counted as succeeded.
+    StatementClosed {
         /// Statement index.
         index: usize,
-        /// Documents.
-        documents: Vec<Document>,
-    },
-    /// Rows affected.
-    UpdateCount {
-        /// Statement index.
-        index: usize,
-        /// Count, when the engine reports one.
-        count: Option<u64>,
-    },
-    /// A server notice or warning.
-    Notice {
-        /// Statement index.
-        index: usize,
-        /// Notice.
-        notice: Notice,
-    },
-    /// The result reached its budget and is incomplete.
-    Truncated {
-        /// Statement index.
-        index: usize,
-        /// Which limit.
-        truncation: Truncation,
+        /// Rows / documents delivered.
+        rows: u64,
     },
     /// Statement `index` ended normally.
     StatementFinished {
@@ -393,10 +409,63 @@ pub enum RunEvent {
     Done(RunSummary),
 }
 
-/// A running statement or script: its events and its cancel path. Dropping it cancels the run.
+/// How much more of a paused result to deliver ([`RunControl::fetch`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum FetchMode {
+    /// About this many more rows (a page ends on a batch boundary).
+    Page(u32),
+    /// Everything left, up to the end of the result or its budget (never unbounded: the
+    /// budget ends the result with `Truncated`).
+    All,
+}
+
+#[derive(Debug)]
+enum Control {
+    Fetch(usize, FetchMode),
+    Release(usize),
+}
+
+/// Paging and release of a run's results, usable from any thread; every method returns at
+/// once. Cheap to clone (the grid's result source holds one). Requests for a statement that is
+/// not the running one are ignored.
+#[derive(Clone)]
+pub struct RunControl {
+    tx: mpsc::UnboundedSender<Control>,
+    cancel: CancelToken,
+}
+
+impl fmt::Debug for RunControl {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("RunControl").finish_non_exhaustive()
+    }
+}
+
+impl RunControl {
+    /// Delivers more of statement `index`'s result (its next page, or all of it).
+    pub fn fetch(&self, index: usize, mode: FetchMode) {
+        let _ = self.tx.send(Control::Fetch(index, mode));
+    }
+
+    /// Closes statement `index`'s stream early (server-side cancel when the engine has one);
+    /// [`RunEvent::StatementClosed`] follows, and a script goes on with its next statement.
+    /// Does nothing once the statement ended.
+    pub fn release(&self, index: usize) {
+        let _ = self.tx.send(Control::Release(index));
+    }
+
+    /// Stops the whole run, as [`Run::cancel`].
+    pub fn cancel(&self) {
+        self.cancel.cancel();
+    }
+}
+
+/// A running statement or script: its events, its cancel path and its paging control.
+/// Dropping it cancels the run.
 pub struct Run {
     events: mpsc::Receiver<RunEvent>,
     cancel: CancelToken,
+    control: RunControl,
 }
 
 impl fmt::Debug for Run {
@@ -412,6 +481,23 @@ impl Run {
     /// the engine has a cancel, and no further statement starts. Never blocks; idempotent.
     pub fn cancel(&self) {
         self.cancel.cancel();
+    }
+
+    /// Paging and release ([`RunRequest::with_paging`]); clone it into the grid's result
+    /// source.
+    #[must_use]
+    pub fn control(&self) -> RunControl {
+        self.control.clone()
+    }
+
+    /// Shortcut for [`RunControl::fetch`].
+    pub fn fetch(&self, index: usize, mode: FetchMode) {
+        self.control.fetch(index, mode);
+    }
+
+    /// Shortcut for [`RunControl::release`].
+    pub fn release(&self, index: usize) {
+        self.control.release(index);
     }
 
     /// Next event; `None` after [`RunEvent::Done`].
@@ -537,6 +623,7 @@ impl ExecutionService {
     #[must_use]
     pub fn run(&self, session: &SessionHandle, request: RunRequest) -> Run {
         let (tx, events) = mpsc::channel(RUN_QUEUE + 1);
+        let (control_tx, control) = mpsc::unbounded_channel();
         let cancel = CancelToken::new();
         let prefs = self.preferences();
         let job = RunJob {
@@ -544,6 +631,8 @@ impl ExecutionService {
             history: self.inner.history.clone(),
             out: RunOutput::new(tx, cancel.clone()),
             cancel: cancel.clone(),
+            control,
+            control_open: true,
             started: Instant::now(),
         };
         let dialect = self
@@ -554,8 +643,85 @@ impl ExecutionService {
         self.inner.manager.runtime().spawn(async move {
             job.run(request, dialect, &prefs).await;
         });
-        Run { events, cancel }
+        Run {
+            events,
+            control: RunControl {
+                tx: control_tx,
+                cancel: cancel.clone(),
+            },
+            cancel,
+        }
     }
+}
+
+/// Kind of one item of a script, as the execution service runs it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ItemKind {
+    /// Sent with one `Session::execute` call.
+    Statement,
+    /// A client-side directive (`DELIMITER`, `\\set`…): never sent to the engine.
+    // Built once `split_script` lands (P3-D integration point in `script_items`).
+    #[allow(dead_code)]
+    ClientDirective,
+    /// Something the dialect refuses to run as part of a script: the whole script is refused
+    /// up front.
+    Refused,
+}
+
+/// One item of a script.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ScriptItem {
+    span: StatementSpan,
+    kind: ItemKind,
+}
+
+/// The items of `text` for `dialect`.
+///
+/// INTEGRATION POINT (P3-D, `feat/p3-d-dialects`): replace the body with
+/// `dialect.split_script(text)`, mapping `ScriptItemKind::Statement` to
+/// [`ItemKind::Statement`], `ClientDirective` to [`ItemKind::ClientDirective`], `Refused(_)`
+/// and any future kind to [`ItemKind::Refused`] (fail-closed), and compute error positions with
+/// `LineIndex::new(text).position(item.span.start + offset)` in [`error_position`]. Until then
+/// every span of `split_statements` is a statement.
+fn script_items(dialect: &dyn ninesql_driver_api::Dialect, text: &str) -> Vec<ScriptItem> {
+    dialect
+        .split_statements(text)
+        .into_iter()
+        .map(|span| ScriptItem {
+            span,
+            kind: ItemKind::Statement,
+        })
+        .collect()
+}
+
+/// Checks the items of a request before anything runs; answers the index of the last
+/// statement. A refused item refuses the whole script (recommended by the dialect contract, and
+/// the safe choice for production); "Execute statement" and bind parameters need a single
+/// statement.
+fn check_items(items: &[ScriptItem], kind: RunKind, has_params: bool) -> Result<usize, CoreError> {
+    if items.iter().any(|i| i.kind == ItemKind::Refused) {
+        return Err(CoreError::InvalidRequest(
+            "the script holds a statement that cannot run as part of a script",
+        ));
+    }
+    let statements = items
+        .iter()
+        .filter(|i| i.kind == ItemKind::Statement)
+        .count();
+    if kind == RunKind::Statement && statements > 1 {
+        return Err(CoreError::InvalidRequest(
+            "the text holds several statements: run it as a script",
+        ));
+    }
+    if has_params && statements > 1 {
+        return Err(CoreError::InvalidRequest(
+            "bind parameters need a single statement",
+        ));
+    }
+    Ok(items
+        .iter()
+        .rposition(|i| i.kind == ItemKind::Statement)
+        .unwrap_or(0))
 }
 
 /// See [`ExecutionService::statement_at`].
@@ -651,12 +817,16 @@ struct RunJob {
     history: Option<History>,
     out: RunOutput,
     cancel: CancelToken,
+    control: mpsc::UnboundedReceiver<Control>,
+    control_open: bool,
     started: Instant,
 }
 
 /// What one statement did.
 enum StatementEnd {
     Finished,
+    /// Released early (the grid's release, or a script moving on after the first page).
+    Closed,
     Failed,
     Cancelled,
     TimedOut,
@@ -698,20 +868,12 @@ impl RunJob {
             Ok(d) => d,
             Err(e) => return self.refuse(e, 0),
         };
-        let spans = dialect.split_statements(&request.text);
-        let total = spans.len();
-        if request.kind == RunKind::Statement && total > 1 {
-            return self.refuse(
-                CoreError::InvalidRequest("the text holds several statements: run it as a script"),
-                total,
-            );
-        }
-        if !request.params.is_empty() && total > 1 {
-            return self.refuse(
-                CoreError::InvalidRequest("bind parameters need a single statement"),
-                total,
-            );
-        }
+        let items = script_items(&*dialect, &request.text);
+        let total = items.len();
+        let last_statement = match check_items(&items, request.kind, !request.params.is_empty()) {
+            Ok(last) => last,
+            Err(e) => return self.refuse(e, total),
+        };
         let info = self.session.info().clone();
         let timeout = match request.timeout {
             TimeoutChoice::Default => prefs.execution.timeout_for(info.connection),
@@ -721,9 +883,15 @@ impl RunJob {
         let budget = request.budget.unwrap_or_else(|| prefs.execution.budget());
         let on_error = request.on_error.unwrap_or(prefs.execution.on_error);
 
+        let _ = self.out.send(RunEvent::Started { statements: total }).await;
         let (mut executed, mut succeeded, mut failed) = (0usize, 0usize, 0usize);
         let mut end = RunEnd::Completed;
-        for (index, span) in spans.iter().enumerate().skip(request.start_at) {
+        for (index, item) in items.iter().enumerate().skip(request.start_at) {
+            let span = &item.span;
+            if item.kind != ItemKind::Statement {
+                // Client directives are never sent.
+                continue;
+            }
             if self.cancel.is_cancelled() || self.out.gone() {
                 end = RunEnd::Cancelled { index };
                 break;
@@ -739,11 +907,12 @@ impl RunJob {
             {
                 exec_request = exec_request.confirmed(token);
             }
+            let last = index == last_statement;
             let outcome = self
-                .statement(index, *span, &request, exec_request, &info.engine)
+                .statement(index, *span, &request, exec_request, &info.engine, last)
                 .await;
             match outcome {
-                StatementEnd::Finished => {
+                StatementEnd::Finished | StatementEnd::Closed => {
                     executed += 1;
                     succeeded += 1;
                 }
@@ -776,14 +945,17 @@ impl RunJob {
         self.out.done(summary);
     }
 
-    /// Runs one statement and forwards its events.
+    /// Runs one statement and forwards its events, paging its results when the request asks
+    /// for it.
+    #[allow(clippy::too_many_lines)] // One state machine; split, it would be harder to follow.
     async fn statement(
-        &self,
+        &mut self,
         index: usize,
         span: StatementSpan,
         request: &RunRequest,
         exec_request: ExecuteRequest,
         engine: &EngineId,
+        last: bool,
     ) -> StatementEnd {
         let params = exec_request.params.len();
         let text = exec_request.text.clone();
@@ -791,43 +963,99 @@ impl RunJob {
         let started_at = SystemTime::now();
         let started = Instant::now();
         let mut execution = self.session.execute(exec_request);
+        let base = request.offset;
+        let page = request.page_rows.map(|n| u64::from(n.max(1)));
+        // Run cancelled ("Stop") / stream released (grid, or the script moving on).
         let mut cancel_sent = false;
+        let mut releasing = false;
         let mut update_count: Option<u64> = None;
         let mut forwarding = true;
-        let base = request.offset;
+        // Rows / documents forwarded, and how many may be forwarded before pausing.
+        let mut delivered: u64 = 0;
+        let mut allowed: Option<u64> = None;
+        let mut page_end_sent = false;
+        let connection = self.session.info().connection;
+        let policy = self.session.info().policy;
+        let history = self.history.clone();
         let record = |status: EntryStatus,
                       rows: Option<u64>,
                       update_count: Option<u64>,
                       error: Option<&CoreError>| {
-            StatementRecord {
-                rows,
-                update_count,
-                error_kind: error.map(CoreError::kind),
-                error_code: error.and_then(|e| e.engine_code().map(str::to_owned)),
-                param_count: params,
-                ..StatementRecord::new(
-                    self.session.info().connection,
-                    engine.clone(),
-                    text.clone(),
-                    started_at,
-                    started.elapsed(),
-                    status,
-                )
+            if let Some(h) = &history {
+                let outcome = h.record(
+                    &policy,
+                    StatementRecord {
+                        rows,
+                        update_count,
+                        error_kind: error.map(CoreError::kind),
+                        error_code: error.and_then(|e| e.engine_code().map(str::to_owned)),
+                        param_count: params,
+                        ..StatementRecord::new(
+                            connection,
+                            engine.clone(),
+                            text.clone(),
+                            started_at,
+                            started.elapsed(),
+                            status,
+                        )
+                    },
+                );
+                tracing::trace!(outcome = ?outcome, "history");
             }
         };
         loop {
-            let event = if cancel_sent {
-                execution.next().await
-            } else {
-                tokio::select! {
-                    biased;
-                    e = execution.next() => e,
-                    () = self.cancel.cancelled() => {
-                        execution.cancel();
-                        cancel_sent = true;
-                        continue;
-                    }
+            let paused = !cancel_sent && !releasing && allowed.is_some_and(|a| delivered >= a);
+            if paused && !page_end_sent {
+                page_end_sent = true;
+                if forwarding {
+                    forwarding = self
+                        .out
+                        .send(RunEvent::PageEnd {
+                            index,
+                            rows: delivered,
+                        })
+                        .await;
                 }
+                if !last {
+                    // A script goes on: the statement's stream is closed after its first page
+                    // (one session runs one statement at a time).
+                    execution.cancel();
+                    releasing = true;
+                    continue;
+                }
+            }
+            let event = tokio::select! {
+                biased;
+                () = self.cancel.cancelled(), if !cancel_sent => {
+                    execution.cancel();
+                    cancel_sent = true;
+                    continue;
+                }
+                control = self.control.recv(), if self.control_open => {
+                    match control {
+                        None => self.control_open = false,
+                        Some(Control::Release(i)) if i == index && !releasing && !cancel_sent => {
+                            execution.cancel();
+                            releasing = true;
+                        }
+                        Some(Control::Fetch(i, mode)) if i == index => match mode {
+                            FetchMode::Page(rows) => {
+                                let base_rows = allowed.unwrap_or(delivered).max(delivered);
+                                if allowed.is_some() {
+                                    allowed = Some(base_rows.saturating_add(u64::from(rows.max(1))));
+                                }
+                                page_end_sent = false;
+                            }
+                            FetchMode::All => {
+                                allowed = None;
+                                page_end_sent = false;
+                            }
+                        },
+                        Some(_) => {}
+                    }
+                    continue;
+                }
+                e = execution.next(), if !paused => e,
             };
             let Some(event) = event else {
                 // The session task ended without a terminal event (shutdown).
@@ -840,17 +1068,6 @@ impl RunJob {
                     })
                     .await;
                 return StatementEnd::Failed;
-            };
-            let forward = |item: ResultItem| -> Option<RunEvent> {
-                Some(match item {
-                    ResultItem::ResultSet(header) => RunEvent::ResultSet { index, header },
-                    ResultItem::Rows(batch) => RunEvent::Rows { index, batch },
-                    ResultItem::Documents(documents) => RunEvent::Documents { index, documents },
-                    ResultItem::UpdateCount(count) => RunEvent::UpdateCount { index, count },
-                    ResultItem::Notice(notice) => RunEvent::Notice { index, notice },
-                    ResultItem::Truncated(truncation) => RunEvent::Truncated { index, truncation },
-                    _ => return None,
-                })
             };
             match event {
                 ExecEvent::WaitingForPreviousCancel => {
@@ -874,11 +1091,31 @@ impl RunJob {
                     }
                 }
                 ExecEvent::Item(item) => {
-                    if let ResultItem::UpdateCount(Some(n)) = &item {
-                        update_count = Some(update_count.unwrap_or(0).saturating_add(*n));
+                    match &item {
+                        ResultItem::UpdateCount(Some(n)) => {
+                            update_count = Some(update_count.unwrap_or(0).saturating_add(*n));
+                        }
+                        // The first page of every result set comes without being asked.
+                        ResultItem::ResultSet(_) => {
+                            if let Some(page) = page {
+                                allowed = Some(delivered.saturating_add(page));
+                                page_end_sent = false;
+                            }
+                        }
+                        _ => {}
                     }
-                    if forwarding && let Some(e) = forward(item) {
-                        forwarding = self.out.send(e).await;
+                    // Only rows actually handed to the UI count (not batches drained after a
+                    // release or a cancel).
+                    if forwarding && !releasing && !cancel_sent {
+                        let n = match &item {
+                            ResultItem::Rows(b) => b.num_rows() as u64,
+                            ResultItem::Documents(d) => d.len() as u64,
+                            _ => 0,
+                        };
+                        forwarding = self.out.send(RunEvent::Item { index, item }).await;
+                        if forwarding {
+                            delivered += n;
+                        }
                     }
                 }
                 ExecEvent::NeedsConfirmation(request) => {
@@ -889,12 +1126,7 @@ impl RunJob {
                 }
                 ExecEvent::Finished { rows, bytes } => {
                     let elapsed = started.elapsed();
-                    self.record(record(
-                        EntryStatus::Succeeded,
-                        Some(rows),
-                        update_count,
-                        None,
-                    ));
+                    record(EntryStatus::Succeeded, Some(rows), update_count, None);
                     self.out
                         .send_end(RunEvent::StatementFinished {
                             index,
@@ -910,15 +1142,36 @@ impl RunJob {
                 ExecEvent::Failed(error) => {
                     let elapsed = started.elapsed();
                     return match error {
+                        // Run cancelled by the user ("Stop"): a cancel, whatever the engine
+                        // answered (`Cancelled`, or SQLSTATE 57014).
+                        _ if cancel_sent => {
+                            record(EntryStatus::Cancelled, Some(delivered), update_count, None);
+                            self.out
+                                .send_end(RunEvent::StatementCancelled { index, elapsed })
+                                .await;
+                            StatementEnd::Cancelled
+                        }
+                        // Stream released early (grid or script): the rows read were what the
+                        // user asked for.
+                        _ if releasing => {
+                            record(EntryStatus::Succeeded, Some(delivered), update_count, None);
+                            self.out
+                                .send_end(RunEvent::StatementClosed {
+                                    index,
+                                    rows: delivered,
+                                })
+                                .await;
+                            StatementEnd::Closed
+                        }
                         CoreError::Driver(DriverError::Cancelled) => {
-                            self.record(record(EntryStatus::Cancelled, None, update_count, None));
+                            record(EntryStatus::Cancelled, Some(delivered), update_count, None);
                             self.out
                                 .send_end(RunEvent::StatementCancelled { index, elapsed })
                                 .await;
                             StatementEnd::Cancelled
                         }
                         CoreError::Driver(DriverError::Timeout(after)) => {
-                            self.record(record(EntryStatus::TimedOut, None, update_count, None));
+                            record(EntryStatus::TimedOut, Some(delivered), update_count, None);
                             self.out
                                 .send_end(RunEvent::StatementTimedOut {
                                     index,
@@ -926,15 +1179,6 @@ impl RunJob {
                                 })
                                 .await;
                             StatementEnd::TimedOut
-                        }
-                        // A statement cancelled by the user may end with the engine's own
-                        // "cancelled" error (SQLSTATE 57014): still a cancel.
-                        _ if cancel_sent => {
-                            self.record(record(EntryStatus::Cancelled, None, update_count, None));
-                            self.out
-                                .send_end(RunEvent::StatementCancelled { index, elapsed })
-                                .await;
-                            StatementEnd::Cancelled
                         }
                         error => {
                             // Not recorded: the statement never reached the engine.
@@ -946,12 +1190,7 @@ impl RunJob {
                                     | CoreError::Driver(DriverError::Busy)
                             );
                             if !refused {
-                                self.record(record(
-                                    EntryStatus::Failed,
-                                    None,
-                                    update_count,
-                                    Some(&error),
-                                ));
+                                record(EntryStatus::Failed, None, update_count, Some(&error));
                             }
                             let position = match &error {
                                 CoreError::Driver(DriverError::Query {
@@ -974,13 +1213,6 @@ impl RunJob {
             }
         }
     }
-
-    fn record(&self, record: StatementRecord) {
-        if let Some(h) = &self.history {
-            let outcome = h.record(&self.session.info().policy, record);
-            tracing::trace!(session = %self.session.id(), outcome = ?outcome, "history");
-        }
-    }
 }
 
 #[cfg(test)]
@@ -990,6 +1222,35 @@ mod tests {
 
     fn span(start: usize, end: usize) -> StatementSpan {
         StatementSpan { start, end }
+    }
+
+    #[test]
+    fn script_items_are_checked_before_anything_runs() {
+        let item = |kind| ScriptItem {
+            span: span(0, 1),
+            kind,
+        };
+        let (st, dir, refused) = (
+            item(ItemKind::Statement),
+            item(ItemKind::ClientDirective),
+            item(ItemKind::Refused),
+        );
+        assert_eq!(
+            check_items(&[st, dir, st, dir], RunKind::Script, false).unwrap(),
+            2
+        );
+        // A directive does not count as a statement.
+        assert_eq!(
+            check_items(&[dir, st], RunKind::Statement, true).unwrap(),
+            1
+        );
+        assert!(check_items(&[st, st], RunKind::Statement, false).is_err());
+        assert!(check_items(&[st, st], RunKind::Script, true).is_err());
+        assert!(matches!(
+            check_items(&[st, refused, st], RunKind::Script, false),
+            Err(CoreError::InvalidRequest(_))
+        ));
+        assert_eq!(check_items(&[], RunKind::Script, false).unwrap(), 0);
     }
 
     #[test]

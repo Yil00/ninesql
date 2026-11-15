@@ -13,6 +13,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use ninesql_core::driver_api::ResultItem;
 use ninesql_core::{
     Auth, Connection, ConnectionTypeId, ConnectionTypes, Endpoint, EngineId, ExecutionService,
     OpenOutcome, OpenRequest, Preferences, RunEnd, RunEvent, RunRequest, SecretSlot, SecretSource,
@@ -124,7 +125,10 @@ fn big_select_streams_first_rows_fast_and_cancels_and_production_deletes_ask() {
                 .await
                 .unwrap()
             {
-                Some(RunEvent::Rows { batch, .. }) => {
+                Some(RunEvent::Item {
+                    item: ResultItem::Rows(batch),
+                    ..
+                }) => {
                     first_rows.get_or_insert_with(|| started.elapsed());
                     rows += batch.num_rows();
                     if rows >= 2_000 {

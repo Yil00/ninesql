@@ -12,11 +12,12 @@ use std::time::Duration;
 use ninesql_core::driver_api::mock::MockDriver;
 use ninesql_core::driver_api::{
     self as api, CancelHandle, Capabilities, ConnectParams, Dialect, Driver, DriverError,
-    DriverResult, ExecOptions, Metadata, Param, ResultStream, Secret, Session, Statement,
+    DriverResult, ExecOptions, FetchBudget, Metadata, Param, ResultItem, ResultStream, Secret,
+    Session, Statement,
 };
 use ninesql_core::{
     CloseReason, ConfirmationPreferences, ConnectionType, ConnectionTypeId, ConnectionTypes,
-    CoreError, CoreEvent, ExecutionService, History, OnError, OpenOutcome, OpenRequest,
+    CoreError, CoreEvent, ExecutionService, FetchMode, History, OnError, OpenOutcome, OpenRequest,
     PreferenceChange, Preferences, ReconnectEvent, ReconnectPolicy, RunEnd, RunEvent, RunRequest,
     RunSummary, SessionManager, TimeoutChoice, TransactionEnd,
 };
@@ -40,7 +41,10 @@ fn rows(events: &[RunEvent], index: usize) -> usize {
     events
         .iter()
         .map(|e| match e {
-            RunEvent::Rows { index: i, batch } if *i == index => batch.num_rows(),
+            RunEvent::Item {
+                index: i,
+                item: ResultItem::Rows(batch),
+            } if *i == index => batch.num_rows(),
             _ => 0,
         })
         .sum()
@@ -76,9 +80,9 @@ fn scripts_and_selections_run_statement_by_statement() {
         assert_eq!(&script[spans[1].1.clone()], "INSERT INTO t VALUES (1)");
         assert!(events.iter().any(|e| matches!(
             e,
-            RunEvent::UpdateCount {
+            RunEvent::Item {
                 index: 1,
-                count: Some(1)
+                item: ResultItem::UpdateCount(Some(1))
             }
         )));
         assert!(events.iter().any(|e| matches!(
@@ -92,7 +96,13 @@ fn scripts_and_selections_run_statement_by_statement() {
         assert_eq!(
             events
                 .iter()
-                .filter(|e| matches!(e, RunEvent::Notice { index: 2, .. }))
+                .filter(|e| matches!(
+                    e,
+                    RunEvent::Item {
+                        index: 2,
+                        item: ResultItem::Notice(_)
+                    }
+                ))
                 .count(),
             2
         );
@@ -209,7 +219,10 @@ fn cancel_stops_the_running_statement_and_the_script() {
                 .await
                 .unwrap()
             {
-                Some(RunEvent::Rows { .. }) => break,
+                Some(RunEvent::Item {
+                    item: ResultItem::Rows(_),
+                    ..
+                }) => break,
                 Some(_) => {}
                 None => panic!("ended early"),
             }
@@ -344,9 +357,9 @@ fn production_scripts_stop_for_confirmation_and_resume() {
         );
         assert!(events.iter().any(|e| matches!(
             e,
-            RunEvent::UpdateCount {
+            RunEvent::Item {
                 index: 1,
-                count: Some(1)
+                item: ResultItem::UpdateCount(Some(1))
             }
         )));
         // The token was single-use.
@@ -881,6 +894,194 @@ fn history_retention_and_disable_apply_from_preferences() {
             .unwrap();
         assert!(left.iter().all(|e| e.statement != "SELECT 1 AS off"));
         assert_eq!(history.clear().await.unwrap().unwrap(), 2);
+    });
+    manager.shutdown(Duration::from_secs(5));
+}
+
+// ---------------------------------------------------------------------------------------------
+// Paging for the grid (P3-B contract)
+
+/// Reads events until `stop` matches one (returned), collecting the rows of `index`.
+async fn until(
+    run: &mut ninesql_core::Run,
+    rows: &mut usize,
+    stop: impl Fn(&RunEvent) -> bool,
+) -> RunEvent {
+    loop {
+        let e = tokio::time::timeout(Duration::from_secs(10), run.next())
+            .await
+            .expect("paging timed out")
+            .expect("run ended");
+        if let RunEvent::Item {
+            item: ResultItem::Rows(b),
+            ..
+        } = &e
+        {
+            *rows += b.num_rows();
+        }
+        if stop(&e) {
+            return e;
+        }
+    }
+}
+
+#[test]
+fn paging_delivers_the_first_page_then_waits_for_fetch_or_release() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mock = mock_driver();
+    let stats = mock.stats();
+    let (manager, _) = manager(Arc::new(mock), tmp.path());
+    let types = ConnectionTypes::default();
+    let exec = service(&manager, None);
+    let budget = FetchBudget::default().with_batch_rows(50);
+    ui(async {
+        let h = open_ok(&manager, mock_connection(ConnectionTypeId::dev()), &types).await;
+        // A script: the first statement is closed after its first page, the last one pauses.
+        let mut run = exec.run(
+            &h,
+            RunRequest::script("SELECT * FROM numbers(100000);\nSELECT * FROM numbers(1000)")
+                .with_budget(budget)
+                .with_paging(100),
+        );
+        assert!(matches!(
+            run.next().await,
+            Some(RunEvent::Started { statements: 2 })
+        ));
+        let mut first = 0;
+        let e = until(&mut run, &mut first, |e| {
+            matches!(e, RunEvent::StatementClosed { index: 0, .. })
+        })
+        .await;
+        assert_eq!(first, 100);
+        assert!(matches!(e, RunEvent::StatementClosed { rows: 100, .. }));
+        assert!(
+            stats.rows_generated() < 100_000,
+            "stream closed, not drained"
+        );
+
+        let mut second = 0;
+        until(&mut run, &mut second, |e| {
+            matches!(
+                e,
+                RunEvent::PageEnd {
+                    index: 1,
+                    rows: 100
+                }
+            )
+        })
+        .await;
+        assert_eq!(second, 100);
+        // Paused: nothing more comes until asked.
+        assert!(
+            tokio::time::timeout(Duration::from_millis(200), run.next())
+                .await
+                .is_err()
+        );
+        let control = run.control();
+        control.fetch(0, FetchMode::All); // not the running statement: ignored
+        control.fetch(1, FetchMode::Page(200));
+        until(&mut run, &mut second, |e| {
+            matches!(e, RunEvent::PageEnd { index: 1, .. })
+        })
+        .await;
+        assert_eq!(second, 300);
+        control.fetch(1, FetchMode::All);
+        until(&mut run, &mut second, |e| {
+            matches!(
+                e,
+                RunEvent::StatementFinished {
+                    index: 1,
+                    rows: 1000,
+                    ..
+                }
+            )
+        })
+        .await;
+        assert_eq!(second, 1000);
+        let Some(RunEvent::Done(summary)) = run.next().await else {
+            panic!("no Done");
+        };
+        assert_eq!(summary.end, RunEnd::Completed);
+        assert_eq!(summary.succeeded, 2);
+
+        // Release while paused: closed early, the session is free again.
+        let mut run = exec.run(
+            &h,
+            RunRequest::statement("SELECT * FROM numbers(100000)")
+                .with_budget(budget)
+                .with_paging(100),
+        );
+        let mut n = 0;
+        until(&mut run, &mut n, |e| matches!(e, RunEvent::PageEnd { .. })).await;
+        run.release(0);
+        until(&mut run, &mut n, |e| {
+            matches!(
+                e,
+                RunEvent::StatementClosed {
+                    index: 0,
+                    rows: 100
+                }
+            )
+        })
+        .await;
+        let Some(RunEvent::Done(summary)) = run.next().await else {
+            panic!("no Done");
+        };
+        assert_eq!(summary.end, RunEnd::Completed);
+        let (_, s) =
+            collect_run(exec.run(&h, RunRequest::statement("SELECT * FROM numbers(3)"))).await;
+        assert_eq!(s.end, RunEnd::Completed);
+
+        // "Fetch all" stays under the budget: the result ends with `Truncated`.
+        let mut run = exec.run(
+            &h,
+            RunRequest::statement("SELECT * FROM numbers(1000000)")
+                .with_budget(budget.with_max_rows(Some(500)))
+                .with_paging(100),
+        );
+        let mut n = 0;
+        until(&mut run, &mut n, |e| matches!(e, RunEvent::PageEnd { .. })).await;
+        run.fetch(0, FetchMode::All);
+        let mut truncated = false;
+        loop {
+            match tokio::time::timeout(Duration::from_secs(10), run.next())
+                .await
+                .unwrap()
+            {
+                Some(RunEvent::Item {
+                    item: ResultItem::Rows(b),
+                    ..
+                }) => n += b.num_rows(),
+                Some(RunEvent::Item {
+                    item: ResultItem::Truncated(_),
+                    ..
+                }) => truncated = true,
+                Some(RunEvent::Done(_)) => break,
+                Some(_) => {}
+                None => panic!("no Done"),
+            }
+        }
+        assert!(truncated);
+        assert_eq!(n, 500);
+
+        // Cancel while paused ends the run as cancelled.
+        let mut run = exec.run(
+            &h,
+            RunRequest::statement("SELECT * FROM numbers(100000)")
+                .with_budget(budget)
+                .with_paging(100),
+        );
+        let mut n = 0;
+        until(&mut run, &mut n, |e| matches!(e, RunEvent::PageEnd { .. })).await;
+        run.control().cancel();
+        let e = until(&mut run, &mut n, |e| matches!(e, RunEvent::Done(_))).await;
+        assert!(matches!(
+            e,
+            RunEvent::Done(RunSummary {
+                end: RunEnd::Cancelled { index: 0 },
+                ..
+            })
+        ));
     });
     manager.shutdown(Duration::from_secs(5));
 }
