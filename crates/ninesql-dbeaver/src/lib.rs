@@ -17,7 +17,7 @@
 //!
 //! [`import_project`] runs the whole pipeline for one project. [`import_source`] runs it for
 //! every project of a detection or a picked folder, under whole-source limits
-//! ([`SourceLimits`]), reading each canonical folder once, and stops when its [`CancelFlag`] is
+//! ([`SourceLimits`]), reading each folder once, and stops when its [`CancelFlag`] is
 //! set ([`source`], P2-D review M1). Real imports use [`import_source`].
 //!
 //! # Rules this crate enforces
@@ -49,7 +49,11 @@ pub mod report;
 pub mod source;
 
 pub use credentials::{Credentials, CredentialsError, decrypt_credentials};
-pub use detect::{InstallKind, Project, SearchRoots, Workspace, detect_workspaces, open_folder};
+pub use detect::{
+    DuplicateProject, InstallKind, MAX_DETECT_DIRS, MAX_DETECT_ENTRIES, MAX_LISTED_DUPLICATES,
+    Project, SearchRoots, Workspace, detect_workspaces, detect_workspaces_with, open_folder,
+    open_folder_with,
+};
 pub use error::DbeaverError;
 pub use mapping::{
     ConnectionImport, DroppedProperty, ImportedConnection, ImportedSecret, Outcome, ProjectImport,
@@ -69,7 +73,7 @@ pub use source::{
 /// Opens files read-only and never writes anything under the DBeaver directory (I4).
 ///
 /// Per-project limits only, and not cancellable: an import of a whole detection or folder uses
-/// [`import_source`], which also bounds the total and reads each canonical folder once.
+/// [`import_source`], which also bounds the total and reads each folder once.
 #[must_use = "the import result carries secrets to move and issues to show"]
 pub fn import_project(project: &Project) -> ProjectImport {
     mapping::import_project(project)

@@ -43,7 +43,7 @@ use crate::model::{
     parse_data_sources,
 };
 use crate::properties;
-use crate::report::{Budget, ImportIssue, IssueKind, Issues, MAX_IDENT, ident};
+use crate::report::{Budget, ImportIssue, IssueKind, Issues, MAX_IDENT, ident, shown_path};
 
 // ---------------------------------------------------------------------------------------------
 // Output model
@@ -614,7 +614,11 @@ pub(crate) fn import_project_limited(
         }
         let limit = project_left.min(budget.bytes).min(MAX_DATA_SOURCES_BYTES);
         let by_source = budget.bytes < project_left.min(MAX_DATA_SOURCES_BYTES);
-        let read = match fsread::read_limited(path, limit) {
+        // Charged whether the read succeeds or not (a read failing partway, a pseudo-file).
+        let (read, charged) = fsread::read_counted(path, limit);
+        project_left = project_left.saturating_sub(charged);
+        budget.bytes = budget.bytes.saturating_sub(charged);
+        let read = match read {
             Err(crate::DbeaverError::TooLarge { .. }) if by_source => {
                 // Larger than what is left of the whole-source budget: nothing more is read.
                 budget.bytes = 0;
@@ -626,7 +630,7 @@ pub(crate) fn import_project_limited(
                         "the import limit of {} bytes read for the whole source was reached: \
                          {} and the remaining data-sources files of this project are not read",
                         budget.source_bytes(),
-                        path.display()
+                        shown_path(path)
                     ),
                 );
                 break;
@@ -634,9 +638,6 @@ pub(crate) fn import_project_limited(
             other => other,
         };
         let parsed = read.map(|bytes| {
-            let n = bytes.len() as u64;
-            project_left = project_left.saturating_sub(n);
-            budget.bytes = budget.bytes.saturating_sub(n);
             parse_data_sources(&bytes).map_err(|e| match e {
                 crate::model::ParseError::InvalidJson { line, column } => {
                     crate::DbeaverError::InvalidJson {
@@ -681,11 +682,10 @@ pub(crate) fn import_project_limited(
         }
         Some(path) => {
             let limit = MAX_CREDENTIALS_BYTES.min(budget.bytes);
-            match fsread::read_limited(path, limit) {
-                Ok(bytes) => {
-                    budget.bytes = budget.bytes.saturating_sub(bytes.len() as u64);
-                    (Some(decrypt_credentials(&bytes)), false)
-                }
+            let (read, charged) = fsread::read_counted(path, limit);
+            budget.bytes = budget.bytes.saturating_sub(charged);
+            match read {
+                Ok(bytes) => (Some(decrypt_credentials(&bytes)), false),
                 Err(e) => {
                     if matches!(e, crate::DbeaverError::TooLarge { .. })
                         && limit < MAX_CREDENTIALS_BYTES
@@ -718,10 +718,13 @@ pub(crate) fn import_project_limited(
         source: budget.source,
         cancel: budget.cancel,
     };
-    let (mut out, source_hit) = map_sources_limited(&project.name, &sources, credentials, &limits);
+    let (mut out, end) = map_sources_limited(&project.name, &sources, credentials, &limits);
     drop(sources);
+    if end.cancelled {
+        return Err(crate::DbeaverError::Cancelled);
+    }
     budget.check_cancel()?;
-    budget.source_limit_hit |= source_hit;
+    budget.source_limit_hit |= end.source_limit_hit;
     if read_failed {
         out.credentials = CredentialsStatus::ReadFailed;
     }
@@ -738,6 +741,15 @@ pub(crate) fn import_project_limited(
             .sum::<usize>();
     budget.issues = budget.issues.saturating_sub(issue_count);
     Ok(out)
+}
+
+/// How a [`map_sources_limited`] call ended.
+#[derive(Debug, Clone, Copy, Default)]
+struct MapEnd {
+    /// A whole-source limit cut the project short.
+    source_limit_hit: bool,
+    /// The cancel flag was seen: the result is partial and must be discarded.
+    cancelled: bool,
 }
 
 /// Limits of one [`map_sources_limited`] call.
@@ -826,20 +838,20 @@ pub fn map_sources(
     map_sources_limited(project, sources, credentials, &limits).0
 }
 
-/// [`map_sources`] under `limits`. The flag is `true` when a whole-source limit cut the
-/// project short. When the cancel flag is set, mapping stops early and the partial result must
-/// be discarded by the caller.
+/// [`map_sources`] under `limits`. When the cancel flag is seen, mapping stops early and
+/// [`MapEnd::cancelled`] tells the caller to discard the partial result.
 fn map_sources_limited(
     project: &str,
     sources: &[DataSources],
     credentials: Option<Result<Credentials, CredentialsError>>,
     limits: &MapLimits<'_>,
-) -> (ProjectImport, bool) {
+) -> (ProjectImport, MapEnd) {
     let max_connections = limits.connections;
     let max_issues = limits.issues;
     let by_source_connections = max_connections < MAX_CONNECTIONS;
     let by_source_issues = max_issues < MAX_ISSUES;
     let mut source_hit = false;
+    let mut cancelled = false;
     let budget = Budget::new(max_issues);
     let mut issues = Issues::with_budget(&budget);
     let (credentials_status, mut creds) = match credentials {
@@ -980,6 +992,7 @@ fn map_sources_limited(
                 .cancel
                 .is_some_and(crate::source::CancelFlag::is_cancelled)
         {
+            cancelled = true;
             break;
         }
         let saved = creds.as_mut().and_then(|c| c.connections.remove(id));
@@ -1047,7 +1060,13 @@ fn map_sources_limited(
         issues = out.issues.len(),
         "DBeaver project mapped"
     );
-    (out, source_hit)
+    (
+        out,
+        MapEnd {
+            source_limit_hit: source_hit,
+            cancelled,
+        },
+    )
 }
 
 struct Ctx<'a> {
@@ -3646,10 +3665,12 @@ mod tests {
             source: None,
             cancel: Some(&cancel),
         };
-        let (all, _) = map_sources_limited("General", std::slice::from_ref(&ds), None, &limits);
+        let (all, end) = map_sources_limited("General", std::slice::from_ref(&ds), None, &limits);
         assert_eq!(all.connections.len(), 200);
+        assert!(!end.cancelled);
         cancel.cancel();
-        let (cut, _) = map_sources_limited("General", std::slice::from_ref(&ds), None, &limits);
+        let (cut, end) = map_sources_limited("General", std::slice::from_ref(&ds), None, &limits);
         assert!(cut.connections.is_empty());
+        assert!(end.cancelled);
     }
 }

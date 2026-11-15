@@ -30,6 +30,12 @@ pub enum DbeaverError {
         /// Size limit in bytes.
         limit: u64,
     },
+    /// The file changed size while it was read (it grew): it is not used.
+    #[error("{path} changed while it was read and was not used")]
+    Changed {
+        /// Path concerned.
+        path: PathBuf,
+    },
     /// The file is not valid JSON. The position is given; the content never is.
     #[error("{path} is not valid JSON (line {line}, column {column})")]
     InvalidJson {

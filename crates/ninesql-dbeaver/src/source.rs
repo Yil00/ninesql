@@ -1,6 +1,6 @@
 //! Reading a whole import source: every project of the workspaces found by one detection
 //! ([`crate::detect_workspaces`]) or one picked folder ([`crate::open_folder`]), under
-//! whole-source limits, read once per canonical folder, and cancellable (P2-D review, M1).
+//! whole-source limits, read once per folder (device and inode), and cancellable (P2-D review, M1).
 //!
 //! The per-file and per-project limits of [`crate::import_project`] still apply to each project;
 //! the limits here bound the sum, so a crafted folder (one large project plus hundreds of
@@ -8,17 +8,27 @@
 //! unbounded amount of data (I6).
 //!
 //! # Rules
-//! - **Read once**: a workspace whose canonical path was already seen in the same call (the
-//!   native, Flatpak and Snap locations can be links to one folder) is skipped; a project whose
-//!   canonical `.dbeaver` folder (or, if that does not resolve, canonical project folder) was
-//!   already read is skipped. Each skip is an [`IssueKind::Duplicate`] entry of
-//!   [`SourceImport::issues`].
+//! - **Read once**: a workspace that is the same directory (device and inode) as one already
+//!   seen in the same call (the native, Flatpak and Snap locations can be links to one folder)
+//!   is skipped; a project whose `.dbeaver` directory is the same directory as one already seen
+//!   is skipped (a symbolic link to a project folder, a `..` path, a linked `.dbeaver`).
+//!   Detection already skips such folders inside one workspace
+//!   ([`crate::Workspace::duplicate_projects`]). Each skip is an [`IssueKind::Duplicate`] entry
+//!   of [`SourceImport::issues`]; a duplicate of a project that was not read because of a limit
+//!   says so.
+//! - **Cut listings**: a workspace whose listing was cut ([`crate::Workspace::listing_truncated`])
+//!   gets an [`IssueKind::Truncated`] entry.
 //! - **Whole-source limits** ([`SourceLimits`]): projects read, connection entries, bytes read
 //!   (data-sources and credentials files together) and report entries. Past a limit, nothing
 //!   more is read: the project being read is cut short with an [`IssueKind::Truncated`] entry in
 //!   its own issues, the projects not read are listed in an [`IssueKind::Truncated`] entry of
-//!   [`SourceImport::issues`], and [`SourceImport::truncated`] is set. Never partial without a
-//!   report.
+//!   [`SourceImport::issues`], and [`SourceImport::truncated`] is set (it is set whenever any
+//!   [`IssueKind::Truncated`] entry exists, at any level). Never partial without a report.
+//! - **Report entries**: duplicate entries count against [`SourceLimits::max_issues`] (past it,
+//!   one last entry counts them); the few limit entries are always kept.
+//! - **Bytes** are charged whether a read succeeds or fails (bytes read before an error, a file
+//!   that grew, the full limit for a pseudo-file reporting a size of 0); files under `/proc`,
+//!   `/sys` and `/dev` are never read.
 //! - **Cancellation**: the [`CancelFlag`] is checked before each project, before each file
 //!   read, after parsing, and every [`CANCEL_CHECK_INTERVAL`] connections while mapping. Once it
 //!   is set, the call returns [`DbeaverError::Cancelled`] and drops everything it read (secrets
@@ -33,9 +43,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::detect::{Project, Workspace};
 use crate::error::DbeaverError;
-use crate::fsread;
+use crate::fsread::{self, FileId};
 use crate::mapping::{self, ProjectImport, ReadBudget};
-use crate::report::{ImportIssue, IssueKind, MAX_IDENT, Severity, ident};
+use crate::report::{ImportIssue, IssueKind, MAX_IDENT, Severity, ident, shown_path};
 
 /// Most distinct projects read in one import source.
 pub const MAX_SOURCE_PROJECTS: usize = 256;
@@ -49,8 +59,6 @@ pub const MAX_SOURCE_ISSUES: usize = 50_000;
 /// Connections mapped between two checks of the [`CancelFlag`].
 pub const CANCEL_CHECK_INTERVAL: usize = 64;
 
-/// Longest path embedded in a source-level report entry, in bytes.
-const MAX_PATH_SHOWN: usize = 512;
 /// Most project names listed in the "not read" entry; the others are counted.
 const MAX_NOT_READ_LISTED: usize = 20;
 
@@ -154,7 +162,7 @@ impl CancelFlag {
 #[derive(Debug)]
 #[must_use = "the import result carries secrets to move and issues to show"]
 pub struct SourceProject {
-    /// The project as found by detection (its first, canonical-unique occurrence).
+    /// The project as found by detection (the first occurrence of its folder).
     pub project: Project,
     /// What reading it produced, as [`crate::import_project`] returns it.
     pub import: ProjectImport,
@@ -207,41 +215,42 @@ pub fn import_source_with_limits(
         cancel: Some(cancel),
         source_limit_hit: false,
     };
-    let mut issues: Vec<ImportIssue> = Vec::new();
-    let mut seen_workspaces: BTreeMap<PathBuf, PathBuf> = BTreeMap::new();
-    let mut seen_projects: BTreeMap<PathBuf, PathBuf> = BTreeMap::new();
+    let mut report = SourceReport::default();
+    let mut seen_workspaces: BTreeMap<Key, PathBuf> = BTreeMap::new();
+    // First folder of each project key, and whether it was read.
+    let mut seen_projects: BTreeMap<Key, (PathBuf, bool)> = BTreeMap::new();
     let mut kept_workspaces = Vec::new();
     let mut projects: Vec<SourceProject> = Vec::new();
     let mut not_read: Vec<String> = Vec::new();
     let mut stop_reason: Option<String> = None;
-    let mut truncated = false;
 
     for mut workspace in workspaces {
         budget.check_cancel()?;
-        let key = canonical_or_lexical(&workspace.path);
+        let key = key_of(&workspace.path);
         if let Some(first) = seen_workspaces.get(&key) {
-            issues.push(ImportIssue::new(
-                Severity::Info,
-                IssueKind::Duplicate,
-                None,
-                format!(
-                    "the workspace {} is the same folder as {}: read once",
-                    shown_path(&workspace.path),
-                    shown_path(first)
+            report.counted(
+                &mut budget,
+                ImportIssue::new(
+                    Severity::Info,
+                    IssueKind::Duplicate,
+                    None,
+                    format!(
+                        "the workspace {} is the same folder as {}: read once",
+                        shown_path(&workspace.path),
+                        shown_path(first)
+                    ),
                 ),
-            ));
+            );
             continue;
         }
         seen_workspaces.insert(key, workspace.path.clone());
-        if workspace.projects.len() > MAX_SOURCE_PROJECTS {
-            truncated = true;
-            issues.push(ImportIssue::new(
+        if workspace.listing_truncated {
+            report.always(ImportIssue::new(
                 Severity::Warning,
                 IssueKind::Truncated,
                 None,
                 format!(
-                    "the folder {} holds more than {MAX_SOURCE_PROJECTS} project folders: the \
-                     others are not listed or read",
+                    "the listing of {} was cut (more than {MAX_SOURCE_PROJECTS} project folders,                      or a directory or detection limit was reached): the projects past the cut                      are not read",
                     shown_path(&workspace.path)
                 ),
             ));
@@ -250,36 +259,49 @@ pub fn import_source_with_limits(
         for project in found {
             budget.check_cancel()?;
             let key = project_key(&project);
-            if let Some(first) = seen_projects.get(&key) {
-                issues.push(ImportIssue::new(
-                    Severity::Warning,
-                    IssueKind::Duplicate,
-                    None,
-                    format!(
-                        "the project `{}` at {} resolves to the same folder as the project at \
-                         {}: read once",
-                        ident(&project.name, MAX_IDENT),
-                        shown_path(&project.path),
-                        shown_path(first)
-                    ),
-                ));
+            if let Some((first, read)) = seen_projects.get(&key) {
+                let issue = duplicate_issue(&project.path, first, *read);
+                report.counted(&mut budget, issue);
                 continue;
             }
-            seen_projects.insert(key, project.path.clone());
             if let Some(reason) = limit_reached(&limits, &budget, projects.len()) {
-                truncated = true;
                 stop_reason.get_or_insert(reason);
                 not_read.push(ident(&project.name, MAX_IDENT));
+                seen_projects.insert(key, (project.path.clone(), false));
                 continue;
             }
+            seen_projects.insert(key, (project.path.clone(), true));
             let import = mapping::import_project_limited(&project, &mut budget)?;
             workspace.projects.push(project.clone());
             projects.push(SourceProject { project, import });
         }
+        // After the projects, so each duplicate says whether its project was read.
+        for dup in std::mem::take(&mut workspace.duplicate_projects) {
+            let read = seen_projects
+                .get(&project_key_of_path(&dup.same_as))
+                .is_some_and(|(_, read)| *read);
+            report.counted(&mut budget, duplicate_issue(&dup.path, &dup.same_as, read));
+        }
+        if workspace.more_duplicates > 0 {
+            report.counted(
+                &mut budget,
+                ImportIssue::new(
+                    Severity::Warning,
+                    IssueKind::Duplicate,
+                    None,
+                    format!(
+                        "{} more project folders of {} resolve to folders already listed: read \
+                         once",
+                        workspace.more_duplicates,
+                        shown_path(&workspace.path)
+                    ),
+                ),
+            );
+            workspace.more_duplicates = 0;
+        }
         kept_workspaces.push(workspace);
     }
 
-    truncated |= budget.source_limit_hit;
     if let Some(reason) = stop_reason {
         let mut names = not_read
             .iter()
@@ -293,14 +315,25 @@ pub fn import_source_with_limits(
                 not_read.len() - MAX_NOT_READ_LISTED
             ));
         }
-        issues.push(ImportIssue::new(
+        report.always(ImportIssue::new(
             Severity::Warning,
             IssueKind::Truncated,
             None,
             format!("{reason}: {} project(s) not read: {names}", not_read.len()),
         ));
     }
+    let issues = report.finish(&limits);
     budget.check_cancel()?;
+    // Any cut at any level: source entries, project entries, connection entries.
+    let truncated = budget.source_limit_hit
+        || issues.iter().any(is_truncation)
+        || projects.iter().any(|p| {
+            p.import.issues.iter().any(is_truncation)
+                || p.import
+                    .connections
+                    .iter()
+                    .any(|c| c.issues.iter().any(is_truncation))
+        });
     tracing::debug!(
         projects = projects.len(),
         source_issues = issues.len(),
@@ -313,6 +346,67 @@ pub fn import_source_with_limits(
         issues,
         truncated,
     })
+}
+
+fn is_truncation(issue: &ImportIssue) -> bool {
+    issue.kind == IssueKind::Truncated
+}
+
+/// Source-level report entries. Duplicate entries draw on the report-entry budget (past it they
+/// are counted in one last entry); limit entries are always kept (a few per source).
+#[derive(Default)]
+struct SourceReport {
+    issues: Vec<ImportIssue>,
+    dropped: usize,
+}
+
+impl SourceReport {
+    fn counted(&mut self, budget: &mut ReadBudget<'_>, issue: ImportIssue) {
+        if budget.issues == 0 {
+            self.dropped += 1;
+        } else {
+            budget.issues -= 1;
+            self.issues.push(issue);
+        }
+    }
+
+    fn always(&mut self, issue: ImportIssue) {
+        self.issues.push(issue);
+    }
+
+    fn finish(mut self, limits: &SourceLimits) -> Vec<ImportIssue> {
+        if self.dropped > 0 {
+            self.issues.push(ImportIssue::new(
+                Severity::Warning,
+                IssueKind::Truncated,
+                None,
+                format!(
+                    "the import limit of {} report entries for the whole source was reached: {} \
+                     more entries are not shown",
+                    limits.max_issues, self.dropped
+                ),
+            ));
+        }
+        self.issues
+    }
+}
+
+fn duplicate_issue(path: &Path, first: &Path, first_read: bool) -> ImportIssue {
+    let message = if first_read {
+        format!(
+            "the project at {} resolves to the same folder as the project at {}: read once",
+            shown_path(path),
+            shown_path(first)
+        )
+    } else {
+        format!(
+            "the project at {} resolves to the same folder as the project at {}, which was not \
+             read because an import limit was reached",
+            shown_path(path),
+            shown_path(first)
+        )
+    };
+    ImportIssue::new(Severity::Warning, IssueKind::Duplicate, None, message)
 }
 
 /// Reads one project like [`crate::import_project`] (per-project limits only), checking
@@ -355,19 +449,28 @@ fn limit_reached(limits: &SourceLimits, budget: &ReadBudget<'_>, read: usize) ->
     }
 }
 
-/// The folder a project is read from: its canonical `.dbeaver` directory, else its canonical
-/// folder, else the path as given.
-fn project_key(project: &Project) -> PathBuf {
-    fsread::canonicalize(&project.path.join(".dbeaver"))
-        .unwrap_or_else(|| canonical_or_lexical(&project.path))
+/// Identity of a folder: device and inode, else its canonical path, else the path as given.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+enum Key {
+    Id(FileId),
+    Path(PathBuf),
 }
 
-fn canonical_or_lexical(path: &Path) -> PathBuf {
-    fsread::canonicalize(path).unwrap_or_else(|| path.to_path_buf())
+fn key_of(path: &Path) -> Key {
+    fsread::file_id(path).map_or_else(
+        || Key::Path(fsread::canonicalize(path).unwrap_or_else(|| path.to_path_buf())),
+        Key::Id,
+    )
 }
 
-fn shown_path(path: &Path) -> String {
-    ident(&path.display().to_string(), MAX_PATH_SHOWN)
+/// The folder a project is read from: its `.dbeaver` directory (device and inode), else its
+/// own folder.
+fn project_key(project: &Project) -> Key {
+    project_key_of_path(&project.path)
+}
+
+fn project_key_of_path(path: &Path) -> Key {
+    fsread::file_id(&path.join(".dbeaver")).map_or_else(|| key_of(path), Key::Id)
 }
 
 #[cfg(test)]

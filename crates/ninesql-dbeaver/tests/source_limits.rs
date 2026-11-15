@@ -13,9 +13,10 @@ use std::path::Path;
 use std::time::{Duration, Instant};
 
 use ninesql_dbeaver::{
-    CancelFlag, DbeaverError, InstallKind, IssueKind, MAX_SOURCE_PROJECTS, SearchRoots,
-    SourceImport, SourceLimits, Workspace, detect_workspaces, import_project, import_project_with,
-    import_source, import_source_with_limits, open_folder,
+    CancelFlag, DbeaverError, InstallKind, IssueKind, MAX_DETECT_DIRS, MAX_LISTED_DUPLICATES,
+    MAX_SOURCE_PROJECTS, SearchRoots, SourceImport, SourceLimits, Workspace, detect_workspaces,
+    detect_workspaces_with, import_project, import_project_with, import_source,
+    import_source_with_limits, open_folder, open_folder_with,
 };
 
 /// A minimal `data-sources.json` with `n` PostgreSQL connections whose ids start with `prefix`.
@@ -67,7 +68,8 @@ fn symlinked_projects_are_read_once_and_reported() {
     crafted_workspace(&ws, 200, 100);
     let start = Instant::now();
     let workspace = open_folder(&ws).unwrap_or_else(|e| panic!("{e}"));
-    assert_eq!(workspace.projects.len(), 101, "listing follows the links");
+    assert_eq!(workspace.projects.len(), 1, "links are not listed twice");
+    assert_eq!(workspace.duplicate_projects.len(), 100);
     let s = import_source(vec![workspace], &CancelFlag::new()).unwrap_or_else(|e| panic!("{e}"));
     let elapsed = start.elapsed();
 
@@ -82,30 +84,190 @@ fn symlinked_projects_are_read_once_and_reported() {
 }
 
 #[test]
-fn many_symlinks_stay_bounded_and_the_cut_listing_is_reported() {
+fn many_symlinks_stay_bounded_and_are_counted() {
     let tmp = tempfile::tempdir().unwrap_or_else(|e| panic!("{e}"));
     let ws = tmp.path().join("ws");
-    let links = MAX_SOURCE_PROJECTS + 44;
+    let links = MAX_LISTED_DUPLICATES + 44;
     crafted_workspace(&ws, 50, links);
     let start = Instant::now();
     let workspace = open_folder(&ws).unwrap_or_else(|e| panic!("{e}"));
-    assert_eq!(
-        workspace.projects.len(),
-        MAX_SOURCE_PROJECTS + 1,
-        "the listing stops one past the limit"
-    );
+    assert_eq!(workspace.projects.len(), 1);
+    assert_eq!(workspace.duplicate_projects.len(), MAX_LISTED_DUPLICATES);
+    assert_eq!(workspace.more_duplicates, 44);
+    assert!(!workspace.listing_truncated, "duplicates are not a cut");
     let s = import_source(vec![workspace], &CancelFlag::new()).unwrap_or_else(|e| panic!("{e}"));
     let elapsed = start.elapsed();
 
     assert_eq!(s.projects.len(), 1);
     assert_eq!(total_connections(&s), 50, "bounded, not 50 x {links}");
-    assert_eq!(count(&s, IssueKind::Duplicate), MAX_SOURCE_PROJECTS);
-    assert!(s.truncated, "the cut listing is reported");
+    assert_eq!(count(&s, IssueKind::Duplicate), MAX_LISTED_DUPLICATES + 1);
     assert!(
-        s.issues.iter().any(|i| i.kind == IssueKind::Truncated
-            && i.message.contains("more than 256 project folders"))
+        s.issues
+            .iter()
+            .any(|i| i.message.contains("44 more project folders"))
     );
+    assert!(!s.truncated);
     assert!(elapsed < Duration::from_secs(10), "took {elapsed:?}");
+}
+
+#[test]
+fn more_than_256_projects_cut_the_listing_and_it_is_reported() {
+    let tmp = tempfile::tempdir().unwrap_or_else(|e| panic!("{e}"));
+    let ws = tmp.path().join("ws");
+    for i in 0..MAX_SOURCE_PROJECTS + 4 {
+        write_project(&ws.join(format!("p{i:04}")), &format!("p{i}"), 1);
+    }
+    let workspace = open_folder(&ws).unwrap_or_else(|e| panic!("{e}"));
+    assert_eq!(workspace.projects.len(), MAX_SOURCE_PROJECTS);
+    assert!(workspace.listing_truncated, "the flag the core must report");
+    let s = import_source(vec![workspace], &CancelFlag::new()).unwrap_or_else(|e| panic!("{e}"));
+    assert!(s.truncated);
+    assert_eq!(s.projects.len(), MAX_SOURCE_PROJECTS);
+    assert!(
+        s.issues
+            .iter()
+            .any(|i| i.kind == IssueKind::Truncated && i.message.contains("was cut"))
+    );
+}
+
+#[test]
+fn links_to_a_large_non_project_folder_cost_one_listing() {
+    // The review case at a smaller scale: many links to a folder whose `.dbeaver` holds many
+    // files that are not data-sources files.
+    let tmp = tempfile::tempdir().unwrap_or_else(|e| panic!("{e}"));
+    let ws = tmp.path().join("ws");
+    let dot = ws.join("junk/.dbeaver");
+    fs::create_dir_all(&dot).unwrap_or_else(|e| panic!("{e}"));
+    for i in 0..5_000 {
+        fs::write(dot.join(format!("f{i}")), b"").unwrap_or_else(|e| panic!("{e}"));
+    }
+    for i in 0..1_000 {
+        symlink(ws.join("junk"), ws.join(format!("link-{i:04}"))).unwrap_or_else(|e| panic!("{e}"));
+    }
+    let start = Instant::now();
+    let res = open_folder(&ws);
+    let elapsed = start.elapsed();
+    assert!(matches!(res, Err(DbeaverError::NotDbeaver { .. })));
+    assert!(elapsed < Duration::from_secs(5), "took {elapsed:?}");
+}
+
+#[test]
+fn the_detection_budget_cuts_the_listing_and_it_is_reported() {
+    // More distinct candidate folders with a `.dbeaver` directory than one detection lists.
+    let tmp = tempfile::tempdir().unwrap_or_else(|e| panic!("{e}"));
+    let ws = tmp.path().join("ws");
+    write_project(&ws.join("a-real"), "real", 2);
+    for i in 0..MAX_DETECT_DIRS + 10 {
+        fs::create_dir_all(ws.join(format!("b{i:05}/.dbeaver"))).unwrap_or_else(|e| panic!("{e}"));
+    }
+    let start = Instant::now();
+    let workspace = open_folder(&ws).unwrap_or_else(|e| panic!("{e}"));
+    assert!(workspace.listing_truncated);
+    assert_eq!(workspace.projects.len(), 1);
+    let s = import_source(vec![workspace], &CancelFlag::new()).unwrap_or_else(|e| panic!("{e}"));
+    assert!(s.truncated);
+    assert_eq!(total_connections(&s), 2);
+    assert!(start.elapsed() < Duration::from_secs(10));
+}
+
+#[test]
+fn cancelled_detection_returns_cancelled() {
+    let tmp = tempfile::tempdir().unwrap_or_else(|e| panic!("{e}"));
+    let ws = tmp.path().join("ws");
+    write_project(&ws.join("General"), "nine", 1);
+    let cancel = CancelFlag::new();
+    cancel.cancel();
+    assert!(matches!(
+        open_folder_with(&ws, &cancel),
+        Err(DbeaverError::Cancelled)
+    ));
+    let home = tmp.path().join("home");
+    write_project(
+        &home.join(".local/share/DBeaverData/workspace6/General"),
+        "nine",
+        1,
+    );
+    let roots = SearchRoots { home };
+    assert!(matches!(
+        detect_workspaces_with(&roots, &cancel),
+        Err(DbeaverError::Cancelled)
+    ));
+    assert_eq!(detect_workspaces(&roots).len(), 1);
+    assert!(open_folder_with(&ws, &CancelFlag::new()).is_ok());
+}
+
+#[test]
+fn pseudo_files_are_not_read_and_exhaust_the_byte_budget() {
+    let tmp = tempfile::tempdir().unwrap_or_else(|e| panic!("{e}"));
+    let ws = tmp.path().join("ws");
+    write_project(&ws.join("General"), "nine", 2);
+    let dot = ws.join("General/.dbeaver");
+    for i in 0..60 {
+        symlink(
+            "/proc/self/pagemap",
+            dot.join(format!("data-sources-{i:02}.json")),
+        )
+        .unwrap_or_else(|e| panic!("{e}"));
+    }
+    symlink("/proc/self/status", dot.join("data-sources-zz.json"))
+        .unwrap_or_else(|e| panic!("{e}"));
+    let start = Instant::now();
+    let workspace = open_folder(&ws).unwrap_or_else(|e| panic!("{e}"));
+    let s = import_source(vec![workspace], &CancelFlag::new()).unwrap_or_else(|e| panic!("{e}"));
+    assert!(
+        start.elapsed() < Duration::from_secs(5),
+        "took {:?}",
+        start.elapsed()
+    );
+    assert_eq!(total_connections(&s), 2);
+    let files = &s.projects[0].import;
+    assert_eq!(files.source_files.len(), 1);
+    assert_eq!(
+        files
+            .issues
+            .iter()
+            .filter(|i| i.kind == IssueKind::File && i.message.contains("not a regular file"))
+            .count(),
+        61
+    );
+}
+
+#[test]
+fn a_per_project_truncation_sets_truncated() {
+    let tmp = tempfile::tempdir().unwrap_or_else(|e| panic!("{e}"));
+    let ws = tmp.path().join("ws");
+    write_project(&ws.join("General"), "nine", 1);
+    let dot = ws.join("General/.dbeaver");
+    for i in 0..70 {
+        fs::write(dot.join(format!("data-sources-{i:02}.json")), "{}")
+            .unwrap_or_else(|e| panic!("{e}"));
+    }
+    let workspace = open_folder(&ws).unwrap_or_else(|e| panic!("{e}"));
+    let s = import_source(vec![workspace], &CancelFlag::new()).unwrap_or_else(|e| panic!("{e}"));
+    assert!(s.issues.is_empty());
+    assert!(s.truncated, "a project-level cut counts");
+}
+
+#[test]
+fn a_duplicate_of_a_project_not_read_says_so() {
+    let tmp = tempfile::tempdir().unwrap_or_else(|e| panic!("{e}"));
+    let ws = tmp.path().join("ws");
+    write_project(&ws.join("A"), "a", 1);
+    write_project(&ws.join("B"), "b", 1);
+    symlink(ws.join("B"), ws.join("link-b")).unwrap_or_else(|e| panic!("{e}"));
+    let workspace = open_folder(&ws).unwrap_or_else(|e| panic!("{e}"));
+    let s = import_source_with_limits(
+        vec![workspace],
+        SourceLimits::default().with_max_projects(1),
+        &CancelFlag::new(),
+    )
+    .unwrap_or_else(|e| panic!("{e}"));
+    let dup = s
+        .issues
+        .iter()
+        .find(|i| i.kind == IssueKind::Duplicate)
+        .unwrap_or_else(|| panic!("duplicate reported"));
+    assert!(dup.message.contains("was not read"), "{}", dup.message);
 }
 
 #[test]
@@ -120,7 +282,8 @@ fn dot_dot_paths_and_linked_dot_dbeaver_folders_are_duplicates() {
     // The same project through `..`.
     let a_again = open_folder(&ws.join("B/../A")).unwrap_or_else(|e| panic!("{e}"));
     let whole = open_folder(&ws).unwrap_or_else(|e| panic!("{e}"));
-    assert_eq!(whole.projects.len(), 2);
+    assert_eq!(whole.projects.len(), 1);
+    assert_eq!(whole.duplicate_projects.len(), 1);
     let s = import_source(vec![a, a_again, whole], &CancelFlag::new())
         .unwrap_or_else(|e| panic!("{e}"));
     assert_eq!(s.projects.len(), 1);
