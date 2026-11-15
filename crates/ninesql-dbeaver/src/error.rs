@@ -30,6 +30,19 @@ pub enum DbeaverError {
         /// Size limit in bytes.
         limit: u64,
     },
+    /// The file is on a special filesystem (`/proc`, `/sys` or `/dev`, `/dev/shm` included):
+    /// it is not opened.
+    #[error("{path} is on a special filesystem (/proc, /sys or /dev); not read")]
+    SpecialFilesystem {
+        /// Path concerned.
+        path: PathBuf,
+    },
+    /// The file changed size while it was read (it grew): it is not used.
+    #[error("{path} changed while it was read and was not used")]
+    Changed {
+        /// Path concerned.
+        path: PathBuf,
+    },
     /// The file is not valid JSON. The position is given; the content never is.
     #[error("{path} is not valid JSON (line {line}, column {column})")]
     InvalidJson {
@@ -46,6 +59,9 @@ pub enum DbeaverError {
         /// Path concerned.
         path: PathBuf,
     },
+    /// The read was stopped through a [`crate::CancelFlag`]; nothing of it should be used.
+    #[error("the DBeaver import was cancelled")]
+    Cancelled,
     /// The folder is neither a DBeaver workspace nor a DBeaver project.
     #[error("{path} is not a DBeaver workspace or project folder")]
     NotDbeaver {

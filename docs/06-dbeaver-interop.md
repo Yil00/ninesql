@@ -91,6 +91,31 @@ Past a limit, the rest is not imported and the report says so.
 | Connection types | 1 000 |
 | Report entries (project and connections together) | 50 000 |
 
+### Detection limits
+Detection (`detect_workspaces`, `open_folder`, and their cancellable forms `detect_workspaces_with` / `open_folder_with`) is bounded too:
+- A directory listing reads at most 100 000 names, sorts them and keeps the first 10 000 by name; a `.dbeaver` listing keeps only `data-sources*.json` names before any `stat`. One detection lists at most 2 048 directories (`MAX_DETECT_DIRS`) and reads or `stat`s at most 200 000 entries (`MAX_DETECT_ENTRIES`), all listings together.
+- A workspace lists at most 256 projects (`MAX_SOURCE_PROJECTS`) and keeps at most 65 `data-sources*.json` names per project (one more than an import reads, so the import can say that there are more).
+- A candidate folder whose `.dbeaver` directory is the same directory (device and inode) as one already examined is not listed again: links to a project are recorded in `Workspace::duplicate_projects` (at most 256, the others counted in `more_duplicates`), links to a folder that is not a project are skipped.
+- When a listing is cut, `Workspace::listing_truncated` is set; `import_source` reports it, and any other caller that imports the projects must report it too.
+
+### Whole-source limits and read-once (P2-D M1)
+One import reads one **source**: every workspace found by one detection (native, Flatpak, Snap) or one picked folder. `ninesql_dbeaver::import_source` reads all its projects under limits on the sum, on top of the per-project limits above. They are public constants (`MAX_SOURCE_*`, `SourceLimits`); a caller may lower them, never raise them.
+
+| Item (whole source) | Limit |
+|---|---|
+| Distinct projects read | 256 (`MAX_SOURCE_PROJECTS`) |
+| Connection entries (imported, disabled or failed) | 10 000 (`MAX_SOURCE_CONNECTIONS`) |
+| Bytes read (`data-sources*.json` and `credentials-config.json` together) | 64 MiB (`MAX_SOURCE_BYTES`) |
+| Report entries (source, projects and connections together) | 50 000 (`MAX_SOURCE_ISSUES`) |
+
+- **Fail closed, never partial without a report**: past a limit nothing more is read. The project being read is cut short with a `Truncated` entry in its own report (a data-sources file larger than what is left of the byte budget is not read at all; a credentials file that cannot be read within the budget means its connections are imported without saved passwords), the projects not read are named in a source-level `Truncated` entry, and `SourceImport::truncated` is set. `SourceImport::truncated` is set whenever any `Truncated` entry exists, at the source, project or connection level (a single project over a per-project limit included).
+- **Bytes are charged on failure too**: the bytes read before an I/O error, the bytes read from a file that grew while it was read (it is refused), and the full limit for a file that reports a size of 0 but has content (a pseudo-file, refused). Files under `/proc`, `/sys` and `/dev` (`/dev/shm` included) are never opened; the report says the file "is on a special filesystem (/proc, /sys or /dev); not read".
+- **Read once per folder**: a workspace that is the same directory (device and inode) as one already seen (for example the Flatpak location being a link to the native one) is skipped; a project whose `.dbeaver` directory is the same directory as one already seen (a symbolic link to a project folder, a `..` path, a project folder whose `.dbeaver` is a link) is skipped. Each skip, and each duplicate recorded by detection, is a source-level `Duplicate` entry; a duplicate of a project that was not read because of a limit says so. The first occurrence in detection order (native, Flatpak, Snap; folders by name) is the one read, so re-imported connections keep a stable source workspace.
+- **Report entries**: source-level `Duplicate` entries count against the report-entry limit (past it, one last entry counts the others); the few `Truncated` entries of the source are always kept. Messages never hold control characters and embed paths shortened to 512 bytes.
+- **Cancellation**: the read checks a `CancelFlag` before each project, before each file, after parsing and every 64 connections (`CANCEL_CHECK_INTERVAL`); once it is set, the read returns `DbeaverError::Cancelled` and drops what it read (decrypted secrets are zeroized on drop). Parsing one file is not interrupted; it is bounded by the per-file size limits. **Residual risk**: the flag is checked between filesystem calls, so a call that blocks inside the kernel, such as a read of a file on a FUSE or stalled network filesystem that never answers, cannot be interrupted by `CancelFlag`; the read thread stays blocked until the filesystem answers. The core can stop waiting for it, but not stop it.
+
+`import_project` keeps the per-project limits only and is not cancellable; real imports go through `import_source`.
+
 ### Connections imported disabled (fail closed, I2)
 A connection whose route NineSQL cannot reproduce is imported **disabled** with the reason in the report, so that it never connects without a hop DBeaver used:
 - **Network profiles** (F-CON-17, not supported yet): any value other than `null`, the empty string or an empty array / object under a key containing `profile`, at the connection level, in `configuration` (DBeaver writes `config-profile` and `config-profile-source`, for example `global`: the profile may live outside the file) or in a handler's properties; and, when the file defines `network-profiles`, any such value under a key starting with `network`. The same test applies in every scope, and a blank value (`" "`) counts as a reference, because DBeaver does not trim the value it looks a profile up by.
