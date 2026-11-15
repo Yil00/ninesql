@@ -1,6 +1,6 @@
 # ADR-0023: Phase 2 import decisions
 
-- **Status**: Proposed. It adds notes to [ADR-0006](0006-dbeaver-interoperability.md) (§3 connection types, §8 re-import) and [ADR-0007](0007-production-safety-model.md) (§1 connection types, §5 manual commit for production) without rewriting their decisions, and builds on [ADR-0021](0021-phase-1-core-secrets-and-storage-decisions.md) and [ADR-0022](0022-pre-phase-2-hardening-decisions.md) (`connections.json` schemas 3 and 4).
+- **Status**: Accepted (maintainer, 2026-11-15). It adds notes to [ADR-0006](0006-dbeaver-interoperability.md) (§3 connection types, §8 re-import) and [ADR-0007](0007-production-safety-model.md) (§1 connection types, §5 manual commit for production) without rewriting their decisions, and builds on [ADR-0021](0021-phase-1-core-secrets-and-storage-decisions.md) and [ADR-0022](0022-pre-phase-2-hardening-decisions.md) (`connections.json` schemas 3 and 4).
 - **Date**: 2026-11-15
 
 ## Context
