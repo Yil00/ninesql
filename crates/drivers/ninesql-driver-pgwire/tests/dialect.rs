@@ -254,6 +254,64 @@ fn one_long_line_splits_in_linear_time() {
     assert!(elapsed < std::time::Duration::from_secs(5), "{elapsed:?}");
 }
 
+/// Re-review L2: the loop compares the lexical rules after every item, so a ROLLBACK that
+/// undoes a `SET standard_conforming_strings` re-splits the rest too.
+#[test]
+fn rollback_undoing_a_mode_change_resplits() {
+    use ninesql_driver_api::conformance::script_plan;
+    let script = "BEGIN;\nSET standard_conforming_strings = off;\nROLLBACK;\n\
+                  UPDATE t SET a = 'x\\' WHERE id = 1;\nSELECT 1;";
+    let mut run = |text: &str| -> Option<Box<dyn Dialect>> {
+        if text.starts_with("SET standard_conforming_strings = off") {
+            Some(Box::new(PgDialect::with_standard_conforming_strings(false)))
+        } else if text == "ROLLBACK" {
+            Some(Box::new(PgDialect::new()))
+        } else {
+            None
+        }
+    };
+    let plan = script_plan(script, Box::new(PgDialect::new()), &mut run);
+    let got: Vec<_> = plan.iter().map(|p| (p.text.as_str(), p.class)).collect();
+    assert_eq!(
+        got,
+        [
+            ("BEGIN", Some(StatementClass::Transaction)),
+            (
+                "SET standard_conforming_strings = off",
+                Some(StatementClass::ChangesAccessMode)
+            ),
+            ("ROLLBACK", Some(StatementClass::Transaction)),
+            (
+                "UPDATE t SET a = 'x\\' WHERE id = 1",
+                Some(StatementClass::Write)
+            ),
+            ("SELECT 1", Some(StatementClass::Read)),
+        ]
+    );
+}
+
+/// Re-review M1: alternating mode changes keep the reference loop linear.
+#[test]
+fn alternating_mode_changes_run_in_linear_time() {
+    use ninesql_driver_api::conformance::script_plan;
+    let mut toggle = |text: &str| -> Option<Box<dyn Dialect>> {
+        if text.ends_with("= off") {
+            Some(Box::new(PgDialect::with_standard_conforming_strings(false)))
+        } else if text.ends_with("= on") {
+            Some(Box::new(PgDialect::new()))
+        } else {
+            None
+        }
+    };
+    let pair = "SET standard_conforming_strings = off;\nSET standard_conforming_strings = on;\n";
+    let script = pair.repeat(276_000 / pair.len());
+    let start = std::time::Instant::now();
+    let plan = script_plan(&script, Box::new(PgDialect::new()), &mut toggle);
+    let elapsed = start.elapsed();
+    assert_eq!(plan.len(), 2 * (276_000 / pair.len()));
+    assert!(elapsed < std::time::Duration::from_secs(5), "{elapsed:?}");
+}
+
 fn junk() -> impl Strategy<Value = String> {
     prop::collection::vec(
         prop::sample::select(vec![

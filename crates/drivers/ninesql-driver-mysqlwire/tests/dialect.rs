@@ -154,10 +154,19 @@ fn lexical_modes() {
         statements("SELECT 1 /*! ; DELETE FROM t */"),
         ["SELECT 1 /*!", "DELETE FROM t */"]
     );
+    // The piece after the `;` starts inside the comment: Unknown (re-review L1).
     assert_eq!(
         MyDialect::mysql().classify("SELECT 1 /*! ; DELETE FROM t */"),
-        StatementClass::Destructive
+        StatementClass::Unknown
     );
+    for junk in ["/*!;*//*", "/*!;*/BEGIN", "SELECT 1 /*! ; */ BEGIN"] {
+        assert_script_split_invariants(&MyDialect::mysql(), junk);
+        assert_eq!(
+            MyDialect::mysql().classify(junk),
+            StatementClass::Unknown,
+            "{junk}"
+        );
+    }
     // A statement keeps its executable comment, and so its version condition.
     assert_eq!(
         statements("/*!40101 SET NAMES utf8mb4 */;\n/*M!100100 SELECT 1 */;"),
@@ -317,6 +326,28 @@ fn stored_program_kind_must_follow_create() {
     let two =
         "CREATE VIEW v AS SELECT procedure_name AS procedure, 1 AS begin FROM t; DROP TABLE x";
     assert_eq!(d.split_statements(two).len(), 2);
+    // Dotted and quoted definer hosts under DELIMITER (re-review M2): one statement each.
+    for def in [
+        "root@127.0.0.1",
+        "root@localhost.localdomain",
+        "'root'@'%'",
+        "`root`@`10.0.0.1`",
+        "CURRENT_USER()",
+        "root",
+    ] {
+        let script = format!(
+            "DELIMITER //\nCREATE DEFINER = {def} PROCEDURE p() BEGIN SELECT 1; DELETE FROM t; END//\nDELIMITER ;"
+        );
+        let got = split(&script);
+        let kinds: Vec<_> = got.iter().map(|(k, _)| *k).collect();
+        assert_eq!(kinds, [D, S, D], "{def}: {got:?}");
+        let plain =
+            format!("CREATE DEFINER = {def} PROCEDURE p() BEGIN SELECT 1; DELETE FROM t; END");
+        assert_eq!(d.split_statements(&plain).len(), 1, "{def}");
+    }
+    // A view with a definer is no stored program.
+    let view = "CREATE DEFINER = root@127.0.0.1 VIEW v AS SELECT procedure_x AS procedure, 1 AS begin FROM t; SELECT 1";
+    assert_eq!(d.split_statements(view).len(), 2);
     for one in [
         "CREATE DEFINER = root@localhost PROCEDURE p() BEGIN SELECT 1; END",
         "CREATE DEFINER = CURRENT_USER TRIGGER tr BEFORE INSERT ON t FOR EACH ROW BEGIN SET NEW.a = 1; END",
@@ -335,6 +366,46 @@ fn one_long_line_splits_in_linear_time() {
     let start = std::time::Instant::now();
     assert_eq!(MyDialect::mysql().split_script(&s).len(), 200_000);
     let elapsed = start.elapsed();
+    assert!(elapsed < std::time::Duration::from_secs(5), "{elapsed:?}");
+}
+
+/// Re-review M1: every statement changing the lexical modes keeps the reference loop linear
+/// (it re-splits a small window ahead, and the delimiter in force is passed along).
+#[test]
+fn alternating_mode_changes_run_in_linear_time() {
+    use ninesql_driver_api::conformance::script_plan;
+    let mut toggle = |text: &str| -> Option<Box<dyn Dialect>> {
+        let t = text.to_ascii_uppercase();
+        if t.starts_with("SET SESSION SQL_MODE='NO_BACKSLASH_ESCAPES'") {
+            Some(Box::new(
+                MyDialect::mysql().with_sql_mode("NO_BACKSLASH_ESCAPES"),
+            ))
+        } else if t.starts_with("SET SESSION SQL_MODE=''") {
+            Some(Box::new(MyDialect::mysql()))
+        } else {
+            None
+        }
+    };
+    let pair =
+        "SET SESSION sql_mode='NO_BACKSLASH_ESCAPES';\nSET SESSION sql_mode='';\nSELECT 'a;b';\n";
+    let script = pair.repeat(276_000 / pair.len());
+    let start = std::time::Instant::now();
+    let plan = script_plan(&script, Box::new(MyDialect::mysql()), &mut toggle);
+    let elapsed = start.elapsed();
+    assert_eq!(plan.len(), 3 * (276_000 / pair.len()));
+    assert!(elapsed < std::time::Duration::from_secs(5), "{elapsed:?}");
+    // Under a custom delimiter too.
+    let pair = "SET SESSION sql_mode='NO_BACKSLASH_ESCAPES' //\nSET SESSION sql_mode='' //\n";
+    let script = format!("DELIMITER //\n{}", pair.repeat(100_000 / pair.len()));
+    let start = std::time::Instant::now();
+    let plan = script_plan(&script, Box::new(MyDialect::mysql()), &mut toggle);
+    let elapsed = start.elapsed();
+    assert_eq!(plan.len(), 2 * (100_000 / pair.len()));
+    assert!(
+        plan.iter().all(|p| !p.text.contains("//")),
+        "{:?}",
+        &plan[..2]
+    );
     assert!(elapsed < std::time::Duration::from_secs(5), "{elapsed:?}");
 }
 

@@ -16,7 +16,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use ninesql_driver_api::{
     CodeToken, CodeTokenKind, Dialect, ExplainFormat, LexicalRules, Param, ScriptItem,
-    ScriptItemKind, ScriptRefusal, StatementSpan, code_tokens, script_items,
+    ScriptItemKind, ScriptRefusal, ScriptState, StatementSpan, TextPosition, code_tokens,
+    script_items, script_items_from,
 };
 
 /// The PostgreSQL dialect.
@@ -102,11 +103,49 @@ impl Dialect for PgDialect {
     }
 
     fn split_script(&self, script: &str) -> Vec<ScriptItem> {
+        script_items(script, self.pieces(script, 0, false))
+    }
+
+    fn split_script_ahead(
+        &self,
+        script: &str,
+        from: TextPosition,
+        _state: &ScriptState,
+    ) -> Vec<ScriptItem> {
+        if from.offset > script.len() || !script.is_char_boundary(from.offset) {
+            return self.split_script_from(script, from.offset);
+        }
+        script_items_from(script, from, self.pieces(script, from.offset, true))
+    }
+
+    fn explain(&self, query: &str, format: ExplainFormat) -> Option<String> {
+        let q = query.trim().trim_end_matches(';');
+        Some(match format {
+            ExplainFormat::Text => format!("EXPLAIN {q}"),
+            ExplainFormat::Json => format!("EXPLAIN (FORMAT JSON) {q}"),
+            ExplainFormat::Analyze => format!("EXPLAIN ANALYZE {q}"),
+            _ => return None,
+        })
+    }
+}
+
+impl PgDialect {
+    /// The pieces of `script` from byte `start`; with `lazy`, only the first window's worth
+    /// (at least one piece unless only blanks and comments are left).
+    fn pieces(
+        &self,
+        script: &str,
+        start: usize,
+        lazy: bool,
+    ) -> Vec<(StatementSpan, ScriptItemKind)> {
         let rules = self.lexical_rules();
         let mut pieces = Vec::new();
-        let mut base = 0;
+        let mut base = start;
         let mut window = MIN_WINDOW;
         'outer: while base < script.len() {
+            if lazy && !pieces.is_empty() {
+                break;
+            }
             // The window follows what the last step consumed (twice it, within bounds), so a
             // script with a meta-command or a COPY block every few bytes lexes a few hundred
             // bytes per step, not a full window (security review M4).
@@ -176,17 +215,7 @@ impl Dialect for PgDialect {
                 _ => break,
             }
         }
-        script_items(script, pieces)
-    }
-
-    fn explain(&self, query: &str, format: ExplainFormat) -> Option<String> {
-        let q = query.trim().trim_end_matches(';');
-        Some(match format {
-            ExplainFormat::Text => format!("EXPLAIN {q}"),
-            ExplainFormat::Json => format!("EXPLAIN (FORMAT JSON) {q}"),
-            ExplainFormat::Analyze => format!("EXPLAIN ANALYZE {q}"),
-            _ => return None,
-        })
+        pieces
     }
 }
 

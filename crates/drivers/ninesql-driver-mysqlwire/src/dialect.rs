@@ -29,8 +29,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use ninesql_driver_api::dialect::{classify_with_rules, split_with_rules};
 use ninesql_driver_api::{
     Dialect, DriverError, DriverResult, ExplainFormat, LexicalRules, Param, RowChange, RowEdit,
-    ScriptItem, ScriptItemKind, ScriptRefusal, Statement, StatementClass, StatementSpan,
-    script_items,
+    ScriptItem, ScriptItemKind, ScriptRefusal, ScriptState, Statement, StatementClass,
+    StatementSpan, TextPosition, script_items, script_items_from,
 };
 
 /// The session's lexical modes, shared between the session and its dialect.
@@ -185,8 +185,44 @@ impl Dialect for MyDialect {
     }
 
     fn split_script(&self, script: &str) -> Vec<ScriptItem> {
-        let (pieces, _) = split_with_delimiters(self, script, self.scan_rules(), 0, None);
+        let (pieces, _) = split_with_delimiters(self, script, self.scan_rules(), 0, None, false);
         script_items(script, pieces)
+    }
+
+    fn split_script_ahead(
+        &self,
+        script: &str,
+        from: TextPosition,
+        state: &ScriptState,
+    ) -> Vec<ScriptItem> {
+        if from.offset > script.len() || !script.is_char_boundary(from.offset) {
+            return self.split_script_from(script, from.offset);
+        }
+        // The caller passes the delimiter in force: nothing before `from` is read again.
+        let (pieces, _) = split_with_delimiters(
+            self,
+            script,
+            self.scan_rules(),
+            from.offset,
+            state.delimiter.clone(),
+            true,
+        );
+        script_items_from(script, from, pieces)
+    }
+
+    fn script_state_after(
+        &self,
+        script: &str,
+        item: &ScriptItem,
+        state: &ScriptState,
+    ) -> ScriptState {
+        if item.kind != ScriptItemKind::ClientDirective {
+            return state.clone();
+        }
+        match delimiter_directive(script, item.span.start) {
+            Some((_, Some(d))) => ScriptState::with_delimiter((d != ";").then_some(d)),
+            _ => state.clone(),
+        }
     }
 
     fn split_script_from(&self, script: &str, from: usize) -> Vec<ScriptItem> {
@@ -196,8 +232,8 @@ impl Dialect for MyDialect {
         }
         let rules = self.scan_rules();
         // The `DELIMITER` in force at `from`, rebuilt from the text before it.
-        let (_, delim) = split_with_delimiters(self, &script[..from], rules, 0, None);
-        let (pieces, _) = split_with_delimiters(self, script, rules, from, delim);
+        let (_, delim) = split_with_delimiters(self, &script[..from], rules, 0, None, false);
+        let (pieces, _) = split_with_delimiters(self, script, rules, from, delim, false);
         script_items(script, pieces)
     }
 
@@ -434,8 +470,8 @@ fn code_words(text: &str, rules: ScanRules) -> Vec<String> {
 /// anonymous block `BEGIN NOT ATOMIC …`.
 /// `CREATE [OR REPLACE] [DEFINER = user] [ALGORITHM = …] [SQL SECURITY …] [AGGREGATE]
 /// PROCEDURE | FUNCTION | TRIGGER | EVENT … BEGIN`, the object kind right after those clauses
-/// (security review L3), or a MariaDB anonymous block `BEGIN NOT ATOMIC …`. The definer's
-/// user and host are at most two unquoted words (quoted parts are not code words).
+/// (security review L3), or a MariaDB anonymous block `BEGIN NOT ATOMIC …`. The definer is
+/// skipped up to the next clause keyword, so dotted hosts (`root@127.0.0.1`) are understood.
 fn is_stored_program(words: &[String]) -> bool {
     if words.len() >= 3 && words[0] == "BEGIN" && words[1] == "NOT" && words[2] == "ATOMIC" {
         return true;
@@ -448,18 +484,34 @@ fn is_stored_program(words: &[String]) -> bool {
     if at(i) == Some("OR") && at(i + 1) == Some("REPLACE") {
         i += 2;
     }
+    if at(i) == Some("ALGORITHM") {
+        i += 2;
+    }
     if at(i) == Some("DEFINER") {
         i += 1;
-        // `CURRENT_USER`, `user`, `user` `host`: up to two words before the next clause.
-        for _ in 0..2 {
-            match at(i) {
-                Some(
-                    "ALGORITHM" | "SQL" | "AGGREGATE" | "PROCEDURE" | "FUNCTION" | "TRIGGER"
-                    | "EVENT",
-                )
-                | None => break,
-                Some(_) => i += 1,
+        // The definer as code words: `CURRENT_USER`, or a user and a host that may hold dots
+        // (`root@127.0.0.1` is the words ROOT, 127, 0, 0, 1; quoted parts are no words). Skip
+        // them up to the next clause or object keyword (re-review M2); a view is no program.
+        let stop = |w: &str| {
+            matches!(
+                w,
+                "ALGORITHM"
+                    | "SQL"
+                    | "AGGREGATE"
+                    | "PROCEDURE"
+                    | "FUNCTION"
+                    | "TRIGGER"
+                    | "EVENT"
+                    | "VIEW"
+            )
+        };
+        let mut skipped = 0;
+        while let Some(w) = at(i) {
+            if stop(w) || skipped == 16 {
+                break;
             }
+            i += 1;
+            skipped += 1;
         }
     }
     if at(i) == Some("ALGORITHM") {
@@ -655,13 +707,15 @@ fn next_window(consumed: usize) -> usize {
 }
 
 /// The pieces of `script` from byte `start`, with `delim` in force there (`None`: `;`), and
-/// the delimiter in force at the end.
+/// the delimiter in force at the end. With `lazy`, only the first step's worth (at least one
+/// piece unless only blanks and comments are left).
 fn split_with_delimiters(
     d: &MyDialect,
     script: &str,
     rules: ScanRules,
     start: usize,
     delim: Option<String>,
+    lazy: bool,
 ) -> (Vec<(StatementSpan, ScriptItemKind)>, Option<String>) {
     let mut pieces: Vec<(StatementSpan, ScriptItemKind)> = Vec::new();
     let mut delim = delim;
@@ -672,6 +726,9 @@ fn split_with_delimiters(
         end: s.end + by,
     };
     'outer: loop {
+        if lazy && !pieces.is_empty() {
+            break;
+        }
         let p = skip_blanks(script, base);
         if p >= script.len() {
             break;
