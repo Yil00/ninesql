@@ -648,9 +648,17 @@ SELECT 1--1
 expect: all=Write
 DELETE FROM t WHERE a = 1--1
 
-## executable comment runs
-expect: my=Destructive
+## statement boundary inside an executable comment
+expect: my=Unknown
 SELECT 1 /*! ; DELETE FROM t */
+
+## executable comment markers only (re-review L1)
+expect: my=Unknown
+/*!;*//*
+
+## piece starting inside an executable comment (re-review L1)
+expect: my=Unknown
+/*!;*/BEGIN
 
 ## statement boundary inside a conditional comment
 expect: my=Unknown
@@ -838,3 +846,34 @@ CREATE SCHEMA s CREATE TABLE t (a int) CREATE VIEW v AS SELECT a FROM t
 ## create schema with a trigger that empties a table
 expect: pg=Destructive
 CREATE SCHEMA s CREATE TRIGGER tr AFTER INSERT ON a FOR EACH ROW EXECUTE FUNCTION f() CREATE RULE r AS ON INSERT TO a DO ALSO DELETE FROM t
+
+%% ------------------------------------------------------------------------------------------
+%% The definer before the object kind (re-review L3, M2)
+
+## definer named like an object kind
+expect: my=Destructive
+CREATE DEFINER = view@localhost TRIGGER tr AFTER INSERT ON a FOR EACH ROW DELETE FROM t
+
+## definer named schema
+expect: my=Destructive
+CREATE DEFINER = schema@localhost TRIGGER tr AFTER INSERT ON a FOR EACH ROW DELETE FROM t
+
+## definer with a dotted host
+expect: my=Destructive
+CREATE DEFINER = root@127.0.0.1 TRIGGER tr AFTER INSERT ON a FOR EACH ROW DELETE FROM t
+
+## definer with quoted user and host
+expect: my=Destructive
+CREATE DEFINER = 'table'@'%' TRIGGER tr AFTER INSERT ON a FOR EACH ROW DELETE FROM t
+
+## definer current_user with parentheses
+expect: my=Destructive
+CREATE DEFINER = CURRENT_USER() TRIGGER tr AFTER INSERT ON a FOR EACH ROW DELETE FROM t
+
+## algorithm and definer before a view
+expect: my=Destructive
+CREATE OR REPLACE ALGORITHM = MERGE DEFINER = root@localhost SQL SECURITY INVOKER VIEW v AS SELECT 1
+
+## schema only right after create
+expect: pg=Ddl
+CREATE TABLE t (a int) TABLESPACE schema

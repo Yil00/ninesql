@@ -267,6 +267,33 @@ pub struct TextPosition {
     pub column: usize,
 }
 
+impl TextPosition {
+    /// The start of a text.
+    pub const START: Self = Self {
+        offset: 0,
+        line: 1,
+        column: 1,
+    };
+}
+
+/// Splitter state carried between calls of [`Dialect::split_script_ahead`]: the MySQL
+/// `DELIMITER` in force (`None`: `;`). Updated item by item with
+/// [`Dialect::script_state_after`].
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct ScriptState {
+    /// The client statement delimiter in force, when not `;`.
+    pub delimiter: Option<String>,
+}
+
+impl ScriptState {
+    /// A state with `delimiter` in force (`None`: `;`).
+    #[must_use]
+    pub fn with_delimiter(delimiter: Option<String>) -> Self {
+        Self { delimiter }
+    }
+}
+
 /// Line starts of a script, to turn byte offsets into [`TextPosition`]s in `O(log lines)`.
 #[derive(Clone, Debug)]
 pub struct LineIndex<'a> {
@@ -392,14 +419,17 @@ struct PositionCursor<'a> {
 
 impl<'a> PositionCursor<'a> {
     fn new(text: &'a str) -> Self {
-        Self {
-            text,
-            at: TextPosition {
-                offset: 0,
-                line: 1,
-                column: 1,
-            },
-        }
+        Self::at(text, TextPosition::START)
+    }
+
+    /// A cursor resuming at `at`, a position of `text` computed earlier.
+    fn at(text: &'a str, at: TextPosition) -> Self {
+        let at = if at.offset <= text.len() && text.is_char_boundary(at.offset) {
+            at
+        } else {
+            TextPosition::START
+        };
+        Self { text, at }
     }
 
     fn position(&mut self, offset: usize) -> TextPosition {
@@ -449,6 +479,34 @@ pub fn script_items(
         })
         .collect()
 }
+
+/// [`script_items`] for pieces at or after `start`, a position of `script` computed earlier
+/// (an item's `end`): positions cost the bytes from `start` on, not from the start of the
+/// script.
+#[must_use]
+pub fn script_items_from(
+    script: &str,
+    start: TextPosition,
+    pieces: impl IntoIterator<Item = (StatementSpan, ScriptItemKind)>,
+) -> Vec<ScriptItem> {
+    let mut cursor = PositionCursor::at(script, start);
+    pieces
+        .into_iter()
+        .map(|(span, kind)| {
+            let start = cursor.position(span.start);
+            let end = cursor.position(span.end);
+            ScriptItem {
+                span,
+                kind,
+                start,
+                end,
+            }
+        })
+        .collect()
+}
+
+/// Smallest window of [`Dialect::split_script_ahead`]'s default.
+const AHEAD_WINDOW: usize = 512;
 
 /// Items of `script[from..]` moved to offsets and positions in the whole `script`.
 #[must_use]
@@ -632,12 +690,19 @@ pub trait Dialect: Send + Sync {
     /// is a different `UPDATE` after the `SET`). So a caller:
     /// 1. classifies each item with the session's dialect **just before running it**, and asks
     ///    for confirmation from that class, never from a class computed earlier;
-    /// 2. after an item for which [`item_may_change_lexical_modes`] is `true` has run, takes the
-    ///    session's current dialect and, unless its `lexical_rules()` equal the ones the script
-    ///    was split with (they capture every mode the splitters use), re-splits the rest with
-    ///    [`split_script_from`](Self::split_script_from) from the end of that item.
+    /// 2. after **every** item, compares the session dialect's `lexical_rules()` with the ones
+    ///    the pending items were split with (they capture every mode the splitters use): a
+    ///    `SET` changes them, but so can a `ROLLBACK`, a `COMMIT` or a `ROLLBACK TO SAVEPOINT`
+    ///    that undoes a `SET`, or a function calling `set_config`
+    ///    ([`item_may_change_lexical_modes`] only names the obvious cases). When they differ,
+    ///    it drops the pending items and splits on from the end of that item with the new
+    ///    dialect.
     ///
-    /// `conformance::script_plan` is a reference implementation.
+    /// To keep that linear, run the script lazily with
+    /// [`split_script_ahead`](Self::split_script_ahead) (a few items at a time, from the end of
+    /// the last item, with the [`ScriptState`] kept up to date by
+    /// [`script_state_after`](Self::script_state_after)) rather than re-splitting the whole
+    /// rest. `conformance::script_plan` is a reference implementation.
     fn split_script(&self, script: &str) -> Vec<ScriptItem> {
         script_items(
             script,
@@ -647,11 +712,72 @@ pub trait Dialect: Send + Sync {
         )
     }
 
+    /// The next items of `script` from `from` (the `end` of the last item handled, or
+    /// [`TextPosition::START`]) with `state` in force: at least one item unless only blanks
+    /// and comments are left, every one exactly as [`split_script`](Self::split_script) of the
+    /// rest would give it, at a cost of a small window of text (it grows only for a longer
+    /// statement). Default: windows of [`split_statements`](Self::split_statements), the last
+    /// statement of a window (possibly cut) left for the next call.
+    fn split_script_ahead(
+        &self,
+        script: &str,
+        from: TextPosition,
+        state: &ScriptState,
+    ) -> Vec<ScriptItem> {
+        let _ = state;
+        if from.offset > script.len() || !script.is_char_boundary(from.offset) {
+            return self.split_script_from(script, from.offset);
+        }
+        let base = from.offset;
+        let mut window = AHEAD_WINDOW;
+        loop {
+            let mut end = base.saturating_add(window).min(script.len());
+            while !script.is_char_boundary(end) {
+                end += 1;
+            }
+            let complete = end == script.len();
+            let mut spans = self.split_statements(&script[base..end]);
+            if !complete {
+                spans.pop();
+                if spans.is_empty() {
+                    window = window.saturating_mul(2);
+                    continue;
+                }
+            }
+            return script_items_from(
+                script,
+                from,
+                spans.into_iter().map(|s| {
+                    (
+                        StatementSpan {
+                            start: s.start + base,
+                            end: s.end + base,
+                        },
+                        ScriptItemKind::Statement,
+                    )
+                }),
+            );
+        }
+    }
+
+    /// The [`ScriptState`] after `item` (an item of `script` handled with `state` in force):
+    /// a MySQL `DELIMITER` directive changes the delimiter. Default: unchanged.
+    fn script_state_after(
+        &self,
+        script: &str,
+        item: &ScriptItem,
+        state: &ScriptState,
+    ) -> ScriptState {
+        let _ = (script, item);
+        state.clone()
+    }
+
     /// Splits the rest of `script` from byte `from` (the end of an item of a previous split,
     /// see the contract on [`split_script`](Self::split_script)). Items carry offsets and
     /// positions in the whole `script`. Splitter state from before `from` is rebuilt (MySQL:
     /// the `DELIMITER` in force). Default: [`split_script`](Self::split_script) of the rest,
-    /// shifted.
+    /// shifted. It splits the whole rest (and mysqlwire also re-reads the text before `from`):
+    /// prefer [`split_script_ahead`](Self::split_script_ahead) in a loop.
     fn split_script_from(&self, script: &str, from: usize) -> Vec<ScriptItem> {
         let mut from = from.min(script.len());
         while !script.is_char_boundary(from) {
@@ -1188,18 +1314,27 @@ fn classify_lexed(text: &str, lexed: &Lexed) -> StatementClass {
     } else {
         None
     };
+    // Inside an executable comment (`/*! … */`) at the current token.
+    let mut in_executable = false;
     for stmt in lexed.toks.split(|t| t.kind == TokKind::Semicolon) {
+        if stmt.is_empty() {
+            continue;
+        }
+        // A piece that starts inside an executable comment (after a `;` in it) reads
+        // differently once split off and sent alone, and a piece of comment markers only is
+        // no statement the classifier can vouch for: both are `Unknown` (re-review L1).
+        let starts_inside = in_executable;
+        for t in stmt.iter().filter(|t| t.kind == TokKind::ExecMarker) {
+            in_executable = text.as_bytes()[t.start] == b'/';
+        }
         let stmt: Vec<Tok> = stmt
             .iter()
             .filter(|t| t.kind != TokKind::ExecMarker)
             .copied()
             .collect();
-        if stmt.is_empty() {
-            continue;
-        }
         let (items, opaque) = locate(text, &stmt);
-        let c = if opaque {
-            // A name the classifier cannot decode could be anything.
+        let c = if starts_inside || stmt.is_empty() || opaque {
+            // Or a name the classifier cannot decode, which could be anything.
             StatementClass::Unknown
         } else {
             classify_items(&items)
@@ -1637,6 +1772,45 @@ fn is_plain_begin(rest: &[Located]) -> bool {
     })
 }
 
+/// Index of the first item after `CREATE [OR REPLACE] [ALGORITHM = x] [DEFINER = user[@host]]`
+/// (`items[0]` is `CREATE`). The definer as the lexer reads it: `CURRENT_USER [()]`, or a user
+/// (word, quoted name or string) followed by an `@host` variable token (dots included) or by a
+/// bare `@` and a quoted host.
+fn skip_definer(items: &[Located]) -> usize {
+    let mut i = 1;
+    if keyword_at(items, i) == Some("OR") && keyword_at(items, i + 1) == Some("REPLACE") {
+        i += 2;
+    }
+    if keyword_at(items, i) == Some("ALGORITHM") {
+        i += 3; // ALGORITHM = x
+    }
+    if keyword_at(items, i) != Some("DEFINER") {
+        return i;
+    }
+    i += 1;
+    if items.get(i).map(|l| &l.item) == Some(&Item::Punct(b'=')) {
+        i += 1;
+    }
+    let user_is_current = items.get(i).and_then(word) == Some("CURRENT_USER");
+    i += 1; // the user
+    if user_is_current
+        && items.get(i).map(|l| &l.item) == Some(&Item::Punct(b'('))
+        && items.get(i + 1).map(|l| &l.item) == Some(&Item::Punct(b')'))
+    {
+        i += 2;
+    }
+    if items.get(i).map(|l| &l.item) == Some(&Item::Punct(b'@')) {
+        i += 1; // `@host` (one token), or a bare `@` before a quoted host
+        if matches!(
+            items.get(i).map(|l| &l.item),
+            Some(Item::Str(_) | Item::Ident(_))
+        ) {
+            i += 1;
+        }
+    }
+    i
+}
+
 /// PostgreSQL `CREATE SCHEMA s [AUTHORIZATION r] [element …]`: every element (`CREATE TABLE`,
 /// `CREATE VIEW`, `CREATE INDEX`, `CREATE SEQUENCE`, `CREATE TRIGGER`, `GRANT`) runs; the class
 /// is the riskiest element's, at least [`StatementClass::Ddl`] (security review M2). Elements
@@ -1670,21 +1844,29 @@ const BODY_STATEMENT_KEYWORDS: &[&str] = &[
 /// STATEMENT`, so the header's events (`AFTER UPDATE OF c ON t`) do not count. `Read`
 /// otherwise, so the caller's class stands.
 fn classify_create_body(items: &[Located]) -> StatementClass {
-    // The object kind is among the first words: `CREATE [OR REPLACE] [TEMP | TEMPORARY]
-    // [CONSTRAINT] [DEFINER = u@h] TRIGGER | RULE | EVENT`.
+    // The object kind follows `CREATE [OR REPLACE] [ALGORITHM = x] [DEFINER = user[@host]]
+    // [SQL SECURITY x] [TEMP | TEMPORARY] [CONSTRAINT]`. The definer is skipped as the lexer
+    // reads it (re-review L3), so `CREATE DEFINER = view@localhost TRIGGER …` is a trigger.
+    // `CREATE SCHEMA` counts only right after `CREATE`.
+    if keyword_at(items, 1) == Some("SCHEMA") {
+        return classify_schema_elements(items);
+    }
+    let start = skip_definer(items);
     let kind = items
         .iter()
         .enumerate()
+        .skip(start)
         .filter(|(_, l)| l.depth == items[0].depth)
         .take(12)
         .find_map(|(i, _)| match keyword_at(items, i) {
-            Some(w @ ("TRIGGER" | "RULE" | "EVENT" | "SCHEMA")) => Some(w),
-            Some("TABLE" | "VIEW" | "FUNCTION" | "PROCEDURE" | "INDEX" | "SEQUENCE") => Some(""),
+            Some(w @ ("TRIGGER" | "RULE" | "EVENT")) => Some(w),
+            Some("TABLE" | "VIEW" | "FUNCTION" | "PROCEDURE" | "INDEX" | "SEQUENCE" | "SCHEMA") => {
+                Some("")
+            }
             _ => None,
         });
     match kind {
         Some("EVENT") => return StatementClass::Unknown,
-        Some("SCHEMA") => return classify_schema_elements(items),
         Some("TRIGGER" | "RULE") => {}
         _ => return StatementClass::Read,
     }

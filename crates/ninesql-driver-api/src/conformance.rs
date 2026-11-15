@@ -1068,7 +1068,11 @@ pub fn assert_script_split_invariants(dialect: &dyn Dialect, script: &str) {
         last_end = s.end;
         if item.kind == ScriptItemKind::Statement {
             let text = item.text(script);
-            assert!(!text.trim().is_empty(), "empty statement in {script:?}");
+            // Blank as the lexers read it: ASCII whitespace only (U+2000 is an identifier byte).
+            assert!(
+                !text.bytes().all(|b| b.is_ascii_whitespace()),
+                "empty statement in {script:?}"
+            );
             // At most one: a statement whose last token was followed, in the script, by a
             // comment can end with a `--` that is a comment only at the end of a text (MySQL).
             // A piece that starts inside an executable comment (after a `;` in it) is lexed
@@ -1164,31 +1168,51 @@ pub struct PlannedStatement {
 }
 
 /// Reference implementation of the "execute script" loop that the contract of
-/// [`Dialect::split_script`] asks of callers, without a server: each statement is classified
-/// with the current dialect right before it "runs"; `run(text)` simulates the server and
-/// returns the session's new dialect when the statement changed its lexical modes; after a
-/// statement for which [`item_may_change_lexical_modes`](crate::item_may_change_lexical_modes)
-/// holds, the rest is re-split with [`Dialect::split_script_from`] when the lexical rules
-/// changed. Client directives are skipped; the plan stops at a refused piece.
+/// [`Dialect::split_script`] asks of callers, without a server:
+/// - items come lazily from [`Dialect::split_script_ahead`], a few at a time, with the
+///   [`ScriptState`](crate::ScriptState) kept by [`Dialect::script_state_after`];
+/// - each statement is classified with the current dialect right before it "runs";
+/// - `run(text)` simulates the server and returns the session's new dialect when the
+///   statement changed it;
+/// - after **every** item the dialect's `lexical_rules()` are compared with the ones the pending
+///   items were split with; when they differ the pending items are dropped and splitting goes on
+///   from the end of that item (re-review L2);
+/// - client directives are skipped; the plan stops at a refused piece.
+///
+/// Each step costs a small window of text, so the loop stays linear even when every statement
+/// changes the lexical modes (re-review M1).
 pub fn script_plan(
     script: &str,
     initial: Box<dyn Dialect>,
     run: &mut dyn FnMut(&str) -> Option<Box<dyn Dialect>>,
 ) -> Vec<PlannedStatement> {
-    use crate::dialect::{ScriptItemKind, item_may_change_lexical_modes};
+    use crate::dialect::{ScriptItemKind, ScriptState, TextPosition};
     let mut current = initial;
-    let mut split_rules = current.lexical_rules();
-    let mut items = current.split_script(script);
+    let mut rules = current.lexical_rules();
+    let mut state = ScriptState::default();
+    let mut pending = std::collections::VecDeque::new();
+    let mut resume = TextPosition::START;
     let mut out = Vec::new();
-    let mut idx = 0;
-    while let Some(item) = items.get(idx).copied() {
+    loop {
+        if pending.is_empty() {
+            if resume.offset >= script.len() {
+                break;
+            }
+            let more = current.split_script_ahead(script, resume, &state);
+            if more.is_empty() {
+                break;
+            }
+            pending.extend(more);
+        }
+        let Some(item) = pending.pop_front() else {
+            break;
+        };
+        resume = item.end;
+        state = current.script_state_after(script, &item, &state);
         let text = item.text(script);
         match item.kind {
             ScriptItemKind::Statement => {}
-            ScriptItemKind::ClientDirective => {
-                idx += 1;
-                continue;
-            }
+            ScriptItemKind::ClientDirective => continue,
             _ => {
                 out.push(PlannedStatement {
                     text: text.to_owned(),
@@ -1201,17 +1225,13 @@ pub fn script_plan(
             text: text.to_owned(),
             class: Some(current.classify(text)),
         });
-        let may_change = item_may_change_lexical_modes(current.as_ref(), &item, script);
         if let Some(next) = run(text) {
             current = next;
         }
-        if may_change && current.lexical_rules() != split_rules {
-            split_rules = current.lexical_rules();
-            items = current.split_script_from(script, item.span.end);
-            idx = 0;
-            continue;
+        if current.lexical_rules() != rules {
+            rules = current.lexical_rules();
+            pending.clear();
         }
-        idx += 1;
     }
     out
 }
