@@ -13,4 +13,20 @@ publish.workspace = true
 workspace = true
 
 [dependencies]
+# Result types (`ResultItem`, `RecordBatch`, `FetchBudget`…) through the core's re-export of
+# `ninesql-driver-api`, so the grid sees the exact Arrow version the drivers produce.
 ninesql-core.workspace = true
+tracing.workspace = true
+# GPUI and gpui-component (DataTable) through gpui-kit, at the workspace pin (ADR-0013). Never
+# enable `hot-reload`, `tracy`, `inspector` or `gpui-fast`. `ninesql-ui` holds the exact pins of
+# the gpui-kit siblings for the whole workspace.
+gpui-kit = { workspace = true, features = ["component"] }
+
+[dev-dependencies]
+# TestAppContext for view-model tests (AGENTS.md): GPUI's own `test-support`, see root Cargo.toml.
+gpui-pre = { workspace = true, features = ["test-support"] }
+
+# Headless benchmarks (P3-E): a plain binary, no benchmark framework; `cargo bench -p ninesql-grid`.
+[[bench]]
+name = "grid"
+harness = false
