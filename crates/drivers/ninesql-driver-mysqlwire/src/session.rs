@@ -267,6 +267,13 @@ impl Session for MySession {
         if self.link.tracker.is_busy() {
             return Err(DriverError::Busy);
         }
+        // A NUL byte ends the text for some lexers and not for others: refused, as in sqlite
+        // (security review L5).
+        if statement.text.contains('\0') {
+            return Err(DriverError::InvalidParams(
+                "the statement holds a NUL character".into(),
+            ));
+        }
         // One statement per protocol call, with the session's current lexical rules.
         ensure_single_statement(self.dialect.as_ref(), &statement.text)?;
         let class = self.dialect.classify(&statement.text);

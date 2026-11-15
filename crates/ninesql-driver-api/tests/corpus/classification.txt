@@ -1,0 +1,879 @@
+%% Classification corpus (P3-D, ADR-0007 §3 and its classifier amendment).
+%%
+%% Every driver runs this file with `conformance::assert_classification_corpus` for its dialect
+%% keys: `pg` (pgwire), `mysql` and `mariadb` (mysqlwire), `sqlite` (sqlite). The format is
+%% documented on `conformance::CLASSIFICATION_CORPUS`. Classes, by increasing risk: Read,
+%% Session, Transaction, Write, Ddl, ChangesAccessMode, Destructive, Unknown. A production
+%% connection confirms ChangesAccessMode, Destructive and Unknown; a read-only session refuses
+%% Write and above client-side, on top of the engine-side mechanism (I3).
+%%
+%% Add a case for every classifier bypass found, with the dialects it affects.
+
+%% ------------------------------------------------------------------------------------------
+%% Reads
+
+## plain select
+expect: all=Read
+SELECT * FROM t
+
+## parenthesised select
+expect: all=Read
+  (SELECT 1)
+
+## show
+expect: all=Read
+SHOW TABLES
+
+## values
+expect: all=Read
+VALUES (1), (2)
+
+## select for update only locks
+expect: all=Read
+SELECT * FROM t WHERE id = 1 FOR UPDATE
+
+## keywords in strings and quoted names are not keywords
+expect: all=Read
+SELECT 'delete from t', "drop" FROM t
+
+## cte read
+expect: all=Read
+WITH x AS (SELECT 1 AS a) SELECT a FROM x
+
+## recursive cte read
+expect: all=Read
+WITH RECURSIVE r(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM r WHERE n < 3) SELECT n FROM r
+
+## plain explain does not run
+expect: all=Read
+EXPLAIN DELETE FROM t
+
+## sqlite explain query plan
+expect: sqlite=Read
+EXPLAIN QUERY PLAN DELETE FROM t
+
+## describe a table
+expect: my=Read
+DESCRIBE t
+
+## comment-only text
+expect: all=Read
+-- nothing here
+/* nor here */
+
+%% ------------------------------------------------------------------------------------------
+%% The production exit criterion (phase 3): DELETE / UPDATE without WHERE need confirmation
+
+## delete without where
+expect: all=Destructive
+DELETE FROM t
+
+## delete without where, lower case and comments
+expect: all=Destructive
+/* cleanup */ delete
+  from   t -- everything
+
+## update without where
+expect: all=Destructive
+UPDATE t SET a = 1
+
+## update without where, several columns
+expect: all=Destructive
+update t set a = 1, b = 'where'
+
+## where only in a comment
+expect: all=Destructive
+DELETE FROM t /* WHERE id = 1 */
+
+## where only in a line comment
+expect: all=Destructive
+UPDATE t SET a = 1 -- WHERE id = 1
+
+## where only in a subquery
+expect: all=Destructive
+UPDATE t SET a = (SELECT b FROM u WHERE u.id = 1)
+
+## where only in a string
+expect: all=Destructive
+DELETE FROM t ORDER BY 'where'
+
+## where as a quoted identifier
+expect: all=Destructive
+UPDATE t SET "where" = 1
+
+## where as a backquoted identifier
+expect: my=Destructive sqlite=Destructive pg=skip
+UPDATE t SET `where` = 1
+
+## where as a bracketed identifier
+expect: sqlite=Destructive
+UPDATE t SET [where] = 1
+
+## delete with where is a write
+expect: all=Write
+DELETE FROM t WHERE id = 1
+
+## update with where is a write
+expect: all=Write
+UPDATE t SET a = 1 WHERE id = 2
+
+## mysql multi-table delete without where
+expect: my=Destructive
+DELETE t1 FROM t1 JOIN t2 ON t1.id = t2.id
+
+## delete with limit but no where
+expect: my=Destructive sqlite=Destructive
+DELETE FROM t LIMIT 10
+
+%% ------------------------------------------------------------------------------------------
+%% Destructive forms
+
+## truncate
+expect: all=Destructive
+TRUNCATE TABLE t
+
+## drop table
+expect: all=Destructive
+DROP TABLE t
+
+## drop database
+expect: all=Destructive sqlite=skip
+DROP DATABASE nine
+
+## alter drop column
+expect: all=Destructive
+ALTER TABLE t DROP COLUMN a
+
+## alter add column is still alter
+expect: all=Destructive
+ALTER TABLE t ADD COLUMN b INT
+
+## grant
+expect: all=Destructive sqlite=skip
+GRANT SELECT ON t TO someone
+
+## revoke
+expect: all=Destructive sqlite=skip
+REVOKE SELECT ON t FROM someone
+
+## rename table
+expect: my=Destructive
+RENAME TABLE a TO b
+
+## create or replace view
+expect: all=Destructive sqlite=skip
+CREATE OR REPLACE VIEW v AS SELECT 1
+
+## create or replace function
+expect: pg=Destructive
+CREATE OR REPLACE FUNCTION f() RETURNS int LANGUAGE sql AS $$ SELECT 1 $$
+
+## create or replace after an executable comment
+expect: my=>=Destructive
+/*!50001 CREATE OR REPLACE */ VIEW v AS SELECT 1
+
+## mariadb create or replace table
+expect: mariadb=Destructive
+CREATE OR REPLACE TABLE t (a INT)
+
+## merge is a write (ADR-0007 §3 lists no MERGE)
+expect: pg=Write
+MERGE INTO t USING s ON t.id = s.id WHEN MATCHED THEN UPDATE SET a = s.a
+
+## replace into is a write
+expect: my=Write sqlite=Write
+REPLACE INTO t VALUES (1, 2)
+
+## insert on conflict do update is a write
+expect: pg=Write sqlite=Write
+INSERT INTO t VALUES (1) ON CONFLICT (id) DO UPDATE SET a = excluded.a
+
+## insert on duplicate key update is a write
+expect: my=Write
+INSERT INTO t VALUES (1) ON DUPLICATE KEY UPDATE a = VALUES(a)
+
+## insert or replace is a write
+expect: sqlite=Write
+INSERT OR REPLACE INTO t VALUES (1)
+
+## select into creates a table
+expect: pg=Write
+SELECT * INTO t2 FROM t
+
+## select into outfile
+expect: my=Write
+SELECT * FROM t INTO OUTFILE '/tmp/x'
+
+## create table is ddl
+expect: all=Ddl
+CREATE TABLE t (a INT)
+
+## create index is ddl
+expect: all=Ddl
+CREATE INDEX i ON t (a)
+
+## create function is ddl
+expect: pg=Ddl
+CREATE FUNCTION f() RETURNS int LANGUAGE sql AS 'SELECT 1'
+
+## create function with a begin atomic body is ddl
+expect: pg=Ddl
+CREATE FUNCTION f() RETURNS int LANGUAGE sql
+BEGIN ATOMIC
+  SELECT 1;
+  SELECT 2;
+END
+
+## mysql procedure with a compound body
+expect: my=Ddl
+CREATE PROCEDURE p() BEGIN SELECT 1; SELECT 2; END
+
+%% ------------------------------------------------------------------------------------------
+%% Triggers, rules and events run their body later
+
+## sqlite trigger that empties a table
+expect: sqlite=Destructive
+CREATE TRIGGER tr AFTER INSERT ON a BEGIN DELETE FROM t; END
+
+## sqlite trigger with a filtered body
+expect: sqlite=Ddl
+CREATE TRIGGER tr AFTER UPDATE OF c ON a FOR EACH ROW BEGIN UPDATE t SET n = n + 1 WHERE id = new.id; END
+
+## sqlite trigger header events do not count
+expect: sqlite=Ddl
+CREATE TRIGGER tr BEFORE DELETE ON a BEGIN SELECT RAISE(ABORT, 'no'); END
+
+## mysql trigger without begin
+expect: my=Destructive
+CREATE TRIGGER tr AFTER INSERT ON a FOR EACH ROW DELETE FROM t
+
+## mysql trigger with definer and a filtered body
+expect: my=Ddl
+CREATE DEFINER = root@localhost TRIGGER tr BEFORE UPDATE ON a FOR EACH ROW BEGIN INSERT INTO log VALUES (1); END
+
+## mysql event runs at once
+expect: my=Unknown
+CREATE EVENT e ON SCHEDULE AT CURRENT_TIMESTAMP DO DELETE FROM t WHERE id = 1
+
+## postgres rule that deletes
+expect: pg=Destructive
+CREATE RULE r AS ON INSERT TO a DO ALSO DELETE FROM t
+
+## postgres trigger calling a function
+expect: pg=Ddl
+CREATE TRIGGER tr AFTER UPDATE ON a FOR EACH ROW EXECUTE FUNCTION f()
+
+%% ------------------------------------------------------------------------------------------
+%% CTEs with DML
+
+## cte delete feeding a select
+expect: all=Unknown
+WITH x AS (DELETE FROM t RETURNING *) SELECT * FROM x
+
+## cte select feeding a delete
+expect: all=Unknown
+WITH x AS (SELECT id FROM u) DELETE FROM t WHERE id IN (SELECT id FROM x)
+
+## cte update
+expect: all=Unknown
+WITH x AS (UPDATE t SET a = 1 RETURNING id) SELECT count(*) FROM x
+
+## cte without a main statement (past bypass)
+expect: all=Unknown
+WITH x AS (DELETE FROM t RETURNING *)
+
+## cte with unbalanced parentheses (past bypass)
+expect: all=Unknown
+WITH x AS (SELECT 1 SELECT * FROM x
+
+## cte main statement in parentheses
+expect: all=Unknown
+WITH x AS (SELECT 1) (SELECT * FROM x)
+
+## cte main statement hidden in the cte list
+expect: all=Unknown
+WITH x AS (SELECT 1), y AS (DELETE FROM t RETURNING 1) SELECT 1
+
+%% ------------------------------------------------------------------------------------------
+%% Side-effect functions
+
+## nextval
+expect: pg=Unknown
+SELECT nextval('s')
+
+## setval quoted name
+expect: pg=Unknown
+SELECT "setval"('s', 1)
+
+## unicode-escaped function name (past bypass)
+expect: pg=Unknown
+SELECT U&"nextv\0061l"('s')
+
+## unicode escape with uescape fails closed
+expect: pg=Unknown
+SELECT U&"nextv!0061l" UESCAPE '!' ('s')
+
+## pg_terminate_backend
+expect: pg=Unknown
+SELECT pg_terminate_backend(42)
+
+## dblink_exec
+expect: pg=Unknown
+SELECT dblink_exec('dbname=x', 'DELETE FROM t')
+
+## set_config lifts read-only
+expect: pg=ChangesAccessMode
+SELECT set_config('default_transaction_read_only', 'off', false)
+
+## lo_unlink
+expect: pg=Unknown
+SELECT lo_unlink(1234)
+
+## sqlite load_extension
+expect: sqlite=Unknown
+SELECT load_extension('/tmp/x.so')
+
+## user function is a read (documented limit L4)
+expect: all=Read
+SELECT my_function_that_writes(1)
+
+%% ------------------------------------------------------------------------------------------
+%% EXPLAIN / ANALYZE that run their statement (past bypasses, ADR-0007 amendment)
+
+## explain analyze delete
+expect: pg=Destructive my=Destructive sqlite=skip
+EXPLAIN ANALYZE DELETE FROM t
+
+## explain quoted analyze option
+expect: pg=Destructive
+EXPLAIN ("analyze") DELETE FROM t
+
+## explain unicode-escaped analyze option
+expect: pg=Destructive
+EXPLAIN (U&"analyze") DELETE FROM t
+
+## explain options with a json format
+expect: pg=Destructive
+EXPLAIN (FORMAT JSON, "analyze" on) DELETE FROM t
+
+## explain with an unbalanced option list
+expect: pg=Unknown
+EXPLAIN (ANALYZE DELETE FROM t
+
+## mariadb desc analyze
+expect: mariadb=Destructive
+DESC ANALYZE DELETE FROM t
+
+## analyze statement
+expect: all=Unknown
+ANALYZE t
+
+## mariadb analyze select
+expect: mariadb=Unknown
+ANALYZE SELECT * FROM t
+
+%% ------------------------------------------------------------------------------------------
+%% Transaction control and access mode
+
+## begin
+expect: all=Transaction
+BEGIN
+
+## begin isolation level
+expect: pg=Transaction
+BEGIN ISOLATION LEVEL SERIALIZABLE, READ ONLY, NOT DEFERRABLE
+
+## sqlite begin immediate
+expect: sqlite=Transaction
+BEGIN IMMEDIATE TRANSACTION
+
+## begin read write
+expect: pg=ChangesAccessMode
+BEGIN READ WRITE
+
+## start transaction read write
+expect: my=ChangesAccessMode pg=ChangesAccessMode
+START TRANSACTION READ WRITE
+
+## mariadb anonymous compound block
+expect: all=Unknown
+BEGIN NOT ATOMIC DELETE FROM t; END
+
+## begin atomic outside a function
+expect: all=Unknown
+BEGIN ATOMIC DELETE FROM t; END
+
+## set transaction comma form (past bypass)
+expect: pg=ChangesAccessMode my=ChangesAccessMode
+SET TRANSACTION ISOLATION LEVEL READ COMMITTED, READ WRITE
+
+## set session transaction read write
+expect: pg=ChangesAccessMode my=ChangesAccessMode
+SET SESSION TRANSACTION READ WRITE
+
+## set session characteristics read write
+expect: pg=ChangesAccessMode
+SET SESSION CHARACTERISTICS AS TRANSACTION READ WRITE
+
+## set default_transaction_read_only
+expect: pg=ChangesAccessMode
+set default_transaction_read_only = off
+
+## quoted setting name
+expect: pg=ChangesAccessMode
+SET "default_transaction_read_only" TO off
+
+## reset all
+expect: pg=ChangesAccessMode
+RESET ALL
+
+## mysql transaction_read_only
+expect: my=ChangesAccessMode
+SET SESSION transaction_read_only = 0
+
+## mysql system variable
+expect: my=ChangesAccessMode
+SET @@session.transaction_read_only = 0
+
+## mysql global system variable
+expect: my=ChangesAccessMode
+SET @@global.read_only = 0
+
+## mysql user variable
+expect: my=Session
+SET @x = 1
+
+## harmless setting
+expect: pg=Session my=Session
+SET search_path = app
+
+## harmless and harmful settings together
+expect: pg=ChangesAccessMode
+SET search_path = app, default_transaction_read_only = off
+
+## non-utf8 client encoding
+expect: pg=ChangesAccessMode my=ChangesAccessMode
+SET NAMES 'sjis'
+
+## utf8 client encoding
+expect: pg=Session my=Session
+SET NAMES 'utf8'
+
+## mysql sql_mode changes the lexical rules
+expect: my=ChangesAccessMode
+SET sql_mode = 'NO_BACKSLASH_ESCAPES'
+
+## sqlite query_only off
+expect: sqlite=ChangesAccessMode
+PRAGMA query_only = OFF
+
+## sqlite bracketed pragma name
+expect: sqlite=ChangesAccessMode
+PRAGMA [query_only] = 0
+
+## sqlite reading pragma
+expect: sqlite=Read
+PRAGMA table_info(t)
+
+## sqlite attach
+expect: sqlite=Unknown
+ATTACH DATABASE '/tmp/x.db' AS x
+
+## sqlite vacuum into
+expect: sqlite=Unknown
+VACUUM INTO '/tmp/copy.db'
+
+## use database
+expect: my=Session
+USE nine
+
+%% ------------------------------------------------------------------------------------------
+%% Statements the classifier does not know
+
+## call
+expect: all=Unknown sqlite=skip
+CALL p()
+
+## do block
+expect: pg=Unknown
+DO $$ BEGIN DELETE FROM t; END $$
+
+## copy from stdin
+expect: pg=Unknown
+COPY t FROM STDIN
+
+## copy to stdout
+expect: pg=Unknown
+COPY t TO STDOUT
+
+## lock table
+expect: pg=Unknown my=Unknown
+LOCK TABLE t
+
+## load data
+expect: my=Unknown
+LOAD DATA INFILE '/tmp/x' INTO TABLE t
+
+## mysql do
+expect: my=Unknown
+DO SLEEP(1)
+
+## starts with punctuation
+expect: all=Unknown
+;;* FROM t
+
+## starts with a string
+expect: all=Unknown
+'DELETE FROM t'
+
+%% ------------------------------------------------------------------------------------------
+%% Multiple statements: the riskiest wins
+
+## read then delete
+expect: all=Destructive
+SELECT 1; DELETE FROM t
+
+## delete hidden after a string with a semicolon
+expect: all=Destructive
+SELECT ';'; DELETE FROM t
+
+## delete after a comment holding a quote
+expect: all=Destructive
+SELECT 1 /* ' */; DELETE FROM t
+
+## delete after a line comment holding a quote
+expect: all=Destructive
+SELECT 1 -- '
+; DELETE FROM t
+
+%% ------------------------------------------------------------------------------------------
+%% PostgreSQL lexical rules
+
+## dollar-quoted string hides a semicolon
+expect: pg=Read
+SELECT $$ ; DELETE FROM t $$
+
+## tagged dollar quote
+expect: pg=Read
+SELECT $tag$ $$ ; DELETE FROM t $$ $tag$
+
+## non-ascii dollar tag
+expect: pg=Read
+SELECT $ä$ ; DELETE FROM t $ä$
+
+## dollar inside an identifier is not a quote
+expect: pg=Destructive
+SELECT a$q$ FROM t; DELETE FROM t; SELECT $q$
+
+## positional parameter is not a dollar quote
+expect: pg=Destructive
+SELECT $1; DELETE FROM t
+
+## e-string escaped quote
+expect: pg=Destructive
+SELECT E'\''; DELETE FROM t
+
+## e-string escaped backslash
+expect: pg=Destructive
+SELECT E'\\'; DELETE FROM t
+
+## standard conforming string backslash is literal
+expect: pg=Destructive
+SELECT '\'; DELETE FROM t
+
+## standard_conforming_strings off: backslash escapes the quote
+expect: pg=Read
+modes: scs_off
+SELECT '\'; DELETE FROM t'
+
+## nested block comments
+expect: pg=Read
+SELECT 1 /* outer /* inner */ ; DELETE FROM t */
+
+## nested comment closes once in sqlite and mysql
+expect: pg=Read my=Destructive sqlite=Destructive
+SELECT 1 /* a /* b */ ; DELETE FROM t */
+
+## carriage return ends a pg line comment
+expect: pg=Unknown my=Read sqlite=Read
+escapes: yes
+SELECT 1 --\r, pg_terminate_backend(42)
+
+## carriage return then a delete in a pg line comment
+expect: pg=Destructive my=Read sqlite=Read
+escapes: yes
+SELECT 1 --\r; DELETE FROM t
+
+## where after a carriage return in a pg line comment
+expect: pg=Write my=Destructive sqlite=Destructive
+escapes: yes
+DELETE FROM t --\rWHERE id = 1
+
+%% ------------------------------------------------------------------------------------------
+%% MySQL / MariaDB lexical rules
+
+## backslash escapes in strings
+expect: my=Read pg=Destructive sqlite=Destructive
+SELECT 'it\'s; DELETE FROM t'
+
+## no_backslash_escapes
+expect: my=Destructive
+modes: no_backslash_escapes
+SELECT 'x\'; DELETE FROM t; SELECT '
+
+## double-quoted string with a backslash
+expect: my=Read
+SELECT "a\"; DELETE FROM t"
+
+## ansi_quotes: a double-quoted identifier has no escapes
+expect: my=Destructive
+modes: ansi_quotes
+SELECT "a\"; DELETE FROM t; SELECT "
+
+## hash comment
+expect: my=Read pg=Unknown sqlite=Unknown
+# DELETE FROM t
+SELECT 1
+
+## hash comment hides a semicolon
+expect: my=Read
+SELECT 1 # ; DELETE FROM t
+
+## dash dash without a space is not a comment
+expect: my=Destructive
+SELECT 1--1
+; DELETE FROM t
+
+## dash dash without a space keeps the where
+expect: all=Write
+DELETE FROM t WHERE a = 1--1
+
+## statement boundary inside an executable comment
+expect: my=Unknown
+SELECT 1 /*! ; DELETE FROM t */
+
+## executable comment markers only (re-review L1)
+expect: my=Unknown
+/*!;*//*
+
+## piece starting inside an executable comment (re-review L1)
+expect: my=Unknown
+/*!;*/BEGIN
+
+## statement boundary inside a conditional comment
+expect: my=Unknown
+SELECT 1 /*M! ; DELETE FROM t */
+
+## versioned executable comment
+expect: my=Destructive
+/*!80000 DELETE FROM t */
+
+## executable comment hides a where (versioned: may be skipped)
+expect: my=Destructive
+DELETE FROM t /*!99999 WHERE 0 */
+
+## mariadb executable comment hides a where on mysql
+expect: my=Destructive
+UPDATE t SET a = 1 /*M! WHERE id = 1 */
+
+## unversioned executable comment where runs everywhere
+expect: my=Write
+DELETE FROM t /*! WHERE id = 1 */
+
+## conditional comment with a string holding a comment closer
+expect: my=Unknown
+SELECT 1 /*!50000 , '*/' */
+
+## unterminated conditional comment
+expect: my=Unknown
+SELECT 1 /*!50000 , 2
+
+## mysqldump view header
+expect: my=Unknown
+/*!50001 CREATE ALGORITHM=UNDEFINED */
+/*!50013 DEFINER=`root`@`localhost` SQL SECURITY DEFINER */
+/*!50001 VIEW `v` AS select 1 AS `a` */
+
+## mysqldump setting
+expect: my=Session
+/*!40101 SET @OLD_CHARACTER_SET_CLIENT=@@CHARACTER_SET_CLIENT */
+
+## executable comment in pg is a comment
+expect: pg=Unknown
+SELECT 1 /*! DELETE FROM t */
+
+## dollar in a mysql identifier hides no where
+expect: my=Destructive sqlite=Destructive pg=Destructive
+DELETE FROM t$WHERE
+
+## identifier starting with a dollar
+expect: my=Destructive
+DELETE FROM $WHERE
+
+## user variable named where
+expect: my=Destructive
+UPDATE t SET a = @WHERE
+
+## user variable with a dot
+expect: my=Destructive
+UPDATE t SET a = @x.WHERE
+
+%% ------------------------------------------------------------------------------------------
+%% SQLite lexical rules
+
+## bracketed identifier hides a semicolon
+expect: sqlite=Read
+SELECT [a;b] FROM t
+
+## bracketed identifier holding a double quote
+expect: sqlite=Destructive
+SELECT [a"b]; DELETE FROM t; SELECT "x"
+
+## tcl variable parentheses hide a quote (past bypass)
+expect: sqlite=Destructive
+SELECT $a(')) x; DELETE FROM t; SELECT ('
+
+## tcl variable with a colon
+expect: sqlite=Destructive
+SELECT :a(;x) ; DELETE FROM t
+
+## variable named where
+expect: sqlite=Destructive
+UPDATE t SET a = :WHERE
+
+## dollar variable named where
+expect: sqlite=Destructive
+UPDATE t SET a = $WHERE
+
+## at variable named where
+expect: sqlite=Destructive
+DELETE FROM t ORDER BY @WHERE LIMIT 1
+
+## hash variable named where
+expect: sqlite=Destructive
+UPDATE t SET a = #WHERE
+
+## backslash is literal in sqlite strings
+expect: sqlite=Destructive
+SELECT 'a\'; DELETE FROM t
+
+## with plus dml in a string is never read in sqlite
+expect: sqlite=Unknown
+WITH x AS (SELECT 'delete') SELECT * FROM x WHERE 'a' = 'b' UNION SELECT 1 FROM t WHERE 0 = (DELETE)
+
+%% ------------------------------------------------------------------------------------------
+%% Keywords used as names (security review H1): after `.` or `AS` a keyword is a name, and a
+%% name can only over-classify. The first four were verified on the engines (every row hit).
+
+## pg where as a returning alias
+expect: pg=Destructive
+DELETE FROM rv RETURNING 1 AS where
+
+## pg where as a qualified column and an alias
+expect: pg=Destructive
+UPDATE rv SET a = x.where FROM (SELECT 7 AS where) x
+
+## mysql where as a qualified column in a multi-table update
+expect: my=Destructive
+UPDATE rv, (SELECT 7 AS `where`) x SET rv.a = x.where
+
+## mysql where as a qualified column in a join condition
+expect: my=Destructive
+DELETE rv FROM rv JOIN (SELECT 1 AS `where`) x ON x.where = 1
+
+## where after as in a delete alias
+expect: all=Destructive
+DELETE FROM t AS where
+
+## a real where after a qualified where column
+expect: all=Write
+UPDATE t SET a = 1 WHERE t.where = 1
+
+## start with transaction only as a name
+expect: my=Unknown
+START REPLICA FOR CHANNEL transaction
+
+## start transaction needs the keyword right after start
+expect: my=Unknown pg=Unknown
+START x.transaction
+
+## quoted transaction names a setting
+expect: pg=ChangesAccessMode
+SET "transaction" ISOLATION LEVEL READ COMMITTED
+
+## with main statement only as a qualified name
+expect: all=Unknown
+WITH x AS (SELECT 1), y AS (SELECT 2) x.select
+
+## trigger kind not hidden by a qualified name
+expect: my=Destructive
+CREATE DEFINER = x.table TRIGGER tr AFTER INSERT ON a FOR EACH ROW DELETE FROM t
+
+%% ------------------------------------------------------------------------------------------
+%% standard_conforming_strings = off: no backslash escapes in identifiers (security review M1)
+
+## scs off: a backslash does not escape inside a double-quoted alias
+expect: pg=Destructive
+modes: scs_off
+DELETE FROM rv AS "x\" -- " WHERE id = 1
+
+## scs off: a backslash does not escape inside a unicode-escaped alias
+expect: pg=>=Destructive
+modes: scs_off
+DELETE FROM rv AS U&"x\" -- " WHERE id = 1
+
+## scs off: a backslash still escapes inside a string
+expect: pg=Write
+modes: scs_off
+DELETE FROM rv WHERE a = 'x\' -- ' AND id = 1
+
+## ansi_quotes: no backslash escapes inside a double-quoted identifier
+expect: my=Destructive
+modes: ansi_quotes
+DELETE FROM rv AS "x\" -- " WHERE id = 1
+
+%% ------------------------------------------------------------------------------------------
+%% CREATE SCHEMA runs its elements (security review M2)
+
+## create schema with a grant element
+expect: pg=Destructive
+CREATE SCHEMA s AUTHORIZATION u CREATE TABLE t (a int) GRANT SELECT ON t TO PUBLIC
+
+## create schema with a table element
+expect: pg=Ddl
+CREATE SCHEMA s CREATE TABLE t (a int) CREATE VIEW v AS SELECT a FROM t
+
+## create schema with a trigger that empties a table
+expect: pg=Destructive
+CREATE SCHEMA s CREATE TRIGGER tr AFTER INSERT ON a FOR EACH ROW EXECUTE FUNCTION f() CREATE RULE r AS ON INSERT TO a DO ALSO DELETE FROM t
+
+%% ------------------------------------------------------------------------------------------
+%% The definer before the object kind (re-review L3, M2)
+
+## definer named like an object kind
+expect: my=Destructive
+CREATE DEFINER = view@localhost TRIGGER tr AFTER INSERT ON a FOR EACH ROW DELETE FROM t
+
+## definer named schema
+expect: my=Destructive
+CREATE DEFINER = schema@localhost TRIGGER tr AFTER INSERT ON a FOR EACH ROW DELETE FROM t
+
+## definer with a dotted host
+expect: my=Destructive
+CREATE DEFINER = root@127.0.0.1 TRIGGER tr AFTER INSERT ON a FOR EACH ROW DELETE FROM t
+
+## definer with quoted user and host
+expect: my=Destructive
+CREATE DEFINER = 'table'@'%' TRIGGER tr AFTER INSERT ON a FOR EACH ROW DELETE FROM t
+
+## definer current_user with parentheses
+expect: my=Destructive
+CREATE DEFINER = CURRENT_USER() TRIGGER tr AFTER INSERT ON a FOR EACH ROW DELETE FROM t
+
+## algorithm and definer before a view
+expect: my=Destructive
+CREATE OR REPLACE ALGORITHM = MERGE DEFINER = root@localhost SQL SECURITY INVOKER VIEW v AS SELECT 1
+
+## schema only right after create
+expect: pg=Ddl
+CREATE TABLE t (a int) TABLESPACE schema

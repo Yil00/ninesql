@@ -1384,3 +1384,40 @@ async fn connect_capabilities_are_enforced() {
         Err(DriverError::InvalidParams(_))
     ));
 }
+
+/// The splitter agrees with SQLite 3.54: a trigger body with `;` and `CASE … END`, `[…]` and
+/// backquoted names holding `;`, doubled quotes (P3-D, F-SQL-18).
+#[tokio::test]
+async fn scripts_split_as_sqlite_parses_them() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("script.db");
+    let mut p = params(&path);
+    p.endpoint = Endpoint::File {
+        path: path.clone(),
+        create_if_missing: true,
+    };
+    let mut s = connect(p).await;
+    let script = "CREATE TABLE [p;t] (id INTEGER, a TEXT);\n\
+        CREATE TABLE log (n);\n\
+        CREATE TRIGGER tr AFTER INSERT ON [p;t] FOR EACH ROW BEGIN\n  \
+        INSERT INTO log VALUES (CASE WHEN new.id > 1 THEN 'big' END);\n  \
+        INSERT INTO log VALUES (2);\nEND;\n\
+        INSERT INTO `p;t` VALUES (1, 'a''b;'), (2, 'x'); -- ;\n\
+        /* ; */ SELECT count(*) FROM log";
+    let items = s.dialect().split_script(script);
+    assert_eq!(items.len(), 5);
+    let mut last = None;
+    for item in &items {
+        assert_eq!(item.kind, ninesql_driver_api::ScriptItemKind::Statement);
+        match run(s.as_mut(), item.text(script)).await {
+            Ok(o) => last = Some(o),
+            Err(e) => panic!(
+                "line {}: {:?} failed: {e}",
+                item.start.line,
+                item.text(script)
+            ),
+        }
+    }
+    assert_eq!(first_i64(&last.unwrap()), Some(4));
+    s.close().await.unwrap();
+}

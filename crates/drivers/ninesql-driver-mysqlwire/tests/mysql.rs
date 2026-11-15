@@ -1214,3 +1214,124 @@ async fn closed_session_refuses_work() {
         s.close().await.unwrap();
     }
 }
+
+/// Runs every statement item of `script` (P3-D), one per call, in order.
+async fn run_script(dev: &Dev, s: &mut dyn Session, script: &str) -> Vec<Collected> {
+    let items = s.dialect().split_script(script);
+    let mut out = Vec::new();
+    for item in &items {
+        match item.kind {
+            ninesql_driver_api::ScriptItemKind::Statement => {
+                let text = item.text(script);
+                match run(s, text).await {
+                    Ok(c) => out.push(c),
+                    Err(e) => panic!(
+                        "{}: line {}: {text:?} failed: {e}",
+                        dev.engine, item.start.line
+                    ),
+                }
+            }
+            ninesql_driver_api::ScriptItemKind::ClientDirective => {}
+            other => panic!("{}: unexpected {other:?}", dev.engine),
+        }
+    }
+    out
+}
+
+/// The splitter agrees with MySQL 8.4 and MariaDB 11.8: `DELIMITER`, stored programs with
+/// `BEGIN … END`, executable comments kept whole, backslash escapes, `#` comments; and the
+/// classifier's reading of conditional comments, `$` in names and user variables matches what
+/// the engines run (P3-D, F-SQL-18).
+#[tokio::test]
+async fn scripts_split_as_the_engines_parse_them() {
+    for dev in devs() {
+        let mut s = connect(&dev).await;
+        let mariadb = dev.engine == EngineId::MARIADB;
+        let script = "DROP TABLE IF EXISTS p3d_t;\n\
+            DROP TABLE IF EXISTS p3d_log;\n\
+            DROP PROCEDURE IF EXISTS p3d_p;\n\
+            CREATE TABLE p3d_t (id INT, a TEXT);\n\
+            CREATE TABLE p3d_log (n INT);\n\
+            /*!40101 SET @p3d = 1 */;\n\
+            INSERT INTO p3d_t VALUES (1, 'it\\'s; ok'), (2, \"dq;\"); # a comment ;\n\
+            DELIMITER //\n\
+            CREATE PROCEDURE p3d_p()\nBEGIN\n  DECLARE x INT DEFAULT 0;\n  \
+            IF x = 0 THEN INSERT INTO p3d_log VALUES (1); END IF;\n  SELECT 'a//b;';\nEND //\n\
+            CREATE TRIGGER p3d_tr AFTER INSERT ON p3d_t FOR EACH ROW \
+            BEGIN INSERT INTO p3d_log VALUES (2); END//\n\
+            DELIMITER ;\n\
+            CALL p3d_p();\n\
+            INSERT INTO p3d_t VALUES (3, 'x');\n\
+            SELECT COUNT(*) FROM p3d_log;\n\
+            SELECT a FROM p3d_t WHERE id = 1;";
+        let results = run_script(&dev, s.as_mut(), script).await;
+        assert_eq!(results.len(), 13, "{}", dev.engine);
+        // The procedure's insert and the trigger's.
+        assert_eq!(scalar(&results[11]).as_deref(), Some("2"), "{}", dev.engine);
+        assert_eq!(
+            scalar(&results[12]).as_deref(),
+            Some("it's; ok"),
+            "{}",
+            dev.engine
+        );
+        if mariadb {
+            // An anonymous compound block, without DELIMITER: one statement.
+            let block = "BEGIN NOT ATOMIC INSERT INTO p3d_log VALUES (3); INSERT INTO p3d_log VALUES (4); END";
+            assert_eq!(s.dialect().split_statements(block).len(), 1);
+            run(s.as_mut(), block).await.unwrap();
+            let c = run(s.as_mut(), "SELECT COUNT(*) FROM p3d_log")
+                .await
+                .unwrap();
+            assert_eq!(scalar(&c).as_deref(), Some("4"));
+        }
+        // Why the classifier reads these as destructive: the engines ignore what looks like a
+        // filter. A versioned comment above the server version is skipped.
+        let c = run(s.as_mut(), "UPDATE p3d_t SET a = 'v' /*!99999 WHERE 0 */")
+            .await
+            .unwrap();
+        assert_eq!(c.counts, [Some(3)], "{}", dev.engine);
+        // `/*M!` runs on MariaDB only.
+        let c = run(s.as_mut(), "UPDATE p3d_t SET a = 'm' /*M! WHERE 0 */")
+            .await
+            .unwrap();
+        assert_eq!(
+            c.counts,
+            [Some(if mariadb { 0 } else { 3 })],
+            "{}",
+            dev.engine
+        );
+        // `@WHERE` is a user variable (NULL), not a clause.
+        let c = run(s.as_mut(), "UPDATE p3d_t SET a = @WHERE")
+            .await
+            .unwrap();
+        assert_eq!(c.counts, [Some(3)], "{}", dev.engine);
+        for sql in [
+            "UPDATE p3d_t SET a = 'v' /*!99999 WHERE 0 */",
+            "UPDATE p3d_t SET a = 'm' /*M! WHERE 0 */",
+            "UPDATE p3d_t SET a = @WHERE",
+            "DELETE FROM p3d_t$WHERE",
+        ] {
+            assert_eq!(
+                s.dialect().classify(sql),
+                ninesql_driver_api::StatementClass::Destructive,
+                "{sql}"
+            );
+        }
+        // A NUL byte is refused before anything is sent (security review L5).
+        assert!(matches!(
+            run(s.as_mut(), "SELECT 1\0; DELETE FROM p3d_t").await,
+            Err(DriverError::InvalidParams(_))
+        ));
+        let c = run(s.as_mut(), "SELECT COUNT(*) FROM p3d_t").await.unwrap();
+        assert_eq!(scalar(&c).as_deref(), Some("3"), "{}", dev.engine);
+        for sql in [
+            "DROP TRIGGER p3d_tr",
+            "DROP PROCEDURE p3d_p",
+            "DROP TABLE p3d_t",
+            "DROP TABLE p3d_log",
+        ] {
+            run(s.as_mut(), sql).await.unwrap();
+        }
+        s.close().await.unwrap();
+    }
+}

@@ -8,7 +8,14 @@
 //! included). Before splitting or classifying, [`lexer_view`] follows SQLite's tokenizer and
 //! rewrites both into forms the shared lexer reads as one token, keeping every byte offset, so
 //! a quote, a comment marker or a `;` inside them cannot hide a statement from the classifier
-//! (security review H1).
+//! (security review H1). A variable's name becomes `_` bytes too (P3-D), so `UPDATE t SET a =
+//! :WHERE` shows no `WHERE` clause (SQLite binds an unbound variable as `NULL` and updates every
+//! row).
+//!
+//! A `CREATE [TEMP] TRIGGER … BEGIN … END` is one statement for
+//! [`split_statements`](Dialect::split_statements) (P3-D): as in SQLite's grammar and
+//! `sqlite3_complete`, the body ends at the first `END` that starts a statement (right after a
+//! `;`), so `;` inside the body does not split it.
 
 use ninesql_driver_api::dialect::{classify_with_rules, split_with_rules};
 use ninesql_driver_api::{Dialect, ExplainFormat, LexicalRules, StatementClass, StatementSpan};
@@ -41,7 +48,8 @@ fn is_space(b: u8) -> bool {
 ///   inside becomes `_` (the first `]` ends it; an unterminated one runs to the end);
 /// - in a variable `$name`, `:name`, `@name` or `#name` (SQLite's `CC_VARALPHA` / `CC_DOLLAR`
 ///   loop: identifier characters, `::` segments, then an optional `(` that runs to the next
-///   whitespace or `)`), the parenthesised part becomes `_` bytes;
+///   whitespace or `)`), everything after the sigil becomes `_` bytes: the name (a variable
+///   named `WHERE` is not a keyword) and the parenthesised part;
 /// - identifiers and numbers are consumed whole (`a$b(` is a function call, not a variable).
 ///
 /// Strings (`'…'`, `x'…'`), `"…"` and `` `…` `` identifiers and comments are copied unchanged.
@@ -114,6 +122,9 @@ fn scan(text: &str, mut on_word: impl FnMut(&str)) -> (String, bool) {
                 while i < src.len() {
                     let d = src[i];
                     if is_id_char(d) {
+                        // The name is a value, never a keyword. Every byte of a multi-byte
+                        // character is an identifier byte, so whole characters are replaced.
+                        out[i] = b'_';
                         n += 1;
                     } else if d == b'(' && n > 0 {
                         let open = i;
@@ -133,6 +144,8 @@ fn scan(text: &str, mut on_word: impl FnMut(&str)) -> (String, bool) {
                         }
                         break;
                     } else if d == b':' && src.get(i + 1) == Some(&b':') {
+                        out[i] = b'_';
+                        out[i + 1] = b'_';
                         i += 1;
                     } else {
                         break;
@@ -330,13 +343,75 @@ fn is_read_pragma(text: &str) -> bool {
     i == b.len()
 }
 
+/// The first `n` bare words of `text` (as SQLite's tokenizer reads it), upper-cased.
+fn first_words(text: &str, n: usize) -> Vec<String> {
+    let mut words = Vec::new();
+    scan(text, |w| {
+        if words.len() < n {
+            words.push(w.to_ascii_uppercase());
+        }
+    });
+    words
+}
+
+/// `[EXPLAIN [QUERY PLAN]] CREATE [TEMP | TEMPORARY] TRIGGER …`.
+fn is_trigger_definition(text: &str) -> bool {
+    let words = first_words(text, 6);
+    let mut i = 0;
+    if words.first().map(String::as_str) == Some("EXPLAIN") {
+        i = 1;
+        if words.get(1).map(String::as_str) == Some("QUERY") {
+            i = 3;
+        }
+    }
+    if words.get(i).map(String::as_str) != Some("CREATE") {
+        return false;
+    }
+    i += 1;
+    if matches!(words.get(i).map(String::as_str), Some("TEMP" | "TEMPORARY")) {
+        i += 1;
+    }
+    words.get(i).map(String::as_str) == Some("TRIGGER")
+}
+
+/// `true` when the statement text starts with the bare word `END`.
+fn starts_with_end(text: &str) -> bool {
+    text.get(..3).is_some_and(|w| w.eq_ignore_ascii_case("end"))
+        && !text.as_bytes().get(3).copied().is_some_and(is_id_char)
+}
+
+/// Joins the spans of a trigger definition up to the span that starts with `END` (included).
+/// SQLite parses the joined text as one statement and refuses a second statement in one
+/// `prepare` anyway, so a heuristic mistake fails instead of running more; the classifier still
+/// looks at every `;`-separated piece. An unterminated trigger runs to the end of the script.
+fn merge_triggers(view: &str, spans: Vec<StatementSpan>) -> Vec<StatementSpan> {
+    let mut out = Vec::with_capacity(spans.len());
+    let mut i = 0;
+    while i < spans.len() {
+        let mut span = spans[i];
+        if is_trigger_definition(span.text(view)) {
+            while i + 1 < spans.len() {
+                i += 1;
+                span.end = spans[i].end;
+                if starts_with_end(spans[i].text(view)) {
+                    break;
+                }
+            }
+        }
+        out.push(span);
+        i += 1;
+    }
+    out
+}
+
 impl Dialect for SqliteDialect {
     fn lexical_rules(&self) -> LexicalRules {
         LexicalRules::SQLITE
     }
 
     fn split_statements(&self, script: &str) -> Vec<StatementSpan> {
-        split_with_rules(&lexer_view(script), LexicalRules::SQLITE)
+        let view = lexer_view(script);
+        merge_triggers(&view, split_with_rules(&view, LexicalRules::SQLITE))
     }
 
     fn classify(&self, text: &str) -> StatementClass {
@@ -515,7 +590,10 @@ mod tests {
             assert!(lexed.is_write(), "{sql} -> {lexed:?}");
             assert_eq!(d.split_statements(sql).len(), 1, "{sql}");
         }
-        assert_eq!(lexer_view("SELECT $a(')) x"), "SELECT $a___) x");
+        assert_eq!(lexer_view("SELECT $a(')) x"), "SELECT $____) x");
+        // The name is neutralised too: a variable named `WHERE` is not a keyword (P3-D).
+        assert_eq!(lexer_view("SET a = :WHERE"), "SET a = :_____");
+        assert_eq!(lexer_view("SELECT $a::b(x)"), "SELECT $_______");
         // A `;` inside the variable's parentheses is not a separator for SQLite either.
         assert_eq!(d.split_statements("SELECT $a(;) FROM t").len(), 1);
         // `a$b(` is a function call, not a variable.

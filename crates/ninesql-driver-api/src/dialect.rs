@@ -42,6 +42,26 @@
 //! `ANALYZE` (MariaDB `ANALYZE <statement>` runs it) is [`StatementClass::Unknown`].
 //! `CREATE OR REPLACE` overwrites an existing object and is [`StatementClass::Destructive`]
 //! (P1-E review M1, L1).
+//!
+//! # Statements whose effect is deferred or conditional (P3-D)
+//! - A `CREATE TRIGGER` / `CREATE RULE` is classified as the riskiest statement of its body
+//!   (at least [`StatementClass::Ddl`]): a trigger that empties a table is destructive. A
+//!   MySQL / MariaDB `CREATE EVENT` (its body may run at once) is [`StatementClass::Unknown`].
+//! - `BEGIN` is transaction control only when every word after it is a transaction mode;
+//!   MariaDB `BEGIN NOT ATOMIC …` and `BEGIN ATOMIC …` are [`StatementClass::Unknown`].
+//! - MySQL / MariaDB conditional executable comments (`/*!80000 … */`, `/*M! … */`) may or may
+//!   not run: every combination is classified and the riskiest wins (see
+//!   [`classify_with_rules`]).
+//!
+//! # Scripts (P3-D, F-SQL-18)
+//! [`Dialect::split_script`] splits a script for "execute script": statements with byte offsets,
+//! lines and columns ([`ScriptItem`]), client directives (MySQL `DELIMITER`) and refused pieces
+//! (PostgreSQL `COPY … FROM STDIN` data, psql and mysql client commands). Each statement item
+//! is then executed (and classified, just before it runs) on its own;
+//! [`Dialect::split_statements`] stays the single-statement check of
+//! [`ensure_single_statement`]. Items are valid only for the lexical modes at split time: after
+//! an item that may change them ([`item_may_change_lexical_modes`]), callers re-split the rest
+//! with [`Dialect::split_script_from`] (contract on [`Dialect::split_script`]).
 
 use crate::capabilities::ExplainFormat;
 use crate::error::{DriverError, DriverResult};
@@ -74,6 +94,22 @@ pub struct LexicalRules {
     pub executable_comments: bool,
     /// `` ` `` quotes identifiers (MySQL family, SQLite, ClickHouse).
     pub backtick_identifiers: bool,
+    /// With [`backslash_escapes`](Self::backslash_escapes), a backslash also escapes inside
+    /// `"…"` (MySQL / MariaDB, where `"…"` is a string unless `ANSI_QUOTES`). Off for
+    /// PostgreSQL: with `standard_conforming_strings = off` a backslash escapes in strings
+    /// only, never in `"…"` or `U&"…"` identifiers (security review M1).
+    pub double_quote_backslash: bool,
+    /// `$` is an identifier character, also at the start of a word (MySQL / MariaDB: `t$x`,
+    /// `$x`; SQLite: `t$x`, its `$x` variables being rewritten by the driver first). Without it,
+    /// `DELETE FROM t$WHERE` would show a `WHERE` the engine never sees. PostgreSQL continues
+    /// identifiers with `$` through [`dollar_quotes`](Self::dollar_quotes) instead.
+    pub dollar_in_identifiers: bool,
+    /// `@name` is one user-variable token, never a keyword (MySQL / MariaDB: `UPDATE t SET
+    /// a = @WHERE` has no `WHERE` clause). `@@name` (system variables) and `@'…'` are unchanged.
+    pub at_variables: bool,
+    /// A carriage return ends a `--` comment, as a line feed does (PostgreSQL: its lexer's
+    /// `non_newline` is `[^\n\r]`). MySQL, MariaDB and SQLite end it at a line feed only.
+    pub line_comment_ends_at_cr: bool,
 }
 
 impl LexicalRules {
@@ -87,13 +123,18 @@ impl LexicalRules {
         dash_comment_needs_space: false,
         executable_comments: false,
         backtick_identifiers: false,
+        double_quote_backslash: false,
+        dollar_in_identifiers: false,
+        at_variables: false,
+        line_comment_ends_at_cr: false,
     };
 
     /// PostgreSQL family with `standard_conforming_strings = on` (the default since 9.1).
     pub const POSTGRES: Self = Self::ANSI
         .with_e_string_backslash(true)
         .with_nested_block_comments(true)
-        .with_dollar_quotes(true);
+        .with_dollar_quotes(true)
+        .with_line_comment_ends_at_cr(true);
 
     /// MySQL / MariaDB in the default `sql_mode` (backslash escapes on).
     pub const MYSQL: Self = Self::ANSI
@@ -101,10 +142,15 @@ impl LexicalRules {
         .with_hash_comments(true)
         .with_dash_comment_needs_space(true)
         .with_executable_comments(true)
-        .with_backtick_identifiers(true);
+        .with_backtick_identifiers(true)
+        .with_double_quote_backslash(true)
+        .with_dollar_in_identifiers(true)
+        .with_at_variables(true);
 
     /// SQLite.
-    pub const SQLITE: Self = Self::ANSI.with_backtick_identifiers(true);
+    pub const SQLITE: Self = Self::ANSI
+        .with_backtick_identifiers(true)
+        .with_dollar_in_identifiers(true);
 
     /// Sets [`backslash_escapes`](Self::backslash_escapes).
     #[must_use]
@@ -161,6 +207,34 @@ impl LexicalRules {
         self.backtick_identifiers = on;
         self
     }
+
+    /// Sets [`double_quote_backslash`](Self::double_quote_backslash).
+    #[must_use]
+    pub const fn with_double_quote_backslash(mut self, on: bool) -> Self {
+        self.double_quote_backslash = on;
+        self
+    }
+
+    /// Sets [`dollar_in_identifiers`](Self::dollar_in_identifiers).
+    #[must_use]
+    pub const fn with_dollar_in_identifiers(mut self, on: bool) -> Self {
+        self.dollar_in_identifiers = on;
+        self
+    }
+
+    /// Sets [`at_variables`](Self::at_variables).
+    #[must_use]
+    pub const fn with_at_variables(mut self, on: bool) -> Self {
+        self.at_variables = on;
+        self
+    }
+
+    /// Sets [`line_comment_ends_at_cr`](Self::line_comment_ends_at_cr).
+    #[must_use]
+    pub const fn with_line_comment_ends_at_cr(mut self, on: bool) -> Self {
+        self.line_comment_ends_at_cr = on;
+        self
+    }
 }
 
 /// Byte range of one statement inside a script, excluding surrounding whitespace, leading
@@ -179,6 +253,296 @@ impl StatementSpan {
     pub fn text<'a>(&self, script: &'a str) -> &'a str {
         script.get(self.start..self.end).unwrap_or("")
     }
+}
+
+/// A position in a script, for error positions (F-SQL-12) and editor navigation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[non_exhaustive]
+pub struct TextPosition {
+    /// Byte offset in the script.
+    pub offset: usize,
+    /// Line, 1-based. Lines end at `\n`; a `\r` before it belongs to the line.
+    pub line: usize,
+    /// Column, 1-based, in Unicode scalar values (`char`s) from the start of the line.
+    pub column: usize,
+}
+
+impl TextPosition {
+    /// The start of a text.
+    pub const START: Self = Self {
+        offset: 0,
+        line: 1,
+        column: 1,
+    };
+}
+
+/// Splitter state carried between calls of [`Dialect::split_script_ahead`]: the MySQL
+/// `DELIMITER` in force (`None`: `;`). Updated item by item with
+/// [`Dialect::script_state_after`].
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct ScriptState {
+    /// The client statement delimiter in force, when not `;`.
+    pub delimiter: Option<String>,
+}
+
+impl ScriptState {
+    /// A state with `delimiter` in force (`None`: `;`).
+    #[must_use]
+    pub fn with_delimiter(delimiter: Option<String>) -> Self {
+        Self { delimiter }
+    }
+}
+
+/// Line starts of a script, to turn byte offsets into [`TextPosition`]s in `O(log lines)`.
+#[derive(Clone, Debug)]
+pub struct LineIndex<'a> {
+    text: &'a str,
+    /// Byte offset of the start of every line.
+    starts: Vec<usize>,
+}
+
+impl<'a> LineIndex<'a> {
+    /// Indexes `text`.
+    #[must_use]
+    pub fn new(text: &'a str) -> Self {
+        let mut starts = vec![0];
+        starts.extend(
+            text.bytes()
+                .enumerate()
+                .filter(|(_, b)| *b == b'\n')
+                .map(|(i, _)| i + 1),
+        );
+        Self { text, starts }
+    }
+
+    /// The position of byte `offset`, clamped to the text and moved back to a `char` boundary.
+    #[must_use]
+    pub fn position(&self, offset: usize) -> TextPosition {
+        let mut offset = offset.min(self.text.len());
+        while !self.text.is_char_boundary(offset) {
+            offset -= 1;
+        }
+        let line = self.starts.partition_point(|s| *s <= offset);
+        let start = self.starts[line - 1];
+        let column = self.text[start..offset].chars().count() + 1;
+        TextPosition {
+            offset,
+            line,
+            column,
+        }
+    }
+}
+
+/// The position of byte `offset` in `text` (see [`LineIndex`] for many lookups).
+#[must_use]
+pub fn position_at(text: &str, offset: usize) -> TextPosition {
+    LineIndex::new(text).position(offset)
+}
+
+/// Why a piece of a script cannot run as a statement ([`ScriptItemKind::Refused`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum ScriptRefusal {
+    /// PostgreSQL `COPY … FROM STDIN` with its inline data block (up to a `\.` line): the
+    /// data is not SQL and is never split or sent; NineSQL does not stream `COPY` input.
+    CopyFromStdin,
+    /// A psql meta-command (`\connect`, `\set`, `\i`…): a client command, not SQL.
+    PsqlMetaCommand,
+    /// A mysql client command other than `DELIMITER` (`\d`, `\g`, `source`…).
+    MysqlClientCommand,
+    /// A `DELIMITER` directive without a delimiter, or with one NineSQL refuses (a
+    /// backslash, a quote, or a comment opener in it). The previous delimiter stays.
+    InvalidDelimiter,
+}
+
+impl ScriptRefusal {
+    /// A user-presentable explanation.
+    #[must_use]
+    pub fn message(self) -> &'static str {
+        match self {
+            Self::CopyFromStdin => "COPY … FROM STDIN with inline data is not supported",
+            Self::PsqlMetaCommand => "psql meta-commands are not supported",
+            Self::MysqlClientCommand => {
+                "mysql client commands other than DELIMITER are not supported"
+            }
+            Self::InvalidDelimiter => {
+                "invalid DELIMITER: it must be non-empty and contain no backslash, quote or comment opener"
+            }
+        }
+    }
+}
+
+/// What a [`ScriptItem`] is.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum ScriptItemKind {
+    /// One statement, to be sent as [`ScriptItem::span`]'s text: it passes
+    /// [`ensure_single_statement`] and is classified with [`Dialect::classify`] like any other.
+    Statement,
+    /// A client directive the splitter applied and that is never sent (MySQL `DELIMITER //`).
+    ClientDirective,
+    /// A piece the splitter recognised but that cannot run. A caller running the script must
+    /// stop before it (or refuse the whole script); it is never sent.
+    Refused(ScriptRefusal),
+}
+
+/// One piece of a script, from [`Dialect::split_script`]. Built with [`script_items`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct ScriptItem {
+    /// The piece's bytes (no surrounding blanks or leading comments, no terminator).
+    pub span: StatementSpan,
+    /// What it is.
+    pub kind: ScriptItemKind,
+    /// Position of `span.start`.
+    pub start: TextPosition,
+    /// Position of `span.end` (exclusive: just past the last character).
+    pub end: TextPosition,
+}
+
+impl ScriptItem {
+    /// The piece's text inside `script`.
+    #[must_use]
+    pub fn text<'a>(&self, script: &'a str) -> &'a str {
+        self.span.text(script)
+    }
+}
+
+/// Positions computed in one forward pass: offsets asked in increasing order cost the bytes
+/// between them, so a script's positions cost one pass whatever its line lengths (security
+/// review M3). An offset behind the cursor restarts from the start of the text.
+struct PositionCursor<'a> {
+    text: &'a str,
+    at: TextPosition,
+}
+
+impl<'a> PositionCursor<'a> {
+    fn new(text: &'a str) -> Self {
+        Self::at(text, TextPosition::START)
+    }
+
+    /// A cursor resuming at `at`, a position of `text` computed earlier.
+    fn at(text: &'a str, at: TextPosition) -> Self {
+        let at = if at.offset <= text.len() && text.is_char_boundary(at.offset) {
+            at
+        } else {
+            TextPosition::START
+        };
+        Self { text, at }
+    }
+
+    fn position(&mut self, offset: usize) -> TextPosition {
+        let mut offset = offset.min(self.text.len());
+        while !self.text.is_char_boundary(offset) {
+            offset -= 1;
+        }
+        if offset < self.at.offset {
+            self.at = TextPosition {
+                offset: 0,
+                line: 1,
+                column: 1,
+            };
+        }
+        for c in self.text[self.at.offset..offset].chars() {
+            if c == '\n' {
+                self.at.line += 1;
+                self.at.column = 1;
+            } else {
+                self.at.column += 1;
+            }
+        }
+        self.at.offset = offset;
+        self.at
+    }
+}
+
+/// Builds [`ScriptItem`]s with their positions, in one pass over the script when the pieces
+/// come in order (as every splitter returns them).
+#[must_use]
+pub fn script_items(
+    script: &str,
+    pieces: impl IntoIterator<Item = (StatementSpan, ScriptItemKind)>,
+) -> Vec<ScriptItem> {
+    let mut cursor = PositionCursor::new(script);
+    pieces
+        .into_iter()
+        .map(|(span, kind)| {
+            let start = cursor.position(span.start);
+            let end = cursor.position(span.end);
+            ScriptItem {
+                span,
+                kind,
+                start,
+                end,
+            }
+        })
+        .collect()
+}
+
+/// [`script_items`] for pieces at or after `start`, a position of `script` computed earlier
+/// (an item's `end`): positions cost the bytes from `start` on, not from the start of the
+/// script.
+#[must_use]
+pub fn script_items_from(
+    script: &str,
+    start: TextPosition,
+    pieces: impl IntoIterator<Item = (StatementSpan, ScriptItemKind)>,
+) -> Vec<ScriptItem> {
+    let mut cursor = PositionCursor::at(script, start);
+    pieces
+        .into_iter()
+        .map(|(span, kind)| {
+            let start = cursor.position(span.start);
+            let end = cursor.position(span.end);
+            ScriptItem {
+                span,
+                kind,
+                start,
+                end,
+            }
+        })
+        .collect()
+}
+
+/// Smallest window of [`Dialect::split_script_ahead`]'s default.
+const AHEAD_WINDOW: usize = 512;
+
+/// Items of `script[from..]` moved to offsets and positions in the whole `script`.
+#[must_use]
+pub fn shift_items(script: &str, from: usize, items: Vec<ScriptItem>) -> Vec<ScriptItem> {
+    script_items(
+        script,
+        items.into_iter().map(|i| {
+            (
+                StatementSpan {
+                    start: i.span.start + from,
+                    end: i.span.end + from,
+                },
+                i.kind,
+            )
+        }),
+    )
+}
+
+/// `true` when running `item` may change the lexical modes the script was split with (MySQL
+/// `sql_mode`, PostgreSQL `standard_conforming_strings`, the client encoding): a statement
+/// item that `dialect` classifies [`StatementClass::Session`],
+/// [`StatementClass::ChangesAccessMode`] or [`StatementClass::Unknown`] (a `SET`, a
+/// `set_config(…)`, a procedure call…). After such an item has run, a caller running the
+/// script re-splits the rest with the session's current dialect
+/// ([`Dialect::split_script_from`]); see the contract on [`Dialect::split_script`].
+#[must_use]
+pub fn item_may_change_lexical_modes(
+    dialect: &(impl Dialect + ?Sized),
+    item: &ScriptItem,
+    script: &str,
+) -> bool {
+    item.kind == ScriptItemKind::Statement
+        && matches!(
+            dialect.classify(item.text(script)),
+            StatementClass::Session | StatementClass::ChangesAccessMode | StatementClass::Unknown
+        )
 }
 
 /// Classification of a statement, ordered by increasing risk.
@@ -301,8 +665,125 @@ pub trait Dialect: Send + Sync {
 
     /// Splits a script into statements on top-level `;`, honouring quotes and comments
     /// according to [`lexical_rules`](Self::lexical_rules).
+    ///
+    /// This is the split [`ensure_single_statement`] uses: what a driver sends in one protocol
+    /// call. Engine compound statements whose body holds `;` (MySQL stored programs, SQLite
+    /// triggers, PostgreSQL `BEGIN ATOMIC` bodies) are one span in the drivers' overrides.
     fn split_statements(&self, script: &str) -> Vec<StatementSpan> {
         split_with_rules(script, self.lexical_rules())
+    }
+
+    /// Splits a script for "execute script" (F-SQL-18): statements, client directives
+    /// (MySQL `DELIMITER`) and refused pieces (PostgreSQL `COPY … FROM STDIN` data, psql
+    /// meta-commands), in order, with byte offsets, lines and columns.
+    ///
+    /// Every [`ScriptItemKind::Statement`] item's text is one statement for
+    /// [`split_statements`](Self::split_statements) (it passes [`ensure_single_statement`]) and
+    /// is run and classified as such, one item per call. Default: the
+    /// [`split_statements`](Self::split_statements) spans, all statements.
+    ///
+    /// # Contract for callers running a script (security review H2)
+    /// The items are valid only for the lexical modes in force when the script was split
+    /// ([`lexical_rules`](Self::lexical_rules): MySQL `NO_BACKSLASH_ESCAPES` and `ANSI_QUOTES`,
+    /// PostgreSQL `standard_conforming_strings`). A statement of the script may change them
+    /// (`SET SESSION sql_mode = 'NO_BACKSLASH_ESCAPES'; UPDATE t SET a = 'x\' -- ' WHERE …`
+    /// is a different `UPDATE` after the `SET`). So a caller:
+    /// 1. classifies each item with the session's dialect **just before running it**, and asks
+    ///    for confirmation from that class, never from a class computed earlier;
+    /// 2. after **every** item, compares the session dialect's `lexical_rules()` with the ones
+    ///    the pending items were split with (they capture every mode the splitters use): a
+    ///    `SET` changes them, but so can a `ROLLBACK`, a `COMMIT` or a `ROLLBACK TO SAVEPOINT`
+    ///    that undoes a `SET`, or a function calling `set_config`
+    ///    ([`item_may_change_lexical_modes`] only names the obvious cases). When they differ,
+    ///    it drops the pending items and splits on from the end of that item with the new
+    ///    dialect.
+    ///
+    /// To keep that linear, run the script lazily with
+    /// [`split_script_ahead`](Self::split_script_ahead) (a few items at a time, from the end of
+    /// the last item, with the [`ScriptState`] kept up to date by
+    /// [`script_state_after`](Self::script_state_after)) rather than re-splitting the whole
+    /// rest. `conformance::script_plan` is a reference implementation.
+    fn split_script(&self, script: &str) -> Vec<ScriptItem> {
+        script_items(
+            script,
+            self.split_statements(script)
+                .into_iter()
+                .map(|s| (s, ScriptItemKind::Statement)),
+        )
+    }
+
+    /// The next items of `script` from `from` (the `end` of the last item handled, or
+    /// [`TextPosition::START`]) with `state` in force: at least one item unless only blanks
+    /// and comments are left, every one exactly as [`split_script`](Self::split_script) of the
+    /// rest would give it, at a cost of a small window of text (it grows only for a longer
+    /// statement). Default: windows of [`split_statements`](Self::split_statements), the last
+    /// statement of a window (possibly cut) left for the next call.
+    fn split_script_ahead(
+        &self,
+        script: &str,
+        from: TextPosition,
+        state: &ScriptState,
+    ) -> Vec<ScriptItem> {
+        let _ = state;
+        if from.offset > script.len() || !script.is_char_boundary(from.offset) {
+            return self.split_script_from(script, from.offset);
+        }
+        let base = from.offset;
+        let mut window = AHEAD_WINDOW;
+        loop {
+            let mut end = base.saturating_add(window).min(script.len());
+            while !script.is_char_boundary(end) {
+                end += 1;
+            }
+            let complete = end == script.len();
+            let mut spans = self.split_statements(&script[base..end]);
+            if !complete {
+                spans.pop();
+                if spans.is_empty() {
+                    window = window.saturating_mul(2);
+                    continue;
+                }
+            }
+            return script_items_from(
+                script,
+                from,
+                spans.into_iter().map(|s| {
+                    (
+                        StatementSpan {
+                            start: s.start + base,
+                            end: s.end + base,
+                        },
+                        ScriptItemKind::Statement,
+                    )
+                }),
+            );
+        }
+    }
+
+    /// The [`ScriptState`] after `item` (an item of `script` handled with `state` in force):
+    /// a MySQL `DELIMITER` directive changes the delimiter. Default: unchanged.
+    fn script_state_after(
+        &self,
+        script: &str,
+        item: &ScriptItem,
+        state: &ScriptState,
+    ) -> ScriptState {
+        let _ = (script, item);
+        state.clone()
+    }
+
+    /// Splits the rest of `script` from byte `from` (the end of an item of a previous split,
+    /// see the contract on [`split_script`](Self::split_script)). Items carry offsets and
+    /// positions in the whole `script`. Splitter state from before `from` is rebuilt (MySQL:
+    /// the `DELIMITER` in force). Default: [`split_script`](Self::split_script) of the rest,
+    /// shifted. It splits the whole rest (and mysqlwire also re-reads the text before `from`):
+    /// prefer [`split_script_ahead`](Self::split_script_ahead) in a loop.
+    fn split_script_from(&self, script: &str, from: usize) -> Vec<ScriptItem> {
+        let mut from = from.min(script.len());
+        while !script.is_char_boundary(from) {
+            from -= 1;
+        }
+        shift_items(script, from, self.split_script(&script[from..]))
     }
 
     /// Wraps a query to fetch one page (ANSI: `SELECT * FROM (<q>) AS ninesql_page LIMIT n
@@ -359,6 +840,10 @@ enum TokKind {
     Ident,
     Semicolon,
     Other,
+    /// The opener (`/*!`, `/*M!`, version digits) or the closing `*/` of an executable
+    /// comment: part of a statement's span (so the statement sent keeps its comment and its
+    /// version condition), invisible to the classifier.
+    ExecMarker,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -372,6 +857,13 @@ struct Lexed {
     toks: Vec<Tok>,
     /// A `/*!` or `/*M!` comment was seen while executable comments were not enabled.
     executable_comment_as_comment: bool,
+    /// Conditional executable comments (`/*!NNNNN …*/` with a version, `/*M!…*/`): byte range
+    /// from the opener to just past the closing `*/` (or the end of the text).
+    conditional: Vec<(usize, usize)>,
+    /// A conditional executable comment is unterminated, or its body holds `/*` or `*/` in a
+    /// token (a string, an identifier, a nested comment): an engine that skips the comment
+    /// ends it elsewhere than an engine that runs it.
+    conditional_ambiguous: bool,
 }
 
 fn is_word_byte(b: u8) -> bool {
@@ -411,7 +903,8 @@ fn dollar_tag(bytes: &[u8], start: usize) -> Option<usize> {
         if b == b'$' {
             return Some(i + 1 - start);
         }
-        if !(b.is_ascii_alphanumeric() || b == b'_') {
+        // PostgreSQL's `dolq_cont`: `[A-Za-z\200-\377_0-9]`.
+        if !(b.is_ascii_alphanumeric() || b == b'_' || b >= 0x80) {
             return None;
         }
         i += 1;
@@ -427,6 +920,13 @@ fn find_sub(hay: &[u8], needle: &[u8], from: usize) -> Option<usize> {
         .windows(needle.len())
         .position(|w| w == needle)
         .map(|p| p + from)
+}
+
+/// `true` when the executable-comment opener at `i` is conditional: it has a version number
+/// (run only from that server version on) or is MariaDB's `/*M!` (a plain comment for MySQL).
+fn executable_opener_is_conditional(bytes: &[u8], i: usize) -> bool {
+    let rest = &bytes[i..];
+    rest.starts_with(b"/*M!") || rest.get(3).is_some_and(u8::is_ascii_digit)
 }
 
 /// Length of an executable-comment opener (`/*!`, `/*M!`, plus version digits) at `i`.
@@ -451,6 +951,10 @@ fn lex(text: &str, rules: LexicalRules) -> Lexed {
     let mut toks = Vec::new();
     let mut executable_comment_as_comment = false;
     let mut in_executable = false;
+    let mut conditional = Vec::new();
+    let mut conditional_ambiguous = false;
+    // Start of the open conditional executable comment, if any.
+    let mut open_conditional: Option<usize> = None;
     let mut i = 0;
     let push = |toks: &mut Vec<Tok>, kind, start, end| toks.push(Tok { kind, start, end });
     while i < bytes.len() {
@@ -465,15 +969,31 @@ fn lex(text: &str, rules: LexicalRules) -> Lexed {
         } else if in_executable && b == b'*' && next == Some(b'/') {
             // End of a `/*! … */` executable comment: its content was lexed as code.
             in_executable = false;
+            push(&mut toks, TokKind::ExecMarker, i, i + 2);
             i += 2;
+            if let Some(start) = open_conditional.take() {
+                conditional.push((start, i));
+                // The body as an engine that skips the comment reads it: up to the first `*/`.
+                let body = &bytes[start + 3..i - 2];
+                if find_sub(body, b"*/", 0).is_some() || find_sub(body, b"/*", 0).is_some() {
+                    conditional_ambiguous = true;
+                }
+            }
         } else if dash_comment || rules.hash_comments && b == b'#' {
-            while i < bytes.len() && bytes[i] != b'\n' {
+            while i < bytes.len()
+                && bytes[i] != b'\n'
+                && !(rules.line_comment_ends_at_cr && bytes[i] == b'\r')
+            {
                 i += 1;
             }
         } else if b == b'/' && next == Some(b'*') {
             if let Some(len) = executable_opener(bytes, i) {
                 if rules.executable_comments && !in_executable {
                     in_executable = true;
+                    if executable_opener_is_conditional(bytes, i) {
+                        open_conditional = Some(i);
+                    }
+                    push(&mut toks, TokKind::ExecMarker, i, i + len);
                     i += len;
                     continue;
                 }
@@ -507,7 +1027,8 @@ fn lex(text: &str, rules: LexicalRules) -> Lexed {
             // `U&"…"` / `U&'…'` (SQL standard, PostgreSQL): one token, decoded by `locate`.
             // The quoted run is skipped exactly as without the prefix, so splitting is unchanged.
             let q = bytes[i + 2];
-            let end = skip_quoted(bytes, i + 2, q, rules.backslash_escapes).min(bytes.len());
+            let backslash = rules.backslash_escapes && (q == b'\'' || rules.double_quote_backslash);
+            let end = skip_quoted(bytes, i + 2, q, backslash).min(bytes.len());
             let kind = if q == b'\'' {
                 TokKind::Str
             } else {
@@ -516,7 +1037,8 @@ fn lex(text: &str, rules: LexicalRules) -> Lexed {
             push(&mut toks, kind, i, end);
             i = end;
         } else if b == b'\'' || b == b'"' || rules.backtick_identifiers && b == b'`' {
-            let backslash = rules.backslash_escapes && b != b'`';
+            let backslash = rules.backslash_escapes
+                && (b == b'\'' || b == b'"' && rules.double_quote_backslash);
             let end = skip_quoted(bytes, i, b, backslash).min(bytes.len());
             let kind = if b == b'\'' {
                 TokKind::Str
@@ -536,14 +1058,34 @@ fn lex(text: &str, rules: LexicalRules) -> Lexed {
                 i += 1;
             }
         } else if b == b';' {
+            if open_conditional.is_some() {
+                // A statement boundary inside a conditional comment: what runs depends on
+                // the client's splitting and the server's version.
+                conditional_ambiguous = true;
+            }
             push(&mut toks, TokKind::Semicolon, i, i + 1);
             i += 1;
-        } else if is_word_byte(b) {
+        } else if rules.at_variables && b == b'@' && next.is_some_and(is_word_byte) {
+            // MySQL user variable `@name` (letters, digits, `_`, `$`, `.`): one token that is
+            // never a keyword.
+            let start = i;
+            i += 1;
+            while i < bytes.len() && (is_word_byte(bytes[i]) || matches!(bytes[i], b'$' | b'.')) {
+                i += 1;
+            }
+            push(&mut toks, TokKind::Other, start, i);
+        } else if rules.at_variables && b == b'@' && next == Some(b'@') {
+            // `@@name`: two `@`, then the system variable's name as a word.
+            push(&mut toks, TokKind::Other, i, i + 1);
+            push(&mut toks, TokKind::Other, i + 1, i + 2);
+            i += 2;
+        } else if is_word_byte(b) || rules.dollar_in_identifiers && b == b'$' {
             // With dollar quotes (PostgreSQL), `$` continues an identifier after its first
             // character (`a$q$` is one name); a dollar tag only starts at a token start.
             let start = i;
             while i < bytes.len()
-                && (is_word_byte(bytes[i]) || rules.dollar_quotes && bytes[i] == b'$')
+                && (is_word_byte(bytes[i])
+                    || (rules.dollar_quotes || rules.dollar_in_identifiers) && bytes[i] == b'$')
             {
                 i += 1;
             }
@@ -553,13 +1095,26 @@ fn lex(text: &str, rules: LexicalRules) -> Lexed {
             i += 1;
         }
     }
+    if let Some(start) = open_conditional {
+        // Unterminated: where it ends depends on the engine.
+        conditional.push((start, bytes.len()));
+        conditional_ambiguous = true;
+    }
     Lexed {
         toks,
         executable_comment_as_comment,
+        conditional,
+        conditional_ambiguous,
     }
 }
 
 /// Splits `script` with the given lexical rules (the default of [`Dialect::split_statements`]).
+///
+/// A statement's span runs from its first token to its last, executable-comment openers and
+/// closers included (`/*!40101 SET NAMES utf8mb4 */` keeps its version condition). A `;`
+/// inside an executable comment ends a statement, as for the mysql client, so
+/// `SELECT 1 /*! ; DROP TABLE t */` is two statements and refused by
+/// [`ensure_single_statement`].
 #[must_use]
 pub fn split_with_rules(script: &str, rules: LexicalRules) -> Vec<StatementSpan> {
     let mut spans = Vec::new();
@@ -585,6 +1140,79 @@ pub fn split_with_rules(script: &str, rules: LexicalRules) -> Vec<StatementSpan>
         spans.push(s);
     }
     spans
+}
+
+/// What a [`CodeToken`] is.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum CodeTokenKind {
+    /// An unquoted word: keyword or identifier.
+    Word,
+    /// A string literal (`'…'`, `E'…'`, `$tag$…$tag$`, `U&'…'`).
+    Str,
+    /// A quoted identifier (`"…"`, `` `…` ``).
+    QuotedIdent,
+    /// `;`.
+    Semicolon,
+    /// `(`.
+    OpenParen,
+    /// `)`.
+    CloseParen,
+    /// Any other punctuation or operator byte, or a user variable (`@x` under
+    /// [`LexicalRules::at_variables`]).
+    Other,
+}
+
+/// A token of a text outside comments and blanks, from [`code_tokens`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct CodeToken {
+    /// What it is.
+    pub kind: CodeTokenKind,
+    /// Start offset (inclusive).
+    pub start: usize,
+    /// End offset (exclusive).
+    pub end: usize,
+}
+
+impl CodeToken {
+    /// The token inside `text`.
+    #[must_use]
+    pub fn text<'a>(&self, text: &'a str) -> &'a str {
+        text.get(self.start..self.end).unwrap_or("")
+    }
+
+    /// `true` when the token is the word `keyword`, ignoring ASCII case.
+    #[must_use]
+    pub fn is_word(&self, text: &str, keyword: &str) -> bool {
+        self.kind == CodeTokenKind::Word && self.text(text).eq_ignore_ascii_case(keyword)
+    }
+}
+
+/// The tokens of `text` as the shared lexer reads them under `rules` (the same tokens as
+/// [`split_with_rules`] and [`classify_with_rules`]): comments and blanks are skipped, the
+/// content of executable comments is code. For drivers that recognise engine constructs on top
+/// of the shared splitter (PostgreSQL `BEGIN ATOMIC` bodies, `COPY … FROM STDIN`).
+#[must_use]
+pub fn code_tokens(text: &str, rules: LexicalRules) -> Vec<CodeToken> {
+    lex(text, rules)
+        .toks
+        .into_iter()
+        .filter(|t| t.kind != TokKind::ExecMarker)
+        .map(|t| CodeToken {
+            kind: match (t.kind, text.as_bytes()[t.start]) {
+                (TokKind::Word, _) => CodeTokenKind::Word,
+                (TokKind::Str, _) => CodeTokenKind::Str,
+                (TokKind::Ident, _) => CodeTokenKind::QuotedIdent,
+                (TokKind::Semicolon, _) => CodeTokenKind::Semicolon,
+                (TokKind::Other, b'(') if t.end == t.start + 1 => CodeTokenKind::OpenParen,
+                (TokKind::Other, b')') if t.end == t.start + 1 => CodeTokenKind::CloseParen,
+                (TokKind::Other | TokKind::ExecMarker, _) => CodeTokenKind::Other,
+            },
+            start: t.start,
+            end: t.end,
+        })
+        .collect()
 }
 
 /// Fails with [`DriverError::MultipleStatements`] when `text` contains more than one statement
@@ -628,23 +1256,85 @@ struct Located {
     depth: u32,
 }
 
+/// Most conditional executable comments a text may hold before it is classified
+/// [`StatementClass::Unknown`] without trying every combination.
+const MAX_CONDITIONAL_COMMENTS: usize = 8;
+
+/// Largest text with conditional executable comments that is classified by trying every
+/// combination; a longer one is [`StatementClass::Unknown`] (security review L2: at most 2^8
+/// passes over 64 KiB).
+const MAX_CONDITIONAL_TEXT: usize = 64 * 1024;
+
 /// Classifies `text` with the given lexical rules (the default of [`Dialect::classify`]).
+///
+/// With [`executable_comments`](LexicalRules::executable_comments), a conditional executable
+/// comment (`/*!80000 … */` runs only from that server version on, `/*M! … */` only on
+/// MariaDB) may or may not run: the class is the riskiest over every combination of them run or
+/// skipped, so `DELETE FROM t /*!99999 WHERE 0 */` is destructive. More than
+/// eight of them, a text longer than 64 KiB holding any, an unterminated one, or one whose end
+/// depends on whether it runs, make the text [`StatementClass::Unknown`].
 #[must_use]
 pub fn classify_with_rules(text: &str, rules: LexicalRules) -> StatementClass {
     let lexed = lex(text, rules);
+    if lexed.conditional.is_empty() {
+        return classify_lexed(text, &lexed);
+    }
+    if lexed.conditional_ambiguous
+        || lexed.conditional.len() > MAX_CONDITIONAL_COMMENTS
+        || text.len() > MAX_CONDITIONAL_TEXT
+    {
+        return StatementClass::Unknown;
+    }
+    let mut worst = classify_lexed(text, &lexed);
+    let n = lexed.conditional.len();
+    for mask in 1u32..(1 << n) {
+        let mut bytes = text.as_bytes().to_vec();
+        for (k, &(s, e)) in lexed.conditional.iter().enumerate() {
+            if mask & (1 << k) != 0 {
+                // Skipped by the engine: a comment, i.e. blanks. Whole UTF-8 sequences are
+                // overwritten, so the text stays valid.
+                bytes[s..e].fill(b' ');
+            }
+        }
+        let Ok(variant) = String::from_utf8(bytes) else {
+            return StatementClass::Unknown;
+        };
+        worst = worst.max(classify_lexed(&variant, &lex(&variant, rules)));
+        if worst == StatementClass::Unknown {
+            break;
+        }
+    }
+    worst
+}
+
+fn classify_lexed(text: &str, lexed: &Lexed) -> StatementClass {
     let mut worst = if lexed.executable_comment_as_comment {
         // The engine might execute what we skipped as a comment.
         Some(StatementClass::Unknown)
     } else {
         None
     };
+    // Inside an executable comment (`/*! … */`) at the current token.
+    let mut in_executable = false;
     for stmt in lexed.toks.split(|t| t.kind == TokKind::Semicolon) {
         if stmt.is_empty() {
             continue;
         }
-        let (items, opaque) = locate(text, stmt);
-        let c = if opaque {
-            // A name the classifier cannot decode could be anything.
+        // A piece that starts inside an executable comment (after a `;` in it) reads
+        // differently once split off and sent alone, and a piece of comment markers only is
+        // no statement the classifier can vouch for: both are `Unknown` (re-review L1).
+        let starts_inside = in_executable;
+        for t in stmt.iter().filter(|t| t.kind == TokKind::ExecMarker) {
+            in_executable = text.as_bytes()[t.start] == b'/';
+        }
+        let stmt: Vec<Tok> = stmt
+            .iter()
+            .filter(|t| t.kind != TokKind::ExecMarker)
+            .copied()
+            .collect();
+        let (items, opaque) = locate(text, &stmt);
+        let c = if starts_inside || stmt.is_empty() || opaque {
+            // Or a name the classifier cannot decode, which could be anything.
             StatementClass::Unknown
         } else {
             classify_items(&items)
@@ -765,7 +1455,9 @@ fn locate(text: &str, toks: &[Tok]) -> (Vec<Located>, bool) {
             }
             TokKind::Ident => Item::Ident(unquote_ident(raw)),
             TokKind::Str => Item::Str(unquote_str(raw)),
-            TokKind::Other | TokKind::Semicolon => Item::Punct(raw.as_bytes()[0]),
+            TokKind::Other | TokKind::Semicolon | TokKind::ExecMarker => {
+                Item::Punct(raw.as_bytes()[0])
+            }
         };
         if item == Item::Punct(b')') {
             depth = depth.saturating_sub(1);
@@ -946,8 +1638,20 @@ fn has_word(items: &[Located], w: &str) -> bool {
     items.iter().any(|l| word(l) == Some(w))
 }
 
-fn has_top_level_word(items: &[Located], w: &str) -> bool {
-    items.iter().any(|l| l.depth == 0 && word(l) == Some(w))
+/// The keyword at `items[i]`, unless the word is used as a name: right after a `.`
+/// (`x.where`) or after `AS` (`RETURNING 1 AS where`), where PostgreSQL and MySQL accept any
+/// keyword as a column or alias name (security review H1). Use it for every keyword test whose
+/// *presence* lowers a class, so a name can only over-classify.
+fn keyword_at(items: &[Located], i: usize) -> Option<&str> {
+    let w = word(items.get(i)?)?;
+    let prev = i.checked_sub(1).and_then(|p| items.get(p));
+    let as_name = prev.is_some_and(|p| p.item == Item::Punct(b'.') || word(p) == Some("AS"));
+    (!as_name).then_some(w)
+}
+
+/// A top-level `w` used as a keyword (see [`keyword_at`]).
+fn has_top_level_keyword(items: &[Located], w: &str) -> bool {
+    (0..items.len()).any(|i| items[i].depth == 0 && keyword_at(items, i) == Some(w))
 }
 
 fn classify_by_keyword(first: &str, items: &[Located]) -> StatementClass {
@@ -985,25 +1689,42 @@ fn classify_by_keyword(first: &str, items: &[Located]) -> StatementClass {
         "INSERT" | "MERGE" | "UPSERT" | "REPLACE" => StatementClass::Write,
         "UPDATE" | "DELETE" => {
             // Only a top-level WHERE filters the statement; a WHERE inside a subquery does not.
-            if has_top_level_word(items, "WHERE") {
+            if has_top_level_keyword(items, "WHERE") {
                 StatementClass::Write
             } else {
                 StatementClass::Destructive
             }
         }
         "CREATE" => {
-            if is_create_or_replace(items) {
+            let base = if is_create_or_replace(items) {
                 // Silently overwrites an existing object (P1-E review L1).
                 StatementClass::Destructive
             } else {
                 StatementClass::Ddl
-            }
+            };
+            // A top-level `GRANT` / `REVOKE` inside a `CREATE` (PostgreSQL `CREATE SCHEMA …
+            // GRANT …`) changes privileges (security review M2).
+            let grants = (1..items.len()).any(|i| {
+                items[i].depth == items[0].depth
+                    && matches!(keyword_at(items, i), Some("GRANT" | "REVOKE"))
+            });
+            let base = if grants {
+                base.max(StatementClass::Destructive)
+            } else {
+                base
+            };
+            base.max(classify_create_body(items))
         }
         "DROP" | "TRUNCATE" | "ALTER" | "GRANT" | "REVOKE" | "RENAME" => {
             StatementClass::Destructive
         }
         "BEGIN" | "START" | "COMMIT" | "ROLLBACK" | "SAVEPOINT" | "RELEASE" | "END" => {
-            if first == "START" && !has_word(items, "TRANSACTION") {
+            if first == "START" && keyword_at(items, 1) != Some("TRANSACTION") {
+                return StatementClass::Unknown;
+            }
+            if first == "BEGIN" && !is_plain_begin(&items[1..]) {
+                // MariaDB `BEGIN NOT ATOMIC … END` is a compound statement that runs its body,
+                // PostgreSQL `BEGIN ATOMIC` a function body: never mere transaction control.
                 return StatementClass::Unknown;
             }
             if has_word(items, "WRITE") {
@@ -1018,6 +1739,155 @@ fn classify_by_keyword(first: &str, items: &[Located]) -> StatementClass {
         "USE" => StatementClass::Session,
         _ => StatementClass::Unknown,
     }
+}
+
+/// Words that may follow `BEGIN` when it starts a transaction: PostgreSQL `BEGIN [WORK |
+/// TRANSACTION] [ISOLATION LEVEL …, READ ONLY | READ WRITE, [NOT] DEFERRABLE]`, MySQL `BEGIN
+/// [WORK]`, SQLite `BEGIN [DEFERRED | IMMEDIATE | EXCLUSIVE] [TRANSACTION]`.
+const BEGIN_WORDS: &[&str] = &[
+    "WORK",
+    "TRANSACTION",
+    "ISOLATION",
+    "LEVEL",
+    "READ",
+    "WRITE",
+    "ONLY",
+    "COMMITTED",
+    "UNCOMMITTED",
+    "REPEATABLE",
+    "SERIALIZABLE",
+    "DEFERRABLE",
+    "NOT",
+    "DEFERRED",
+    "IMMEDIATE",
+    "EXCLUSIVE",
+];
+
+/// `true` when everything after `BEGIN` is a transaction mode ([`BEGIN_WORDS`] and commas).
+fn is_plain_begin(rest: &[Located]) -> bool {
+    rest.iter().all(|l| match &l.item {
+        Item::Word(w) => BEGIN_WORDS.contains(&w.as_str()),
+        Item::Punct(b',') => true,
+        _ => false,
+    })
+}
+
+/// Index of the first item after `CREATE [OR REPLACE] [ALGORITHM = x] [DEFINER = user[@host]]`
+/// (`items[0]` is `CREATE`). The definer as the lexer reads it: `CURRENT_USER [()]`, or a user
+/// (word, quoted name or string) followed by an `@host` variable token (dots included) or by a
+/// bare `@` and a quoted host.
+fn skip_definer(items: &[Located]) -> usize {
+    let mut i = 1;
+    if keyword_at(items, i) == Some("OR") && keyword_at(items, i + 1) == Some("REPLACE") {
+        i += 2;
+    }
+    if keyword_at(items, i) == Some("ALGORITHM") {
+        i += 3; // ALGORITHM = x
+    }
+    if keyword_at(items, i) != Some("DEFINER") {
+        return i;
+    }
+    i += 1;
+    if items.get(i).map(|l| &l.item) == Some(&Item::Punct(b'=')) {
+        i += 1;
+    }
+    let user_is_current = items.get(i).and_then(word) == Some("CURRENT_USER");
+    i += 1; // the user
+    if user_is_current
+        && items.get(i).map(|l| &l.item) == Some(&Item::Punct(b'('))
+        && items.get(i + 1).map(|l| &l.item) == Some(&Item::Punct(b')'))
+    {
+        i += 2;
+    }
+    if items.get(i).map(|l| &l.item) == Some(&Item::Punct(b'@')) {
+        i += 1; // `@host` (one token), or a bare `@` before a quoted host
+        if matches!(
+            items.get(i).map(|l| &l.item),
+            Some(Item::Str(_) | Item::Ident(_))
+        ) {
+            i += 1;
+        }
+    }
+    i
+}
+
+/// PostgreSQL `CREATE SCHEMA s [AUTHORIZATION r] [element …]`: every element (`CREATE TABLE`,
+/// `CREATE VIEW`, `CREATE INDEX`, `CREATE SEQUENCE`, `CREATE TRIGGER`, `GRANT`) runs; the class
+/// is the riskiest element's, at least [`StatementClass::Ddl`] (security review M2). Elements
+/// are classified on their own slices, so nothing recurses into the rest of the statement.
+fn classify_schema_elements(items: &[Located]) -> StatementClass {
+    let base = items[0].depth;
+    let starts: Vec<usize> = (1..items.len())
+        .filter(|&i| {
+            items[i].depth == base && matches!(keyword_at(items, i), Some("CREATE" | "GRANT"))
+        })
+        .collect();
+    let mut class = StatementClass::Ddl;
+    for (k, &start) in starts.iter().enumerate() {
+        let end = starts.get(k + 1).copied().unwrap_or(items.len());
+        class = class.max(classify_items(&items[start..end]));
+    }
+    class
+}
+
+/// Keywords that start a statement inside a trigger or rule body.
+const BODY_STATEMENT_KEYWORDS: &[&str] = &[
+    "INSERT", "UPDATE", "DELETE", "MERGE", "REPLACE", "UPSERT", "TRUNCATE", "DROP", "ALTER",
+    "GRANT", "REVOKE", "RENAME", "CALL",
+];
+
+/// The body of a `CREATE TRIGGER` / `CREATE RULE` runs later, on other sessions' statements;
+/// a `CREATE EVENT` (MySQL / MariaDB) runs its body at a scheduled time, possibly at once.
+/// Triggers and rules are classified as the riskiest statement of their body (so a trigger
+/// whose body deletes every row of a table is destructive); events are
+/// [`StatementClass::Unknown`]. The body starts after `BEGIN`, `DO`, or `FOR EACH ROW |
+/// STATEMENT`, so the header's events (`AFTER UPDATE OF c ON t`) do not count. `Read`
+/// otherwise, so the caller's class stands.
+fn classify_create_body(items: &[Located]) -> StatementClass {
+    // The object kind follows `CREATE [OR REPLACE] [ALGORITHM = x] [DEFINER = user[@host]]
+    // [SQL SECURITY x] [TEMP | TEMPORARY] [CONSTRAINT]`. The definer is skipped as the lexer
+    // reads it (re-review L3), so `CREATE DEFINER = view@localhost TRIGGER …` is a trigger.
+    // `CREATE SCHEMA` counts only right after `CREATE`.
+    if keyword_at(items, 1) == Some("SCHEMA") {
+        return classify_schema_elements(items);
+    }
+    let start = skip_definer(items);
+    let kind = items
+        .iter()
+        .enumerate()
+        .skip(start)
+        .filter(|(_, l)| l.depth == items[0].depth)
+        .take(12)
+        .find_map(|(i, _)| match keyword_at(items, i) {
+            Some(w @ ("TRIGGER" | "RULE" | "EVENT")) => Some(w),
+            Some("TABLE" | "VIEW" | "FUNCTION" | "PROCEDURE" | "INDEX" | "SEQUENCE" | "SCHEMA") => {
+                Some("")
+            }
+            _ => None,
+        });
+    match kind {
+        Some("EVENT") => return StatementClass::Unknown,
+        Some("TRIGGER" | "RULE") => {}
+        _ => return StatementClass::Read,
+    }
+    let body_start =
+        items
+            .windows(2)
+            .enumerate()
+            .find_map(|(p, w)| match (word(&w[0]), word(&w[1])) {
+                (Some("BEGIN" | "DO"), _) => Some(p + 1),
+                (Some("EACH"), Some("ROW" | "STATEMENT")) => Some(p + 2),
+                _ => None,
+            });
+    let Some(body_start) = body_start else {
+        return StatementClass::Read;
+    };
+    let body = items.get(body_start..).unwrap_or(&[]);
+    body.iter()
+        .enumerate()
+        .filter(|(_, l)| word(l).is_some_and(|w| BODY_STATEMENT_KEYWORDS.contains(&w)))
+        .map(|(p, _)| classify_items(&body[p..]))
+        .fold(StatementClass::Read, StatementClass::max)
 }
 
 /// Keywords that can start the statement wrapped by `EXPLAIN` / `DESCRIBE`: PostgreSQL's
@@ -1150,10 +2020,10 @@ fn with_main_statement_found(items: &[Located]) -> bool {
     if depth != 0 {
         return false;
     }
-    items
-        .iter()
-        .skip(1)
-        .any(|l| l.depth == base && word(l).is_some_and(|w| WITH_MAIN_KEYWORDS.contains(&w)))
+    (1..items.len()).any(|i| {
+        items[i].depth == base
+            && keyword_at(items, i).is_some_and(|w| WITH_MAIN_KEYWORDS.contains(&w))
+    })
 }
 
 /// `true` when a `SET` (after its scope modifiers) targets `TRANSACTION`: `SET [SESSION | LOCAL]
@@ -1161,8 +2031,8 @@ fn with_main_statement_found(items: &[Located]) -> bool {
 fn is_set_transaction(rest: &[Located]) -> bool {
     rest.iter()
         .find(|l| !matches!(word(l), Some("SESSION" | "LOCAL")))
-        .and_then(name)
-        .is_some_and(|n| n == "transaction")
+        .and_then(word)
+        .is_some_and(|w| w == "TRANSACTION")
 }
 
 /// `SET` / `RESET`: every assignment must target an allowlisted setting.
@@ -1221,8 +2091,9 @@ fn classify_set_target(first: &str, seg: &[Located]) -> StatementClass {
     if first == "RESET" && target == "all" {
         return StatementClass::ChangesAccessMode;
     }
-    if target == "transaction" {
-        // `SET TRANSACTION ISOLATION LEVEL …` is harmless; `… READ WRITE` is not.
+    if target == "transaction" && seg.get(i).and_then(word) == Some("TRANSACTION") {
+        // `SET TRANSACTION ISOLATION LEVEL …` is harmless; `… READ WRITE` is not. Only the
+        // bare keyword: a quoted `"transaction"` names a setting.
         return if has_word(seg, "WRITE") {
             StatementClass::ChangesAccessMode
         } else {
@@ -1874,6 +2745,89 @@ mod tests {
             }
             assert_eq!(split_with_rules(sql, rules).len(), spans, "{sql}");
         }
+    }
+
+    /// Phase 3 exit criterion: a `DELETE` / `UPDATE` without `WHERE` asks for confirmation on
+    /// a production connection, whatever the dialect's lexical rules.
+    #[test]
+    fn delete_and_update_without_where_need_confirmation() {
+        for rules in [
+            LexicalRules::ANSI,
+            LexicalRules::POSTGRES,
+            LexicalRules::MYSQL,
+            LexicalRules::SQLITE,
+        ] {
+            for sql in [
+                "DELETE FROM t",
+                "delete from t;",
+                "UPDATE t SET a = 1",
+                "update t set a = 1, b = 2 -- where id = 1",
+                "SELECT 1; DELETE FROM t",
+            ] {
+                let c = classify_with_rules(sql, rules);
+                assert!(c.needs_confirmation(), "{sql} -> {c:?} ({rules:?})");
+                assert!(c.is_write(), "{sql}");
+            }
+            for sql in [
+                "DELETE FROM t WHERE id = 1",
+                "UPDATE t SET a = 1 WHERE id = 1",
+            ] {
+                assert!(
+                    !classify_with_rules(sql, rules).needs_confirmation(),
+                    "{sql}"
+                );
+            }
+        }
+    }
+
+    /// Security review L2: conditional comments in a long text are not enumerated.
+    #[test]
+    fn long_text_with_conditional_comments_is_unknown() {
+        let mut sql = "SELECT 1 /*!50000 , 2 */ FROM t WHERE a IN (".to_owned();
+        sql.push_str(&"1, ".repeat(30_000));
+        sql.push_str("1)");
+        assert!(sql.len() > MAX_CONDITIONAL_TEXT);
+        assert_eq!(
+            classify_with_rules(&sql, LexicalRules::MYSQL),
+            StatementClass::Unknown
+        );
+        // Without conditional comments, the same text is a read.
+        let plain = sql.replace("/*!50000 , 2 */", "");
+        assert_eq!(
+            classify_with_rules(&plain, LexicalRules::MYSQL),
+            StatementClass::Read
+        );
+    }
+
+    /// Security review M3: positions cost one pass, whatever the line length.
+    #[test]
+    fn positions_are_linear_on_one_long_line() {
+        let script = "SELECT 1;".repeat(200_000);
+        let start = std::time::Instant::now();
+        let items = AnsiDialect.split_script(&script);
+        let elapsed = start.elapsed();
+        assert_eq!(items.len(), 200_000);
+        let last = items[199_999];
+        assert_eq!((last.start.line, last.start.column), (1, 9 * 199_999 + 1));
+        assert!(elapsed < std::time::Duration::from_secs(5), "{elapsed:?}");
+    }
+
+    #[test]
+    fn line_index_positions() {
+        let s = "ab\r\nçd\n\nx";
+        let ix = LineIndex::new(s);
+        let pos = |o| {
+            let p = ix.position(o);
+            (p.line, p.column)
+        };
+        assert_eq!(pos(0), (1, 1));
+        assert_eq!(pos(2), (1, 3)); // the `\r` belongs to line 1
+        assert_eq!(pos(4), (2, 1));
+        assert_eq!(pos(6), (2, 2)); // `ç` is one column
+        assert_eq!(pos(5), (2, 1)); // inside `ç`: moved back to its start
+        assert_eq!(pos(9), (4, 1));
+        assert_eq!(pos(100), (4, 2));
+        assert_eq!(position_at(s, 6), ix.position(6));
     }
 
     #[test]

@@ -44,8 +44,10 @@ pub use capabilities::{
     TransactionCapabilities,
 };
 pub use dialect::{
-    AnsiDialect, Dialect, LexicalRules, RowChange, RowEdit, StatementClass, StatementSpan,
-    ensure_single_statement,
+    AnsiDialect, CodeToken, CodeTokenKind, Dialect, LexicalRules, LineIndex, RowChange, RowEdit,
+    ScriptItem, ScriptItemKind, ScriptRefusal, ScriptState, StatementClass, StatementSpan,
+    TextPosition, code_tokens, ensure_single_statement, item_may_change_lexical_modes, position_at,
+    script_items, script_items_from, shift_items,
 };
 pub use driver::{Driver, Session};
 pub use error::{DriverError, DriverResult, redact_connection_string, redact_secret};
