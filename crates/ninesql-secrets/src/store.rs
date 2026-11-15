@@ -46,4 +46,11 @@ pub trait SecretStore: Send + Sync {
     /// # Errors
     /// A backend error.
     fn delete(&self, id: &SecretId) -> Result<bool, SecretError>;
+
+    /// Whether the store is locked now, so that reads would fail with
+    /// [`SecretError::Locked`] until it is unlocked (the vault). Lets the core ask for the
+    /// unlock before any other prompt. Default: `false` (stores that unlock on demand).
+    fn is_locked(&self) -> bool {
+        false
+    }
 }

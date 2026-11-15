@@ -1,0 +1,56 @@
+{
+  "schema_version": 3,
+  "connections": [
+    {
+      "id": "3c2b1a09-8f7e-4d6c-9b5a-493827160b07",
+      "name": "Billing, SCRAM only",
+      "engine": "postgresql",
+      "endpoint": {
+        "kind": "tcp",
+        "host": "billing.example.test",
+        "port": 5432,
+        "database": "billing"
+      },
+      "auth": {
+        "method": "password",
+        "username": "billing_ro",
+        "secret": {
+          "source": "prompt"
+        }
+      },
+      "password_exchange": "scram-only",
+      "tls": {
+        "mode": "require"
+      },
+      "connection_type": "prod",
+      "origin": {
+        "kind": "native"
+      }
+    },
+    {
+      "id": "3c2b1a09-8f7e-4d6c-9b5a-493827160b08",
+      "name": "Billing replica",
+      "engine": "postgresql",
+      "endpoint": {
+        "kind": "tcp",
+        "host": "billing-replica.example.test",
+        "port": 5432,
+        "database": "billing"
+      },
+      "auth": {
+        "method": "password",
+        "username": "billing_ro",
+        "secret": {
+          "source": "prompt"
+        }
+      },
+      "tls": {
+        "mode": "verify-full"
+      },
+      "connection_type": "prod",
+      "origin": {
+        "kind": "native"
+      }
+    }
+  ]
+}

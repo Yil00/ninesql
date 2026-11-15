@@ -4,8 +4,8 @@
 //! # Shape
 //! - [`SessionManager::open`] runs the connect flow on the runtime and answers through a
 //!   [`Reply`]: the session ([`OpenOutcome::Opened`]), the secrets to ask for
-//!   ([`OpenOutcome::NeedsSecrets`]) or an SSH host key to confirm
-//!   ([`OpenOutcome::HostKeyNeedsConfirmation`]).
+//!   ([`OpenOutcome::NeedsSecrets`]), the vault to unlock ([`OpenOutcome::NeedsVaultUnlock`])
+//!   or an SSH host key to confirm ([`OpenOutcome::HostKeyNeedsConfirmation`]).
 //! - Each session is owned by one task. [`SessionHandle`] sends it commands over a bounded
 //!   channel; [`SessionHandle::execute`] returns an [`Execution`] whose events
 //!   ([`ExecEvent`]) carry the result items one by one through a small bounded channel: a slow
@@ -62,7 +62,7 @@ use ninesql_driver_api::{
     CancelToken, Capabilities, DriverError, ExecOptions, ExecutionId, FetchBudget, Param,
     QueryLanguage, ReadOnlyMechanism, ResultItem, Session, Statement, StatementClass, TunnelInfo,
 };
-use ninesql_secrets::{SecretStores, SecretString};
+use ninesql_secrets::{SecretError, SecretStores, SecretString, StoreKind};
 use ninesql_ssh::{
     KnownHosts, KnownHostsStore, SshError, SshSecurityWarning, Tunnel, UnknownHostKey,
 };
@@ -71,8 +71,9 @@ use tokio::sync::{OnceCell, mpsc, oneshot};
 use uuid::Uuid;
 
 use crate::connect::{self, SecretPrompt};
-use crate::connection::{Connection, ConnectionId, EngineId, SecretSlot};
+use crate::connection::{Connection, ConnectionId, Endpoint, EngineId, SecretSlot};
 use crate::connection_type::{ConnectionTypes, SafetyPolicy};
+use crate::dbeaver_roots::{DbeaverRoots, FileCheck};
 use crate::error::CoreError;
 use crate::registry::{DriverRegistry, api_engine};
 use crate::runtime::{DEFAULT_WORKERS, DriverRuntime};
@@ -129,12 +130,12 @@ impl<T> fmt::Debug for Reply<T> {
 }
 
 impl<T> Reply<T> {
-    fn channel() -> (oneshot::Sender<T>, Self) {
+    pub(crate) fn channel() -> (oneshot::Sender<T>, Self) {
         let (tx, rx) = oneshot::channel();
         (tx, Self { rx: Some(rx) })
     }
 
-    fn ready(value: T) -> Self {
+    pub(crate) fn ready(value: T) -> Self {
         let (tx, reply) = Self::channel();
         let _ = tx.send(value);
         reply
@@ -207,7 +208,7 @@ pub struct ManagerConfig {
     pub workers: usize,
     /// Connect timeout, per SSH hop and for the driver's connect.
     pub connect_timeout: Duration,
-    /// How long an open waits for its saved secrets (every store call together) before failing with [`SecretError::Unavailable`](ninesql_secrets::SecretError::Unavailable).
+    /// How long an open waits for its saved secrets (every store call together) before failing with [`SecretError::Unavailable`].
     /// Default: [`connect::DEFAULT_SECRET_TIMEOUT`] (60 s).
     pub secret_timeout: Duration,
     /// How long a statement waits for the previous, cancelled one to be confirmed ended before
@@ -222,10 +223,14 @@ pub struct ManagerConfig {
     pub event_queue: usize,
     /// `known_hosts` files.
     pub known_hosts: KnownHostsFiles,
+    /// DBeaver workspace roots: a file connection under one is opened read-only by its driver
+    /// (`inside_dbeaver_workspace`, I4). Default: [`DbeaverRoots::from_env`].
+    pub dbeaver_roots: DbeaverRoots,
 }
 
 impl ManagerConfig {
-    /// Defaults, with the `known_hosts` files of `paths`.
+    /// Defaults, with the `known_hosts` files of `paths`. **Blocking**: canonicalizes `$HOME`
+    /// for [`DbeaverRoots::from_env`]; build it off the UI thread.
     #[must_use]
     pub fn new(paths: &Paths) -> Self {
         Self::with_known_hosts(KnownHostsFiles::new(paths))
@@ -243,6 +248,7 @@ impl ManagerConfig {
             command_queue: 16,
             event_queue: CORE_EVENT_QUEUE,
             known_hosts,
+            dbeaver_roots: DbeaverRoots::from_env(),
         }
     }
 }
@@ -312,6 +318,41 @@ pub enum CoreEvent {
         /// Why.
         reason: CloseReason,
     },
+    /// Secrets left memory: the vault was locked and / or the "ask every time" cache cleared
+    /// ([`crate::CoreServices`]). The UI updates its vault indicator; the next open that needs a
+    /// vault secret answers [`OpenOutcome::NeedsVaultUnlock`].
+    SecretsLocked {
+        /// Why.
+        reason: SecretsLockReason,
+    },
+}
+
+/// Why secrets were locked ([`CoreEvent::SecretsLocked`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum SecretsLockReason {
+    /// The system is about to suspend (logind `PrepareForSleep(true)`).
+    Sleep,
+    /// The desktop session locked (logind `Lock` / `LockedHint`).
+    SessionLock,
+    /// The user or the application asked for it ([`crate::CoreServices::lock_now`]), or the
+    /// lock watcher lost the system bus.
+    Requested,
+    /// The vault was not used for longer than its idle timeout.
+    Idle,
+}
+
+impl SecretsLockReason {
+    /// A short, stable name, safe to log.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Sleep => "sleep",
+            Self::SessionLock => "session-lock",
+            Self::Requested => "requested",
+            Self::Idle => "idle",
+        }
+    }
 }
 
 /// A weakened security setting of an open session, shown on its tabs (I3, I5).
@@ -355,6 +396,10 @@ pub struct SessionInfo {
     pub tunnel: Option<TunnelInfo>,
     /// Weakened security settings.
     pub warnings: Vec<SessionWarning>,
+    /// The database file lies inside a DBeaver workspace (or the check could not tell), so the
+    /// driver was asked to open it read-only (I4). The UI says so: "opened read-only: the file
+    /// is inside a DBeaver workspace". Always `false` for network endpoints.
+    pub inside_dbeaver_workspace: bool,
 }
 
 /// Transaction state of a session after a transaction command.
@@ -451,6 +496,16 @@ pub enum OpenOutcome {
     /// [`OpenRequest::with_init_sql_confirmation`]. Nothing reached a secret store or the
     /// network.
     InitSqlNeedsConfirmation(InitSqlConfirmation),
+    /// A saved secret of the connection is in the vault, and the vault is locked (at startup,
+    /// after its idle timeout, on sleep or screen lock). Ask for the master password, call
+    /// [`crate::CoreServices::unlock_vault`] and open again (prompted secrets must be given
+    /// again: they were dropped, zeroized, with this request). Nothing reached the network.
+    NeedsVaultUnlock {
+        /// The connection.
+        connection: ConnectionId,
+        /// The first credential field found in the locked vault.
+        slot: SecretSlot,
+    },
 }
 
 /// Single-use permission to record one SSH host key, issued with
@@ -695,6 +750,13 @@ impl SessionManager {
         &self.shared.registry
     }
 
+    /// The DBeaver workspace roots ([`ManagerConfig::dbeaver_roots`]). Shared: a root added
+    /// here (a folder picked for an import) applies to the next open.
+    #[must_use]
+    pub fn dbeaver_roots(&self) -> &DbeaverRoots {
+        &self.shared.config.dbeaver_roots
+    }
+
     /// The runtime, to spawn other driver-side work (exports, tunnels).
     #[must_use]
     pub fn runtime(&self) -> &DriverRuntime {
@@ -712,6 +774,11 @@ impl SessionManager {
         lock(&self.events_rx).take()
     }
 
+    /// A handle that emits [`CoreEvent`]s without keeping the manager alive.
+    pub(crate) fn event_sink(&self) -> EventSink {
+        EventSink(Arc::downgrade(&self.shared))
+    }
+
     /// Session-level events dropped because the channel was full (never a
     /// [`CoreEvent::SessionClosed`], unless more than 4096 of them waited unread). When it grows,
     /// the UI resyncs its open sessions from [`Self::sessions_of`].
@@ -724,13 +791,15 @@ impl SessionManager {
     ///
     /// The flow: driver lookup and [`Connection::validate_for_driver`]; prompts still needed
     /// ([`OpenOutcome::NeedsSecrets`], before anything touches a store or the network); saved
-    /// secrets read on the blocking pool; the SSH tunnel, if any, opened with each hop's host key
+    /// secrets read on the blocking pool ([`OpenOutcome::NeedsVaultUnlock`] when one is in the
+    /// locked vault); for a file endpoint, `inside_dbeaver_workspace` computed from
+    /// [`ManagerConfig::dbeaver_roots`]; the SSH tunnel, if any, opened with each hop's host key
     /// policy ([`OpenOutcome::HostKeyNeedsConfirmation`]); the driver's connect, with the policy's
     /// read-only, auto-commit and production flags; a check that a read-only connection got a
     /// read-only session (I3). Secrets are dropped (zeroized) before the driver returns.
     ///
     /// Saved secrets get at most [`ManagerConfig::secret_timeout`] (a store that does not answer
-    /// fails the open with [`SecretError::Unavailable`](ninesql_secrets::SecretError::Unavailable));
+    /// fails the open with [`SecretError::Unavailable`]);
     /// reads are single-flight per secret and bounded in number ([`connect::SecretReads`]).
     /// If the [`Reply`] is dropped before the answer, the open is abandoned where it stands (no
     /// more waiting on a secret store, the tunnel or the driver; a tunnel already opened is shut
@@ -845,6 +914,39 @@ impl SessionManager {
     }
 }
 
+/// Emits [`CoreEvent`]s on the manager's channel, from any thread, without waiting and without
+/// keeping the manager alive.
+#[derive(Clone)]
+pub(crate) struct EventSink(std::sync::Weak<Shared>);
+
+impl EventSink {
+    /// Emits `event` if the manager still exists (dropped and counted when the channel is full).
+    pub(crate) fn emit(&self, event: CoreEvent) {
+        if let Some(shared) = self.0.upgrade() {
+            shared.emit(event);
+        }
+    }
+}
+
+/// The first credential field saved in the vault, when the vault is locked. The lock state is
+/// read on the blocking pool (the vault may be busy deriving a key); an unanswered check is
+/// `None` (the secret resolution then reports the lock).
+async fn locked_vault_slot(shared: &Arc<Shared>, connection: &Connection) -> Option<SecretSlot> {
+    let slot = connect::credential_fields(connection)
+        .into_iter()
+        .find(|(_, _, source)| source.stored().is_some_and(|r| r.store == StoreKind::Vault))
+        .map(|(slot, _, _)| slot)?;
+    let stores = shared.reads.stores().clone();
+    let locked = tokio::task::spawn_blocking(move || {
+        stores
+            .store(StoreKind::Vault)
+            .is_ok_and(|store| store.is_locked())
+    })
+    .await
+    .unwrap_or(false);
+    locked.then_some(slot)
+}
+
 async fn open_session(
     shared: &Arc<Shared>,
     request: OpenRequest,
@@ -908,17 +1010,40 @@ async fn open_session(
     let supplied: Vec<SecretSlot> = prompted.iter().map(|(s, _)| *s).collect();
     let missing = connect::missing_prompts(&connection, &supplied);
     if !missing.is_empty() {
+        // A saved secret in the locked vault is asked for first, so the prompted secrets are
+        // typed once, after the unlock (review P1-D wiring, L8).
+        if let Some(slot) = locked_vault_slot(shared, &connection).await {
+            tracing::debug!(connection = %connection.id, "the vault is locked; asking to unlock it");
+            return Ok(OpenOutcome::NeedsVaultUnlock {
+                connection: connection.id,
+                slot,
+            });
+        }
         return Ok(OpenOutcome::NeedsSecrets(missing));
     }
 
     let connection = Arc::new(connection);
-    let mut bag = connect::resolve_secrets_bounded(
+    let mut bag = match connect::resolve_secrets_bounded(
         &connection,
         &shared.reads,
         prompted,
         shared.config.secret_timeout,
     )
-    .await?;
+    .await
+    {
+        Ok(bag) => bag,
+        Err(CoreError::Secret {
+            slot,
+            source: SecretError::Locked(StoreKind::Vault),
+        }) => {
+            tracing::debug!(connection = %connection.id, "the vault is locked; asking to unlock it");
+            return Ok(OpenOutcome::NeedsVaultUnlock {
+                connection: connection.id,
+                slot,
+            });
+        }
+        Err(e) => return Err(e),
+    };
 
     let timeout = shared.config.connect_timeout;
     let mut tunnel = None;
@@ -937,7 +1062,7 @@ async fn open_session(
         }
     }
 
-    let params =
+    let mut params =
         match connect::connect_params(&connection, &policy, &mut bag, tunnel.as_ref(), timeout) {
             Ok(p) => p,
             Err(e) => {
@@ -945,6 +1070,35 @@ async fn open_session(
                 return Err(e);
             }
         };
+    let mut inside_dbeaver_workspace = false;
+    if let Endpoint::File { path } = &connection.endpoint {
+        // I4: a database file inside a DBeaver workspace is opened read-only by its driver.
+        // File system checks: on the blocking pool; a failed check counts as inside.
+        let roots = shared.config.dbeaver_roots.clone();
+        let path = path.clone();
+        let check = tokio::task::spawn_blocking(move || roots.check(&path))
+            .await
+            .unwrap_or(FileCheck {
+                path: None,
+                inside: true,
+            });
+        // The driver opens the canonical path that was checked, so the check and the open name
+        // the same file (review P1-D wiring, L5). Unresolvable: the configured path, read-only.
+        if let (Some(checked), ninesql_driver_api::Endpoint::File { path, .. }) =
+            (check.path, &mut params.endpoint)
+        {
+            *path = checked;
+        }
+        let inside = check.inside;
+        inside_dbeaver_workspace = inside;
+        if inside {
+            tracing::info!(
+                connection = %connection.id,
+                "database file inside a DBeaver workspace: the driver opens it read-only"
+            );
+        }
+        params.inside_dbeaver_workspace = inside;
+    }
     // Every secret left the bag (into the params or the tunnel); drop it anyway, zeroized.
     drop(bag);
     let mut warnings: Vec<SessionWarning> = params
@@ -1006,6 +1160,7 @@ async fn open_session(
         tunnel: tunnel_info,
         warnings,
         capabilities,
+        inside_dbeaver_workspace,
     };
     let (cmd_tx, cmd_rx) = mpsc::channel(shared.config.command_queue.max(1));
     let (close_tx, close_rx) = oneshot::channel();

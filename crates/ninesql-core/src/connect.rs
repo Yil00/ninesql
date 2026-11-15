@@ -24,11 +24,11 @@ use tokio::sync::watch;
 
 use crate::connection::{
     Auth, ClientCertificate, Connection, Endpoint, SecretSlot, SecretSource, SshAuth, SshHop,
-    SshTunnel, TlsMode,
+    SshTunnel,
 };
 use crate::connection_type::SafetyPolicy;
 use crate::error::{ConnectionError, CoreError};
-use crate::registry::api_engine;
+use crate::registry::{api_engine, api_tls_mode};
 use crate::session::ConfirmReason;
 
 /// Whether a statement of `class` needs the user's confirmation under `policy` (ADR-0007 §1,
@@ -660,15 +660,6 @@ pub fn tunnel_spec(
     Ok(spec)
 }
 
-const fn api_tls_mode(mode: TlsMode) -> api::TlsMode {
-    match mode {
-        TlsMode::Disable => api::TlsMode::Disable,
-        TlsMode::Require => api::TlsMode::Require,
-        TlsMode::VerifyCa => api::TlsMode::VerifyCa,
-        TlsMode::VerifyFull => api::TlsMode::VerifyFull,
-    }
-}
-
 /// Builds the driver's parameters. Database and TLS secrets are moved out of `bag`.
 ///
 /// - endpoint: the tunnel's local end when `tunnel` is set, the real host otherwise; with a
@@ -676,6 +667,10 @@ const fn api_tls_mode(mode: TlsMode) -> api::TlsMode {
 ///   server's name (ADR-0011);
 /// - read-only, auto-commit, production and statement logging (`log_query_text`) come from
 ///   `policy` (I3, ADR-0007);
+/// - the password exchange policy comes from [`Connection::password_exchange`];
+/// - `inside_dbeaver_workspace` is left `false`: it needs the file system, so the session
+///   manager sets it from its [`crate::DbeaverRoots`] ([`crate::DbeaverRoots::contains`]) on
+///   the blocking pool;
 /// - init SQL and driver properties as saved (validated by
 ///   [`Connection::validate_for_driver`] before).
 ///
@@ -726,6 +721,7 @@ pub fn connect_params(
     tls.server_name = real_host;
     params.tls = tls;
     params.tunnel = tunnel.map(|t| t.info().clone());
+    params.password_exchange = connection.password_exchange.to_api();
     params.read_only = policy.read_only;
     params.auto_commit = policy.auto_commit;
     params.production = policy.production;

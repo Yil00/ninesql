@@ -8,7 +8,8 @@
 //!   (cleared: every cached value zeroized).
 //! - [`LockHooks`]: the set the application registers once (every open vault, every cache) and
 //!   triggers as a whole.
-//! - With the `secret-service` feature, `DesktopLockWatcher` listens to logind on the
+//! - With the `desktop-lock` feature (on by default, and implied by `secret-service`),
+//!   `DesktopLockWatcher` listens to logind on the
 //!   system bus and calls a hook on `PrepareForSleep(true)` (holding a sleep delay inhibitor
 //!   until the hook ran) and when the current session locks (`Lock` signal or `LockedHint`
 //!   turning `true`). Without it, the application calls [`LockHooks::lock_all`] from whatever
@@ -19,6 +20,7 @@
 //! after resume.
 
 use std::fmt;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 
 use crate::session_cache::SessionSecretCache;
@@ -84,6 +86,8 @@ impl LockHook for SessionSecretCache {
 #[derive(Default)]
 pub struct LockHooks {
     hooks: Mutex<Vec<Arc<dyn LockHook>>>,
+    /// Incremented when [`LockHooks::lock_all`] starts, before any hook runs.
+    generation: AtomicU64,
 }
 
 impl fmt::Debug for LockHooks {
@@ -124,9 +128,19 @@ impl LockHooks {
         self.len() == 0
     }
 
+    /// Number of [`Self::lock_all`] calls started so far. An unlock captures it before it
+    /// starts and compares it when it ends: a lock that arrived in between, while the unlock was
+    /// queued or deriving its key, may have found nothing to lock, so the caller locks again
+    /// (review P1-D wiring, L2).
+    #[must_use]
+    pub fn generation(&self) -> u64 {
+        self.generation.load(Ordering::SeqCst)
+    }
+
     /// Calls every hook. The list is copied first, so a hook may register another without
-    /// deadlocking.
+    /// deadlocking. [`Self::generation`] moves before the first hook runs.
     pub fn lock_all(&self, trigger: LockTrigger) {
+        self.generation.fetch_add(1, Ordering::SeqCst);
         let hooks = self
             .hooks
             .lock()
@@ -225,5 +239,23 @@ mod tests {
         assert_eq!(counter.0.load(Ordering::SeqCst), 3);
         assert_eq!(LockTrigger::Sleep.to_string(), "sleep");
         assert_eq!(LockTrigger::SessionLock.as_str(), "session-lock");
+    }
+
+    #[test]
+    fn the_generation_moves_before_the_hooks_run() {
+        struct Seen(Arc<LockHooks>, Mutex<Vec<u64>>);
+        impl LockHook for Seen {
+            fn lock_now(&self, _: LockTrigger) {
+                self.1.lock().unwrap().push(self.0.generation());
+            }
+        }
+        let hooks = Arc::new(LockHooks::new());
+        assert_eq!(hooks.generation(), 0);
+        let seen = Arc::new(Seen(Arc::clone(&hooks), Mutex::new(Vec::new())));
+        hooks.add(seen.clone());
+        hooks.lock_all(LockTrigger::Sleep);
+        hooks.lock_all(LockTrigger::Requested);
+        assert_eq!(hooks.generation(), 2);
+        assert_eq!(*seen.1.lock().unwrap(), [1, 2]);
     }
 }

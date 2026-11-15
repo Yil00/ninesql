@@ -8,7 +8,7 @@ mod support;
 use std::sync::Arc;
 use std::time::Duration;
 
-use ninesql_core::driver_api::mock::{MOCK_RESERVED_PROPERTY, MockDriver};
+use ninesql_core::driver_api::mock::MOCK_RESERVED_PROPERTY;
 use ninesql_core::driver_api::{
     DriverError, FetchBudget, ResultItem, Secret, SecurityWarning as ApiWarning, StatementClass,
 };
@@ -35,7 +35,7 @@ fn rows_of(events: &[ExecEvent]) -> usize {
 #[test]
 fn open_execute_stream_close_lifecycle() {
     let tmp = tempfile::tempdir().unwrap();
-    let wrap = Wrap::new(MockDriver::new());
+    let wrap = Wrap::new(mock_driver());
     let stats = wrap.mock.stats();
     let (manager, _) = manager(Arc::new(wrap.clone()), tmp.path());
     let mut events = manager.take_events().unwrap();
@@ -122,7 +122,7 @@ fn open_execute_stream_close_lifecycle() {
 #[test]
 fn results_stop_at_the_budget_and_backpressure_bounds_the_fetch() {
     let tmp = tempfile::tempdir().unwrap();
-    let mock = MockDriver::new();
+    let mock = mock_driver();
     let stats = mock.stats();
     let (manager, _) = manager(Arc::new(mock), tmp.path());
     let types = ConnectionTypes::default();
@@ -169,7 +169,7 @@ fn results_stop_at_the_budget_and_backpressure_bounds_the_fetch() {
 #[test]
 fn cancel_reaches_the_server_and_the_next_statement_runs() {
     let tmp = tempfile::tempdir().unwrap();
-    let mock = MockDriver::new();
+    let mock = mock_driver();
     let stats = mock.stats();
     let (manager, _) = manager(Arc::new(mock), tmp.path());
     let types = ConnectionTypes::default();
@@ -217,7 +217,7 @@ fn cancel_reaches_the_server_and_the_next_statement_runs() {
 #[test]
 fn busy_after_cancel_waits_then_reports_still_cancelling() {
     let tmp = tempfile::tempdir().unwrap();
-    let wrap = Wrap::new(MockDriver::new());
+    let wrap = Wrap::new(mock_driver());
     let (manager, _) = manager(Arc::new(wrap.clone()), tmp.path());
     let types = ConnectionTypes::default();
     ui(async {
@@ -270,7 +270,7 @@ fn busy_after_cancel_waits_then_reports_still_cancelling() {
 #[test]
 fn read_only_connections_get_engine_side_read_only_sessions() {
     let tmp = tempfile::tempdir().unwrap();
-    let mock = MockDriver::new();
+    let mock = mock_driver();
     let stats = mock.stats();
     let (manager, _) = manager(Arc::new(mock), tmp.path());
     let mut events = manager.take_events().unwrap();
@@ -316,7 +316,7 @@ fn read_only_connections_get_engine_side_read_only_sessions() {
 #[test]
 fn a_driver_that_ignores_read_only_is_refused() {
     let tmp = tempfile::tempdir().unwrap();
-    let mut wrap = Wrap::new(MockDriver::new());
+    let mut wrap = Wrap::new(mock_driver());
     wrap.ignore_read_only = true;
     let (manager, _) = manager(Arc::new(wrap.clone()), tmp.path());
     let mut ro = ConnectionType::test();
@@ -337,7 +337,7 @@ fn a_driver_that_ignores_read_only_is_refused() {
 #[test]
 fn production_requires_a_confirmation_token_for_destructive_statements() {
     let tmp = tempfile::tempdir().unwrap();
-    let wrap = Wrap::new(MockDriver::new());
+    let wrap = Wrap::new(mock_driver());
     let (manager, _) = manager(Arc::new(wrap.clone()), tmp.path());
     let types = ConnectionTypes::default();
     ui(async {
@@ -430,7 +430,7 @@ fn production_requires_a_confirmation_token_for_destructive_statements() {
 #[test]
 fn confirm_every_write_types_confirm_inserts() {
     let tmp = tempfile::tempdir().unwrap();
-    let (manager, _) = manager(Arc::new(MockDriver::new()), tmp.path());
+    let (manager, _) = manager(Arc::new(mock_driver()), tmp.path());
     let mut careful = ConnectionType::development();
     careful.id = ConnectionTypeId::new("careful").unwrap();
     careful.confirm_every_write = true;
@@ -473,7 +473,7 @@ fn workspace(root: &std::path::Path) -> Workspace {
 #[test]
 fn saved_and_prompted_secrets_reach_the_driver() {
     let tmp = tempfile::tempdir().unwrap();
-    let mock = MockDriver::new().with_password(Secret::new("Corr3ct-Horse".into()));
+    let mock = mock_driver().with_password(Secret::new("Corr3ct-Horse".into()));
     let stats = mock.stats();
     let wrap = Wrap::new(mock);
     let (manager, keyring) = manager(Arc::new(wrap.clone()), tmp.path());
@@ -557,7 +557,7 @@ fn saved_and_prompted_secrets_reach_the_driver() {
 #[test]
 fn reserved_properties_are_refused_before_save_and_before_connect() {
     let tmp = tempfile::tempdir().unwrap();
-    let mock = MockDriver::new();
+    let mock = mock_driver();
     let stats = mock.stats();
     let (manager, _) = manager(Arc::new(mock), tmp.path());
     let types = ConnectionTypes::default();
@@ -610,18 +610,17 @@ fn reserved_properties_are_refused_before_save_and_before_connect() {
 /// again before any connect.
 #[test]
 fn settings_the_driver_refuses_fail_validation() {
-    use ninesql_core::driver_api::mock::full_capabilities;
     use ninesql_core::driver_api::{AuthKind, ConnectCapabilities};
     use ninesql_core::{ClientCertificate, TlsMode};
     let tmp = tempfile::tempdir().unwrap();
-    let mut caps = full_capabilities();
+    let mut caps = mock_capabilities();
     let mut connect = ConnectCapabilities::default();
     connect.accepted_properties = Some(["application_name".to_owned()].into());
     connect.auth = [AuthKind::Password].into();
     connect.client_certificates = true;
     connect.encrypted_client_keys = false;
     caps.connect = connect;
-    let mock = MockDriver::new().with_capabilities(caps);
+    let mock = mock_driver().with_capabilities(caps);
     let stats = mock.stats();
     let (manager, _) = manager(Arc::new(mock), tmp.path());
     let types = ConnectionTypes::default();
@@ -720,7 +719,7 @@ fn closed_port() -> u16 {
 #[test]
 fn ssh_tunnel_is_opened_before_the_driver_and_its_failures_are_typed() {
     let tmp = tempfile::tempdir().unwrap();
-    let mock = MockDriver::new();
+    let mock = mock_driver();
     let stats = mock.stats();
     let (manager, _) = manager(Arc::new(mock), tmp.path());
     let types = ConnectionTypes::default();
@@ -758,7 +757,7 @@ fn ssh_tunnel_is_opened_before_the_driver_and_its_failures_are_typed() {
 #[test]
 fn ssh_protocol_failures_are_typed() {
     let tmp = tempfile::tempdir().unwrap();
-    let mock = MockDriver::new();
+    let mock = mock_driver();
     let stats = mock.stats();
     let (manager, _) = manager(Arc::new(mock), tmp.path());
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
@@ -786,12 +785,9 @@ fn ssh_protocol_failures_are_typed() {
 #[test]
 fn session_warnings_report_weakened_settings() {
     let tmp = tempfile::tempdir().unwrap();
-    let mut caps = ninesql_core::driver_api::mock::full_capabilities();
+    let mut caps = mock_capabilities();
     caps.read_only = ninesql_core::driver_api::ReadOnlyMechanism::ClientSideOnly;
-    let (manager, _) = manager(
-        Arc::new(MockDriver::new().with_capabilities(caps)),
-        tmp.path(),
-    );
+    let (manager, _) = manager(Arc::new(mock_driver().with_capabilities(caps)), tmp.path());
     let types = ConnectionTypes::default();
     ui(async {
         let mut c = mock_connection(ConnectionTypeId::dev());
@@ -815,7 +811,7 @@ fn session_warnings_report_weakened_settings() {
 #[test]
 fn closing_all_sessions_and_dropping_the_manager() {
     let tmp = tempfile::tempdir().unwrap();
-    let (manager, _) = manager(Arc::new(MockDriver::new()), tmp.path());
+    let (manager, _) = manager(Arc::new(mock_driver()), tmp.path());
     let types = ConnectionTypes::default();
     let c = mock_connection(ConnectionTypeId::dev());
     let (a, running) = ui(async {
@@ -848,7 +844,7 @@ fn closing_all_sessions_and_dropping_the_manager() {
 #[test]
 fn a_consumer_that_stops_reading_never_blocks_the_session() {
     let tmp = tempfile::tempdir().unwrap();
-    let (manager, _) = manager(Arc::new(MockDriver::new()), tmp.path());
+    let (manager, _) = manager(Arc::new(mock_driver()), tmp.path());
     let types = ConnectionTypes::default();
     let big = || {
         ExecuteRequest::sql("SELECT * FROM numbers(1000000)")
@@ -920,7 +916,7 @@ fn a_consumer_that_stops_reading_never_blocks_the_session() {
 #[test]
 fn init_sql_that_needs_confirmation_is_confirmed_before_connecting() {
     let tmp = tempfile::tempdir().unwrap();
-    let wrap = Wrap::new(MockDriver::new());
+    let wrap = Wrap::new(mock_driver());
     let stats = wrap.mock.stats();
     let (manager, _) = manager(Arc::new(wrap.clone()), tmp.path());
     let types = ConnectionTypes::default();
@@ -1065,7 +1061,7 @@ fn init_sql_that_needs_confirmation_is_confirmed_before_connecting() {
 #[test]
 fn core_events_are_bounded_and_drops_are_counted() {
     let tmp = tempfile::tempdir().unwrap();
-    let (manager, _) = manager_with(Arc::new(MockDriver::new()), tmp.path(), |c| {
+    let (manager, _) = manager_with(Arc::new(mock_driver()), tmp.path(), |c| {
         c.event_queue = 2;
     });
     let types = ConnectionTypes::default();
@@ -1125,7 +1121,7 @@ fn core_events_are_bounded_and_drops_are_counted() {
 #[test]
 fn init_sql_that_changes_the_lexical_mode_or_follows_a_setting_is_confirmed() {
     let tmp = tempfile::tempdir().unwrap();
-    let (manager, _) = manager(Arc::new(MockDriver::new()), tmp.path());
+    let (manager, _) = manager(Arc::new(mock_driver()), tmp.path());
     let types = ConnectionTypes::default();
     let flagged = |init: &[&str]| {
         let mut c = mock_connection(ConnectionTypeId::prod());

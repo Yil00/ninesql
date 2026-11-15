@@ -2,7 +2,7 @@
 //!
 //! On-disk documents:
 //! - `project.json`: [`ProjectFile`] (`schema_version` 2)
-//! - `connections.json`: [`ConnectionsFile`] (`schema_version` 2)
+//! - `connections.json`: [`ConnectionsFile`] (`schema_version` 3)
 //! - `connection-types.json`: [`ConnectionTypesFile`] (`schema_version` 1)
 //!
 //! Secrets given to [`Workspace::create_connection`] go to the secret store; only their
@@ -26,7 +26,8 @@ use uuid::Uuid;
 
 use crate::connection::{Connection, ConnectionId, SecretSlot};
 use crate::connection_type::{ConnectionType, ConnectionTypes};
-use crate::error::{ConnectionError, WorkspaceError};
+use crate::error::{ConnectionError, CoreError, WorkspaceError};
+use crate::registry::DriverRegistry;
 
 /// Stable identifier of a project (UUID v4), stored in `project.json`.
 ///
@@ -122,9 +123,11 @@ impl Document for ConnectionsFile {
     const FORMAT: Format = Format::Json;
     /// Schema history: version 1 is the first published schema (fixture
     /// `tests/fixtures/connections/v1.json`); version 2 adds the optional per-hop
-    /// `host_key_policy` of SSH hops (ADR-0016), strict when absent. A bump adds a [`Migration`]
-    /// here.
-    const SCHEMA_VERSION: u32 = 2;
+    /// `host_key_policy` of SSH hops (ADR-0016), strict when absent; version 3 adds the optional
+    /// `password_exchange` of a connection (`any` when absent, `scram-only`). A bump adds a
+    /// [`Migration`] here. An older NineSQL refuses a newer file instead of dropping a field it
+    /// does not know and saving the connection weaker than the user set it.
+    const SCHEMA_VERSION: u32 = 3;
     fn migrations() -> &'static [Migration] {
         CONNECTIONS_MIGRATIONS
     }
@@ -192,11 +195,34 @@ fn connections_v1_to_v2(doc: &mut Value) -> Result<(), String> {
     Ok(())
 }
 
-const CONNECTIONS_MIGRATIONS: &[Migration] = &[Migration {
-    from: 1,
-    description: "add the per-hop SSH host key policy (strict when absent)",
-    apply: connections_v1_to_v2,
-}];
+/// `connections.json` 2 → 3: connections gain `password_exchange`. Version 2 files have no such
+/// key, and an absent key means `any`, exactly the version 2 behavior: nothing to rewrite. A
+/// `password_exchange` key already present in a version 2 file (hand edit) is removed, so the
+/// policy only ever comes from a NineSQL that knows the field and validated it.
+fn connections_v2_to_v3(doc: &mut Value) -> Result<(), String> {
+    let Some(connections) = doc.get_mut("connections").and_then(Value::as_array_mut) else {
+        return Ok(());
+    };
+    for connection in connections {
+        if let Some(connection) = connection.as_object_mut() {
+            connection.remove("password_exchange");
+        }
+    }
+    Ok(())
+}
+
+const CONNECTIONS_MIGRATIONS: &[Migration] = &[
+    Migration {
+        from: 1,
+        description: "add the per-hop SSH host key policy (strict when absent)",
+        apply: connections_v1_to_v2,
+    },
+    Migration {
+        from: 2,
+        description: "add the password exchange policy (any when absent)",
+        apply: connections_v2_to_v3,
+    },
+];
 
 /// `connection-types.json`: built-in types as customized plus user-defined types.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -308,6 +334,20 @@ pub struct LoadedConnections {
     pub issues: Vec<LoadIssue>,
     /// Unknown keys that looked like secrets (paths only); dropped on the next save.
     pub secret_like_keys: Vec<String>,
+}
+
+/// [`DriverRegistry::validate_connection`] for enabled connections, the model rules for
+/// disabled ones (kept for a later version, they may have no driver).
+fn check_for_driver(registry: &DriverRegistry, c: &Connection) -> Result<(), WorkspaceError> {
+    let result = if c.enabled {
+        registry.validate_connection(c)
+    } else {
+        c.validate().map_err(CoreError::from)
+    };
+    result.map_err(|source| WorkspaceError::Core {
+        name: c.name.clone(),
+        source: Box::new(source),
+    })
 }
 
 /// One project of the NineSQL workspace on disk. Holds the workspace lock while any clone is
@@ -493,6 +533,45 @@ impl Workspace {
         document::save(&self.project_paths.connections_file(), &file)?;
         tracing::debug!(project = %self.project, count = connections.len(), "saved connections");
         Ok(())
+    }
+
+    /// [`Self::save_connections`] after [`DriverRegistry::validate_connection`] of every
+    /// connection: what the P1-C dialog calls, so a connection its driver would refuse at
+    /// connect (property, authentication, password exchange, TLS mode…) is never saved.
+    /// Disabled connections (engines without a driver, imported for later, ADR-0006 §5) are
+    /// checked against the model rules only.
+    ///
+    /// # Errors
+    /// [`WorkspaceError::Core`] with the first connection its driver refuses (nothing is
+    /// written), then the errors of [`Self::save_connections`].
+    pub fn save_connections_checked(
+        &self,
+        connections: &Connections,
+        registry: &DriverRegistry,
+    ) -> Result<(), WorkspaceError> {
+        for c in connections.iter() {
+            check_for_driver(registry, c)?;
+        }
+        self.save_connections(connections)
+    }
+
+    /// [`Self::create_connection`] after [`DriverRegistry::validate_connection`]: nothing is
+    /// stored (no secret, no file) when the driver would refuse the connection.
+    ///
+    /// # Errors
+    /// [`WorkspaceError::Core`] when the driver refuses it, then the errors of
+    /// [`Self::create_connection`].
+    pub fn create_connection_checked(
+        &self,
+        connections: &mut Connections,
+        connection: Connection,
+        secrets: Vec<(SecretSlot, SecretString)>,
+        store: StoreKind,
+        stores: &SecretStores,
+        registry: &DriverRegistry,
+    ) -> Result<ConnectionId, WorkspaceError> {
+        check_for_driver(registry, &connection)?;
+        self.create_connection(connections, connection, secrets, store, stores)
     }
 
     /// Loads `connection-types.json`; built-in types are always present.

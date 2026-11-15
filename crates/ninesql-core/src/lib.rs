@@ -1,31 +1,44 @@
 //! Application core: connection model, workspace services, Tokio driver runtime and the bridge to
 //! the UI (ADR-0004). ROADMAP: P0-D (connection model, workspace), P1-D, P3-C.
+//!
+//! The application starts it with [`CoreServices::start`] ([`services`]): workspace, secret
+//! backend (keyring → vault → ask every time), session manager, sleep / screen-lock locking and
+//! the idle timer, all off the UI thread.
 #![forbid(unsafe_code)]
 
 pub mod connect;
 pub mod connection;
 pub mod connection_type;
+pub mod dbeaver_roots;
 mod error;
 pub mod properties;
 pub mod registry;
 pub mod runtime;
+pub mod services;
 pub mod session;
 pub mod workspace;
 
 pub use connect::{FlaggedInitStatement, SecretPrompt};
 pub use connection::{
     Auth, ClientCertificate, Connection, ConnectionId, Endpoint, EngineId, HostKeyPolicy, Origin,
-    SecretSlot, SecretSource, SecurityWarning, SshAuth, SshHop, SshTunnel, TlsConfig, TlsMode,
+    PasswordExchange, SecretSlot, SecretSource, SecurityWarning, SshAuth, SshHop, SshTunnel,
+    TlsConfig, TlsMode,
 };
 pub use connection_type::{Color, ConnectionType, ConnectionTypeId, ConnectionTypes, SafetyPolicy};
+pub use dbeaver_roots::{DbeaverRoots, FileCheck};
 pub use error::{ConnectionError, CoreError, WorkspaceError};
 pub use registry::DriverRegistry;
 pub use runtime::DriverRuntime;
+pub use services::{
+    CoreConfig, CoreServices, DEFAULT_LOCK_CHECK_INTERVAL, DEFAULT_VAULT_IDLE_TIMEOUT,
+    LockWatcherStatus, SecretBackend, StartupError,
+};
 pub use session::{
     CloseReason, ConfirmReason, ConfirmationRequest, ConfirmationToken, CoreEvent, CoreEvents,
     ExecEvent, ExecuteRequest, Execution, HostKeyConfirmation, HostKeyToken, InitSqlConfirmation,
     InitSqlToken, KnownHostsFiles, ManagerConfig, Next, OpenOutcome, OpenRequest, Reply,
-    SessionHandle, SessionId, SessionInfo, SessionManager, SessionWarning, TransactionState,
+    SecretsLockReason, SessionHandle, SessionId, SessionInfo, SessionManager, SessionWarning,
+    TransactionState,
 };
 pub use workspace::{
     ConnectionTypesFile, Connections, ConnectionsFile, LoadIssue, LoadedConnections, ProjectFile,

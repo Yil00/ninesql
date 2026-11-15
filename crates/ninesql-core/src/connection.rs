@@ -373,6 +373,49 @@ pub enum TlsMode {
     VerifyFull,
 }
 
+/// Which password exchanges the driver may use for this connection (`connections.json` schema 3).
+/// Defaults to [`PasswordExchange::Any`], also when the key is absent from the file.
+///
+/// [`PasswordExchange::ScramOnly`] is accepted at save only by drivers that declare it
+/// ([`ninesql_driver_api::ConnectCapabilities::password_exchanges`], checked by
+/// [`Connection::validate_for_driver`]); today `ninesql-driver-pgwire`.
+#[derive(
+    Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize,
+)]
+#[serde(rename_all = "kebab-case")]
+pub enum PasswordExchange {
+    /// Every exchange the driver supports, under its own transport rules. The default.
+    #[default]
+    Any,
+    /// Only a SCRAM exchange in which the server proves it knows the password verifier
+    /// (PostgreSQL `SCRAM-SHA-256`): md5, cleartext and trust are refused. It stops method
+    /// downgrades, **not** a man in the middle that relays the exchange: there is no channel
+    /// binding, so only TLS `verify-full` (or `verify-ca` with a private CA) protects against
+    /// that ([`Connection::scram_without_verified_tls`]).
+    ScramOnly,
+}
+
+impl PasswordExchange {
+    /// `true` for [`PasswordExchange::Any`].
+    #[must_use]
+    pub const fn is_any(self) -> bool {
+        matches!(self, Self::Any)
+    }
+
+    /// The driver API policy.
+    #[must_use]
+    pub const fn to_api(self) -> ninesql_driver_api::PasswordExchange {
+        match self {
+            Self::Any => ninesql_driver_api::PasswordExchange::Any,
+            Self::ScramOnly => ninesql_driver_api::PasswordExchange::ScramOnly,
+        }
+    }
+}
+
+fn is_any_exchange(p: &PasswordExchange) -> bool {
+    p.is_any()
+}
+
 /// TLS client certificate (mTLS, ADR-0011 §3).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ClientCertificate {
@@ -510,6 +553,10 @@ pub struct Connection {
     pub endpoint: Endpoint,
     /// Database authentication.
     pub auth: Auth,
+    /// Password exchanges the driver may use; [`PasswordExchange::Any`] when absent
+    /// (`connections.json` schema 3).
+    #[serde(default, skip_serializing_if = "is_any_exchange")]
+    pub password_exchange: PasswordExchange,
     /// SSH tunnel, if any.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ssh: Option<SshTunnel>,
@@ -559,6 +606,7 @@ impl Connection {
             engine,
             endpoint,
             auth,
+            password_exchange: PasswordExchange::Any,
             ssh: None,
             tls: TlsConfig::default(),
             connection_type,
@@ -674,6 +722,16 @@ impl Connection {
             keep
         });
         issues
+    }
+
+    /// `true` when [`PasswordExchange::ScramOnly`] is set on a network endpoint whose TLS mode
+    /// is below `verify-ca`: SCRAM without channel binding does not stop a relaying man in the
+    /// middle there, so the UI flags the combination (ROADMAP, driver-API PR, P1-C row).
+    #[must_use]
+    pub fn scram_without_verified_tls(&self) -> bool {
+        self.password_exchange == PasswordExchange::ScramOnly
+            && self.endpoint.is_network()
+            && matches!(self.tls.mode, TlsMode::Disable | TlsMode::Require)
     }
 
     /// Weakened security settings of this connection, for the warning badge (I5).

@@ -8,7 +8,7 @@ use std::collections::BTreeMap;
 use std::fmt;
 use std::sync::Arc;
 
-use ninesql_driver_api::{AuthKind, Capabilities, Dialect, Driver};
+use ninesql_driver_api::{self as api, AuthKind, Capabilities, Dialect, Driver};
 
 use crate::connection::{Auth, Connection, EngineId, TlsMode};
 use crate::error::{ConnectionError, CoreError};
@@ -18,6 +18,16 @@ use crate::error::{ConnectionError, CoreError};
 #[must_use]
 pub fn api_engine(engine: &EngineId) -> ninesql_driver_api::EngineId {
     ninesql_driver_api::EngineId::new(engine.as_str())
+}
+
+/// The driver API TLS mode of a model TLS mode.
+pub(crate) const fn api_tls_mode(mode: TlsMode) -> api::TlsMode {
+    match mode {
+        TlsMode::Disable => api::TlsMode::Disable,
+        TlsMode::Require => api::TlsMode::Require,
+        TlsMode::VerifyCa => api::TlsMode::VerifyCa,
+        TlsMode::VerifyFull => api::TlsMode::VerifyFull,
+    }
 }
 
 /// Registered drivers, by engine id.
@@ -91,14 +101,19 @@ impl DriverRegistry {
         Ok(self.driver(engine)?.dialect(&api_engine(engine))?)
     }
 
-    /// Validates a connection against its driver: [`Connection::validate`], then every driver
-    /// property against [`Capabilities::is_reserved_property`], so the keys the driver reserves
-    /// on top of the shared rule (`extra_reserved_properties`) are refused **before** the
-    /// connection is saved or imported, not only at connect time.
+    /// **The** validation entry point for saving and importing a connection: the model rules
+    /// ([`Connection::validate`]) and every driver rule ([`Connection::validate_for_driver`]:
+    /// reserved and unknown properties, authentication kind, password-exchange policy, TLS mode
+    /// against [`Capabilities::tls`], `verify-ca` CA file, client certificates), so what the
+    /// driver would refuse at connect is refused **before** the connection is saved or
+    /// imported.
     ///
-    /// Call it before [`crate::Workspace::create_connection`] /
-    /// [`crate::Workspace::save_connections`] (connection dialog) and before persisting an
-    /// imported connection (P2-C). The connect flow calls it again.
+    /// - P1-C (connection dialog): call it on every change to show the error next to the
+    ///   field, and save through [`crate::Workspace::create_connection_checked`] /
+    ///   [`crate::Workspace::save_connections_checked`], which call it for every connection.
+    /// - P2-C (DBeaver import): call it on each converted connection before persisting it; a
+    ///   connection it refuses is reported (and may be saved disabled), never saved as is.
+    /// - The connect flow calls it again ([`crate::SessionManager::open`]).
     ///
     /// # Errors
     /// [`CoreError::NoDriver`], [`CoreError::InvalidConnection`].
@@ -117,9 +132,14 @@ impl Connection {
     ///   with [`ConnectionError::ReservedProperty`];
     /// - a property off the driver's allowlist
     ///   ([`ConnectCapabilities::accepted_properties`](ninesql_driver_api::ConnectCapabilities::accepted_properties)),
-    ///   an authentication method the driver does not list, and on network endpoints
-    ///   `verify-ca` without a CA file (ADR-0019), a client certificate or an encrypted client
-    ///   key the driver does not support, are refused with [`ConnectionError::InvalidField`].
+    ///   an authentication method the driver does not list, a password-exchange policy the
+    ///   driver does not declare
+    ///   ([`ConnectCapabilities::password_exchanges`](ninesql_driver_api::ConnectCapabilities::password_exchanges)),
+    ///   and on network endpoints a TLS mode outside [`Capabilities::tls`] (with an empty set,
+    ///   only `disable` is accepted: the driver has no TLS, and a connection saved as
+    ///   `verify-full` must not look encrypted when it is not, I5 / I8), `verify-ca` without a
+    ///   CA file (ADR-0019), a client certificate or an encrypted client key the driver does
+    ///   not support, are refused with [`ConnectionError::InvalidField`].
     ///
     /// Values are never echoed.
     ///
@@ -152,6 +172,29 @@ impl Connection {
             return Err(ConnectionError::InvalidField {
                 field: "auth".to_owned(),
                 reason: "uses an authentication method the driver of this engine does not support",
+            });
+        }
+        if !accepts.accepts_password_exchange(self.password_exchange.to_api()) {
+            return Err(ConnectionError::InvalidField {
+                field: "password_exchange".to_owned(),
+                reason: "is a policy the driver of this engine cannot enforce; use `any`",
+            });
+        }
+        // A driver without TLS (empty set) accepts only `disable`; a driver with TLS accepts
+        // exactly the modes it declares, `disable` included (a TLS-only driver refuses it).
+        let tls_ok = if capabilities.tls.is_empty() {
+            self.tls.mode == TlsMode::Disable
+        } else {
+            capabilities.tls.contains(&api_tls_mode(self.tls.mode))
+        };
+        if self.endpoint.is_network() && !tls_ok {
+            return Err(ConnectionError::InvalidField {
+                field: "tls.mode".to_owned(),
+                reason: if capabilities.tls.is_empty() {
+                    "must be `disable`: the driver of this engine does not support TLS"
+                } else {
+                    "is a TLS mode the driver of this engine does not support (a driver that requires TLS refuses `disable`)"
+                },
             });
         }
         if self.endpoint.is_network() && self.tls.mode != TlsMode::Disable {

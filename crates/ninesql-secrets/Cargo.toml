@@ -28,18 +28,25 @@ rustix = { workspace = true, features = ["time"] }
 # Only to enable `aes/zeroize` (feature unification) for the AES-128 key schedule that
 # secret-service keeps in its cbc Encryptor / Decryptor.
 aes = { workspace = true, optional = true }
-# Session-bus connection with a method timeout for secret-service (same zbus 6).
+# Session-bus connection with a method timeout for secret-service, and the system-bus
+# connection of `DesktopLockWatcher` (feature `desktop-lock`). Same zbus 6 as secret-service.
 zbus = { workspace = true, optional = true }
 
 [features]
-default = []
+# `desktop-lock` is on by default: the vault and the "ask every time" cache are locked on sleep
+# and screen lock in default builds, independently of the Secret Service backend.
+default = ["desktop-lock"]
 # In-memory store and fast (insecure) vault KDF parameters for tests of dependent crates
 # (ADR-0005). Never enabled in release builds.
 memory-store = []
 # Freedesktop Secret Service backend (pure-Rust zbus 6 client, Rust crypto). Needs Rust >= 1.89.
 # Off by default until the review of secret-service 6.0.0-rc.1 (ROADMAP, P0-D review L5) and the
 # desktop round trip (ADR-0012) are closed.
-secret-service = ["dep:secret-service", "dep:aes", "dep:zbus"]
+secret-service = ["dep:secret-service", "dep:aes", "dep:zbus", "desktop-lock"]
+# `DesktopLockWatcher`: listens to logind on the system bus (sleep, session lock) with zbus 6
+# only. No Secret Service client, no crypto: the bus connection talks to logind and the bus
+# daemon only (docs/05-security.md).
+desktop-lock = ["dep:zbus"]
 
 [dev-dependencies]
 serde_json.workspace = true

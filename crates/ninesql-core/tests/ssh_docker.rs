@@ -13,7 +13,6 @@ mod support;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use ninesql_core::driver_api::mock::MockDriver;
 use ninesql_core::driver_api::{Endpoint as ApiEndpoint, SecurityWarning as ApiWarning};
 use ninesql_core::ssh::{SshError, SshWarningKind};
 use ninesql_core::{
@@ -36,7 +35,7 @@ fn ssh_tunnel_through_the_core_connect_flow() {
     let port = sshd.port;
 
     let tmp = tempfile::tempdir().unwrap();
-    let wrap = Wrap::new(MockDriver::new());
+    let wrap = Wrap::new(mock_driver());
     let (manager, _) = manager(Arc::new(wrap.clone()), tmp.path());
     let types = ConnectionTypes::default();
     let secret = || SecretString::from(password.clone());

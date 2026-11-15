@@ -92,6 +92,16 @@ pub enum WorkspaceError {
     /// Secret store failure.
     #[error(transparent)]
     Secrets(#[from] ninesql_secrets::SecretError),
+    /// A connection its driver refuses ([`crate::DriverRegistry::validate_connection`]), or
+    /// whose engine has no driver.
+    #[error("connection `{name}`: {source}")]
+    Core {
+        /// Name of the offending connection.
+        name: String,
+        /// What is wrong.
+        #[source]
+        source: Box<CoreError>,
+    },
 }
 
 /// Error of the driver runtime, the connect flow and sessions (P1-D). User-presentable: no
@@ -152,6 +162,12 @@ pub enum CoreError {
     /// The driver runtime is shut down or failed to start.
     #[error("driver runtime: {0}")]
     Runtime(String),
+    /// A vault operation failed (wrong master password, too many attempts, damaged file…).
+    #[error(transparent)]
+    Vault(#[from] ninesql_secrets::VaultError),
+    /// No vault is open in this session (it could not be opened at startup).
+    #[error("no vault is available in this session: {0}")]
+    NoVault(String),
 }
 
 impl CoreError {
@@ -175,6 +191,8 @@ impl CoreError {
             Self::InvalidConfirmation => "invalid-confirmation",
             Self::SessionClosed => "session-closed",
             Self::Runtime(_) => "runtime",
+            Self::Vault(e) => vault_error_kind(e),
+            Self::NoVault(_) => "no-vault",
         }
     }
 
@@ -186,6 +204,21 @@ impl CoreError {
             Self::Driver(ninesql_driver_api::DriverError::Query { code, .. }) => code.as_deref(),
             _ => None,
         }
+    }
+}
+
+/// A short, stable name of a vault error kind, safe to log at any level (no path).
+fn vault_error_kind(e: &ninesql_secrets::VaultError) -> &'static str {
+    use ninesql_secrets::VaultError as E;
+    match e {
+        E::NotCreated => "vault-not-created",
+        E::AlreadyExists(_) => "vault-already-exists",
+        E::Locked => "vault-locked",
+        E::WrongPassword => "vault-wrong-password",
+        E::TooManyAttempts { .. } => "vault-too-many-attempts",
+        E::EmptyPassword => "vault-empty-password",
+        E::Corrupted { .. } | E::NewerVersion { .. } => "vault-file",
+        _ => "vault-other",
     }
 }
 

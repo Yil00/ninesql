@@ -979,6 +979,11 @@ impl SecretStore for VaultStore {
         StoreKind::Vault
     }
 
+    /// A vault that exists and is locked (a vault not created yet holds nothing: not locked).
+    fn is_locked(&self) -> bool {
+        matches!(self.vault.status(), Ok(VaultStatus::Locked))
+    }
+
     fn get(&self, id: &SecretId) -> Result<SecretString, SecretError> {
         match self.vault.get(&self.project, id) {
             Ok(Some(secret)) => Ok(secret),
