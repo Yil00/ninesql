@@ -16,6 +16,7 @@
 //!     conformance::assert_access_mode_change_detected(&driver, dev_params(..), LIFT_SQL).await;
 //!     conformance::assert_stale_cancel_ignored(&driver, dev_params(..), Q1, Q2).await;
 //!     conformance::assert_batches_within_budget(&driver, dev_params(..), WIDE_SQL, budget).await;
+//!     conformance::assert_credential_statements_not_logged(&driver, dev_params(..)).await;
 //!     conformance::assert_identifier_quoting(
 //!         &driver, dev_params(..), conformance::ALIAS_TEMPLATE, conformance::IDENTIFIER_SAMPLES,
 //!     ).await;
@@ -709,6 +710,100 @@ pub async fn assert_stale_cancel_ignored(
 }
 
 /// Executes `sql` and drains the stream; the first error wins.
+/// Statements (init SQL, then run) whose text holds a credential: never logged (I1). Valid in
+/// PostgreSQL, MySQL, MariaDB and SQLite. They hold [`LOG_HYGIENE_SECRET`].
+pub const CREDENTIAL_STATEMENT_SAMPLES: &[&str] = &[
+    "SELECT 'hunter2-log-probe' AS user_password",
+    "SELECT 'postgresql://u:hunter2-log-probe@h/db' AS dsn",
+    "SELECT 'hunter2-log-probe' AS Pwd",
+];
+
+/// The value every [`CREDENTIAL_STATEMENT_SAMPLES`] statement holds.
+pub const LOG_HYGIENE_SECRET: &str = "hunter2-log-probe";
+
+/// Records the fields of every event, on the thread it is installed on.
+#[derive(Clone, Default)]
+struct LogCapture(std::sync::Arc<std::sync::Mutex<Vec<String>>>);
+
+struct LogFields<'a>(&'a mut String);
+
+impl tracing::field::Visit for LogFields<'_> {
+    fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+        self.0.push_str(&format!("{}={value:?} ", field.name()));
+    }
+}
+
+impl tracing::Subscriber for LogCapture {
+    fn enabled(&self, _: &tracing::Metadata<'_>) -> bool {
+        true
+    }
+    fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+        tracing::span::Id::from_u64(1)
+    }
+    fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+    fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+    fn event(&self, event: &tracing::Event<'_>) {
+        let mut line = String::new();
+        event.record(&mut LogFields(&mut line));
+        self.0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(line);
+    }
+    fn enter(&self, _: &tracing::span::Id) {}
+    fn exit(&self, _: &tracing::span::Id) {}
+}
+
+/// Connects with statement logging allowed and every event captured (`trace` included), runs
+/// [`CREDENTIAL_STATEMENT_SAMPLES`] as init SQL and as statements, then a harmless statement
+/// as both, and asserts that the log shows the harmless ones (so logging was on) but neither
+/// the credential statements nor [`LOG_HYGIENE_SECRET`] (I1, `text_may_hold_credentials`).
+///
+/// Events are captured on the calling thread: the driver must log statement text from the
+/// task that calls `connect` / `execute` (every NineSQL driver does).
+///
+/// # Panics
+/// When a credential statement is logged, or when no statement is (logging was not on).
+pub async fn assert_credential_statements_not_logged(driver: &dyn Driver, params: ConnectParams) {
+    let capture = LogCapture::default();
+    let _guard = tracing::subscriber::set_default(capture.clone());
+    let mut p = params;
+    p.log_statements = true;
+    p.production = false;
+    p.read_only = false;
+    p.init_statements = CREDENTIAL_STATEMENT_SAMPLES
+        .iter()
+        .map(|s| (*s).to_owned())
+        .chain(["SELECT 7 AS init_log_probe".to_owned()])
+        .collect();
+    let mut session = match driver.connect(p).await {
+        Ok(s) => s,
+        Err(e) => panic!("connect failed: {e}"),
+    };
+    for sql in CREDENTIAL_STATEMENT_SAMPLES {
+        if let Err(e) = run(session.as_mut(), sql).await {
+            panic!("`{sql}` failed: {e}");
+        }
+    }
+    if let Err(e) = run(session.as_mut(), "SELECT 42 AS log_probe").await {
+        panic!("harmless statement failed: {e}");
+    }
+    let _ = session.close().await;
+    let all = capture
+        .0
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .join("\n");
+    assert!(
+        all.contains("SELECT 7 AS init_log_probe") && all.contains("SELECT 42 AS log_probe"),
+        "statement text was not logged at all: the check proves nothing"
+    );
+    assert!(
+        !all.contains(LOG_HYGIENE_SECRET),
+        "a statement holding a credential was logged"
+    );
+}
+
 async fn run(session: &mut dyn Session, sql: &str) -> Result<(), DriverError> {
     let mut stream = session
         .execute(Statement::sql(sql), ExecOptions::default())

@@ -279,6 +279,12 @@ impl TextPosition {
 /// Splitter state carried between calls of [`Dialect::split_script_ahead`]: the MySQL
 /// `DELIMITER` in force (`None`: `;`). Updated item by item with
 /// [`Dialect::script_state_after`].
+///
+/// A delimiter that a `DELIMITER` directive would refuse (empty, with whitespace, a
+/// backslash, a quote or a comment opener) can never be in force: mysqlwire then returns one
+/// [`ScriptRefusal::InvalidDelimiter`] item for the rest of the script (fails closed). Dialects
+/// without a `DELIMITER` directive (pgwire, sqlite, the defaults) never produce a delimiter and
+/// ignore one: they split on `;` as always.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct ScriptState {
