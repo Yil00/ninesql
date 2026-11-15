@@ -77,7 +77,9 @@ pub struct SqliteSession {
     pub(crate) link: Link,
     pub(crate) capabilities: Capabilities,
     pub(crate) interrupt: Arc<InterruptHandle>,
-    pub(crate) production: bool,
+    /// Statement text may be logged at `trace` level (`ConnectParams::may_log_statements`:
+    /// the connection type allows it and the connection is not production, ADR-0007 §6).
+    pub(crate) log_statements: bool,
     /// State of the current execution, shared with `Session::cancel_handle`.
     pub(crate) current_exec: Mutex<Arc<ExecState>>,
 }
@@ -246,7 +248,7 @@ impl Session for SqliteSession {
                 "statement refused: the session is read-only".into(),
             ));
         }
-        if !self.production {
+        if self.log_statements {
             tracing::trace!(statement = %statement.text, "sqlite execute");
         }
         let guard = self.link.tracker.begin()?;

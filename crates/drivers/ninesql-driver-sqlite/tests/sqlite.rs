@@ -1278,3 +1278,109 @@ async fn wal_databases_leave_no_file_behind() {
     assert!(!o.items.iter().any(|i| matches!(i, ResultItem::Notice(_))));
     s.close().await.unwrap();
 }
+
+/// I4: a file flagged as inside a DBeaver workspace is opened read-only and immutable whatever
+/// the connection asks for, and nothing is created or modified next to it, including the
+/// `-wal`-only case (a writer that crashed or is still running, without its `-shm`).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn dbeaver_workspace_files_are_never_touched() {
+    let flagged = |path: &Path| {
+        let mut p = ConnectParams::new(
+            EngineId::SQLITE,
+            Endpoint::File {
+                path: path.to_owned(),
+                create_if_missing: true,
+            },
+        );
+        // Read-write asked for: the flag wins.
+        p.read_only = false;
+        p.inside_dbeaver_workspace = true;
+        p
+    };
+    // A rollback-journal database.
+    let dir = tempfile::tempdir().unwrap();
+    let db = nine_copy(dir.path());
+    let before = files_in(dir.path());
+    let mut s = connect(flagged(&db)).await;
+    assert!(s.is_read_only(), "the DBeaver flag forces read-only");
+    let o = run(s.as_mut(), "SELECT count(*) FROM customers")
+        .await
+        .unwrap();
+    assert!(first_i64(&o).is_some_and(|n| n > 0));
+    assert!(
+        matches!(o.items.first(), Some(ResultItem::Notice(n)) if n.message.contains("DBeaver"))
+    );
+    for sql in [
+        "INSERT INTO customers (id) VALUES (999999)",
+        "CREATE TABLE x (a)",
+        "PRAGMA journal_mode = WAL",
+    ] {
+        assert!(
+            matches!(run(s.as_mut(), sql).await, Err(DriverError::ReadOnly(_))),
+            "{sql}"
+        );
+    }
+    assert!(s.set_read_only(false).await.is_err());
+    s.close().await.unwrap();
+    assert_eq!(files_in(dir.path()), before, "a file changed or appeared");
+
+    // A missing file is not created.
+    let missing = dir.path().join("missing.db");
+    assert!(
+        SqliteDriver::new()
+            .connect(flagged(&missing))
+            .await
+            .is_err()
+    );
+    assert!(!missing.exists());
+
+    // The `-wal`-only case: committed rows still in the `-wal` file are not visible, no
+    // `-shm` appears and the notice says so.
+    let src = tempfile::tempdir().unwrap();
+    let wal_db = src.path().join("w.db");
+    {
+        let c = rusqlite::Connection::open(&wal_db).unwrap();
+        let _: String = c
+            .query_row("PRAGMA journal_mode = WAL", [], |r| r.get(0))
+            .unwrap();
+        c.execute_batch("CREATE TABLE t (a INTEGER); INSERT INTO t VALUES (1), (2);")
+            .unwrap();
+    }
+    let writer = rusqlite::Connection::open(&wal_db).unwrap();
+    writer
+        .execute_batch("PRAGMA wal_autocheckpoint = 0; INSERT INTO t VALUES (3);")
+        .unwrap();
+    let copy = tempfile::tempdir().unwrap();
+    std::fs::copy(&wal_db, copy.path().join("w.db")).unwrap();
+    std::fs::copy(src.path().join("w.db-wal"), copy.path().join("w.db-wal")).unwrap();
+    drop(writer);
+    let before = files_in(copy.path());
+    assert_eq!(before.len(), 2);
+    let mut s = connect(flagged(&copy.path().join("w.db"))).await;
+    let o = run(s.as_mut(), "SELECT count(*) FROM t").await.unwrap();
+    assert_eq!(first_i64(&o), Some(2), "rows in the -wal file are not read");
+    assert!(matches!(o.items.first(), Some(ResultItem::Notice(n)) if n.message.contains("-wal")));
+    s.close().await.unwrap();
+    assert_eq!(files_in(copy.path()), before, "a file changed or appeared");
+}
+
+/// M2: the capabilities declare what `connect` refuses.
+#[tokio::test]
+async fn connect_capabilities_are_enforced() {
+    let d = SqliteDriver::new();
+    let caps = d.capabilities(&EngineId::SQLITE, None).unwrap();
+    assert!(caps.connect.accepts_property("busy_timeout"));
+    assert!(!caps.connect.accepts_property("mmap_size"));
+    let mut p = params(nine_db());
+    p.auth = ninesql_driver_api::Auth::password("nine", None);
+    assert!(matches!(
+        d.connect(p).await,
+        Err(DriverError::InvalidParams(_))
+    ));
+    let mut p = params(nine_db());
+    p.password_exchange = ninesql_driver_api::PasswordExchange::ScramOnly;
+    assert!(matches!(
+        d.connect(p).await,
+        Err(DriverError::InvalidParams(_))
+    ));
+}

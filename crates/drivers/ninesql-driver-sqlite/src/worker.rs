@@ -206,6 +206,8 @@ pub(crate) enum Target {
 #[derive(Clone, Debug)]
 pub(crate) struct OpenOptions {
     pub(crate) read_only: bool,
+    /// Open immutable (read-only sessions only): a file inside a DBeaver workspace (I4).
+    pub(crate) immutable: bool,
     pub(crate) busy_timeout: Duration,
     /// `PRAGMA` statements built by the driver from validated property values.
     pub(crate) pragmas: Vec<String>,
@@ -329,12 +331,14 @@ pub(crate) fn wal_without_sidecars(path: &Path) -> bool {
     {
         return false;
     }
-    let sidecar = |suffix: &str| {
-        let mut p = path.as_os_str().to_owned();
-        p.push(suffix);
-        std::fs::symlink_metadata(PathBuf::from(p)).is_ok()
-    };
-    !sidecar("-wal") && !sidecar("-shm")
+    !has_sidecar(path, "-wal") && !has_sidecar(path, "-shm")
+}
+
+/// `true` when `<path><suffix>` exists (even as a dangling link).
+pub(crate) fn has_sidecar(path: &Path, suffix: &str) -> bool {
+    let mut p = path.as_os_str().to_owned();
+    p.push(suffix);
+    std::fs::symlink_metadata(PathBuf::from(p)).is_ok()
 }
 
 /// `file:<canonical path>?mode=ro&immutable=1`, every byte outside `[A-Za-z0-9/._~-]`
@@ -628,7 +632,32 @@ impl Worker {
         let conn = match target {
             Target::File { path, create } => {
                 let real = resolve_path(path, *create && !read_only)?;
-                if read_only && wal_without_sidecars(&real) {
+                if read_only && options.immutable {
+                    // A file inside a DBeaver workspace (I4): never create or modify anything
+                    // next to it, whatever its journal mode and sidecar files.
+                    let pending = has_sidecar(&real, "-wal") || has_sidecar(&real, "-journal");
+                    tracing::warn!(pending, "DBeaver workspace file: opened immutable");
+                    startup_notice = Some(Notice::new(
+                        NoticeSeverity::Warning,
+                        if pending {
+                            "this database file is inside a DBeaver workspace: it is opened \
+                             read-only and immutable so that nothing is written next to it; \
+                             changes held in its -wal or -journal file are not visible, and \
+                             results may be stale or fail with SQLITE_CORRUPT"
+                        } else {
+                            "this database file is inside a DBeaver workspace: it is opened \
+                             read-only and immutable so that nothing is written next to it; if \
+                             another program writes to it while this session is open, results \
+                             may be stale or fail with SQLITE_CORRUPT"
+                        },
+                    ));
+                    let flags = OpenFlags::SQLITE_OPEN_READ_ONLY
+                        | OpenFlags::SQLITE_OPEN_URI
+                        | OpenFlags::SQLITE_OPEN_NO_MUTEX
+                        | OpenFlags::SQLITE_OPEN_NOFOLLOW;
+                    Connection::open_with_flags(immutable_uri(&real), flags)
+                        .map_err(|e| open_err(&e))?
+                } else if read_only && wal_without_sidecars(&real) {
                     // A plain read-only open of a WAL database would create `-wal` and `-shm`
                     // next to it (I4, review M1). With neither present no writer is active and
                     // the file holds every committed page: open it immutable, through a URI the
@@ -1629,6 +1658,7 @@ mod tests {
     fn open(path: &Path, read_only: bool) -> Worker {
         let options = OpenOptions {
             read_only,
+            immutable: false,
             busy_timeout: Duration::from_millis(200),
             pragmas: Vec::new(),
         };

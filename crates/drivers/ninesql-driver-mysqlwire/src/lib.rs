@@ -16,7 +16,8 @@
 //!   `caching_sha2_password` and `mysql_native_password`; the password itself (full
 //!   `caching_sha2_password` exchange, `mysql_clear_password`) only over verified TLS or a
 //!   host-key-verified SSH tunnel to a loopback endpoint; the server's RSA key is never asked
-//!   for. No `CLIENT_MULTI_STATEMENTS`, no `CLIENT_LOCAL_FILES`.
+//!   for. `PasswordExchange::ScramOnly` is not offered (no MySQL exchange proves that the server
+//!   knows the password verifier) and is refused at connect. No `CLIENT_MULTI_STATEMENTS`, no `CLIENT_LOCAL_FILES`.
 //! - **Cancel**: `KILL QUERY` on a control connection opened and authenticated during
 //!   `connect` (same address, same TLS settings), so the password is dropped before `connect`
 //!   returns (`retains_secret_after_connect = false`).
@@ -44,10 +45,11 @@ use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
 use ninesql_driver_api::{
-    Auth, CancelSupport, Capabilities, ConnectParams, Dialect, Driver, DriverError, DriverResult,
-    EditingCapabilities, Endpoint, EngineId, ExecOptions, ExplainFormat, HostKeyVerification,
-    IsolationLevel, MetadataCapabilities, ObjectKind, Param, PropertyValue, ReadOnlyMechanism,
-    Session, Statement, TlsMode, TransactionCapabilities, redact_connection_string, redact_secret,
+    Auth, AuthKind, CancelSupport, Capabilities, ConnectCapabilities, ConnectParams, Dialect,
+    Driver, DriverError, DriverResult, EditingCapabilities, Endpoint, EngineId, ExecOptions,
+    ExplainFormat, HostKeyVerification, IsolationLevel, MetadataCapabilities, ObjectKind, Param,
+    PasswordExchange, PropertyValue, ReadOnlyMechanism, Session, Statement, TlsMode,
+    TransactionCapabilities, redact_connection_string, redact_secret,
 };
 use tokio::sync::mpsc;
 
@@ -219,6 +221,22 @@ fn capabilities_for(engine: &EngineId, server_version: Option<&str>) -> Capabili
         .map(|k| (*k).to_owned())
         .collect();
     c.retains_secret_after_connect = false;
+    let mut connect = ConnectCapabilities::default();
+    connect.accepted_properties = Some(
+        ACCEPTED_PROPERTIES
+            .iter()
+            .filter(|(_, var)| prop_engine_ok(var, engine))
+            .map(|(_, var)| (*var).to_owned())
+            .collect(),
+    );
+    connect.auth = BTreeSet::from([AuthKind::Password]);
+    // No exchange of the MySQL protocol proves that the server knows the password verifier
+    // (`caching_sha2_password` is not SCRAM): `ScramOnly` is not offered.
+    connect.password_exchanges = BTreeSet::from([PasswordExchange::Any]);
+    connect.verify_ca_requires_ca_file = true;
+    connect.client_certificates = true;
+    connect.encrypted_client_keys = false;
+    c.connect = connect;
     c
 }
 
@@ -362,8 +380,11 @@ impl Driver for MySqlWireDriver {
     async fn connect(&self, params: ConnectParams) -> DriverResult<Box<dyn Session>> {
         Self::check_engine(&params.engine)?;
         // Before any network traffic: properties, endpoint, credentials, TLS files.
-        capabilities_for(&params.engine, None).check_properties(&params.properties)?;
+        let declared = capabilities_for(&params.engine, None);
+        declared.check_properties(&params.properties)?;
+        declared.connect.check_connect_params(&params)?;
         let settings = accepted_properties(&params.engine, &params.properties)?;
+        let log_statements = params.may_log_statements();
         let ConnectParams {
             engine,
             endpoint,
@@ -375,7 +396,6 @@ impl Driver for MySqlWireDriver {
             auto_commit,
             connect_timeout,
             init_statements,
-            production,
             application_name,
             ..
         } = params;
@@ -495,7 +515,7 @@ impl Driver for MySqlWireDriver {
                 engine == EngineId::MYSQL,
             )),
             control: Arc::clone(&control),
-            production,
+            log_statements,
             current_exec: std::sync::Mutex::new(Arc::default()),
         };
         tracing::debug!(server_version = %version, read_only, "mysqlwire session opened");
@@ -737,5 +757,48 @@ mod tests {
             d.connect(p).await,
             Err(DriverError::InvalidParams(_))
         ));
+        // M2 and SCRAM only: refused before any traffic, as declared.
+        let mut p = base();
+        p.password_exchange = PasswordExchange::ScramOnly;
+        let err = d.connect(p).await.err().unwrap();
+        assert!(matches!(err, DriverError::InvalidParams(_)), "{err:?}");
+        let mut p = base();
+        p.auth = Auth::token(None, ninesql_driver_api::Secret::new("tok".into()));
+        assert!(matches!(
+            d.connect(p).await,
+            Err(DriverError::InvalidParams(_))
+        ));
+        let mut p = base();
+        p.tls.mode = TlsMode::VerifyCa;
+        assert!(matches!(d.connect(p).await, Err(DriverError::Tls(_))));
+        let mut p = base();
+        p.engine = EngineId::MARIADB;
+        p.properties.insert(
+            "max_execution_time".into(),
+            PropertyValue::Plain("10".into()),
+        );
+        assert!(matches!(
+            d.connect(p).await,
+            Err(DriverError::InvalidParams(_))
+        ));
+    }
+
+    #[test]
+    fn connect_capabilities_match_the_driver() {
+        let my = capabilities_for(&EngineId::MYSQL, None).connect;
+        let maria = capabilities_for(&EngineId::MARIADB, None).connect;
+        for c in [&my, &maria] {
+            assert!(c.accepts_property("time_zone") && c.accepts_property("timeZone"));
+            assert!(c.accepts_property("lock_wait_timeout"));
+            assert!(!c.accepts_property("connectTimeout"));
+            assert_eq!(c.auth, BTreeSet::from([AuthKind::Password]));
+            assert!(!c.accepts_password_exchange(PasswordExchange::ScramOnly));
+            assert!(c.verify_ca_requires_ca_file);
+            assert!(c.client_certificates && !c.encrypted_client_keys);
+        }
+        assert!(my.accepts_property("max_execution_time"));
+        assert!(!my.accepts_property("max_statement_time"));
+        assert!(maria.accepts_property("max_statement_time"));
+        assert!(!maria.accepts_property("max_execution_time"));
     }
 }

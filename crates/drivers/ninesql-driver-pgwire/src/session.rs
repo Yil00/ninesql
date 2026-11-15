@@ -61,7 +61,9 @@ pub struct PgSession {
     pub(crate) dialect: Arc<PgDialect>,
     pub(crate) cancel_target: Arc<CancelTarget>,
     pub(crate) auto_commit: bool,
-    pub(crate) production: bool,
+    /// Statement text may be logged at `trace` level (`ConnectParams::may_log_statements`:
+    /// the connection type allows it and the connection is not production, ADR-0007 §6).
+    pub(crate) log_statements: bool,
     /// Cancel flag of the current execution, shared with `Session::cancel_handle`.
     pub(crate) current_exec: std::sync::Mutex<Arc<ExecCancel>>,
 }
@@ -223,7 +225,7 @@ impl Session for PgSession {
                 "statement refused: the session is read-only".into(),
             ));
         }
-        if !self.production {
+        if self.log_statements {
             tracing::trace!(statement = %statement.text, "pgwire execute");
         }
         let guard = self.link.tracker.begin()?;

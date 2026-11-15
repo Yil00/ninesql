@@ -61,7 +61,9 @@ pub struct MySession {
     pub(crate) capabilities: Capabilities,
     pub(crate) dialect: Arc<MyDialect>,
     pub(crate) control: Arc<Control>,
-    pub(crate) production: bool,
+    /// Statement text may be logged at `trace` level (`ConnectParams::may_log_statements`:
+    /// the connection type allows it and the connection is not production, ADR-0007 §6).
+    pub(crate) log_statements: bool,
     /// Cancel flag of the current execution, shared with `Session::cancel_handle`.
     pub(crate) current_exec: std::sync::Mutex<Arc<ExecCancel>>,
 }
@@ -232,7 +234,7 @@ impl Session for MySession {
             ));
         }
         let text = self.dialect.bind(&statement.text, &statement.params)?;
-        if !self.production {
+        if self.log_statements {
             tracing::trace!(statement = %statement.text, "mysqlwire execute");
         }
         let guard = self.link.tracker.begin()?;

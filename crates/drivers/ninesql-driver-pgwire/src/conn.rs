@@ -242,6 +242,9 @@ pub(crate) struct Startup<'a> {
     /// Whether the transport is protected (TLS or an SSH tunnel): cleartext passwords are
     /// refused otherwise.
     pub(crate) protected_transport: bool,
+    /// `PasswordExchange::ScramOnly`: only a SCRAM-SHA-256 exchange in which the server proves
+    /// it knows the verifier; md5, cleartext and no authentication at all are refused.
+    pub(crate) scram_only: bool,
 }
 
 impl Conn {
@@ -321,6 +324,15 @@ impl Conn {
         loop {
             match self.next(RowSink::None).await? {
                 Msg::Other(backend::Message::AuthenticationOk) => {
+                    if startup.scram_only && !scram_verified {
+                        // libpq `require_auth=scram-sha-256`: a server that skips the exchange
+                        // (trust) never proves it knows the verifier.
+                        return Err(DriverError::Auth(
+                            "the server did not authenticate with SCRAM-SHA-256, which this \
+                             connection requires (SCRAM only)"
+                                .into(),
+                        ));
+                    }
                     if scram.is_some() && !scram_verified {
                         // The server must prove it knows the verifier (SASLFinal) before the
                         // session is trusted: an impostor could otherwise skip it.
@@ -339,6 +351,16 @@ impl Conn {
                 ) if answered => {
                     return Err(DriverError::Auth(
                         "the server asked for a second authentication exchange".into(),
+                    ));
+                }
+                Msg::Other(
+                    backend::Message::AuthenticationCleartextPassword
+                    | backend::Message::AuthenticationMd5Password(_),
+                ) if startup.scram_only => {
+                    return Err(DriverError::Auth(
+                        "the server asks for md5 or cleartext password authentication; this \
+                         connection requires SCRAM-SHA-256 (SCRAM only)"
+                            .into(),
                     ));
                 }
                 Msg::Other(backend::Message::AuthenticationCleartextPassword) => {
@@ -730,6 +752,10 @@ mod tests {
     }
 
     async fn client(port: u16, protected: bool) -> DriverResult<Conn> {
+        client_with(port, protected, false).await
+    }
+
+    async fn client_with(port: u16, protected: bool, scram_only: bool) -> DriverResult<Conn> {
         let (io, _) = open_transport("127.0.0.1", port, None).await?;
         let startup = Startup {
             user: "nine",
@@ -737,6 +763,7 @@ mod tests {
             application_name: "t",
             extra: &[],
             protected_transport: protected,
+            scram_only,
         };
         let pw = Secret::new("Pa55-secret".into());
         Conn::startup(io, Arc::new(AtomicBool::new(true)), &startup, Some(&pw)).await
@@ -775,6 +802,60 @@ mod tests {
         let rest = rx.await.unwrap();
         assert!(!rest.contains(&b'p'), "a password message was sent");
         assert!(!rest.windows(6).any(|w| w == b"Pa55-s"));
+    }
+
+    /// SCRAM only: md5 and cleartext are refused even over a protected transport, and nothing
+    /// derived from the password is sent.
+    #[tokio::test]
+    async fn scram_only_refuses_md5_and_cleartext() {
+        for (code, data) in [(5, vec![1u8, 2, 3, 4]), (3, Vec::new())] {
+            let (tx, rx) = oneshot::channel();
+            let port = serve(move |mut s| async move {
+                read_startup(&mut s).await;
+                auth(&mut s, code, &data).await;
+                let mut rest = Vec::new();
+                let _ = s.read_to_end(&mut rest).await;
+                let _ = tx.send(rest);
+            })
+            .await;
+            match client_with(port, true, true).await {
+                Err(DriverError::Auth(m)) => {
+                    assert!(m.contains("SCRAM"), "{m}");
+                    assert!(!m.contains("Pa55-secret"));
+                }
+                other => panic!("code {code}: {:?}", other.map(|_| ())),
+            }
+            let rest = rx.await.unwrap();
+            assert!(
+                !rest.contains(&b'p'),
+                "code {code}: a password message was sent"
+            );
+        }
+        // Without SCRAM only, md5 over a protected transport is still answered.
+        let (tx, rx) = oneshot::channel();
+        let port = serve(|mut s| async move {
+            read_startup(&mut s).await;
+            auth(&mut s, 5, &[1, 2, 3, 4]).await;
+            let _ = tx.send(read_msg(&mut s).await.map(|(tag, _)| tag));
+        })
+        .await;
+        let _ = client_with(port, true, false).await;
+        assert_eq!(rx.await.unwrap(), Some(b'p'));
+    }
+
+    /// SCRAM only: a server that skips authentication (trust) is refused.
+    #[tokio::test]
+    async fn scram_only_refuses_a_server_that_skips_authentication() {
+        let port = serve(|mut s| async move {
+            read_startup(&mut s).await;
+            auth(&mut s, 0, &[]).await;
+            let _ = read_msg(&mut s).await;
+        })
+        .await;
+        assert!(matches!(
+            client_with(port, true, true).await,
+            Err(DriverError::Auth(_))
+        ));
     }
 
     async fn sasl_start(s: &mut TcpStream) -> String {

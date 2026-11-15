@@ -13,7 +13,9 @@
 //!   `verify-ca` requires and trusts only `TlsConfig::ca_file`, `verify-full` trusts only the CA
 //!   file when set, the platform store otherwise (libpq `sslrootcert` semantics);
 //!   SCRAM-SHA-256 (server signature required) or md5; cleartext passwords only over verified
-//!   TLS or a host-key-verified SSH tunnel to a loopback endpoint; the password is dropped
+//!   TLS or a host-key-verified SSH tunnel to a loopback endpoint; with
+//!   `PasswordExchange::ScramOnly`, SCRAM-SHA-256 only (md5, cleartext and a server that skips
+//!   authentication are refused, as libpq's `require_auth=scram-sha-256`); the password is dropped
 //!   (zeroized) before `connect` returns: cancel requests use the backend key. Remaining
 //!   password remnants outside the driver's control are listed in the `auth` module.
 //! - **Internal queries** never depend on the session's `search_path`: operators are
@@ -45,10 +47,11 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use ninesql_driver_api::{
-    Auth, CancelSupport, Capabilities, ConnectParams, Dialect, Driver, DriverError, DriverResult,
-    EditingCapabilities, Endpoint, EngineId, ExecOptions, ExplainFormat, HostKeyVerification,
-    IsolationLevel, MetadataCapabilities, ObjectKind, PropertyValue, ReadOnlyMechanism, Session,
-    Statement, TlsMode, TransactionCapabilities, redact_connection_string, redact_secret,
+    Auth, AuthKind, CancelSupport, Capabilities, ConnectCapabilities, ConnectParams, Dialect,
+    Driver, DriverError, DriverResult, EditingCapabilities, Endpoint, EngineId, ExecOptions,
+    ExplainFormat, HostKeyVerification, IsolationLevel, MetadataCapabilities, ObjectKind,
+    PasswordExchange, PropertyValue, ReadOnlyMechanism, Session, Statement, TlsMode,
+    TransactionCapabilities, redact_connection_string, redact_secret,
 };
 use tokio::sync::mpsc;
 
@@ -176,6 +179,20 @@ fn postgres_capabilities(server_version: Option<&str>) -> Capabilities {
         .map(|k| (*k).to_owned())
         .collect();
     c.retains_secret_after_connect = false;
+    let mut connect = ConnectCapabilities::default();
+    connect.accepted_properties = Some(
+        ACCEPTED_PROPERTIES
+            .iter()
+            .map(|(_, name)| (*name).to_owned())
+            .collect(),
+    );
+    connect.auth = BTreeSet::from([AuthKind::Password]);
+    connect.password_exchanges =
+        BTreeSet::from([PasswordExchange::Any, PasswordExchange::ScramOnly]);
+    connect.verify_ca_requires_ca_file = true;
+    connect.client_certificates = true;
+    connect.encrypted_client_keys = false;
+    c.connect = connect;
     c
 }
 
@@ -275,8 +292,12 @@ impl Driver for PgWireDriver {
     async fn connect(&self, params: ConnectParams) -> DriverResult<Box<dyn Session>> {
         Self::check_engine(&params.engine)?;
         // Before any network traffic: properties, endpoint, credentials, TLS files.
-        postgres_capabilities(None).check_properties(&params.properties)?;
+        let declared = postgres_capabilities(None);
+        declared.check_properties(&params.properties)?;
+        declared.connect.check_connect_params(&params)?;
         let extra = accepted_properties(&params.properties)?;
+        let log_statements = params.may_log_statements();
+        let scram_only = params.password_exchange == PasswordExchange::ScramOnly;
         let ConnectParams {
             endpoint,
             auth,
@@ -287,7 +308,6 @@ impl Driver for PgWireDriver {
             auto_commit,
             connect_timeout,
             init_statements,
-            production,
             application_name,
             ..
         } = params;
@@ -334,6 +354,7 @@ impl Driver for PgWireDriver {
                 application_name: &application_name,
                 extra: &extra,
                 protected_transport: verified_tls || (strict_tunnel && peer.ip().is_loopback()),
+                scram_only,
             };
             let conn = Conn::startup(io, Arc::clone(&scs), &startup, password.as_ref()).await?;
             DriverResult::Ok((conn, peer))
@@ -397,7 +418,7 @@ impl Driver for PgWireDriver {
             dialect: Arc::new(PgDialect::tracking(scs)),
             cancel_target,
             auto_commit,
-            production,
+            log_statements,
             current_exec: std::sync::Mutex::new(Arc::default()),
         };
         tracing::debug!(
@@ -538,5 +559,43 @@ mod tests {
             d.connect(p).await,
             Err(DriverError::InvalidParams(_))
         ));
+        // M2: what the capabilities refuse, connect refuses before any traffic.
+        let mut p = base();
+        p.auth = Auth::token(None, ninesql_driver_api::Secret::new("tok-value".into()));
+        let err = d.connect(p).await.err().unwrap();
+        assert!(matches!(err, DriverError::InvalidParams(_)), "{err:?}");
+        assert!(!err.to_string().contains("tok-value"));
+        let mut p = base();
+        p.properties
+            .insert("fetch_size".into(), PropertyValue::Plain("10".into()));
+        assert!(matches!(
+            d.connect(p).await,
+            Err(DriverError::InvalidParams(_))
+        ));
+        let mut p = base();
+        p.tls.mode = TlsMode::VerifyCa;
+        assert!(matches!(d.connect(p).await, Err(DriverError::Tls(_))));
+        let mut p = base();
+        let mut cc = ninesql_driver_api::ClientCertificate::new("/c.pem", "/k.pem");
+        cc.key_passphrase = Some(ninesql_driver_api::Secret::new("kp".into()));
+        p.tls.client_certificate = Some(cc);
+        assert!(matches!(
+            d.connect(p).await,
+            Err(DriverError::InvalidParams(_))
+        ));
+    }
+
+    #[test]
+    fn connect_capabilities_match_the_driver() {
+        let c = postgres_capabilities(None).connect;
+        for (_, name) in ACCEPTED_PROPERTIES {
+            assert!(c.accepts_property(name), "{name}");
+        }
+        assert!(c.accepts_property("searchPath"));
+        assert!(!c.accepts_property("fetch_size"));
+        assert_eq!(c.auth, BTreeSet::from([AuthKind::Password]));
+        assert!(c.accepts_password_exchange(PasswordExchange::ScramOnly));
+        assert!(c.verify_ca_requires_ca_file);
+        assert!(c.client_certificates && !c.encrypted_client_keys);
     }
 }

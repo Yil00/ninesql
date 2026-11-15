@@ -9,6 +9,10 @@
 //!   opened with `SQLITE_OPEN_NOFOLLOW`, never as a URI; a regular file only; created only for
 //!   read-write sessions that ask for it. `Endpoint::InMemory` opens a private in-memory
 //!   database, refused for read-only sessions. No authentication, no TLS, no tunnel.
+//! - **DBeaver workspace files** (`ConnectParams::inside_dbeaver_workspace`, I4): always opened
+//!   read-only **and** immutable (`?mode=ro&immutable=1`), so SQLite creates no journal, `-wal`
+//!   or `-shm` file next to it; committed pages still in a `-wal` file (or a hot `-journal`)
+//!   are not visible, and the session says so in a notice.
 //! - **Read-only** (I3, [`ReadOnlyMechanism::OpenMode`], not liftable): `SQLITE_OPEN_READ_ONLY`,
 //!   `PRAGMA query_only = ON`, no attached databases, and an authorizer that denies every write,
 //!   `ATTACH` (so `VACUUM INTO`), temporary objects and non-reading pragmas while statements are
@@ -32,10 +36,11 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use ninesql_driver_api::{
-    Auth, CancelSupport, Capabilities, ConnectParams, Dialect, Driver, DriverError, DriverResult,
-    EditingCapabilities, Endpoint, EngineId, ExecOptions, ExecutionTracker, ExplainFormat,
-    IsolationLevel, MetadataCapabilities, ObjectKind, PropertyValue, ReadOnlyMechanism, Session,
-    Statement, TransactionCapabilities,
+    Auth, AuthKind, CancelSupport, Capabilities, ConnectCapabilities, ConnectParams, Dialect,
+    Driver, DriverError, DriverResult, EditingCapabilities, Endpoint, EngineId, ExecOptions,
+    ExecutionTracker, ExplainFormat, IsolationLevel, MetadataCapabilities, ObjectKind,
+    PasswordExchange, PropertyValue, ReadOnlyMechanism, Session, Statement,
+    TransactionCapabilities,
 };
 
 pub use dialect::{SqliteDialect, lexer_view};
@@ -191,6 +196,19 @@ fn capabilities_for(server_version: Option<&str>) -> Capabilities {
         .map(|k| (*k).to_owned())
         .collect();
     c.retains_secret_after_connect = false;
+    let mut connect = ConnectCapabilities::default();
+    connect.accepted_properties = Some(
+        ["busy_timeout", "cache_size", "foreign_keys"]
+            .iter()
+            .map(|k| (*k).to_owned())
+            .collect(),
+    );
+    // No authentication, no TLS: a local file.
+    connect.auth = BTreeSet::from([AuthKind::None]);
+    connect.password_exchanges = BTreeSet::from([PasswordExchange::Any]);
+    connect.client_certificates = false;
+    connect.encrypted_client_keys = false;
+    c.connect = connect;
     c
 }
 
@@ -281,8 +299,15 @@ impl Driver for SqliteDriver {
     async fn connect(&self, params: ConnectParams) -> DriverResult<Box<dyn Session>> {
         Self::check_engine(&params.engine)?;
         // Before touching the file system: properties, endpoint, credentials.
-        capabilities_for(None).check_properties(&params.properties)?;
+        let declared = capabilities_for(None);
+        declared.check_properties(&params.properties)?;
+        declared.connect.check_connect_params(&params)?;
         let (busy_timeout, pragmas) = accepted_properties(&params.properties)?;
+        let log_statements = params.may_log_statements();
+        // A file inside a DBeaver workspace is opened read-only and immutable, whatever the
+        // connection asks for: nothing is created or modified next to it (I4).
+        let dbeaver_file =
+            params.inside_dbeaver_workspace && matches!(params.endpoint, Endpoint::File { .. });
         let ConnectParams {
             endpoint,
             auth,
@@ -293,9 +318,9 @@ impl Driver for SqliteDriver {
             auto_commit,
             connect_timeout,
             init_statements,
-            production,
             ..
         } = params;
+        let read_only = read_only || dbeaver_file;
         if !matches!(auth, Auth::None) {
             // Dropped (zeroized) on return: SQLite has no authentication.
             return Err(DriverError::InvalidParams(
@@ -346,6 +371,7 @@ impl Driver for SqliteDriver {
         let shared = Arc::new(Shared::new(read_only, auto_commit));
         let options = OpenOptions {
             read_only,
+            immutable: dbeaver_file,
             busy_timeout,
             pragmas,
         };
@@ -373,7 +399,7 @@ impl Driver for SqliteDriver {
             },
             capabilities: capabilities_for(Some(&opened.version)),
             interrupt: opened.interrupt,
-            production,
+            log_statements,
             current_exec: Mutex::new(Arc::default()),
         };
         tracing::debug!(sqlite_version = %opened.version, read_only, "sqlite session opened");
