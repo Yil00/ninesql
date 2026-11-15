@@ -11,6 +11,9 @@
 //!    PRO master password, corruption) are detected and skipped.
 //! 4. [`mapping`]: turn both into an import model mirroring `ninesql-core`'s connection model,
 //!    with per-connection issues ([`report`]) and the secrets to move to `ninesql-secrets`.
+//!    JDBC driver properties and URL parameters are converted to the property names of the
+//!    NineSQL driver that serves the engine, or dropped with a report entry
+//!    ([`ImportedConnection::dropped_properties`]).
 //!
 //! [`import_project`] runs the whole pipeline for one project.
 //!

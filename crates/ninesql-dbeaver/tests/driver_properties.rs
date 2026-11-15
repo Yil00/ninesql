@@ -200,6 +200,11 @@ fn connector_j_time_zone_needs_force() {
             "{extra}"
         );
     }
+    // Connector/J 5.1 (DBeaver's `mysql5`) has no forceConnectionTimeZoneToSession.
+    let cfg = r#"{"host":"db.example.test","properties":{"serverTimezone":"UTC",
+        "forceConnectionTimeZoneToSession":"true"}}"#;
+    let c = only(&map(&one("mysql", "mysql5", cfg))).properties.clone();
+    assert!(c.is_empty());
     // LOCAL depends on the machine.
     let cfg = r#"{"host":"db.example.test","properties":{"connectionTimeZone":"LOCAL",
         "forceConnectionTimeZoneToSession":"true"}}"#;

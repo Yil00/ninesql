@@ -21,8 +21,9 @@ pub(crate) enum Rules {
     /// pgjdbc → `ninesql-driver-pgwire` (PostgreSQL, TimescaleDB, YugabyteDB, QuestDB).
     PgJdbc,
     /// MySQL Connector/J → `ninesql-driver-mysqlwire` (MySQL, TiDB). `mariadb`: the server is
-    /// MariaDB (`max_statement_time` instead of `max_execution_time`).
-    ConnectorJ { mariadb: bool },
+    /// MariaDB (`max_statement_time` instead of `max_execution_time`). `legacy`: DBeaver's
+    /// `mysql5` driver (Connector/J 5.1), which has no `forceConnectionTimeZoneToSession`.
+    ConnectorJ { mariadb: bool, legacy: bool },
     /// MariaDB Connector/J → `ninesql-driver-mysqlwire`. `mariadb` as above.
     MariaDbJ { mariadb: bool },
     /// xerial sqlite-jdbc → `ninesql-driver-sqlite`.
@@ -34,6 +35,7 @@ pub(crate) enum Rules {
 impl Rules {
     pub(crate) fn for_connection(engine: &EngineId, dbeaver_driver: &str) -> Self {
         let mariadb_driver = dbeaver_driver.eq_ignore_ascii_case("mariadb");
+        let legacy = dbeaver_driver.eq_ignore_ascii_case("mysql5");
         if *engine == EngineId::POSTGRESQL
             || *engine == EngineId::TIMESCALEDB
             || *engine == EngineId::YUGABYTEDB
@@ -44,13 +46,19 @@ impl Rules {
             if mariadb_driver {
                 Self::MariaDbJ { mariadb: false }
             } else {
-                Self::ConnectorJ { mariadb: false }
+                Self::ConnectorJ {
+                    mariadb: false,
+                    legacy,
+                }
             }
         } else if *engine == EngineId::MARIADB {
             if mariadb_driver {
                 Self::MariaDbJ { mariadb: true }
             } else {
-                Self::ConnectorJ { mariadb: true }
+                Self::ConnectorJ {
+                    mariadb: true,
+                    legacy,
+                }
             }
         } else if *engine == EngineId::SQLITE {
             Self::SqliteJdbc
@@ -66,11 +74,11 @@ impl Rules {
                 "search_path, TimeZone, statement_timeout, lock_timeout, work_mem, \
                  client_min_messages"
             }
-            Self::ConnectorJ { mariadb: false } | Self::MariaDbJ { mariadb: false } => {
+            Self::ConnectorJ { mariadb: false, .. } | Self::MariaDbJ { mariadb: false } => {
                 "time_zone, lock_wait_timeout, innodb_lock_wait_timeout, group_concat_max_len, \
                  max_execution_time"
             }
-            Self::ConnectorJ { mariadb: true } | Self::MariaDbJ { mariadb: true } => {
+            Self::ConnectorJ { mariadb: true, .. } | Self::MariaDbJ { mariadb: true } => {
                 "time_zone, lock_wait_timeout, innodb_lock_wait_timeout, group_concat_max_len, \
                  max_statement_time"
             }
@@ -93,10 +101,10 @@ impl Rules {
     fn targets(self) -> &'static [(&'static str, &'static str)] {
         match self {
             Self::PgJdbc => PG_TARGETS,
-            Self::ConnectorJ { mariadb: false } | Self::MariaDbJ { mariadb: false } => {
+            Self::ConnectorJ { mariadb: false, .. } | Self::MariaDbJ { mariadb: false } => {
                 MYSQL_TARGETS
             }
-            Self::ConnectorJ { mariadb: true } | Self::MariaDbJ { mariadb: true } => {
+            Self::ConnectorJ { mariadb: true, .. } | Self::MariaDbJ { mariadb: true } => {
                 MARIADB_TARGETS
             }
             Self::SqliteJdbc => SQLITE_TARGETS,
@@ -251,7 +259,8 @@ pub(crate) fn map(rules: Rules, path: &str, key: &str, value: &str) -> Option<Ve
             }
         }
         Rules::ConnectorJ { .. } | Rules::MariaDbJ { .. } => {
-            let cj = matches!(rules, Rules::ConnectorJ { .. });
+            // Connector/J 8 and later (`mysql8`, `tidb`): the time zone options below.
+            let cj = matches!(rules, Rules::ConnectorJ { legacy: false, .. });
             if key.eq_ignore_ascii_case("sessionVariables") {
                 session_variables(rules, path, value)
             } else if cj
@@ -727,7 +736,10 @@ mod tests {
             split_session_variables("a=1,b='x,y',c=f(1,2), ,d=\"q\""),
             ["a=1", "b='x,y'", "c=f(1,2)", "d=\"q\""]
         );
-        let rules = Rules::ConnectorJ { mariadb: false };
+        let rules = Rules::ConnectorJ {
+            mariadb: false,
+            legacy: false,
+        };
         let a = session_variables(
             rules,
             "p",
@@ -785,7 +797,17 @@ mod tests {
         );
         assert_eq!(
             Rules::for_connection(&EngineId::MYSQL, "mysql8"),
-            Rules::ConnectorJ { mariadb: false }
+            Rules::ConnectorJ {
+                mariadb: false,
+                legacy: false
+            }
+        );
+        assert_eq!(
+            Rules::for_connection(&EngineId::MYSQL, "mysql5"),
+            Rules::ConnectorJ {
+                mariadb: false,
+                legacy: true
+            }
         );
         assert_eq!(
             Rules::for_connection(&EngineId::TIMESCALEDB, "x"),

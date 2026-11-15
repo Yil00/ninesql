@@ -2,7 +2,7 @@
 
 Decision record: [ADR-0006](adr/0006-dbeaver-interoperability.md). Owner: `interop-engineer` (`crates/ninesql-dbeaver/`).
 
-> **Verification status.** The format notes below come from DBeaver Community's public source and documentation, checked against the P0-E fixtures: synthetic workspaces written by five DBeaver CE builds, 22.3.5 to 26.2.4 ([fixtures README](../crates/ninesql-dbeaver/tests/fixtures/README.md)). Items marked *verified* were confirmed on those fixtures. Items still marked *(to verify)* are not covered by them and must be confirmed before the importer relies on them. Do not "fix" the importer to match this page: fix this page to match the fixtures.
+> **Verification status.** The format notes below come from DBeaver Community's public source and documentation, checked against the P0-E fixtures: synthetic workspaces written by five DBeaver CE builds, 22.3.5 to 26.2.4 ([fixtures README](../crates/ninesql-dbeaver/tests/fixtures/README.md)). Items marked *verified* were confirmed on those fixtures. Items marked *(source)* were read in DBeaver CE's public source (`dbeaver/dbeaver`, branch `devel`, checked on 2026-11-15: the plugin descriptors `plugins/org.jkiss.dbeaver.ext.*/plugin.xml`, `DataSourceSerializerModern.java` and `RegistryConstants.java`) but no fixture covers them; the importer still reports them as not verified against a DBeaver-written workspace. Items still marked *(to verify)* are covered by neither and must be confirmed before the importer relies on them. Do not "fix" the importer to match this page: fix this page to match the fixtures.
 
 ## Where DBeaver keeps its data on Linux
 | Install | Default workspace |
@@ -29,8 +29,8 @@ Inside a workspace, each project is a folder (`General/` by default) with:
   - `provider` (e.g. `postgresql`, `mysql`, `sqlite`, `generic`) and `driver` (e.g. `postgres-jdbc`, `mysql8`, `mariaDB`) → NineSQL engine id (table below);
   - `name`, `folder`, `save-password`, `read-only`;
   - `configuration`: `host`, `port` (a string, verified), `database`, `server`, `url`, `configurationType` (`MANUAL` in the fixtures), `type` (connection type id), `auth-model`, `user` (when not in credentials), `bootstrap`, `provider-properties`, driver `properties`, `handlers`;
-  - `bootstrap` (verified): `defaultSchema`, `query` (array of init queries), `autocommit` (`false` for manual commit); default catalog and isolation keys *(to verify)*;
-  - `handlers` (verified for `ssh_tunnel`, `postgre_ssl`, `mysql_ssl`; proxy handlers *to verify*): each with `type` (`TUNNEL` / `CONFIG`), `enabled`, `save-password`, `properties`. Handler property values may be strings, integers or floats (`"22"`, `22`, `22.0`): the parser accepts all three;
+  - `bootstrap` (verified): `defaultSchema`, `query` (array of init queries), `autocommit` (`false` for manual commit). From the source *(source)*: `defaultCatalog` (string), `txnIsolation` (an integer, the JDBC isolation constant), `ignoreErrors` (boolean, written only when `true`) and a legacy `defaultObject`, which DBeaver reads only when `defaultSchema` is empty, as the name of another `bootstrap` key holding the schema. DBeaver writes `defaultCatalog` / `defaultSchema` only when not empty, and `autocommit` only when set;
+  - `handlers` (verified for `ssh_tunnel`, `postgre_ssl`, `mysql_ssl`; from the source *(source)*: the SOCKS proxy handler `socks_proxy` of type `proxy`, and ClickHouse's TLS handler `clickhouse-ssl` of type `config`, both without a fixture): each with `type` (`TUNNEL` / `CONFIG`), `enabled`, `save-password`, `properties`. Handler property values may be strings, integers or floats (`"22"`, `22`, `22.0`): the parser accepts all three;
   - `configuration.closeIdleConnection` appears in 23.x to 25.x only (verified).
 - Unknown keys are preserved in the parsed model's `extra` map and listed in the import report.
 
@@ -43,27 +43,27 @@ Inside a workspace, each project is a folder (`General/` by default) with:
 ## Engine mapping
 | DBeaver `provider` / `driver` (examples) | NineSQL engine id | Phase |
 |---|---|---|
-| `postgresql` / `postgres-jdbc` (verified) | `postgresql` | MVP |
+| `postgresql` / `postgres-jdbc` (verified); legacy `postgresql` / `postgresql` ("PostgreSQL (Old)", *source*) | `postgresql` | MVP |
 | `postgresql` / `postgres-timescale-jdbc` (verified) | `timescaledb` | MVP |
-| `postgresql` / `postgres-yugabytedb-jdbc` *(to verify: no fixture)* | `yugabytedb` | MVP |
-| `mysql` / `mysql8` (verified), `mysql5` | `mysql` | MVP |
+| `postgresql` / `postgres-yugabytedb-jdbc` *(source; no fixture)* | `yugabytedb` | MVP |
+| `mysql` / `mysql8` (verified), `mysql5` ("MySQL 5 (Legacy)", *source*) | `mysql` | MVP |
 | `mysql` / `mariaDB` (verified) | `mariadb` | MVP |
-| `generic` / `tidb` *(to verify)* | `tidb` | MVP |
-| `generic` / `questdb` *(to verify)* | `questdb` | MVP |
-| `sqlite` / `sqlite_jdbc` (verified) | `sqlite` | MVP |
-| `duckdb` *(to verify)* | `duckdb` | v0.2 |
-| `clickhouse` / `com_clickhouse` (verified); legacy `yandex_clickhouse` driver of older workspaces *(to verify: no fixture)* | `clickhouse` | v0.2 |
-| `generic` / `trino_jdbc` *(to verify)* | `trino` | v0.2 |
-| `jaybird` / `firebird` *(to verify)* | `firebird` | v0.2 |
-| Elasticsearch, OpenSearch (CE providers, enhanced in PRO) *(ids to verify)* | `elasticsearch`, `opensearch` | v0.4 |
-| InfluxDB (PRO provider) *(ids to verify)* | `influxdb` | v0.2 |
-| MongoDB, Redis, Cassandra, Neo4j (PRO providers) *(ids to verify)* | matching ids | v0.3 / v0.4 |
-| Oracle (`oracle` / `oracle_thin`, verified), SQL Server, DB2, Snowflake, … | — (imported disabled, ADR-0003) | after v1 |
+| `tidb` / `tidb` *(source: DBeaver's TiDB plugin, MySQL Connector/J; no fixture)*. `mysql` / `tidb` and `generic` / `tidb` are also accepted, though no DBeaver build is known to write them | `tidb` | MVP |
+| `generic` / `questdb` *(to verify: no DBeaver CE plugin descriptor checked declares QuestDB)* | `questdb` | MVP |
+| `sqlite` / `sqlite_jdbc` (verified); legacy `generic` / `sqlite_jdbc` *(source)* | `sqlite` | MVP |
+| `duckdb` / `duckdb_jdbc` *(source)*; legacy `generic` / `duckdb_jdbc` *(source)*. `duckdb` / `motherduck_jdbc` (MotherDuck, a cloud service, `jdbc:duckdb:md:`) is **not** mapped: imported disabled | `duckdb` | v0.2 |
+| `clickhouse` / `com_clickhouse` (verified); legacy `clickhouse` / `yandex_clickhouse` ("ClickHouse (Legacy)", *source*) | `clickhouse` | v0.2 |
+| `generic` / `trino_jdbc` *(source)* | `trino` | v0.2 |
+| `jaybird` / `jaybird` *(source)*; legacy `generic` / `firebird_jaybird` and `firebird_jaybird3` *(source)*. `jaybird` / `jaybird_embedded` (an embedded engine on a local file) is **not** mapped | `firebird` | v0.2 |
+| Elasticsearch: `elasticsearch` / `elastic_search_jdbc` *(source)*; Open Distro: `open-distro-elasticsearch` / `open_distro_elastic_search_jdbc` *(source)*; OpenSearch *(ids to verify)*. Imported disabled until the v0.4 drivers land | `elasticsearch`, `opensearch` | v0.4 |
+| InfluxDB (PRO provider) *(ids to verify: not in the CE source)* | `influxdb` | v0.2 |
+| MongoDB, Redis, Cassandra, Neo4j (PRO providers) *(ids to verify: not in the CE source)* | matching ids | v0.3 / v0.4 |
+| Oracle (`oracle` / `oracle_thin`, verified), SQL Server, DB2, Snowflake, … ; also other PostgreSQL- and MySQL-plugin drivers (Greenplum, CockroachDB, Redshift, NDB Cluster `mysql_ndb`, StarRocks, libSQL `sqlite` / `libsql_jdbc`…) | — (imported disabled, ADR-0003) | after v1 |
 
 Unknown provider / driver pairs are imported disabled with their raw values kept, never dropped.
 
 ## Field mapping rules
-- **JDBC URL**: when `url` is set and host / port are empty, parse the JDBC URL per engine (`jdbc:postgresql://host:port/db?params`, `jdbc:mysql://…`, `jdbc:sqlite:/path`). Parameters with a NineSQL equivalent (`sslmode`, `connectTimeout`, `currentSchema`…) are mapped; the others are kept in properties and reported.
+- **JDBC URL**: when `url` is set and host / port are empty, parse the JDBC URL per engine (`jdbc:postgresql://host:port/db?params`, `jdbc:mysql://…`, `jdbc:sqlite:/path`). Parameters go through the same rules as driver properties: TLS keys feed the TLS settings, and the rest is converted or dropped (see [Driver properties](#driver-properties)). A driver property wins over the same URL parameter.
 - **Connection types**: DBeaver's `dev`, `test`, `prod` map to NineSQL's Development, Test, Production; custom types (such as the fixtures' `staging`) are created with their color and flags.
 - **Connection ids** are generated by DBeaver (`<driver-id>-<hex>-<hex>`) and are kept as `origin.dbeaver_id` for idempotent re-import.
 - **SSH**: host, port, user, auth type (password / public key / agent), key path, saved passphrase, jump servers (`jumpServer<i>.*`, selected as DBeaver does, see [SSH jump servers](#ssh-jump-servers); their saved secrets are not imported and NineSQL asks for them). The host key is **not** trusted automatically: the first connection asks (ADR-0011). RSA key files cannot be used until RSA support is enabled ([ADR-0016](adr/0016-ssh-rsa-and-host-key-policies.md)); the import report flags them by file name (see [SSH key files](#ssh-key-files)).
@@ -114,6 +114,48 @@ DBeaver stores jump servers as `jumpServer<i>.<field>` properties of the `ssh_tu
 ### SSH key files
 NineSQL refuses RSA private key files ([ADR-0016](adr/0016-ssh-rsa-and-host-key-policies.md) §1.2). DBeaver stores no key type and the importer never reads key files, so the check is a heuristic on the file name (`SshKeyType` warning in the report, without the path): a name starting with `id_rsa` or containing an `rsa` word is flagged as RSA; a name that says neither RSA nor Ed25519 / ECDSA is flagged as unchecked; `id_ed25519*`, `id_ecdsa*` and names with an `ed25519` / `ecdsa` word are not flagged. A key named `id_ed25519` may still be RSA: `ninesql-ssh` then refuses it at the first connection.
 
+### Driver properties
+DBeaver passes its driver properties (`configuration.properties`) and JDBC URL parameters to a Java JDBC driver. NineSQL's drivers accept only a short allowlist of their own property names (`ConnectCapabilities::accepted_properties`, [docs/08](08-engine-capabilities.md)) and refuse any other key at connect, so the importer converts or drops every property (code: `crates/ninesql-dbeaver/src/properties.rs`). Order of the rules, for each property:
+1. TLS keys (`sslmode`, `useSSL`, `verifyServerCertificate`…) feed the TLS settings ([TLS](#tls)); `user` / `username` gives the user name when the credentials have none; `readOnly=true` sets the read-only flag.
+2. A key or value that looks like a secret is removed (`SecretRemoved`).
+3. A key the driver API reserves (`is_reserved_property`: endpoint, credentials, TLS, read-only, init SQL, multi-statements…) is dropped (`ReservedProperty`), except pgjdbc `options` and Connector/J `sessionVariables`, which embed several settings and are read setting by setting (below).
+4. For an engine a NineSQL driver family serves, the property is **converted** to that driver's property names (`PropertyMapped`, info) or **dropped** (`PropertyDropped`, warning). For any other engine (no NineSQL driver yet), it is kept as DBeaver stored it.
+
+Every dropped property is also listed in `ImportedConnection::dropped_properties` (DBeaver key path and reason: no equivalent, invalid value, reserved, looks like a secret). The report and the list name the key, and the setting name inside `options` / `sessionVariables` when it is a plain identifier (`configuration.properties.options.geqo`); never a value (I1). Values are checked as the NineSQL driver checks them, so a converted property is never refused at connect; a value the driver would refuse is dropped as invalid.
+
+Which JDBC driver's semantics apply depends on the DBeaver driver: `mariaDB` uses MariaDB Connector/J, `mysql8`, `mysql5` and `tidb` use MySQL Connector/J, the PostgreSQL-plugin drivers use pgjdbc, `sqlite_jdbc` uses xerial sqlite-jdbc. JDBC property names are matched ignoring ASCII case.
+
+**pgjdbc → pgwire** (PostgreSQL, TimescaleDB, YugabyteDB, QuestDB; pgwire accepts `search_path`, `TimeZone`, `statement_timeout`, `lock_timeout`, `work_mem`, `client_min_messages`):
+
+| JDBC property | NineSQL | Notes |
+|---|---|---|
+| `currentSchema` | `search_path` | pgjdbc sends it as the `search_path` startup parameter. Dropped if blank or if it lists `pg_catalog` after another schema (pgwire keeps `pg_catalog` first) |
+| `options` | one property per allowlisted `-c name=value`, `-cname=value` or `--name=value` setting | Split like the server does (whitespace, backslash escapes); names compared after normalization (`TimeZone` = `timezone`). `default_transaction_read_only=on` sets the read-only flag. Any other setting, and any word that is not a setting, is dropped. A dedicated property (`currentSchema`) wins over the same setting in `options`, as PostgreSQL applies the startup parameters after `options` |
+| anything else (`ApplicationName`, `connectTimeout`, `socketTimeout`, `prepareThreshold`, `defaultRowFetchSize`, `stringtype`, `tcpKeepAlive`, `targetServerType`…) | dropped | No pgwire equivalent. NineSQL applies its own connect timeout. A key named like a pgwire property (`statement_timeout`) is not a pgjdbc property: it had no effect in DBeaver and is dropped too |
+
+**MySQL Connector/J and MariaDB Connector/J → mysqlwire** (MySQL, MariaDB, TiDB; mysqlwire accepts `time_zone`, `lock_wait_timeout`, `innodb_lock_wait_timeout`, `group_concat_max_len`, and `max_execution_time` on MySQL / `max_statement_time` on MariaDB):
+
+| JDBC property | NineSQL | Notes |
+|---|---|---|
+| `sessionVariables` (both drivers) | one property per allowlisted `name=value` entry | Split on commas outside quotes and parentheses; a `@@`, `@@session.` or `session.` prefix is removed; values checked as mysqlwire checks them (digits for the integer variables, a decimal for `max_statement_time`, a non-empty text with its quotes removed for `time_zone`). The variable must exist on the connection's engine (`max_statement_time` is dropped on MySQL, `max_execution_time` on MariaDB). `transaction_read_only` / `tx_read_only` = on sets the read-only flag. Any other variable (`sql_mode`…) is dropped |
+| Connector/J 8 and later (`mysql8`, `tidb`): `connectionTimeZone` (or its alias `serverTimezone`) with `forceConnectionTimeZoneToSession=true` | `time_zone` | Only with that flag does Connector/J set the session time zone (Connector/J 5.1, DBeaver's `mysql5`, has no such flag: dropped); without it, the time zone only drives client-side date conversion and is dropped. `LOCAL` and `SERVER` depend on the machine or the server and are dropped. Wins over `time_zone` in `sessionVariables`. A time zone name the server does not know fails at connect, as it did in DBeaver |
+| MariaDB Connector/J `timezone` | dropped | Its effect on the session time zone differs between MariaDB Connector/J versions *(to verify)*; not converted |
+| anything else (`connectTimeout`, `socketTimeout`, `useCursorFetch`, `rewriteBatchedStatements`, `zeroDateTimeBehavior`, `tinyInt1isBit`…) | dropped | No mysqlwire equivalent (`characterEncoding`, `allowLoadLocalInfile`, `allowPublicKeyRetrieval`… are reserved, step 3) |
+
+**sqlite-jdbc → sqlite** (sqlite accepts `busy_timeout`, `cache_size`, `foreign_keys`):
+
+| JDBC property | NineSQL | Notes |
+|---|---|---|
+| `busy_timeout` | `busy_timeout` | Milliseconds, 0 to 600 000 |
+| `cache_size` | `cache_size` | Only the KiB form (a negative number, -1 to -1 048 576). A positive value is a page count, which depends on the file's page size: dropped |
+| `foreign_keys` | `foreign_keys` | `true` / `false` (also `on` / `off`, `1` / `0`, `yes` / `no`) |
+| anything else (`open_mode`, `date_class`, `enable_load_extension`, `journal_mode`, `synchronous`…) | dropped | No equivalent, or a setting the sqlite driver reserves |
+
+When the same NineSQL property is produced twice, a dedicated property wins over a setting embedded in `options` / `sessionVariables`, and between two of the same kind the driver property wins over the URL parameter; the loser is dropped with a report entry.
+
+### Default schema, catalog and auto-commit
+DBeaver's `bootstrap` values are exposed as they are in the mirror model, for the core to persist (P2-C): `ImportedConnection::default_schema` (`bootstrap.defaultSchema`), `default_catalog` (`bootstrap.defaultCatalog`), both trimmed, `None` when absent or blank, and `auto_commit` (`bootstrap.autocommit`: `Some(false)` manual commit, `Some(true)` auto-commit, `None` when DBeaver stored nothing and the connection type's default applies). Until the core model has fields for them, each value has a report entry saying it is not applied yet (`Unsupported`, keys `configuration.bootstrap.defaultSchema`, `.defaultCatalog`, `.autocommit`; the auto-commit entry only when the value differs from the connection type's default).
+
 ### Database files inside `DBeaverData`
 A file endpoint (SQLite and other file engines) is canonicalized. If it lies inside the DBeaver workspace, or inside the `DBeaverData` directory that contains it (or the parent of a workspace named `workspace6`), the connection is forced **read-only** with a warning (I4: NineSQL never modifies a file under a DBeaver directory). Drivers must honor that flag by opening the file read-only (P2-C follow-up).
 
@@ -139,6 +181,7 @@ Every `data-sources.json` key is either mapped, **ignored** (no report entry: no
 | `configuration.auth-properties` | unsupported | Authentication model properties |
 | `bootstrap.txnIsolation` | unsupported | No default isolation level yet |
 | `bootstrap.ignoreErrors` | unsupported | NineSQL stops at the first failing init statement |
+| `bootstrap.defaultObject` | unsupported | Legacy key; DBeaver reads it only when `defaultSchema` is empty, through an indirection NineSQL does not reproduce |
 | SSH `localHost`, `localPort` | unsupported | NineSQL binds `127.0.0.1` on an ephemeral port (ADR-0011) |
 | SSH `aliveInterval`, `aliveCount`, `sshConnectTimeout` | unsupported | SSH keep-alive and timeout settings are not imported |
 | SSH host-key bypass keys (containing `hostverif`, `stricthost` or `hostkey`) | unsupported | NineSQL always verifies host keys; the first connection asks (ADR-0011, I5) |
