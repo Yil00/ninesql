@@ -1,6 +1,6 @@
 # ADR-0006: DBeaver interoperability
 
-- **Status**: Accepted
+- **Status**: Accepted. Note (accepted by the maintainer, 2026-11-15) in [ADR-0020](0020-phase-1-driver-decisions.md) §8: a database file inside a DBeaver workspace is opened read-only, and by sqlite immutable, at the cost of pages held only in a `-wal` file or a hot journal (point 1, I4); the decision above is unchanged.
 - **Date**: 2026-11-14
 
 ## Context

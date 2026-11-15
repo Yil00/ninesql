@@ -1,6 +1,6 @@
 # ADR-0017: Workspace lock, rewrite-on-load and project identity
 
-- **Status**: Accepted (maintainer, 2026-11-14). Amends [ADR-0008](0008-workspace-and-config-storage.md) Decision §1 (a lock file in `$XDG_DATA_HOME/ninesql`, a stable id in `project.json`), §2 (contents of migration backups) and §3 (single writer); amends [ADR-0012](0012-secret-service-client-and-msrv.md) Decision §4 (two more item attributes). Every other point of both ADRs stands.
+- **Status**: Accepted (maintainer, 2026-11-14). Amends [ADR-0008](0008-workspace-and-config-storage.md) Decision §1 (a lock file in `$XDG_DATA_HOME/ninesql`, a stable id in `project.json`), §2 (contents of migration backups) and §3 (single writer); amends [ADR-0012](0012-secret-service-client-and-msrv.md) Decision §4 (two more item attributes). Every other point of both ADRs stands. Amended (`known_hosts` lock wait, accepted by the maintainer on 2026-11-15) by the [section at the end](#amendment-known_hosts-lock-wait-2026-11-15): a bounded 2 s retry of the non-blocking lock by `known_hosts` writers; opening the workspace is unchanged.
 - **Date**: 2026-11-14
 
 ## Context
@@ -58,3 +58,27 @@ The P0-D security review deferred several storage items to "before P1-D" ([ROADM
 - **Running unlocked on NFS with a warning**: silently reopens the two-writer problem the lock exists to prevent.
 - **Waiting for the next save to drop a plaintext secret**: leaves it on disk for an unbounded time.
 - **Keeping the project name as keyring scope and migrating items on rename**: a failed or interrupted migration loses secrets; a stable id avoids the migration.
+
+## Amendment (`known_hosts` lock wait, 2026-11-15)
+**Status: Accepted** (maintainer, 2026-11-15). It adds to Decision §1 and changes none of its points for the workspace itself. Raised by the P1-E review: `ninesql-ssh` does not follow the wording of §1. Behaviour as implemented: `crates/ninesql-ssh/src/known_hosts.rs` (`LOCK_WAIT`, `KnownHosts::lock_own`, `KnownHosts::add`) and [docs/02](../02-architecture.md).
+
+**Context.** §1.1 takes the workspace lock with an exclusive, **non-blocking** `flock(2)`, and §1.3 refuses a second process at once. Since phase 1, wave 3a, `ninesql-ssh` also takes this lock (`ninesql_storage::DirLock` on `ninesql.lock`, next to NineSQL's `known_hosts` in `$XDG_DATA_HOME/ninesql`) around every read-modify-write of NineSQL's `known_hosts`, so that two writers cannot drop each other's host keys (P1-D follow-up). A process that holds the workspace (the core keeps the lock for its whole lifetime) shares the lock it already has and never waits. A `KnownHosts` writer in a process **without** an open workspace (a tool, a test, a start-up path before the workspace opens) takes the lock for a few milliseconds only; failing at once when two such writers meet would turn a short overlap into an error.
+
+**Decision.**
+1. A `known_hosts` writer first takes a process-wide mutex (writers of one process are serialized), then the workspace lock.
+2. When another process holds the workspace lock, the writer **retries the same non-blocking `flock`** every 20 ms (`LOCK_RETRY`) for at most **2 s** (`LOCK_WAIT`), then fails with `SshError::KnownHosts`. It never makes a blocking `flock` call and never waits without a bound.
+3. The wait runs on a blocking thread, never on a Tokio worker or the GPUI foreground executor (I6).
+4. Against another NineSQL process with an open workspace, which holds the lock for its lifetime, the wait cannot succeed: the write fails after 2 s, as §1.3 requires. The retry only helps against holders that take the lock briefly.
+5. Every other use of the workspace lock keeps §1 unchanged: opening the workspace is refused at once when another process holds it.
+6. Under the lock, both `known_hosts` files (NineSQL's and the user's) are re-read before a key is added, and NineSQL's file is rewritten atomically with mode `0600`.
+
+**Consequences.**
+- Confirming a host key can take up to 2 s longer before failing when another process holds the lock.
+- Two short-lived writers without an open workspace no longer fail on each other's lock.
+- Test kept: the wait is bounded (`known_hosts.rs` checks that a write against a held lock fails after at least `LOCK_WAIT`).
+
+**Rejected alternatives.**
+- **Fail at once, as §1.3 does for the workspace**: a write from a process without an open workspace would fail on a lock held for a few milliseconds.
+- **A blocking `flock` with no bound**: a NineSQL process that holds the workspace for hours would hang the writer.
+- **A separate lock file for `known_hosts`**: a second lock to keep consistent with the workspace lock, for no gain; one lock guards every write under `$XDG_DATA_HOME/ninesql`.
+
