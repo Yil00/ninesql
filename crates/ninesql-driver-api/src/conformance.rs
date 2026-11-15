@@ -767,6 +767,10 @@ impl tracing::Subscriber for LogCapture {
 pub async fn assert_credential_statements_not_logged(driver: &dyn Driver, params: ConnectParams) {
     let capture = LogCapture::default();
     let _guard = tracing::subscriber::set_default(capture.clone());
+    // Other tests of the same binary may have hit the drivers' `trace!` callsites with no
+    // subscriber in scope, caching "never interested": recompute the interest now that this
+    // thread has one, so the capture sees every event.
+    tracing::callsite::rebuild_interest_cache();
     let mut p = params;
     p.log_statements = true;
     p.production = false;
