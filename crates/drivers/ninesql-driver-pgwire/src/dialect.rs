@@ -1,10 +1,23 @@
 //! PostgreSQL dialect: quoting, literals, `$n` placeholders, explain, and the lexical rules kept
 //! in sync with the session's `standard_conforming_strings` (docs/08, ADR-0004).
+//!
+//! Splitting follows psql on top of the shared lexer's tokens (P3-D):
+//! - `;` inside parentheses does not end a statement (`CREATE RULE … DO ALSO (DELETE …;
+//!   DELETE …)` is one statement);
+//! - a `CREATE [OR REPLACE] FUNCTION | PROCEDURE` whose SQL-standard body is `BEGIN ATOMIC …
+//!   END` (PostgreSQL 14+) is one statement: `;` inside the body does not split it (psql's
+//!   heuristic: `BEGIN` / `CASE` / `END` counted outside parentheses);
+//! - in [`split_script`](Dialect::split_script), `COPY … FROM STDIN` and its inline data block
+//!   (up to a `\.` line) are one refused item, so data lines are never read as SQL, and a psql
+//!   meta-command (a statement starting with `\`, to the end of its line) is refused too.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use ninesql_driver_api::{Dialect, ExplainFormat, LexicalRules, Param};
+use ninesql_driver_api::{
+    CodeToken, CodeTokenKind, Dialect, ExplainFormat, LexicalRules, Param, ScriptItem,
+    ScriptItemKind, ScriptRefusal, StatementSpan, code_tokens, script_items,
+};
 
 /// The PostgreSQL dialect.
 ///
@@ -30,6 +43,14 @@ impl PgDialect {
     pub fn new() -> Self {
         Self {
             standard_conforming_strings: Arc::new(AtomicBool::new(true)),
+        }
+    }
+
+    /// A dialect with a fixed `standard_conforming_strings` value (tests, offline splitting).
+    #[must_use]
+    pub fn with_standard_conforming_strings(on: bool) -> Self {
+        Self {
+            standard_conforming_strings: Arc::new(AtomicBool::new(on)),
         }
     }
 
@@ -76,6 +97,73 @@ impl Dialect for PgDialect {
         format!("${index}")
     }
 
+    fn split_statements(&self, script: &str) -> Vec<StatementSpan> {
+        split_psql(script, self.lexical_rules())
+    }
+
+    fn split_script(&self, script: &str) -> Vec<ScriptItem> {
+        let rules = self.lexical_rules();
+        let mut pieces = Vec::new();
+        let mut base = 0;
+        let mut window = SCRIPT_WINDOW;
+        'outer: while base < script.len() {
+            // Split a window of the rest. Every statement the window ends with a `;` is exactly
+            // what splitting the whole rest gives (the lexer reads left to right, and under
+            // PostgreSQL's rules no state crosses a statement boundary); the last one may be
+            // cut by the window and is split again with the next window. So each COPY block
+            // or meta-command costs one window, not a pass over the rest of the script.
+            let mut end = (base + window).min(script.len());
+            while !script.is_char_boundary(end) {
+                end += 1;
+            }
+            let complete = end == script.len();
+            let mut spans = split_psql(&script[base..end], rules);
+            // Where the next window starts: the first token of the statement the window may
+            // have cut (a token start of the whole text, so the lexer restarts in step).
+            let mut next = None;
+            if !complete {
+                next = spans.pop().map(|s| s.start + base);
+                if spans.is_empty() {
+                    window = window.saturating_mul(2);
+                    continue;
+                }
+            }
+            window = SCRIPT_WINDOW;
+            for span in spans {
+                let span = StatementSpan {
+                    start: span.start + base,
+                    end: span.end + base,
+                };
+                let text = span.text(script);
+                if text.starts_with('\\') {
+                    // psql meta-command: runs to the end of its line.
+                    let eol = line_end(script, span.start);
+                    pieces.push((
+                        trimmed(script, span.start, eol),
+                        ScriptItemKind::Refused(ScriptRefusal::PsqlMetaCommand),
+                    ));
+                    base = eol;
+                    continue 'outer;
+                }
+                if is_copy_from_stdin(text, rules) {
+                    let data_end = copy_data_end(script, span.end);
+                    pieces.push((
+                        trimmed(script, span.start, data_end),
+                        ScriptItemKind::Refused(ScriptRefusal::CopyFromStdin),
+                    ));
+                    base = data_end;
+                    continue 'outer;
+                }
+                pieces.push((span, ScriptItemKind::Statement));
+            }
+            match next {
+                Some(n) if !complete => base = n,
+                _ => break,
+            }
+        }
+        script_items(script, pieces)
+    }
+
     fn explain(&self, query: &str, format: ExplainFormat) -> Option<String> {
         let q = query.trim().trim_end_matches(';');
         Some(match format {
@@ -84,6 +172,131 @@ impl Dialect for PgDialect {
             ExplainFormat::Analyze => format!("EXPLAIN ANALYZE {q}"),
             _ => return None,
         })
+    }
+}
+
+/// Splits like psql (`psqlscan.l`): a `;` ends a statement only outside parentheses and
+/// outside a `BEGIN … END` block of a routine definition. A statement starting `CREATE [OR
+/// REPLACE] FUNCTION | PROCEDURE` counts, outside parentheses, `BEGIN` (opens a block), `CASE`
+/// (opens one inside a block) and `END` (closes one). The server parses each piece as one
+/// statement, and the extended protocol refuses anything else, so a heuristic mistake fails
+/// on the server instead of running a second statement. The classifier still splits on every
+/// `;`, so nothing a merged piece holds escapes it.
+fn split_psql(script: &str, rules: LexicalRules) -> Vec<StatementSpan> {
+    let mut spans = Vec::new();
+    let mut current: Option<StatementSpan> = None;
+    let mut paren = 0u32;
+    let mut begin = 0u32;
+    // First words of the current statement, lower-cased (psql keeps four).
+    let mut words: Vec<String> = Vec::new();
+    for t in code_tokens(script, rules) {
+        if t.kind == CodeTokenKind::Semicolon && paren == 0 && begin == 0 {
+            if let Some(s) = current.take() {
+                spans.push(s);
+            }
+            words.clear();
+            continue;
+        }
+        match current.as_mut() {
+            Some(s) => s.end = t.end,
+            None => {
+                current = Some(StatementSpan {
+                    start: t.start,
+                    end: t.end,
+                });
+            }
+        }
+        match t.kind {
+            CodeTokenKind::OpenParen => paren += 1,
+            CodeTokenKind::CloseParen => paren = paren.saturating_sub(1),
+            CodeTokenKind::Word => track_routine_blocks(script, &t, &mut words, paren, &mut begin),
+            _ => {}
+        }
+    }
+    if let Some(s) = current {
+        spans.push(s);
+    }
+    spans
+}
+
+fn track_routine_blocks(
+    script: &str,
+    t: &CodeToken,
+    words: &mut Vec<String>,
+    paren: u32,
+    begin: &mut u32,
+) {
+    if words.len() < 4 {
+        words.push(t.text(script).to_ascii_lowercase());
+    }
+    let w = |i: usize| words.get(i).map(String::as_str);
+    let routine = |x: Option<&str>| matches!(x, Some("function" | "procedure"));
+    let in_routine = w(0) == Some("create")
+        && (routine(w(1)) || (w(1) == Some("or") && w(2) == Some("replace") && routine(w(3))));
+    if !in_routine || paren > 0 {
+        return;
+    }
+    // `CASE` also ends with `END`: counted only inside a block.
+    if t.is_word(script, "begin") || (t.is_word(script, "case") && *begin >= 1) {
+        *begin += 1;
+    } else if t.is_word(script, "end") && *begin > 0 {
+        *begin -= 1;
+    }
+}
+
+/// Bytes of script split per step by [`PgDialect::split_script`] (doubled while no statement
+/// ends inside the window).
+const SCRIPT_WINDOW: usize = 64 * 1024;
+
+/// `COPY … FROM STDIN` (top-level `FROM` followed by `STDIN`).
+fn is_copy_from_stdin(text: &str, rules: LexicalRules) -> bool {
+    let toks = code_tokens(text, rules);
+    let mut depth = 0u32;
+    let mut top_level = Vec::new();
+    for t in &toks {
+        match t.kind {
+            CodeTokenKind::OpenParen => depth += 1,
+            CodeTokenKind::CloseParen => depth = depth.saturating_sub(1),
+            _ if depth == 0 => top_level.push(*t),
+            _ => {}
+        }
+    }
+    toks.first().is_some_and(|t| t.is_word(text, "copy"))
+        && top_level
+            .windows(2)
+            .any(|p| p[0].is_word(text, "from") && p[1].is_word(text, "stdin"))
+}
+
+/// End of the line holding `from` (the offset of its `\n`, or the end of the text).
+fn line_end(script: &str, from: usize) -> usize {
+    script[from..].find('\n').map_or(script.len(), |p| from + p)
+}
+
+/// End of the inline data of a `COPY … FROM STDIN` whose text ends at `stmt_end`: the data
+/// starts on the line after the terminating `;` and ends with a line holding only `\.` (psql);
+/// without one, it runs to the end of the script. Without a `;`, there is no data.
+fn copy_data_end(script: &str, stmt_end: usize) -> usize {
+    let Some(semi) = script[stmt_end..].find(';').map(|p| stmt_end + p) else {
+        return script.len();
+    };
+    let mut line_start = line_end(script, semi);
+    while line_start < script.len() {
+        line_start += 1; // past the `\n`
+        let end = line_end(script, line_start);
+        if script[line_start..end].trim_end_matches('\r') == "\\." {
+            return end;
+        }
+        line_start = end;
+    }
+    script.len()
+}
+
+/// `start..end` without trailing whitespace.
+fn trimmed(script: &str, start: usize, end: usize) -> StatementSpan {
+    let len = script[start..end].trim_end().len();
+    StatementSpan {
+        start,
+        end: start + len,
     }
 }
 

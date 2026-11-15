@@ -1338,3 +1338,69 @@ async fn verify_ca_needs_a_ca_file_and_notices_are_chunked() {
     .unwrap();
     assert_eq!(c.notices.len(), 3000);
 }
+
+/// Runs every item of `script` (P3-D): statements one per call, in order. Returns the results
+/// of the statements and the kinds of every item.
+async fn run_script(
+    s: &mut dyn Session,
+    script: &str,
+) -> (Vec<Collected>, Vec<ninesql_driver_api::ScriptItemKind>) {
+    let items = s.dialect().split_script(script);
+    let mut out = Vec::new();
+    for item in &items {
+        if item.kind == ninesql_driver_api::ScriptItemKind::Statement {
+            let text = item.text(script);
+            match run(s, text).await {
+                Ok(c) => out.push(c),
+                Err(e) => panic!("line {}: {text:?} failed: {e}", item.start.line),
+            }
+        }
+    }
+    (out, items.iter().map(|i| i.kind).collect())
+}
+
+/// The splitter agrees with PostgreSQL 18 on dollar quotes, `E''` strings, nested comments, a
+/// carriage return ending a line comment, `BEGIN ATOMIC` bodies, `;` inside a rule's
+/// parentheses, and `COPY … FROM STDIN` data that is never sent (P3-D, F-SQL-18).
+#[tokio::test]
+async fn scripts_split_as_postgres_parses_them() {
+    use ninesql_driver_api::{ScriptItemKind, ScriptRefusal};
+    let Some(dev) = dev() else { return };
+    let mut s = connect(&dev).await;
+    let script = "CREATE TEMP TABLE p3d_t (id int, a text);\n\
+        INSERT INTO p3d_t VALUES (1, E'it\\'s; ok'), (2, $q$semi;colon$q$), (3, 'back\\');\n\
+        /* nested /* comment ; */ still ; */ SELECT 1;\n\
+        CREATE FUNCTION pg_temp.p3d_f(x int) RETURNS int LANGUAGE sql\n\
+        BEGIN ATOMIC\n  SELECT CASE WHEN x > 0 THEN x ELSE 0 END;\nEND;\n\
+        CREATE FUNCTION pg_temp.p3d_g() RETURNS int LANGUAGE plpgsql AS $body$\n\
+        BEGIN RETURN 1; END;\n$body$;\n\
+        CREATE TEMP TABLE p3d_log (n int);\n\
+        CREATE RULE p3d_r AS ON INSERT TO p3d_t DO ALSO \
+        (INSERT INTO p3d_log VALUES (1); INSERT INTO p3d_log VALUES (2));\n\
+        SELECT 1 --x\r, 2;\n\
+        COPY p3d_t FROM STDIN;\n4\tDROP TABLE p3d_t;\n\\.\n\
+        INSERT INTO p3d_t VALUES (5, 'x');\n\
+        SELECT count(*) FROM p3d_log;\n\
+        SELECT a FROM p3d_t WHERE id = 1";
+    let (results, kinds) = run_script(s.as_mut(), script).await;
+    let statements = kinds
+        .iter()
+        .filter(|k| **k == ScriptItemKind::Statement)
+        .count();
+    assert_eq!(statements, 11, "{kinds:?}");
+    assert!(kinds.contains(&ScriptItemKind::Refused(ScriptRefusal::CopyFromStdin)));
+    // `--x\r` ended the comment: two columns.
+    assert_eq!(results[7].schema.as_ref().unwrap().fields().len(), 2);
+    // The rule's two inserts ran as one statement.
+    assert_eq!(scalar(&results[9]).as_deref(), Some("2"));
+    assert_eq!(scalar(&results[10]).as_deref(), Some("it's; ok"));
+    // The COPY data was never sent.
+    let c = run(s.as_mut(), "SELECT count(*) FROM p3d_t").await.unwrap();
+    assert_eq!(scalar(&c).as_deref(), Some("4"));
+    // The merged routine definition is one statement for the driver too.
+    let c = run(s.as_mut(), "SELECT pg_temp.p3d_f(7) + pg_temp.p3d_g()")
+        .await
+        .unwrap();
+    assert_eq!(scalar(&c).as_deref(), Some("8"));
+    s.close().await.unwrap();
+}

@@ -8,6 +8,15 @@
 //! into a backtick identifier of the same length before splitting or classifying, so both see
 //! the same token boundaries as the server.
 //!
+//! [`split_script`](Dialect::split_script) follows the mysql client's `DELIMITER` directive
+//! (P3-D): `DELIMITER //` at the start of a statement changes the statement terminator until
+//! the next `DELIMITER` (the directive runs to the end of its line and is never sent). With a
+//! custom delimiter, the text between two delimiters is split again with
+//! [`split_statements`](Dialect::split_statements), so a statement item is always one statement
+//! for the single-statement check. A stored-program definition or a MariaDB `BEGIN NOT ATOMIC
+//! … END` block is one statement in both. Other mysql client commands (a statement starting
+//! with `\`) are refused.
+//!
 //! Parameters ([`bind_params`]) are inlined client-side as literals that cannot leave their
 //! token whatever the session's modes: hexadecimal literals (`X'…'`, converted with `CONVERT(…
 //! USING utf8mb4)` for text), digits, `DATE` / `TIMESTAMP` literals. Placeholders are found with
@@ -20,7 +29,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use ninesql_driver_api::dialect::{classify_with_rules, split_with_rules};
 use ninesql_driver_api::{
     Dialect, DriverError, DriverResult, ExplainFormat, LexicalRules, Param, RowChange, RowEdit,
-    Statement, StatementClass, StatementSpan,
+    ScriptItem, ScriptItemKind, ScriptRefusal, Statement, StatementClass, StatementSpan,
+    script_items,
 };
 
 /// The session's lexical modes, shared between the session and its dialect.
@@ -77,6 +87,19 @@ impl MyDialect {
         Self {
             modes: Arc::default(),
             explain_analyze: false,
+        }
+    }
+
+    /// The same dialect with the lexical modes of an `@@sql_mode` value
+    /// (`NO_BACKSLASH_ESCAPES`, `ANSI_QUOTES`), not tied to any session (tests, offline
+    /// splitting).
+    #[must_use]
+    pub fn with_sql_mode(self, sql_mode: &str) -> Self {
+        let modes = Modes::default();
+        modes.set_sql_mode(sql_mode);
+        Self {
+            modes: Arc::new(modes),
+            explain_analyze: self.explain_analyze,
         }
     }
 
@@ -155,6 +178,10 @@ impl Dialect for MyDialect {
 
     fn classify(&self, text: &str) -> StatementClass {
         classify_with_rules(&self.normalized(text), self.lexical_rules())
+    }
+
+    fn split_script(&self, script: &str) -> Vec<ScriptItem> {
+        split_script_with_delimiters(self, script, self.scan_rules())
     }
 
     fn explain(&self, query: &str, format: ExplainFormat) -> Option<String> {
@@ -263,32 +290,46 @@ fn executable_opener(b: &[u8], i: usize) -> Option<usize> {
 /// Splits `text` into code, quoted and comment segments with MySQL's lexical rules (the same
 /// rules as `LexicalRules::MYSQL` of the shared lexer, plus `ANSI_QUOTES`).
 fn scan(text: &str, rules: ScanRules) -> Vec<Segment> {
-    let b = text.as_bytes();
     let mut out = Vec::new();
+    scan_with(text, rules, |seg| {
+        out.push(seg);
+        true
+    });
+    out
+}
+
+/// [`scan`], handing each segment to `f` in order and stopping as soon as `f` returns `false`.
+fn scan_with(text: &str, rules: ScanRules, mut f: impl FnMut(Segment) -> bool) {
+    let b = text.as_bytes();
     let mut i = 0;
     let mut code_start = 0;
     let mut in_exec = false;
-    let push = |out: &mut Vec<Segment>, code_start: &mut usize, kind, s, e| {
-        if *code_start < s {
-            out.push(Segment {
+    // Hands the code before `s`, then the segment `s..e`, to `f`; `false` stops the scan.
+    let mut push = |code_start: &mut usize, kind, s, e| -> bool {
+        if *code_start < s
+            && !f(Segment {
                 kind: Seg::Code,
                 start: *code_start,
                 end: s,
-            });
+            })
+        {
+            return false;
         }
-        out.push(Segment {
+        *code_start = e;
+        f(Segment {
             kind,
             start: s,
             end: e,
-        });
-        *code_start = e;
+        })
     };
     while i < b.len() {
         let c = b[i];
         let next = b.get(i + 1).copied();
         if in_exec && c == b'*' && next == Some(b'/') {
             in_exec = false;
-            push(&mut out, &mut code_start, Seg::Comment, i, i + 2);
+            if !push(&mut code_start, Seg::Comment, i, i + 2) {
+                return;
+            }
             i += 2;
         } else if c == b'#'
             || (c == b'-'
@@ -299,21 +340,27 @@ fn scan(text: &str, rules: ScanRules) -> Vec<Segment> {
                 .iter()
                 .position(|x| *x == b'\n')
                 .map_or(b.len(), |p| i + p);
-            push(&mut out, &mut code_start, Seg::Comment, i, e);
+            if !push(&mut code_start, Seg::Comment, i, e) {
+                return;
+            }
             i = e;
         } else if c == b'/' && next == Some(b'*') {
             if let Some(len) = executable_opener(b, i)
                 && !in_exec
             {
                 in_exec = true;
-                push(&mut out, &mut code_start, Seg::Comment, i, i + len);
+                if !push(&mut code_start, Seg::Comment, i, i + len) {
+                    return;
+                }
                 i += len;
                 continue;
             }
             let e = (i + 2..b.len().saturating_sub(1))
                 .find(|&j| b[j] == b'*' && b[j + 1] == b'/')
                 .map_or(b.len(), |j| j + 2);
-            push(&mut out, &mut code_start, Seg::Comment, i, e);
+            if !push(&mut code_start, Seg::Comment, i, e) {
+                return;
+            }
             i = e;
         } else if c == b'\'' || c == b'`' || c == b'"' {
             let ident_dq = c == b'"' && rules.ansi_quotes;
@@ -324,20 +371,21 @@ fn scan(text: &str, rules: ScanRules) -> Vec<Segment> {
             } else {
                 Seg::Quoted
             };
-            push(&mut out, &mut code_start, kind, i, e);
+            if !push(&mut code_start, kind, i, e) {
+                return;
+            }
             i = e;
         } else {
             i += 1;
         }
     }
     if code_start < b.len() {
-        out.push(Segment {
+        f(Segment {
             kind: Seg::Code,
             start: code_start,
             end: b.len(),
         });
     }
-    out
 }
 
 /// Upper-cased words of the code segments of `text` (outside strings, identifiers, comments).
@@ -357,8 +405,12 @@ fn code_words(text: &str, rules: ScanRules) -> Vec<String> {
     words
 }
 
-/// `CREATE … PROCEDURE | FUNCTION | TRIGGER | EVENT` with a `BEGIN` after it.
+/// `CREATE … PROCEDURE | FUNCTION | TRIGGER | EVENT` with a `BEGIN` after it, or a MariaDB
+/// anonymous block `BEGIN NOT ATOMIC …`.
 fn is_stored_program(words: &[String]) -> bool {
+    if words.len() >= 3 && words[0] == "BEGIN" && words[1] == "NOT" && words[2] == "ATOMIC" {
+        return true;
+    }
     if words.first().map(String::as_str) != Some("CREATE") {
         return false;
     }
@@ -409,6 +461,201 @@ fn merge_compound(text: &str, spans: Vec<StatementSpan>, rules: ScanRules) -> Ve
         i += 1;
     }
     out
+}
+
+// ---------------------------------------------------------------------------------------------
+// Scripts: the mysql client's DELIMITER
+
+/// Offset of the first byte at or after `p` that is not blank or inside a comment (`#`, `-- `,
+/// `/* */`; an executable comment `/*! … */` is code).
+fn skip_blanks(text: &str, mut p: usize) -> usize {
+    let b = text.as_bytes();
+    loop {
+        while p < b.len() && b[p].is_ascii_whitespace() {
+            p += 1;
+        }
+        let rest = &b[p..];
+        let dash = rest.starts_with(b"--") && rest.get(2).is_none_or(|x| *x <= b' ' || *x == 0x7f);
+        if rest.starts_with(b"#") || dash {
+            p = b[p..]
+                .iter()
+                .position(|x| *x == b'\n')
+                .map_or(b.len(), |q| p + q);
+        } else if rest.starts_with(b"/*") && executable_opener(b, p).is_none() {
+            p = (p + 2..b.len().saturating_sub(1))
+                .find(|&j| b[j] == b'*' && b[j + 1] == b'/')
+                .map_or(b.len(), |j| j + 2);
+        } else {
+            return p;
+        }
+    }
+}
+
+/// End of the line holding `from` (its `\n`, or the end of the text).
+fn line_end(text: &str, from: usize) -> usize {
+    text[from..].find('\n').map_or(text.len(), |q| from + q)
+}
+
+/// `start..end` without trailing whitespace.
+fn trimmed(text: &str, start: usize, end: usize) -> StatementSpan {
+    StatementSpan {
+        start,
+        end: start + text[start..end].trim_end().len(),
+    }
+}
+
+/// When a `DELIMITER` directive starts at `p`: the end of its line and the new delimiter
+/// (`None` when it is missing or refused).
+fn delimiter_directive(text: &str, p: usize) -> Option<(usize, Option<String>)> {
+    const WORD: &str = "delimiter";
+    let rest = text.get(p..)?;
+    let head = rest.get(..WORD.len())?;
+    if !head.eq_ignore_ascii_case(WORD) {
+        return None;
+    }
+    let after = rest.as_bytes().get(WORD.len()).copied();
+    if after.is_some_and(|c| !(c == b' ' || c == b'\t' || c == b'\r' || c == b'\n')) {
+        return None; // `delimiters`, `delimiter_x`: not the directive
+    }
+    let end = line_end(text, p);
+    let arg = text[p + WORD.len()..end].trim();
+    // The mysql client takes the first word (or a quoted string, which NineSQL refuses).
+    let delim = arg.split_whitespace().next().unwrap_or("");
+    let refused = delim.is_empty()
+        || delim.contains(['\\', '\'', '"', '`'])
+        || delim.starts_with('#')
+        || delim.starts_with("--")
+        || delim.contains("/*");
+    Some((end, (!refused).then(|| delim.to_owned())))
+}
+
+/// Offset of the first occurrence of `delim` (ASCII case-insensitive) in code at or after
+/// `from`: outside strings, quoted identifiers, comments and executable comments.
+fn find_delimiter(text: &str, from: usize, delim: &str, rules: ScanRules) -> Option<usize> {
+    let rest = &text[from..];
+    let mut in_exec = false;
+    let mut found = None;
+    // Stops at the first match: a script under a custom delimiter is scanned once.
+    scan_with(rest, rules, |seg| {
+        let raw = &rest[seg.start..seg.end];
+        if seg.kind == Seg::Comment {
+            if executable_opener(raw.as_bytes(), 0).is_some() && !raw.ends_with("*/") {
+                in_exec = true;
+            } else if in_exec && raw == "*/" {
+                in_exec = false;
+            }
+        }
+        // Inside an executable comment the delimiter does not end the statement.
+        if seg.kind != Seg::Code || in_exec {
+            return true;
+        }
+        let code = &rest.as_bytes()[seg.start..seg.end];
+        let d = delim.as_bytes();
+        match code
+            .windows(d.len())
+            .position(|w| w.eq_ignore_ascii_case(d))
+        {
+            Some(q) => {
+                found = Some(from + seg.start + q);
+                false
+            }
+            None => true,
+        }
+    });
+    found
+}
+
+/// Bytes of script split per step in the default-delimiter mode (doubled while no statement
+/// ends inside the window).
+const SCRIPT_WINDOW: usize = 64 * 1024;
+
+fn split_script_with_delimiters(d: &MyDialect, script: &str, rules: ScanRules) -> Vec<ScriptItem> {
+    let mut pieces: Vec<(StatementSpan, ScriptItemKind)> = Vec::new();
+    let mut delim: Option<String> = None; // `None`: the default `;`
+    let mut base = 0;
+    let mut window = SCRIPT_WINDOW;
+    let shifted = |s: StatementSpan, by: usize| StatementSpan {
+        start: s.start + by,
+        end: s.end + by,
+    };
+    'outer: loop {
+        let p = skip_blanks(script, base);
+        if p >= script.len() {
+            break;
+        }
+        if let Some((end, new)) = delimiter_directive(script, p) {
+            let kind = match new {
+                Some(n) => {
+                    delim = (n != ";").then_some(n);
+                    ScriptItemKind::ClientDirective
+                }
+                None => ScriptItemKind::Refused(ScriptRefusal::InvalidDelimiter),
+            };
+            pieces.push((trimmed(script, p, end), kind));
+            base = end;
+            continue;
+        }
+        if script.as_bytes()[p] == b'\\' {
+            let end = line_end(script, p);
+            pieces.push((
+                trimmed(script, p, end),
+                ScriptItemKind::Refused(ScriptRefusal::MysqlClientCommand),
+            ));
+            base = end;
+            continue;
+        }
+        match &delim {
+            Some(dl) => {
+                let end = find_delimiter(script, p, dl, rules).unwrap_or(script.len());
+                for s in d.split_statements(&script[p..end]) {
+                    pieces.push((shifted(s, p), ScriptItemKind::Statement));
+                }
+                base = (end + dl.len()).min(script.len());
+                if end >= script.len() {
+                    break;
+                }
+            }
+            None => {
+                // Split a window of the rest: the statements it ends with a `;` are those of
+                // the whole rest; the last one may be cut and is split again from its first
+                // token (so a script with many `DELIMITER` blocks is not re-split to its end
+                // after each). A `;` inside an executable comment is the one exception: the
+                // piece after it is lexed again without that context, which can only split it
+                // further (and the driver refuses a piece holding several statements).
+                let mut end = (p + window).min(script.len());
+                while !script.is_char_boundary(end) {
+                    end += 1;
+                }
+                let complete = end == script.len();
+                let mut spans = d.split_statements(&script[p..end]);
+                let mut next = None;
+                if !complete {
+                    next = spans.pop().map(|s| s.start + p);
+                    if spans.is_empty() {
+                        window = window.saturating_mul(2);
+                        continue;
+                    }
+                }
+                window = SCRIPT_WINDOW;
+                for s in spans {
+                    let s = shifted(s, p);
+                    let first = s.start;
+                    if delimiter_directive(script, first).is_some()
+                        || script.as_bytes()[first] == b'\\'
+                    {
+                        base = first;
+                        continue 'outer;
+                    }
+                    pieces.push((s, ScriptItemKind::Statement));
+                }
+                match next {
+                    Some(n) => base = n,
+                    None => break,
+                }
+            }
+        }
+    }
+    script_items(script, pieces)
 }
 
 // ---------------------------------------------------------------------------------------------
