@@ -23,7 +23,8 @@ use crate::connections::engines::tls_label;
 pub const INIT_SQL_NOTE: &str = "will ask for confirmation on first connect";
 
 /// Shown with the "accept the imported TLS settings" toggle (I5).
-pub const TLS_ACCEPT_WARNING: &str = "The imported TLS settings are weaker than, or differ from, the ones saved in NineSQL. Accept them only if you know the server needs them: a weaker mode lets a man in the middle read or change the traffic.";
+/// Shown before and after the box is ticked.
+pub const TLS_ACCEPT_WARNING: &str = "The imported TLS settings are weaker than, or differ from, the ones saved in NineSQL. Accept them only if you know the server needs them: a weaker mode lets a man in the middle read or change the traffic, and a different CA file lets whoever holds that CA impersonate the server.";
 
 /// Shown when a route reason must be confirmed before enabling.
 pub const ROUTE_CONFIRMATION: &str =
@@ -332,6 +333,9 @@ pub struct ConnectionRow {
     pub init_sql: usize,
     /// Differences of an update.
     pub diff: Option<DiffView>,
+    /// TLS settings of a new connection over the network (`Create` rows only; an update shows
+    /// its TLS change in [`DiffView::tls`]).
+    pub create_tls: Option<RowTls>,
     /// Report entries.
     pub issues: Vec<IssueRow>,
     /// The user can leave it out.
@@ -365,6 +369,13 @@ impl ConnectionRow {
             PlanAction::Update { diff, .. } => Some(DiffView::of(diff, types)),
             _ => None,
         };
+        let create_tls = c
+            .filter(|_| kind == RowKind::Create)
+            .filter(|c| c.endpoint.is_network())
+            .map(|c| RowTls {
+                text: tls_text(&(c.tls.mode, c.tls.ca_file.clone())),
+                weak: c.tls.mode != TlsMode::VerifyFull,
+            });
         Self {
             dbeaver_id: plan.dbeaver_id.clone(),
             name: plan.name.clone(),
@@ -384,6 +395,7 @@ impl ConnectionRow {
                 .collect(),
             init_sql: c.map_or(0, |c| c.init_sql.len()),
             diff,
+            create_tls,
             issues: plan.issues.iter().map(IssueRow::of).collect(),
             skippable: kind != RowKind::NotImported,
             testable: c.is_some_and(|c| c.enabled) && kind != RowKind::NotImported,
@@ -398,6 +410,15 @@ impl ConnectionRow {
             .and_then(|d| d.tls.as_ref())
             .is_some_and(|t| t.kept_saved)
     }
+}
+
+/// TLS settings of a new connection, as shown on its row.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RowTls {
+    /// Mode, and CA file if any.
+    pub text: String,
+    /// Weaker than verify-full (shown in the warning colour, I5).
+    pub weak: bool,
 }
 
 /// One DBeaver project.

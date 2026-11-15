@@ -692,6 +692,11 @@ impl ConnectionHub {
     /// replaced by `ImportOutcome::connections` (the list as written) and the connection types
     /// are read again, so the hub never keeps a stale list that a later save would write back
     /// (P2-C review, L-d). The returned outcome's `connections` is empty (moved into the hub).
+    ///
+    /// The work runs in a detached task owned by the hub, not by the caller: dropping the
+    /// returned task only drops the answer. The hub still takes the list as written and resets
+    /// its "importing" state, so saves are never refused for the rest of the session (P2-D
+    /// review, L2b).
     pub fn apply_import(
         &mut self,
         preview: ImportPreview,
@@ -711,6 +716,7 @@ impl ConnectionHub {
         let reply = core.apply_import(preview, choices);
         self.importing = true;
         cx.notify();
+        let (tx, rx) = local_oneshot::<Result<ImportOutcome, ImportError>>();
         cx.spawn(async move |this, cx| {
             let result = reply
                 .await
@@ -732,23 +738,32 @@ impl ConnectionHub {
                 }
                 Err(_) => None,
             };
-            this.update(cx, |hub, cx| {
-                hub.importing = false;
-                let out = result.map(|mut outcome| {
-                    hub.connections = std::mem::take(&mut outcome.connections);
-                    match types {
-                        Some(Ok(t)) => hub.types = t,
-                        Some(Err(e)) => hub.problems.push(format!(
-                            "Cannot read the connection types after the import ({e}): restart NineSQL to see them."
-                        )),
-                        None => {}
-                    }
-                    outcome
+            let out = this
+                .update(cx, |hub, cx| {
+                    hub.importing = false;
+                    let out = result.map(|mut outcome| {
+                        hub.connections = std::mem::take(&mut outcome.connections);
+                        match types {
+                            Some(Ok(t)) => hub.types = t,
+                            Some(Err(e)) => hub.problems.push(format!(
+                                "Cannot read the connection types after the import ({e}): restart NineSQL to see them."
+                            )),
+                            None => {}
+                        }
+                        outcome
+                    });
+                    cx.notify();
+                    out
+                })
+                .unwrap_or_else(|_| {
+                    Err(ImportError::Runtime("the application is closing".to_owned()))
                 });
-                cx.notify();
-                out
-            })
-            .unwrap_or_else(|_| Err(ImportError::Runtime("the application is closing".to_owned())))
+            tx.send(out);
+        })
+        .detach();
+        cx.spawn(async move |_, _| {
+            rx.await
+                .unwrap_or_else(|| Err(ImportError::Runtime("the import stopped".to_owned())))
         })
     }
 
@@ -981,4 +996,65 @@ pub fn registry_with(drivers: Vec<Arc<dyn ninesql_core::driver_api::Driver>>) ->
         r.register(d);
     }
     r
+}
+
+/// A single-threaded one-shot channel: the detached import task answers the caller's task
+/// through it (both run on the foreground executor). The receiver yields `None` when the
+/// sender is dropped without answering.
+fn local_oneshot<T>() -> (LocalSender<T>, LocalReceiver<T>) {
+    let slot = std::rc::Rc::new(std::cell::RefCell::new(LocalSlot {
+        value: None,
+        closed: false,
+        waker: None,
+    }));
+    (LocalSender(slot.clone()), LocalReceiver(slot))
+}
+
+struct LocalSlot<T> {
+    value: Option<T>,
+    closed: bool,
+    waker: Option<std::task::Waker>,
+}
+
+struct LocalSender<T>(std::rc::Rc<std::cell::RefCell<LocalSlot<T>>>);
+
+impl<T> LocalSender<T> {
+    fn send(self, value: T) {
+        self.0.borrow_mut().value = Some(value);
+        // `Drop` marks the slot closed and wakes the receiver.
+    }
+}
+
+impl<T> Drop for LocalSender<T> {
+    fn drop(&mut self) {
+        let waker = {
+            let mut slot = self.0.borrow_mut();
+            slot.closed = true;
+            slot.waker.take()
+        };
+        if let Some(w) = waker {
+            w.wake();
+        }
+    }
+}
+
+struct LocalReceiver<T>(std::rc::Rc<std::cell::RefCell<LocalSlot<T>>>);
+
+impl<T> std::future::Future for LocalReceiver<T> {
+    type Output = Option<T>;
+
+    fn poll(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<T>> {
+        let mut slot = self.0.borrow_mut();
+        if let Some(v) = slot.value.take() {
+            return std::task::Poll::Ready(Some(v));
+        }
+        if slot.closed {
+            return std::task::Poll::Ready(None);
+        }
+        slot.waker = Some(cx.waker().clone());
+        std::task::Poll::Pending
+    }
 }
