@@ -39,8 +39,8 @@ pub mod secret;
 pub mod statement;
 
 pub use capabilities::{
-    CancelSupport, Capabilities, EditingCapabilities, ExplainFormat, Feature, IsolationLevel,
-    MetadataCapabilities, ObjectKind, QueryLanguage, ReadOnlyMechanism, ResultKind,
+    CancelSupport, Capabilities, ConnectCapabilities, EditingCapabilities, ExplainFormat, Feature,
+    IsolationLevel, MetadataCapabilities, ObjectKind, QueryLanguage, ReadOnlyMechanism, ResultKind,
     TransactionCapabilities,
 };
 pub use dialect::{
@@ -55,9 +55,9 @@ pub use metadata::{
     TableInfo, escape_like,
 };
 pub use params::{
-    Auth, ClientCertificate, ConnectParams, Endpoint, EngineId, HostKeyVerification, PropertyValue,
-    ProxyInfo, ProxyKind, SecurityWarning, SshHop, TlsConfig, TlsMode, TunnelInfo,
-    check_properties, is_reserved_property,
+    Auth, AuthKind, ClientCertificate, ConnectParams, Endpoint, EngineId, HostKeyVerification,
+    PasswordExchange, PropertyValue, ProxyInfo, ProxyKind, SecurityWarning, SshHop, TlsConfig,
+    TlsMode, TunnelInfo, check_properties, is_reserved_property,
 };
 pub use result::{
     CancelHandle, DocValue, Document, ENGINE_TYPE_METADATA_KEY, MAX_DOCUMENT_DEPTH, NoServerCancel,

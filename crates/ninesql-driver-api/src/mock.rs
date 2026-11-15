@@ -47,8 +47,8 @@ use arrow_array::{ArrayRef, Int64Array, RecordBatch, StringArray};
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
 
 use crate::capabilities::{
-    CancelSupport, Capabilities, EditingCapabilities, ExplainFormat, Feature, IsolationLevel,
-    MetadataCapabilities, ObjectKind, QueryLanguage, ReadOnlyMechanism, ResultKind,
+    CancelSupport, Capabilities, ConnectCapabilities, EditingCapabilities, ExplainFormat, Feature,
+    IsolationLevel, MetadataCapabilities, ObjectKind, QueryLanguage, ReadOnlyMechanism, ResultKind,
     TransactionCapabilities,
 };
 use crate::dialect::{AnsiDialect, Dialect, StatementClass, ensure_single_statement};
@@ -58,7 +58,7 @@ use crate::execution::{ExecutionGuard, ExecutionTracker};
 use crate::metadata::{
     ColumnInfo, Metadata, ObjectDetails, ObjectInfo, ObjectPath, Page, PageRequest, TableInfo,
 };
-use crate::params::{Auth, ConnectParams, Endpoint, EngineId, TlsMode};
+use crate::params::{Auth, AuthKind, ConnectParams, Endpoint, EngineId, PasswordExchange, TlsMode};
 use crate::result::{
     CancelHandle, DocValue, Document, Notice, NoticeSeverity, RawResultStream, ResultItem,
     ResultSetHeader, ResultSetKind, ResultStream, TRUNCATED_VALUES_METADATA_KEY,
@@ -175,6 +175,19 @@ pub fn full_capabilities() -> Capabilities {
         parameters: true,
         extra_reserved_properties: BTreeSet::from([MOCK_RESERVED_PROPERTY.to_owned()]),
         retains_secret_after_connect: false,
+        connect: ConnectCapabilities {
+            // Any key that is not reserved.
+            accepted_properties: None,
+            auth: BTreeSet::from([AuthKind::None, AuthKind::Password, AuthKind::Token]),
+            // The mock has no real exchange: it declares the policy so UI tests see it.
+            password_exchanges: BTreeSet::from([
+                PasswordExchange::Any,
+                PasswordExchange::ScramOnly,
+            ]),
+            verify_ca_requires_ca_file: true,
+            client_certificates: true,
+            encrypted_client_keys: true,
+        },
     }
 }
 
@@ -304,6 +317,7 @@ impl Driver for MockDriver {
     async fn connect(&self, params: ConnectParams) -> DriverResult<Box<dyn Session>> {
         Self::check_engine(&params.engine)?;
         self.capabilities.check_properties(&params.properties)?;
+        self.capabilities.connect.check_connect_params(&params)?;
         if let Endpoint::Tcp { host, .. } = &params.endpoint
             && host == MOCK_SELF_SIGNED_HOST
         {

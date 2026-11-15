@@ -87,6 +87,9 @@ pub const POSTGRES_ACCESS_MODE_WRITES: &[&str] = &[
     "RESET default_transaction_read_only",
     "SELECT set_config('default_transaction_read_only', 'off', false)",
     "BEGIN READ WRITE",
+    "SET TRANSACTION ISOLATION LEVEL READ COMMITTED, READ WRITE",
+    "SET SESSION CHARACTERISTICS AS TRANSACTION ISOLATION LEVEL READ COMMITTED, READ WRITE",
+    "SET TRANSACTION READ ONLY, READ WRITE",
 ];
 
 /// MySQL-family statements that try to lift a read-only session or change lexical modes.
@@ -97,6 +100,9 @@ pub const MYSQL_ACCESS_MODE_WRITES: &[&str] = &[
     "SET `transaction_read_only` = 0",
     "START TRANSACTION READ WRITE",
     "SET sql_mode = 'NO_BACKSLASH_ESCAPES'",
+    "SET TRANSACTION ISOLATION LEVEL READ COMMITTED, READ WRITE",
+    "SET SESSION TRANSACTION ISOLATION LEVEL READ COMMITTED, READ WRITE",
+    "SET SESSION TRANSACTION READ ONLY, READ WRITE",
 ];
 
 /// SQLite statements that try to lift a read-only session.
@@ -133,6 +139,9 @@ fn clone_params(p: &ConnectParams) -> ConnectParams {
     out.auto_commit = p.auto_commit;
     out.connect_timeout = p.connect_timeout;
     out.production = p.production;
+    out.log_statements = p.log_statements;
+    out.password_exchange = p.password_exchange;
+    out.inside_dbeaver_workspace = p.inside_dbeaver_workspace;
     out
 }
 

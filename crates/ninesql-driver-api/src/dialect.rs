@@ -966,7 +966,11 @@ fn classify_by_keyword(first: &str, items: &[Located]) -> StatementClass {
             }
         }
         "WITH" => {
-            if ["INSERT", "UPDATE", "DELETE", "MERGE"]
+            if !with_main_statement_found(items) {
+                // Unbalanced or unterminated text, or a main statement the classifier cannot
+                // see (P1-B sqlite review): never a mere read.
+                StatementClass::Unknown
+            } else if ["INSERT", "UPDATE", "DELETE", "MERGE"]
                 .iter()
                 .any(|w| has_word(items, w))
             {
@@ -1008,10 +1012,63 @@ fn classify_by_keyword(first: &str, items: &[Located]) -> StatementClass {
     }
 }
 
+/// Keywords that start the main statement of a `WITH`.
+const WITH_MAIN_KEYWORDS: &[&str] = &[
+    "SELECT", "VALUES", "TABLE", "INSERT", "UPDATE", "DELETE", "MERGE", "REPLACE", "UPSERT",
+];
+
+/// `true` when the `WITH` statement starting at `items[0]` has balanced parentheses and a main
+/// statement keyword at the `WITH`'s own depth, i.e. outside every CTE body. The CTE list
+/// (`name [(columns)] AS [NOT] [MATERIALIZED] (…)`, PostgreSQL's `SEARCH` / `CYCLE` clauses)
+/// holds none of these keywords at that depth.
+///
+/// A main statement written in parentheses (`WITH c AS (…) (SELECT …)`) is not found either:
+/// it classifies as [`StatementClass::Unknown`], which only asks for confirmation.
+fn with_main_statement_found(items: &[Located]) -> bool {
+    let Some(base) = items.first().map(|l| l.depth) else {
+        return false;
+    };
+    // `items` may start after opening parentheses (`(WITH …)`): they count as open.
+    let mut depth = i64::from(base);
+    for l in items {
+        match l.item {
+            Item::Punct(b'(') => depth += 1,
+            Item::Punct(b')') => {
+                depth -= 1;
+                if depth < 0 {
+                    return false;
+                }
+            }
+            _ => {}
+        }
+    }
+    if depth != 0 {
+        return false;
+    }
+    items
+        .iter()
+        .skip(1)
+        .any(|l| l.depth == base && word(l).is_some_and(|w| WITH_MAIN_KEYWORDS.contains(&w)))
+}
+
+/// `true` when a `SET` (after its scope modifiers) targets `TRANSACTION`: `SET [SESSION | LOCAL]
+/// TRANSACTION <mode> [, <mode>]…`.
+fn is_set_transaction(rest: &[Located]) -> bool {
+    rest.iter()
+        .find(|l| !matches!(word(l), Some("SESSION" | "LOCAL")))
+        .and_then(name)
+        .is_some_and(|n| n == "transaction")
+}
+
 /// `SET` / `RESET`: every assignment must target an allowlisted setting.
 fn classify_set(first: &str, rest: &[Located]) -> StatementClass {
     if rest.is_empty() {
         return StatementClass::Unknown;
+    }
+    if first == "SET" && is_set_transaction(rest) && has_word(rest, "WRITE") {
+        // Every comma segment is a transaction mode (`SET TRANSACTION ISOLATION LEVEL READ
+        // COMMITTED, READ WRITE`): `READ WRITE` in any of them lifts read-only (P1-B review).
+        return StatementClass::ChangesAccessMode;
     }
     let segments = rest.split(|l| l.depth == 0 && l.item == Item::Punct(b','));
     let mut class = StatementClass::Session;
@@ -1923,6 +1980,137 @@ mod tests {
             let toks = lex(&lit, rules).toks;
             prop_assert_eq!(toks.len(), 1);
             prop_assert_eq!(toks[0].end, lit.len());
+        }
+    }
+
+    /// P1-B review: `SET [SESSION | LOCAL] TRANSACTION` is classified from every comma segment.
+    #[test]
+    fn set_transaction_comma_forms() {
+        use StatementClass as C;
+        for rules in [
+            LexicalRules::ANSI,
+            LexicalRules::POSTGRES,
+            LexicalRules::MYSQL,
+            LexicalRules::SQLITE,
+        ] {
+            for sql in [
+                "SET TRANSACTION ISOLATION LEVEL READ COMMITTED, READ WRITE",
+                "SET SESSION TRANSACTION ISOLATION LEVEL READ COMMITTED, READ WRITE",
+                "SET LOCAL TRANSACTION ISOLATION LEVEL SERIALIZABLE, READ WRITE",
+                "set session transaction read only, isolation level serializable, read write",
+                "SET TRANSACTION READ WRITE, ISOLATION LEVEL REPEATABLE READ",
+                "SET TRANSACTION ISOLATION LEVEL SERIALIZABLE, READ WRITE, DEFERRABLE",
+                "SET TRANSACTION ISOLATION LEVEL READ COMMITTED,READ/**/WRITE",
+            ] {
+                assert_eq!(
+                    classify_with_rules(sql, rules),
+                    C::ChangesAccessMode,
+                    "{sql}"
+                );
+            }
+            for sql in [
+                "SET TRANSACTION ISOLATION LEVEL READ COMMITTED",
+                "SET TRANSACTION ISOLATION LEVEL READ COMMITTED, READ ONLY",
+                "SET SESSION TRANSACTION READ ONLY, ISOLATION LEVEL SERIALIZABLE",
+            ] {
+                assert_eq!(classify_with_rules(sql, rules), C::Session, "{sql}");
+            }
+        }
+    }
+
+    /// P1-B (sqlite) review: a `WITH` whose main statement is never found is `Unknown`.
+    #[test]
+    fn with_without_a_main_statement_is_unknown() {
+        use StatementClass as C;
+        let d = AnsiDialect;
+        for sql in [
+            // Unterminated string swallowing the main statement.
+            "WITH c AS (SELECT ') DELETE FROM t WHERE a = 1",
+            // Unbalanced parentheses.
+            "WITH c AS (SELECT (1) SELECT * FROM c",
+            "WITH c AS (SELECT 1)) SELECT * FROM c",
+            // No main statement at all.
+            "WITH c AS (SELECT 1)",
+            "WITH",
+            "WITH c AS (SELECT 1), d AS (SELECT 2)",
+            // Unterminated quoted identifier inside the CTE list.
+            "WITH \"c AS (SELECT 1) SELECT * FROM c",
+            // A main statement in parentheses is not looked into (over-classified only).
+            "WITH c AS (SELECT 1) (SELECT * FROM c)",
+        ] {
+            assert_eq!(d.classify(sql), C::Unknown, "{sql}");
+        }
+        for sql in [
+            "WITH c AS (SELECT 1) SELECT * FROM c",
+            "with recursive r(n) as (select 1 union all select n + 1 from r where n < 3) \
+             select * from r",
+            "WITH c AS MATERIALIZED (SELECT 1), d (x) AS NOT MATERIALIZED (SELECT 2) \
+             SELECT * FROM c, d",
+            "(WITH c AS (SELECT 1) SELECT * FROM c)",
+            "WITH c AS (SELECT 1) VALUES (1)",
+            "WITH c AS (SELECT 1) TABLE c",
+            "WITH RECURSIVE t(id, p) AS (SELECT 1, 0) SEARCH DEPTH FIRST BY id SET ord \
+             CYCLE id SET is_cycle USING path SELECT * FROM t",
+            "EXPLAIN ANALYZE WITH c AS (SELECT 1) SELECT * FROM c",
+        ] {
+            assert_eq!(d.classify(sql), C::Read, "{sql}");
+        }
+        assert_eq!(
+            d.classify("WITH c AS (SELECT 1) INSERT INTO t SELECT * FROM c"),
+            C::Unknown
+        );
+        assert_eq!(
+            d.classify("EXPLAIN ANALYZE WITH c AS (SELECT ') DELETE FROM t"),
+            C::Unknown
+        );
+    }
+
+    proptest! {
+        /// Any comma list of transaction modes with `READ WRITE` somewhere lifts read-only;
+        /// without it, it does not.
+        #[test]
+        fn set_transaction_modes_in_any_order(
+            scope in prop::sample::select(vec!["", "SESSION ", "LOCAL ", "session "]),
+            modes in prop::collection::vec(
+                prop::sample::select(vec![
+                    "ISOLATION LEVEL READ COMMITTED",
+                    "ISOLATION LEVEL SERIALIZABLE",
+                    "isolation level repeatable read",
+                    "READ ONLY",
+                    "DEFERRABLE",
+                    "NOT DEFERRABLE",
+                ]),
+                0..4,
+            ),
+            write_at in any::<prop::sample::Index>(),
+            sep in prop::sample::select(vec![", ", ",", " ,\n", " /* c */ , "]),
+        ) {
+            let mut with_write = modes.clone();
+            let at = write_at.index(modes.len() + 1);
+            with_write.insert(at, "READ WRITE");
+            let sql = format!("SET {scope}TRANSACTION {}", with_write.join(sep));
+            prop_assert_eq!(AnsiDialect.classify(&sql), StatementClass::ChangesAccessMode, "{}", sql);
+            if !modes.is_empty() {
+                let sql = format!("SET {scope}TRANSACTION {}", modes.join(sep));
+                prop_assert_eq!(AnsiDialect.classify(&sql), StatementClass::Session, "{}", sql);
+            }
+        }
+
+        /// A `WITH` is a read only when its parentheses balance and a main statement is
+        /// found: cutting a read-only `WITH` anywhere inside its CTE list or its first
+        /// parenthesis never yields `Read`.
+        #[test]
+        fn truncated_with_is_never_read(
+            body in "[a-z0-9 ,]{0,12}",
+            cut in any::<prop::sample::Index>(),
+        ) {
+            let sql = format!("WITH c AS (SELECT {body}) SELECT * FROM c");
+            prop_assert_eq!(AnsiDialect.classify(&sql), StatementClass::Read, "{}", sql);
+            let main = sql.rfind(") SELECT").map_or(sql.len(), |i| i + 1);
+            // At least `WITH`: an empty text is no statement at all.
+            let end = 4 + cut.index(main - 4);
+            let truncated = &sql[..end];
+            prop_assert_ne!(AnsiDialect.classify(truncated), StatementClass::Read, "{}", truncated);
         }
     }
 }

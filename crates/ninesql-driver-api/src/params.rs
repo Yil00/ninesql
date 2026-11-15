@@ -192,7 +192,49 @@ impl Endpoint {
     }
 }
 
+/// Kind of [`Auth`], without the credentials: what
+/// [`ConnectCapabilities::auth`](crate::ConnectCapabilities::auth) lists.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[non_exhaustive]
+pub enum AuthKind {
+    /// [`Auth::None`].
+    None,
+    /// [`Auth::Password`] (with or without a password).
+    Password,
+    /// [`Auth::Token`].
+    Token,
+}
+
+/// Which password exchanges a driver may use for one connection. Defaults to
+/// [`PasswordExchange::Any`].
+///
+/// A driver that cannot enforce a policy other than `Any` does not list it in
+/// [`ConnectCapabilities::password_exchanges`](crate::ConnectCapabilities::password_exchanges)
+/// and refuses it at connect ([`ConnectCapabilities::check_connect_params`](crate::ConnectCapabilities::check_connect_params)),
+/// so the core refuses it when the connection is saved (I8).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[non_exhaustive]
+pub enum PasswordExchange {
+    /// Every exchange the driver supports, under the driver's own transport rules (default).
+    #[default]
+    Any,
+    /// Only a SCRAM exchange in which the server proves it knows the password verifier
+    /// (PostgreSQL `SCRAM-SHA-256`, as libpq's `require_auth=scram-sha-256`): md5, cleartext and
+    /// a server that skips authentication are refused, whatever the transport.
+    ScramOnly,
+}
+
 impl Auth {
+    /// The kind of authentication, without the credentials.
+    #[must_use]
+    pub fn kind(&self) -> AuthKind {
+        match self {
+            Self::None => AuthKind::None,
+            Self::Password { .. } => AuthKind::Password,
+            Self::Token { .. } => AuthKind::Token,
+        }
+    }
+
     /// User name and password (`None` = explicitly empty password).
     #[must_use]
     pub fn password(user: impl Into<String>, password: Option<Secret>) -> Self {
@@ -229,7 +271,15 @@ impl ClientCertificate {
 pub struct TlsConfig {
     /// Verification mode; default [`TlsMode::VerifyFull`].
     pub mode: TlsMode,
-    /// Extra CA bundle (PEM) trusted in addition to the platform trust store.
+    /// CA bundle (PEM) of the server's certificate authority (ADR-0019, libpq `sslrootcert`
+    /// semantics):
+    /// - when set, it is the **only** trust anchor: the platform trust store is not added;
+    /// - [`TlsMode::VerifyCa`] **requires** it: without one the connect fails with a TLS error
+    ///   (no fallback to the platform store);
+    /// - [`TlsMode::VerifyFull`] without one uses the platform trust store;
+    /// - an unreadable file, or one without a valid PEM certificate, is a TLS error (fails
+    ///   closed, never ignored);
+    /// - [`TlsMode::Require`] and [`TlsMode::Disable`] do not use it.
     pub ca_file: Option<PathBuf>,
     /// Client certificate for mTLS.
     pub client_certificate: Option<ClientCertificate>,
@@ -245,16 +295,21 @@ pub enum HostKeyVerification {
     /// Check `known_hosts`; unknown keys need user confirmation; changed keys block (default).
     #[default]
     Strict,
+    /// Unknown hosts are recorded without asking (trust on first use); known keys are still
+    /// verified and changed or revoked keys block (ADR-0016 §2). An explicit, per-connection,
+    /// per-hop, visibly flagged choice (I5).
+    AcceptNew,
     /// Host key not checked: an explicit, per-connection, visibly flagged choice (I5).
     Disabled,
 }
 
 impl HostKeyVerification {
-    /// Ordering by strength: lower is weaker.
+    /// Ordering by strength: lower is weaker (`Disabled` < `AcceptNew` < `Strict`).
     fn strength(self) -> u8 {
         match self {
             Self::Disabled => 0,
-            Self::Strict => 1,
+            Self::AcceptNew => 1,
+            Self::Strict => 2,
         }
     }
 
@@ -417,6 +472,16 @@ pub enum SecurityWarning {
     /// key. Reported in addition to [`SecurityWarning::SshHostKeyNotVerified`] so the UI can
     /// name the hop.
     SshHopHostKeyNotVerified {
+        /// Index in [`TunnelInfo::hops`].
+        hop: u8,
+    },
+    /// The weakest SSH hop accepts unknown host keys without asking
+    /// ([`HostKeyVerification::AcceptNew`], ADR-0016 §2); no hop has verification disabled.
+    SshHostKeyAcceptNew,
+    /// The hop at this index of [`TunnelInfo::hops`] uses
+    /// [`HostKeyVerification::AcceptNew`]. Reported in addition to
+    /// [`SecurityWarning::SshHostKeyAcceptNew`] or [`SecurityWarning::SshHostKeyNotVerified`].
+    SshHopHostKeyAcceptNew {
         /// Index in [`TunnelInfo::hops`].
         hop: u8,
     },
@@ -651,6 +716,22 @@ pub struct ConnectParams {
     /// `true` for connections typed "production": the driver must never log query text, even at
     /// `trace` level (ADR-0007 §6).
     pub production: bool,
+    /// The connection type allows query text in logs (`log_query_text` of the connection type,
+    /// ADR-0007 §1). Drivers log statement text (at `trace` level only) when
+    /// [`ConnectParams::may_log_statements`] is `true`, i.e. this flag is set **and** the
+    /// connection is not [`production`](Self::production). Defaults to `true`; the core sets it
+    /// from the connection type (L1 of the wave 2 integration review).
+    pub log_statements: bool,
+    /// Which password exchanges the driver may use (default [`PasswordExchange::Any`]). A driver
+    /// refuses a policy it does not list in
+    /// [`ConnectCapabilities::password_exchanges`](crate::ConnectCapabilities::password_exchanges).
+    pub password_exchange: PasswordExchange,
+    /// The database file of an [`Endpoint::File`] lies inside a DBeaver workspace
+    /// (`DBeaverData`, I4, ADR-0006). File drivers then open it read-only whatever
+    /// [`read_only`](Self::read_only) says, never create it and never create or modify a file
+    /// next to it (journal, `-wal`, `-shm`); network drivers ignore the flag. Set by the core
+    /// for imported connections whose file is in the DBeaver workspace.
+    pub inside_dbeaver_workspace: bool,
     /// Application name reported to the server where supported (`application_name`…).
     pub application_name: String,
 }
@@ -677,8 +758,19 @@ impl ConnectParams {
             init_statements: Vec::new(),
             properties: BTreeMap::new(),
             production: false,
+            log_statements: true,
+            password_exchange: PasswordExchange::Any,
+            inside_dbeaver_workspace: false,
             application_name: "NineSQL".to_owned(),
         }
+    }
+
+    /// `true` when the driver may log statement text at `trace` level:
+    /// [`log_statements`](Self::log_statements) and not [`production`](Self::production)
+    /// (ADR-0007 §6).
+    #[must_use]
+    pub fn may_log_statements(&self) -> bool {
+        self.log_statements && !self.production
     }
 
     /// Downgrades the UI must display (I5). Empty for the secure defaults.
@@ -695,14 +787,20 @@ impl ConnectParams {
             }
         }
         if let Some(t) = &self.tunnel {
-            if t.weakest_host_key() == HostKeyVerification::Disabled {
-                out.push(SecurityWarning::SshHostKeyNotVerified);
+            match t.weakest_host_key() {
+                HostKeyVerification::Strict => {}
+                HostKeyVerification::AcceptNew => out.push(SecurityWarning::SshHostKeyAcceptNew),
+                // `Disabled`, and any weaker policy added later: fails safe.
+                _ => out.push(SecurityWarning::SshHostKeyNotVerified),
             }
             for (i, hop) in t.hops.iter().enumerate() {
-                if hop.host_key == HostKeyVerification::Disabled {
-                    out.push(SecurityWarning::SshHopHostKeyNotVerified {
-                        hop: u8::try_from(i).unwrap_or(u8::MAX),
-                    });
+                let hop_index = u8::try_from(i).unwrap_or(u8::MAX);
+                match hop.host_key {
+                    HostKeyVerification::Strict => {}
+                    HostKeyVerification::AcceptNew => {
+                        out.push(SecurityWarning::SshHopHostKeyAcceptNew { hop: hop_index });
+                    }
+                    _ => out.push(SecurityWarning::SshHopHostKeyNotVerified { hop: hop_index }),
                 }
             }
         }
@@ -726,6 +824,9 @@ impl fmt::Debug for ConnectParams {
             .field("init_statements", &self.init_statements.len())
             .field("property_keys", &self.properties.keys().collect::<Vec<_>>())
             .field("production", &self.production)
+            .field("log_statements", &self.log_statements)
+            .field("password_exchange", &self.password_exchange)
+            .field("inside_dbeaver_workspace", &self.inside_dbeaver_workspace)
             .field("application_name", &self.application_name)
             .finish()
     }
@@ -857,6 +958,64 @@ mod tests {
         assert_eq!(
             TunnelInfo::new("x", 22).with_hops(Vec::new()),
             TunnelInfo::new("x", 22)
+        );
+    }
+
+    /// ADR-0016: `AcceptNew` has its own warnings and ranks between `Disabled` and `Strict`.
+    #[test]
+    fn accept_new_is_reported_as_such() {
+        use HostKeyVerification::{AcceptNew, Disabled, Strict};
+        assert_eq!(Strict.weakest(AcceptNew), AcceptNew);
+        assert_eq!(AcceptNew.weakest(Strict), AcceptNew);
+        assert_eq!(AcceptNew.weakest(Disabled), Disabled);
+        let mut p = ConnectParams::new(EngineId::POSTGRESQL, tcp());
+        p.tunnel = Some(TunnelInfo::new("x", 22).with_hops(vec![
+            SshHop::new("jump.example.test", 22, AcceptNew),
+            SshHop::new("bastion.example.test", 22, Strict),
+        ]));
+        assert_eq!(p.tunnel.as_ref().unwrap().host_key, AcceptNew);
+        let w = p.security_warnings();
+        assert!(w.contains(&SecurityWarning::SshHostKeyAcceptNew));
+        assert!(w.contains(&SecurityWarning::SshHopHostKeyAcceptNew { hop: 0 }));
+        assert!(!w.contains(&SecurityWarning::SshHostKeyNotVerified));
+        assert!(!w.iter().any(|x| matches!(
+            x,
+            SecurityWarning::SshHopHostKeyNotVerified { .. }
+                | SecurityWarning::SshHopHostKeyAcceptNew { hop: 1 }
+        )));
+
+        // A disabled hop wins the summary; each hop keeps its own warning.
+        p.tunnel = Some(TunnelInfo::new("x", 22).with_hops(vec![
+            SshHop::new("jump.example.test", 22, AcceptNew),
+            SshHop::new("bastion.example.test", 22, Disabled),
+        ]));
+        let w = p.security_warnings();
+        assert!(w.contains(&SecurityWarning::SshHostKeyNotVerified));
+        assert!(!w.contains(&SecurityWarning::SshHostKeyAcceptNew));
+        assert!(w.contains(&SecurityWarning::SshHopHostKeyAcceptNew { hop: 0 }));
+        assert!(w.contains(&SecurityWarning::SshHopHostKeyNotVerified { hop: 1 }));
+    }
+
+    #[test]
+    fn statement_logging_follows_type_and_production() {
+        let mut p = ConnectParams::new(EngineId::POSTGRESQL, tcp());
+        assert!(p.log_statements && p.may_log_statements());
+        assert_eq!(p.password_exchange, PasswordExchange::Any);
+        assert!(!p.inside_dbeaver_workspace);
+        p.log_statements = false;
+        assert!(!p.may_log_statements());
+        p.log_statements = true;
+        p.production = true;
+        assert!(!p.may_log_statements());
+    }
+
+    #[test]
+    fn auth_kinds() {
+        assert_eq!(Auth::None.kind(), AuthKind::None);
+        assert_eq!(Auth::password("u", None).kind(), AuthKind::Password);
+        assert_eq!(
+            Auth::token(None, Secret::new("t".to_owned())).kind(),
+            AuthKind::Token
         );
     }
 
