@@ -11,18 +11,31 @@
 //! - the connection is not production ([`SafetyPolicy::production`]; production types never
 //!   allow it anyway, ADR-0007 §6).
 //!
-//! This is the rule that decides whether query text may be logged (AGENTS.md, ADR-0007 §6), and
-//! like ADR-0008 §4 says, nothing at all is stored otherwise: no redacted entry, no timing, no
-//! row count. There is no redaction mode.
+//! - the statement text holds no credential word ([`has_credential_word`]): `ALTER ROLE …
+//!   PASSWORD '…'`, `CREATE USER … IDENTIFIED BY …`, `SET PASSWORD`, `CREATE USER MAPPING …
+//!   OPTIONS (password …)`, `CREATE SECRET`, `pgp_sym_encrypt(…)` and the like are never
+//!   recorded (I1: no password in history), and their text is not logged either.
+//!
+//! The first three are the rule that decides whether query text may be logged (AGENTS.md,
+//! ADR-0007 §6), and like ADR-0008 §4 says, nothing at all is stored otherwise: no redacted
+//! entry, no timing, no row count. There is no redaction mode.
+//!
+//! # Credential words (fail closed)
+//! [`has_credential_word`] splits the **whole** text into words of letters and digits (`_`,
+//! quotes, dots and every other character separate words, so `aws_secret_access_key` holds
+//! `secret`) and looks for [`CREDENTIAL_WORDS`], ignoring case. It deliberately looks inside
+//! string literals, quoted identifiers and comments too, which is broader than SQL syntax
+//! needs: dynamic SQL hides `ALTER ROLE … PASSWORD` inside a literal, and a password can sit in
+//! a comment. A false positive (`SELECT password_hash …`, a column named `token`) only means
+//! one history entry is missing; a false negative would put a secret on disk.
 //!
 //! When a statement is recorded, the entry holds its text exactly as it was sent, the
 //! connection, project and engine ids, start time, duration, rows delivered, update count,
 //! status, the stable error kind and engine error code (never the engine message, which may
 //! quote values), and the **number** of bind parameters. **Bind parameter values are never
-//! recorded** (I1): the model has no place for them. A secret typed as a literal inside the
-//! statement text is not detected or removed: it is part of the text the user chose to run on a
-//! connection that allows its queries to be logged (the editor's parameters prompt, F-SQL-06,
-//! binds values separately).
+//! recorded** (I1): the model has no place for them. A secret typed as a literal in a statement
+//! that has no credential word (an `INSERT` of a password into an application table) is not
+//! detected: the editor's parameters prompt (F-SQL-06) binds such values separately.
 //!
 //! # Writer
 //! One thread (`ninesql-history`) owns the database. Executions hand it entries through a
@@ -51,11 +64,42 @@ pub const HISTORY_QUEUE: usize = 1024;
 /// Retention runs again after this many recorded entries.
 pub const PRUNE_EVERY: u64 = 500;
 
-/// Whether a statement of a connection with `policy` may be recorded under `prefs`. See the
-/// module documentation.
+/// Whether a statement of a connection with `policy` may be recorded under `prefs`, before
+/// looking at its text ([`has_credential_word`]). See the module documentation.
 #[must_use]
 pub fn may_record(policy: &SafetyPolicy, prefs: &HistoryPreferences) -> bool {
     prefs.enabled && policy.log_query_text && !policy.production
+}
+
+/// Words that mark a statement as handling a credential (lower case). See
+/// [`has_credential_word`].
+pub const CREDENTIAL_WORDS: &[&str] = &[
+    "password",
+    "passwd",
+    "pwd",
+    "passphrase",
+    "identified",
+    "secret",
+    "secrets",
+    "credential",
+    "credentials",
+    "encrypted",
+    "unencrypted",
+    "encrypt",
+    "decrypt",
+    "token",
+    "apikey",
+    "privatekey",
+];
+
+/// Whether `text` holds a credential word anywhere: in keywords, identifiers, string literals
+/// or comments (fail closed, see the module documentation). Such a statement is never recorded
+/// in the history and its text is never logged.
+#[must_use]
+pub fn has_credential_word(text: &str) -> bool {
+    text.split(|c: char| !c.is_alphanumeric())
+        .filter(|w| (3..=16).contains(&w.len()))
+        .any(|w| CREDENTIAL_WORDS.iter().any(|k| w.eq_ignore_ascii_case(k)))
 }
 
 /// Why the history could not answer.
@@ -84,6 +128,8 @@ pub enum Recorded {
     /// Not recorded: the connection type does not allow query text to be logged, or it is
     /// production.
     NotAllowed,
+    /// Not recorded: the statement holds a credential word ([`has_credential_word`]).
+    Sensitive,
     /// Not recorded: the writer's queue was full or the writer stopped.
     Dropped,
 }
@@ -261,6 +307,9 @@ impl History {
         if !policy.log_query_text || policy.production {
             return Recorded::NotAllowed;
         }
+        if has_credential_word(&record.text) {
+            return Recorded::Sensitive;
+        }
         let mut entry = NewEntry::new(
             unix_ms(record.started_at),
             self.inner.project.clone(),
@@ -408,6 +457,36 @@ fn writer(mut db: HistoryDb, jobs: &mpsc::Receiver<Job>, mut retention: Retentio
 mod tests {
     use super::*;
     use crate::connection_type::ConnectionType;
+
+    #[test]
+    fn credential_words_are_found_anywhere_ignoring_case() {
+        for text in [
+            "ALTER ROLE bob PASSWORD 'x'",
+            "alter role bob with encrypted password 'x'",
+            "CREATE USER bob IDENTIFIED BY 'x'",
+            "ALTER USER bob IDENTIFIED WITH mysql_native_password BY 'x'",
+            "SET PASSWORD FOR bob = 'x'",
+            "CREATE USER MAPPING FOR bob SERVER s OPTIONS (user 'u', password 'x')",
+            "CREATE SECRET s (TYPE s3, KEY_ID 'k', SECRET 'x')",
+            "SELECT pgp_sym_encrypt('data', 'x')",
+            "EXECUTE 'ALTER ROLE bob PASSWORD ' || quote_literal(p)",
+            "SELECT 1 -- password: hunter2",
+            "SELECT \"Password\" FROM t",
+            "UPDATE s SET aws_secret_access_key = 'x'",
+            "ALTER ROLE bob PASSWORD$$x$$",
+        ] {
+            assert!(has_credential_word(text), "{text}");
+        }
+        for text in [
+            "SELECT * FROM numbers(3)",
+            "DELETE FROM t WHERE id = 1",
+            "SELECT passwordless FROM t",
+            "CREATE TABLE tokens (id int)",
+            "",
+        ] {
+            assert!(!has_credential_word(text), "{text}");
+        }
+    }
 
     #[test]
     fn the_logging_rule_decides() {

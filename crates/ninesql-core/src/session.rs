@@ -2523,7 +2523,8 @@ impl SessionTask {
             }
             tracing::info!(session = %id, class = ?class, "confirmed statement");
         }
-        if self.policy().log_query_text {
+        // Never the text of a statement that handles a credential (I1, same rule as history).
+        if self.policy().log_query_text && !crate::history::has_credential_word(&request.text) {
             tracing::trace!(session = %id, statement = %request.text, "executing");
         } else {
             tracing::debug!(session = %id, class = ?class, "executing");

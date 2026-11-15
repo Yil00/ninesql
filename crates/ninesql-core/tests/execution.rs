@@ -890,10 +890,18 @@ fn history_records_text_never_parameter_values_and_respects_types() {
         )
         .await;
         assert_eq!(s.end, RunEnd::Completed, "{s:?}");
-        // A password typed inside a literal is part of the text: not specially handled.
+        // Review M3: a statement with a credential word is never recorded (I1).
         let (_, s) = collect_run(exec.run(
             &h,
             RunRequest::statement(format!("ALTER USER bob PASSWORD '{literal}'")),
+        ))
+        .await;
+        assert_eq!(s.end, RunEnd::Completed);
+        let (_, s) = collect_run(exec.run(
+            &h,
+            RunRequest::statement(format!(
+                "CREATE USER MAPPING FOR bob SERVER s OPTIONS (user 'u', password '{literal}-2')"
+            )),
         ))
         .await;
         assert_eq!(s.end, RunEnd::Completed);
@@ -916,13 +924,24 @@ fn history_records_text_never_parameter_values_and_respects_types() {
         .await;
         assert_eq!(s.end, RunEnd::Completed);
 
-        history.flush().await.unwrap().unwrap();
+        // The query runs after every queued insert; the bytes are read before any checkpoint,
+        // so the write-ahead log is checked too.
         let entries = history
             .query(HistoryQuery::recent(100))
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(entries.len(), 3, "{entries:?}");
+        let before_checkpoint = all_bytes(&state);
+        assert!(
+            contains(&before_checkpoint, "numbers(2)"),
+            "entries are on disk"
+        );
+        assert!(
+            !contains(&before_checkpoint, literal),
+            "I1: a password literal reached history"
+        );
+        assert!(!contains(&before_checkpoint, param_secret));
+        assert_eq!(entries.len(), 2, "{entries:?}");
         assert!(entries.iter().all(|e| e.connection == dev.id.to_string()));
         assert!(entries.iter().all(|e| e.project == "project-1"));
         let select = entries
@@ -938,9 +957,9 @@ fn history_records_text_never_parameter_values_and_respects_types() {
             .unwrap();
         assert_eq!(failed.error_kind.as_deref(), Some("driver-query"));
         assert_eq!(failed.error_code.as_deref(), Some("XX000"));
-        assert!(entries.iter().any(|e| e.statement.contains(literal)));
+        assert!(!entries.iter().any(|e| e.statement.contains(literal)));
         let recent = history.recent(dev.id, 10).await.unwrap().unwrap();
-        assert_eq!(recent.len(), 3);
+        assert_eq!(recent.len(), 2);
     });
     manager.shutdown(Duration::from_secs(5));
     drop(exec);
@@ -950,8 +969,8 @@ fn history_records_text_never_parameter_values_and_respects_types() {
     let bytes = all_bytes(&state);
     assert!(!bytes.is_empty());
     assert!(
-        contains(&bytes, literal),
-        "the typed literal is stored as typed"
+        !contains(&bytes, literal),
+        "I1: a password literal reached history"
     );
     assert!(
         !contains(&bytes, param_secret),
