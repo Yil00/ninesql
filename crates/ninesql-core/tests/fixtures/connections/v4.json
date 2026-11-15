@@ -1,0 +1,65 @@
+{
+  "schema_version": 4,
+  "connections": [
+    {
+      "id": "4d3c2b1a-9f8e-4d7c-8b6a-5a4938271605",
+      "name": "Orders, imported",
+      "engine": "postgresql",
+      "endpoint": {
+        "kind": "tcp",
+        "host": "orders.example.test",
+        "port": 5432,
+        "database": "orders"
+      },
+      "auth": {
+        "method": "password",
+        "username": "orders_app",
+        "secret": {
+          "source": "prompt"
+        }
+      },
+      "tls": {
+        "mode": "verify-full"
+      },
+      "connection_type": "dev",
+      "init_sql": [
+        "SET search_path TO orders",
+        "SET statement_timeout = 30000"
+      ],
+      "init_sql_needs_confirmation": true,
+      "origin": {
+        "kind": "dbeaver",
+        "dbeaver_id": "postgres-jdbc-18c0f2d3a4b-5e6f7a8b9c0d1e2f"
+      }
+    },
+    {
+      "id": "4d3c2b1a-9f8e-4d7c-8b6a-5a4938271606",
+      "name": "Orders, confirmed",
+      "engine": "postgresql",
+      "endpoint": {
+        "kind": "tcp",
+        "host": "orders.example.test",
+        "port": 5432,
+        "database": "orders"
+      },
+      "auth": {
+        "method": "password",
+        "username": "orders_app",
+        "secret": {
+          "source": "prompt"
+        }
+      },
+      "tls": {
+        "mode": "verify-full"
+      },
+      "connection_type": "dev",
+      "init_sql": [
+        "SET search_path TO orders"
+      ],
+      "origin": {
+        "kind": "dbeaver",
+        "dbeaver_id": "postgres-jdbc-18c0f2d3a4b-5e6f7a8b9c0d1e30"
+      }
+    }
+  ]
+}

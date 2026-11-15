@@ -13,7 +13,7 @@
 //! files at the same time.
 
 use std::fmt;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use ninesql_secrets::{SecretId, SecretMeta, SecretRef, SecretStores, SecretString, StoreKind};
 use ninesql_storage::document::{self, Document, Format, Migration};
@@ -124,10 +124,12 @@ impl Document for ConnectionsFile {
     /// Schema history: version 1 is the first published schema (fixture
     /// `tests/fixtures/connections/v1.json`); version 2 adds the optional per-hop
     /// `host_key_policy` of SSH hops (ADR-0016), strict when absent; version 3 adds the optional
-    /// `password_exchange` of a connection (`any` when absent, `scram-only`). A bump adds a
+    /// `password_exchange` of a connection (`any` when absent, `scram-only`); version 4 adds the
+    /// optional `init_sql_needs_confirmation` marker of imported init SQL (`false` when
+    /// absent). A bump adds a
     /// [`Migration`] here. An older NineSQL refuses a newer file instead of dropping a field it
     /// does not know and saving the connection weaker than the user set it.
-    const SCHEMA_VERSION: u32 = 3;
+    const SCHEMA_VERSION: u32 = 4;
     fn migrations() -> &'static [Migration] {
         CONNECTIONS_MIGRATIONS
     }
@@ -211,6 +213,29 @@ fn connections_v2_to_v3(doc: &mut Value) -> Result<(), String> {
     Ok(())
 }
 
+/// `connections.json` 3 → 4: connections gain `init_sql_needs_confirmation` (P1-E review, for
+/// the P2-C import). Version 3 files have no such key, and an absent key means `false`, exactly
+/// the version 3 behavior: nothing to rewrite. Unlike the earlier migrations, a key already
+/// present (hand edit) is kept: `true` only adds a confirmation, so it can never weaken the
+/// connection. The bump makes an older NineSQL refuse a version 4 file instead of dropping the
+/// marker and skipping the confirmation.
+fn connections_v3_to_v4(doc: &mut Value) -> Result<(), String> {
+    let Some(connections) = doc.get_mut("connections").and_then(Value::as_array_mut) else {
+        return Ok(());
+    };
+    for connection in connections {
+        if let Some(connection) = connection.as_object_mut()
+            && connection
+                .get("init_sql_needs_confirmation")
+                .is_some_and(|v| !v.is_boolean())
+        {
+            // Anything but a boolean would fail the load: read as "needs confirmation".
+            connection.insert("init_sql_needs_confirmation".to_owned(), Value::Bool(true));
+        }
+    }
+    Ok(())
+}
+
 const CONNECTIONS_MIGRATIONS: &[Migration] = &[
     Migration {
         from: 1,
@@ -221,6 +246,11 @@ const CONNECTIONS_MIGRATIONS: &[Migration] = &[
         from: 2,
         description: "add the password exchange policy (any when absent)",
         apply: connections_v2_to_v3,
+    },
+    Migration {
+        from: 3,
+        description: "add the imported init SQL marker (not set when absent)",
+        apply: connections_v3_to_v4,
     },
 ];
 
@@ -358,6 +388,9 @@ pub struct Workspace {
     project: ProjectName,
     project_id: ProjectId,
     project_paths: ProjectPaths,
+    /// Serializes the writes of `connections.json` within the process, so a read-modify-write
+    /// ([`Self::clear_init_sql_marker`]) cannot lose a save made in between.
+    connections_guard: Arc<Mutex<()>>,
     _lock: Arc<DirLock>,
 }
 
@@ -406,6 +439,7 @@ impl Workspace {
             project,
             project_id,
             project_paths,
+            connections_guard: Arc::default(),
             _lock: lock,
         })
     }
@@ -451,6 +485,17 @@ impl Workspace {
     /// secret-looking keys are removed from it first (atomic rewrite of the raw file).
     #[must_use = "load issues (removed connection data) must be shown to the user"]
     pub fn load_connections(&self) -> Result<LoadedConnections, WorkspaceError> {
+        let _guard = self.guard();
+        self.load_connections_unguarded()
+    }
+
+    fn guard(&self) -> MutexGuard<'_, ()> {
+        self.connections_guard
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+    }
+
+    fn load_connections_unguarded(&self) -> Result<LoadedConnections, WorkspaceError> {
         let path = self.project_paths.connections_file();
         let Some(loaded) = document::load::<ConnectionsFile>(&path)? else {
             return Ok(LoadedConnections::default());
@@ -480,7 +525,7 @@ impl Workspace {
             }
         };
         if !issues.is_empty() {
-            self.save_connections(&connections)?;
+            self.save_connections_unguarded(&connections)?;
             tracing::warn!(
                 project = %self.project,
                 removed = issues.len(),
@@ -520,6 +565,11 @@ impl Workspace {
     /// # Errors
     /// Invalid connections (nothing is written), storage errors.
     pub fn save_connections(&self, connections: &Connections) -> Result<(), WorkspaceError> {
+        let _guard = self.guard();
+        self.save_connections_unguarded(connections)
+    }
+
+    fn save_connections_unguarded(&self, connections: &Connections) -> Result<(), WorkspaceError> {
         for c in connections.iter() {
             c.validate()
                 .map_err(|source| WorkspaceError::InvalidConnection {
@@ -533,6 +583,34 @@ impl Workspace {
         document::save(&self.project_paths.connections_file(), &file)?;
         tracing::debug!(project = %self.project, count = connections.len(), "saved connections");
         Ok(())
+    }
+
+    /// Clears [`Connection::init_sql_needs_confirmation`] of connection `id` in
+    /// `connections.json`, if its init SQL on disk is still exactly `statements` (what the user
+    /// confirmed). Called by the session manager once the user confirmed imported init SQL;
+    /// returns whether the file changed. Load, change and save run under the in-process guard
+    /// of `connections.json`, so a save made meanwhile is not lost (a save of an older copy
+    /// afterwards may set the marker again: one more confirmation, never one less).
+    ///
+    /// # Errors
+    /// Storage errors and the load / validation errors of [`Self::load_connections`].
+    pub fn clear_init_sql_marker(
+        &self,
+        id: ConnectionId,
+        statements: &[String],
+    ) -> Result<bool, WorkspaceError> {
+        let _guard = self.guard();
+        let mut connections = self.load_connections_unguarded()?.connections;
+        let Some(c) = connections.get_mut(id) else {
+            return Ok(false);
+        };
+        if !c.init_sql_needs_confirmation || c.init_sql != statements {
+            return Ok(false);
+        }
+        c.init_sql_needs_confirmation = false;
+        self.save_connections_unguarded(&connections)?;
+        tracing::info!(project = %self.project, connection = %id, "imported init SQL confirmed");
+        Ok(true)
     }
 
     /// [`Self::save_connections`] after [`DriverRegistry::validate_connection`] of every

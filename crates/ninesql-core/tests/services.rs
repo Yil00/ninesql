@@ -463,6 +463,151 @@ fn the_password_exchange_and_the_dbeaver_flag_reach_the_driver() {
     });
 }
 
+/// P1-E review (for P2-C): once the user confirms imported init SQL, the core clears the
+/// marker in `connections.json`, only when the init SQL on disk is still what was confirmed.
+#[test]
+fn confirming_imported_init_sql_clears_the_marker_on_disk() {
+    let tmp = tempfile::tempdir().unwrap();
+    let wrap = Wrap::new(mock_driver());
+    let services = start(config(tmp.path(), Arc::new(wrap.clone())));
+    let types = ConnectionTypes::default();
+    let mut c = mock_connection(ConnectionTypeId::dev());
+    c.init_sql = vec!["SET search_path TO app".into()];
+    c.init_sql_needs_confirmation = true;
+    let mut other = mock_connection(ConnectionTypeId::dev());
+    other.name = "Other".into();
+    other.init_sql = vec!["SELECT * FROM numbers(1)".into()];
+    other.init_sql_needs_confirmation = true;
+    let ws = services.workspace();
+    ws.save_connections_checked(
+        &Connections::from_vec(vec![c.clone(), other.clone()]).unwrap(),
+        services.registry(),
+    )
+    .unwrap();
+    let raw = std::fs::read_to_string(ws.project_paths().connections_file()).unwrap();
+    assert!(
+        raw.contains("\"init_sql_needs_confirmation\": true"),
+        "{raw}"
+    );
+    let marker = |id| {
+        ws.load_connections()
+            .unwrap()
+            .connections
+            .get(id)
+            .unwrap()
+            .init_sql_needs_confirmation
+    };
+
+    ui(async {
+        // A stale request (init SQL changed on disk since): confirmed, but the marker of the
+        // statements on disk stays.
+        let mut stale = other.clone();
+        stale.init_sql = vec!["SELECT * FROM numbers(2)".into()];
+        let OpenOutcome::InitSqlNeedsConfirmation(ic) =
+            open(services.sessions(), OpenRequest::new(stale.clone(), &types))
+                .await
+                .unwrap()
+        else {
+            panic!("no confirmation");
+        };
+        let h = match open(
+            services.sessions(),
+            OpenRequest::new(stale, &types).with_init_sql_confirmation(ic.token),
+        )
+        .await
+        .unwrap()
+        {
+            OpenOutcome::Opened(h) => h,
+            out => panic!("{out:?}"),
+        };
+        h.close().await.unwrap().unwrap();
+        assert!(marker(other.id), "other statements than the ones on disk");
+
+        let OpenOutcome::InitSqlNeedsConfirmation(ic) =
+            open(services.sessions(), OpenRequest::new(c.clone(), &types))
+                .await
+                .unwrap()
+        else {
+            panic!("no confirmation");
+        };
+        assert!(ic.imported);
+        let h = match open(
+            services.sessions(),
+            OpenRequest::new(c.clone(), &types).with_init_sql_confirmation(ic.token),
+        )
+        .await
+        .unwrap()
+        {
+            OpenOutcome::Opened(h) => h,
+            out => panic!("{out:?}"),
+        };
+        h.close().await.unwrap().unwrap();
+    });
+    assert!(!marker(c.id), "cleared once confirmed");
+    assert!(marker(other.id), "only the confirmed connection");
+    let raw = std::fs::read_to_string(ws.project_paths().connections_file()).unwrap();
+    assert_eq!(raw.matches("init_sql_needs_confirmation").count(), 1);
+
+    // The connection as saved now opens without confirmation (dev type, harmless statement).
+    let reloaded = ws
+        .load_connections()
+        .unwrap()
+        .connections
+        .get(c.id)
+        .cloned();
+    ui(async {
+        let h = open_ok(services.sessions(), reloaded.unwrap(), &types).await;
+        h.close().await.unwrap().unwrap();
+    });
+}
+
+/// P1-E review, L2 (I4, defence in depth): a file inside a DBeaver workspace is also opened as
+/// a read-only session, and a driver that ignores both flags (a future file driver) is refused.
+#[test]
+fn a_dbeaver_file_on_a_driver_that_ignores_read_only_is_refused() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut wrap = Wrap::new(mock_driver());
+    wrap.ignore_read_only = true;
+    wrap.ignore_dbeaver_flag = true;
+    let mut c = config(tmp.path(), Arc::new(wrap.clone()));
+    let dbeaver_ws = tmp
+        .path()
+        .join("home/.local/share/DBeaverData/workspace6/General");
+    std::fs::create_dir_all(&dbeaver_ws).unwrap();
+    c.manager.dbeaver_roots =
+        ninesql_core::DbeaverRoots::from_search_roots(&ninesql_core::dbeaver::SearchRoots {
+            home: tmp.path().join("home"),
+        });
+    let services = start(c);
+    let types = ConnectionTypes::default();
+    ui(async {
+        // A writable type: only the DBeaver location asks for read-only.
+        let mut inside = mock_connection(ConnectionTypeId::dev());
+        inside.endpoint = Endpoint::File {
+            path: dbeaver_ws.join("sample.db"),
+        };
+        let inside_id = inside.id;
+        let err = open(services.sessions(), OpenRequest::new(inside, &types))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, CoreError::ReadOnlyNotEnforced), "{err:?}");
+        let seen = wrap.last_seen();
+        assert!(seen.read_only, "the core asked for a read-only session");
+        assert!(seen.inside_dbeaver_workspace);
+        assert!(services.sessions().sessions_of(inside_id).is_empty());
+
+        // Outside a DBeaver workspace the same driver opens a writable dev session.
+        let mut outside = mock_connection(ConnectionTypeId::dev());
+        outside.endpoint = Endpoint::File {
+            path: tmp.path().join("data.db"),
+        };
+        let h = open_ok(services.sessions(), outside, &types).await;
+        assert!(!wrap.last_seen().read_only);
+        assert!(!h.info().read_only);
+        h.close().await.unwrap().unwrap();
+    });
+}
+
 /// Review P1-D wiring, L8 / L9: with the vault locked, `open` asks for the unlock before it
 /// asks for prompted secrets, and before anything dials the SSH hop.
 #[test]
