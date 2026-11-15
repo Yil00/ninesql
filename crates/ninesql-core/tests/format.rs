@@ -87,12 +87,12 @@ fn connections_v1_fixture_loads_with_every_field() {
 
 #[test]
 fn connections_v1_round_trip_is_stable() {
-    // Version 1 → 4 changes nothing but the version: a hop without `host_key_policy` is strict,
+    // Version 1 → 5 changes nothing but the version: a hop without `host_key_policy` is strict,
     // a connection without `password_exchange` is `any`, without
     // `init_sql_needs_confirmation` not marked.
     let path = fixture("connections/v1.json");
     let mut original: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
-    original["schema_version"] = Value::from(4);
+    original["schema_version"] = Value::from(5);
     let file = decode_connections("connections/v1.json");
     let encoded: Value = serde_json::from_slice(&document::encode(&file).unwrap()).unwrap();
     assert_eq!(encoded, original);
@@ -107,8 +107,8 @@ fn connections_v1_round_trip_is_stable() {
 fn connections_v2_fixture_keeps_per_hop_host_key_policies() {
     let path = fixture("connections/v2.json");
     let mut original: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
-    // Version 2 → 4 changes nothing but the version.
-    original["schema_version"] = Value::from(4);
+    // Version 2 → 5 changes nothing but the version.
+    original["schema_version"] = Value::from(5);
     let file = decode_connections("connections/v2.json");
     let c = &file.connections[0];
     c.validate().unwrap();
@@ -137,8 +137,8 @@ fn connections_v2_fixture_keeps_per_hop_host_key_policies() {
 fn connections_v3_fixture_keeps_the_password_exchange_policy() {
     let path = fixture("connections/v3.json");
     let mut original: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
-    // Version 3 → 4 changes nothing but the version.
-    original["schema_version"] = Value::from(4);
+    // Version 3 → 5 changes nothing but the version.
+    original["schema_version"] = Value::from(5);
     let file = decode_connections("connections/v3.json");
     let (scram, any) = (&file.connections[0], &file.connections[1]);
     scram.validate().unwrap();
@@ -154,7 +154,9 @@ fn connections_v3_fixture_keeps_the_password_exchange_policy() {
 #[test]
 fn connections_v4_fixture_keeps_the_imported_init_sql_marker() {
     let path = fixture("connections/v4.json");
-    let original: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    let mut original: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    // Version 4 → 5 changes nothing but the version.
+    original["schema_version"] = Value::from(5);
     let file = decode_connections("connections/v4.json");
     let (imported, confirmed) = (&file.connections[0], &file.connections[1]);
     imported.validate().unwrap();
@@ -209,7 +211,7 @@ fn a_password_exchange_in_a_v2_file_is_ignored() {
 fn a_newer_connections_file_is_refused_and_left_untouched() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("connections.json");
-    let bytes = br#"{ "schema_version": 5, "connections": [] }"#;
+    let bytes = br#"{ "schema_version": 6, "connections": [] }"#;
     std::fs::write(&path, bytes).unwrap();
     assert!(document::load::<ConnectionsFile>(&path).is_err());
     assert_eq!(std::fs::read(&path).unwrap(), bytes);
@@ -228,7 +230,57 @@ fn a_v2_file_on_disk_is_migrated_with_a_backup() {
             .unwrap();
     assert_eq!(backup["schema_version"], 2);
     let migrated: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
-    assert_eq!(migrated["schema_version"], 4);
+    assert_eq!(migrated["schema_version"], 5);
+}
+
+#[test]
+fn connections_v5_fixture_keeps_the_import_fields() {
+    let path = fixture("connections/v5.json");
+    let original: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    let file = decode_connections("connections/v5.json");
+    let (enabled, disabled) = (&file.connections[0], &file.connections[1]);
+    enabled.validate().unwrap();
+    disabled.validate().unwrap();
+    assert_eq!(enabled.default_schema.as_deref(), Some("app"));
+    assert_eq!(enabled.default_catalog.as_deref(), Some("main"));
+    assert_eq!(enabled.auto_commit, Some(false));
+    assert!(!disabled.enabled);
+    let reason = disabled.disabled_reason.as_ref().unwrap();
+    assert_eq!(reason.kind, ninesql_core::DisabledKind::Route);
+    let encoded: Value = serde_json::from_slice(&document::encode(&file).unwrap()).unwrap();
+    assert_eq!(encoded, original);
+}
+
+#[test]
+fn import_fields_in_a_v4_file_are_ignored() {
+    // Only a NineSQL that knows (and validates) these fields writes them; `enabled` stays.
+    let json = br#"{ "schema_version": 4, "connections": [ {
+        "id": "0b0c6c0e-6f0a-4d4e-9c47-1f1e0f3a9a99", "name": "n", "engine": "postgresql",
+        "endpoint": { "kind": "tcp", "host": "h" }, "auth": { "method": "none" },
+        "connection_type": "prod", "auto_commit": true, "default_schema": "s",
+        "default_catalog": "c", "enabled": false,
+        "disabled_reason": { "kind": "route", "message": "m" }
+    } ] }"#;
+    let loaded = document::decode::<ConnectionsFile>(Path::new("mem"), json).unwrap();
+    assert_eq!(loaded.migrated_from, Some(4));
+    let c = &loaded.document.connections[0];
+    assert_eq!(c.auto_commit, None);
+    assert_eq!(c.default_schema, None);
+    assert_eq!(c.default_catalog, None);
+    assert_eq!(c.disabled_reason, None);
+    assert!(!c.enabled);
+}
+
+#[test]
+fn a_disabled_reason_on_an_enabled_connection_is_invalid() {
+    let json = br#"{ "schema_version": 5, "connections": [ {
+        "id": "0b0c6c0e-6f0a-4d4e-9c47-1f1e0f3a9a99", "name": "n", "engine": "postgresql",
+        "endpoint": { "kind": "tcp", "host": "h" }, "auth": { "method": "none" },
+        "connection_type": "dev",
+        "disabled_reason": { "kind": "route", "message": "a proxy was not imported" }
+    } ] }"#;
+    let loaded = document::decode::<ConnectionsFile>(Path::new("mem"), json).unwrap();
+    assert!(loaded.document.connections[0].validate().is_err());
 }
 
 #[test]

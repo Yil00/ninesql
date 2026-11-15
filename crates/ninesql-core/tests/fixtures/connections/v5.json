@@ -1,0 +1,73 @@
+{
+  "schema_version": 5,
+  "connections": [
+    {
+      "id": "5e4d3c2b-0a9f-4e8d-9c7b-6b5a49382716",
+      "name": "Orders, imported (schema 5)",
+      "engine": "postgresql",
+      "endpoint": {
+        "kind": "tcp",
+        "host": "orders.example.test",
+        "port": 5432,
+        "database": "orders"
+      },
+      "auth": {
+        "method": "password",
+        "username": "orders_app",
+        "secret": {
+          "source": "prompt"
+        }
+      },
+      "tls": {
+        "mode": "verify-full"
+      },
+      "connection_type": "dev",
+      "init_sql": [
+        "SET search_path TO orders",
+        "SET statement_timeout = 30000"
+      ],
+      "init_sql_needs_confirmation": true,
+      "default_schema": "app",
+      "default_catalog": "main",
+      "auto_commit": false,
+      "origin": {
+        "kind": "dbeaver",
+        "dbeaver_id": "postgres-jdbc-18c0f2d3a4b-5e6f7a8b9c0d1e2f"
+      }
+    },
+    {
+      "id": "5e4d3c2b-0a9f-4e8d-9c7b-6b5a49382717",
+      "name": "Orders through a proxy",
+      "engine": "postgresql",
+      "endpoint": {
+        "kind": "tcp",
+        "host": "orders.example.test",
+        "port": 5432,
+        "database": "orders"
+      },
+      "auth": {
+        "method": "password",
+        "username": "orders_app",
+        "secret": {
+          "source": "prompt"
+        }
+      },
+      "tls": {
+        "mode": "verify-full"
+      },
+      "connection_type": "dev",
+      "init_sql": [
+        "SET search_path TO orders"
+      ],
+      "enabled": false,
+      "disabled_reason": {
+        "kind": "route",
+        "message": "an enabled network handler `proxy` may route traffic: not imported"
+      },
+      "origin": {
+        "kind": "dbeaver",
+        "dbeaver_id": "postgres-jdbc-18c0f2d3a4b-5e6f7a8b9c0d1e31"
+      }
+    }
+  ]
+}

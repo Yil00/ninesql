@@ -2,7 +2,7 @@
 //!
 //! On-disk documents:
 //! - `project.json`: [`ProjectFile`] (`schema_version` 2)
-//! - `connections.json`: [`ConnectionsFile`] (`schema_version` 4)
+//! - `connections.json`: [`ConnectionsFile`] (`schema_version` 5)
 //! - `connection-types.json`: [`ConnectionTypesFile`] (`schema_version` 1)
 //!
 //! Secrets given to [`Workspace::create_connection`] go to the secret store; only their
@@ -126,10 +126,12 @@ impl Document for ConnectionsFile {
     /// `host_key_policy` of SSH hops (ADR-0016), strict when absent; version 3 adds the optional
     /// `password_exchange` of a connection (`any` when absent, `scram-only`); version 4 adds the
     /// optional `init_sql_needs_confirmation` marker of imported init SQL (`false` when
-    /// absent). A bump adds a
+    /// absent); version 5 adds `default_schema`, `default_catalog`, the per-connection
+    /// `auto_commit` override and the `disabled_reason` of a connection (P2-C, all absent by
+    /// default). A bump adds a
     /// [`Migration`] here. An older NineSQL refuses a newer file instead of dropping a field it
     /// does not know and saving the connection weaker than the user set it.
-    const SCHEMA_VERSION: u32 = 4;
+    const SCHEMA_VERSION: u32 = 5;
     fn migrations() -> &'static [Migration] {
         CONNECTIONS_MIGRATIONS
     }
@@ -236,6 +238,33 @@ fn connections_v3_to_v4(doc: &mut Value) -> Result<(), String> {
     Ok(())
 }
 
+/// `connections.json` 4 → 5: connections gain `default_schema`, `default_catalog`,
+/// `auto_commit` and `disabled_reason` (P2-C). Version 4 files have no such keys, and absent
+/// keys mean exactly the version 4 behavior: nothing to rewrite. Keys already present in a
+/// version 4 file (hand edit) are removed, as in the 1 → 2 and 2 → 3 migrations, so these
+/// settings only ever come from a NineSQL that knows and validated them; `enabled` is left as
+/// it is, so a connection disabled by hand stays disabled.
+fn connections_v4_to_v5(doc: &mut Value) -> Result<(), String> {
+    let Some(connections) = doc.get_mut("connections").and_then(Value::as_array_mut) else {
+        return Ok(());
+    };
+    for connection in connections {
+        if let Some(connection) = connection.as_object_mut() {
+            for key in [
+                "default_schema",
+                "default_catalog",
+                "auto_commit",
+                "disabled_reason",
+            ] {
+                if let Some(mut v) = connection.remove(key) {
+                    zeroize_value(&mut v);
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 const CONNECTIONS_MIGRATIONS: &[Migration] = &[
     Migration {
         from: 1,
@@ -251,6 +280,11 @@ const CONNECTIONS_MIGRATIONS: &[Migration] = &[
         from: 3,
         description: "add the imported init SQL marker (not set when absent)",
         apply: connections_v3_to_v4,
+    },
+    Migration {
+        from: 4,
+        description: "add the default schema / catalog, the auto-commit override and the disabled reason",
+        apply: connections_v4_to_v5,
     },
 ];
 
@@ -378,6 +412,42 @@ fn check_for_driver(registry: &DriverRegistry, c: &Connection) -> Result<(), Wor
         name: c.name.clone(),
         source: Box::new(source),
     })
+}
+
+/// What a save must keep from the copy of a connection on disk, whatever the caller's copy says
+/// (P2-C): the imported init SQL marker (a UI copy that lost it must not clear it: one more
+/// confirmation, never one less) and the disabled reason (only
+/// [`Workspace::enable_connection`] clears it, after [`Connection::try_enable`]).
+///
+/// - Marker: set again when the disk copy has it and the new copy holds the same init SQL. New
+///   init SQL without the marker is checked at open against the disk anyway
+///   ([`Workspace::init_sql_marked_on_disk`]).
+/// - Disabled reason: when the disk copy has one and the new copy has none, the save is refused
+///   ([`ConnectionError::InvalidField`] on `disabled_reason`), unless `allow_reason_change` (the
+///   import, which recomputes the reason from the source).
+fn carry_protected_state(
+    disk: &Connections,
+    next: &mut Connections,
+    allow_reason_change: bool,
+) -> Result<(), WorkspaceError> {
+    for c in &mut next.items {
+        let Some(old) = disk.get(c.id) else {
+            continue;
+        };
+        if old.init_sql_needs_confirmation && !c.init_sql.is_empty() && old.init_sql == c.init_sql {
+            c.init_sql_needs_confirmation = true;
+        }
+        if !allow_reason_change && old.disabled_reason.is_some() && c.disabled_reason.is_none() {
+            return Err(WorkspaceError::InvalidConnection {
+                name: c.name.clone(),
+                source: ConnectionError::InvalidField {
+                    field: "disabled_reason".to_owned(),
+                    reason: "can only be cleared by enabling the connection once its cause is fixed",
+                },
+            });
+        }
+    }
+    Ok(())
 }
 
 /// The process-wide write guard of one `connections.json`, keyed by its canonical path (the
@@ -697,9 +767,15 @@ impl Workspace {
     /// Disabled connections (engines without a driver, imported for later, ADR-0006 §5) are
     /// checked against the model rules only.
     ///
+    /// Since P2-C it also keeps what the disk copy protects ([`carry_protected_state`]): the
+    /// imported init SQL marker of a connection whose init SQL is unchanged is kept even if
+    /// `connections` lost it, and a disabled reason cannot be dropped (use
+    /// [`Self::enable_connection`]). The file is read under the write guard first.
+    ///
     /// # Errors
     /// [`WorkspaceError::Core`] with the first connection its driver refuses (nothing is
-    /// written), then the errors of [`Self::save_connections`].
+    /// written), [`WorkspaceError::InvalidConnection`] for a dropped disabled reason, then the
+    /// load and save errors of [`Self::load_connections`] and [`Self::save_connections`].
     pub fn save_connections_checked(
         &self,
         connections: &Connections,
@@ -708,7 +784,107 @@ impl Workspace {
         for c in connections.iter() {
             check_for_driver(registry, c)?;
         }
-        self.save_connections(connections)
+        let _guard = self.guard();
+        let disk = self.load_connections_unguarded()?.connections;
+        let mut next = connections.clone();
+        carry_protected_state(&disk, &mut next, false)?;
+        self.save_connections_unguarded(&next)
+    }
+
+    /// Replaces one connection (same id) and saves `connections.json`, so the UI does not
+    /// rewrite the whole list to edit one connection (wave 3 follow-up). The connection is
+    /// checked like [`Self::save_connections_checked`] (driver rules for an enabled connection,
+    /// model rules for a disabled one), and the file is read, changed and written under the
+    /// process-wide write guard, so a marker clear or another save made meanwhile is not lost.
+    /// The protected state of the disk copy is kept ([`carry_protected_state`]): the imported
+    /// init SQL marker of unchanged init SQL, and the disabled reason (refused if dropped).
+    ///
+    /// `connections` (the caller's copy) is updated with what was written, the other entries
+    /// refreshed from the file.
+    ///
+    /// # Errors
+    /// [`ConnectionError::NotFound`] when no connection with that id is on disk; the check
+    /// errors; storage errors. Nothing is written on error and `connections` is unchanged.
+    pub fn update_connection(
+        &self,
+        connections: &mut Connections,
+        connection: Connection,
+        registry: &DriverRegistry,
+    ) -> Result<(), WorkspaceError> {
+        check_for_driver(registry, &connection)?;
+        let _guard = self.guard();
+        let disk = self.load_connections_unguarded()?.connections;
+        let mut next = disk.clone();
+        let slot = next
+            .get_mut(connection.id)
+            .ok_or(ConnectionError::NotFound(connection.id))?;
+        *slot = connection;
+        carry_protected_state(&disk, &mut next, false)?;
+        self.save_connections_unguarded(&next)?;
+        *connections = next;
+        Ok(())
+    }
+
+    /// Enables connection `id` through [`Connection::try_enable`] (the cause of its
+    /// [`DisabledReason`](crate::DisabledReason) must be gone; `route_fixed` confirms a route
+    /// the import could not reproduce was set up again) and saves it, under the write guard.
+    ///
+    /// # Errors
+    /// [`ConnectionError::NotFound`]; [`WorkspaceError::Core`] when the driver refuses it or the
+    /// route is not confirmed (the message says which); storage errors.
+    pub fn enable_connection(
+        &self,
+        connections: &mut Connections,
+        id: ConnectionId,
+        route_fixed: bool,
+        registry: &DriverRegistry,
+    ) -> Result<(), WorkspaceError> {
+        let _guard = self.guard();
+        let mut next = self.load_connections_unguarded()?.connections;
+        let c = next.get_mut(id).ok_or(ConnectionError::NotFound(id))?;
+        let name = c.name.clone();
+        c.try_enable(registry, route_fixed)
+            .map_err(|e| WorkspaceError::Core {
+                name,
+                source: Box::new(match e {
+                    crate::registry::EnableError::Refused(core) => core,
+                    route @ crate::registry::EnableError::RouteNotConfirmed(_) => {
+                        CoreError::Runtime(route.to_string())
+                    }
+                }),
+            })?;
+        self.save_connections_unguarded(&next)?;
+        *connections = next;
+        tracing::info!(project = %self.project, connection = %id, "connection enabled");
+        Ok(())
+    }
+
+    /// The bulk write of the DBeaver import (P2-C): every connection is checked
+    /// ([`check_for_driver`]), the file is read and written under the write guard, connections
+    /// of `upserts` replace those with the same id or are appended, and the imported init SQL
+    /// marker of the disk copy is kept like [`Self::save_connections_checked`] does. Unlike the
+    /// UI paths, the import may set or clear a disabled reason (it recomputes it from the
+    /// source). Returns the connections as written.
+    pub(crate) fn save_imported(
+        &self,
+        upserts: Vec<Connection>,
+        registry: &DriverRegistry,
+    ) -> Result<Connections, WorkspaceError> {
+        for c in &upserts {
+            check_for_driver(registry, c)?;
+        }
+        let _guard = self.guard();
+        let disk = self.load_connections_unguarded()?.connections;
+        let mut next = disk.clone();
+        for c in upserts {
+            match next.get_mut(c.id) {
+                Some(slot) => *slot = c,
+                None => next.insert(c)?,
+            }
+        }
+        carry_protected_state(&disk, &mut next, true)?;
+        self.save_connections_unguarded(&next)?;
+        Ok(next)
     }
 
     /// [`Self::create_connection`] after [`DriverRegistry::validate_connection`]: nothing is

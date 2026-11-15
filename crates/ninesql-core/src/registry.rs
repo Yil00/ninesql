@@ -124,7 +124,55 @@ impl DriverRegistry {
     }
 }
 
+/// Why [`Connection::try_enable`] refused.
+#[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
+pub enum EnableError {
+    /// The route of the imported connection was not reproduced, and the caller did not confirm
+    /// it was set up again (`route_fixed`).
+    #[error(
+        "the connection was disabled because its route could not be imported ({0}); set the route up again and confirm it"
+    )]
+    RouteNotConfirmed(String),
+    /// The driver (still) refuses the connection, or there is none.
+    #[error(transparent)]
+    Refused(#[from] CoreError),
+}
+
 impl Connection {
+    /// Enables a connection, clearing its [`DisabledReason`](crate::DisabledReason) only when
+    /// the cause is gone (P2-C: a connection disabled for a missing hop, profile or handler
+    /// cannot simply be re-enabled):
+    /// - every kind: [`DriverRegistry::validate_connection`] must pass (a driver is registered
+    ///   for the engine and accepts the settings);
+    /// - [`DisabledKind::Route`](crate::DisabledKind::Route): `route_fixed` must be `true`, which
+    ///   the UI passes only after showing the reason and the user confirming the route (SSH hops,
+    ///   proxy) was set up again.
+    ///
+    /// A connection disabled without a reason (by the user) only needs the validation. On error
+    /// nothing changes.
+    ///
+    /// # Errors
+    /// [`EnableError`].
+    pub fn try_enable(
+        &mut self,
+        registry: &DriverRegistry,
+        route_fixed: bool,
+    ) -> Result<(), EnableError> {
+        if let Some(reason) = &self.disabled_reason
+            && reason.kind == crate::connection::DisabledKind::Route
+            && !route_fixed
+        {
+            return Err(EnableError::RouteNotConfirmed(reason.message.clone()));
+        }
+        let mut candidate = self.clone();
+        candidate.enabled = true;
+        candidate.disabled_reason = None;
+        registry.validate_connection(&candidate)?;
+        *self = candidate;
+        Ok(())
+    }
+
     /// [`Connection::validate`] plus the driver-specific rules, so a connection the driver
     /// would refuse at connect is refused when it is saved or imported (M2):
     /// - a property whose key `capabilities` reserves ([`Capabilities::is_reserved_property`],

@@ -22,6 +22,8 @@
 //! - [`CoreServices::unlock_vault`] / [`CoreServices::create_vault`] when an open answers
 //!   [`OpenOutcome::NeedsVaultUnlock`](crate::OpenOutcome::NeedsVaultUnlock), then opens again;
 //! - [`CoreServices::lock_now`] for a "lock secrets" action;
+//! - [`CoreServices::preview_import`] / [`CoreServices::apply_import`] for the DBeaver import
+//!   (P2-B / P2-C, [`crate::import`]);
 //! - [`CoreServices::lock_watcher_status`] to say whether sleep / screen lock are watched.
 //!
 //! Every call that may block (store access, Argon2id, file I/O) runs on the runtime's blocking
@@ -42,6 +44,9 @@ use tokio::task::JoinHandle;
 
 use crate::connection::Connection;
 use crate::error::{CoreError, WorkspaceError};
+use crate::import::{
+    ImportChoices, ImportError, ImportOutcome, ImportPreview, ImportSource, Importer,
+};
 use crate::registry::DriverRegistry;
 use crate::session::{
     CoreEvent, CoreEvents, EventSink, ManagerConfig, Reply, SecretsLockReason, SessionManager,
@@ -421,6 +426,75 @@ impl CoreServices {
     /// [`CoreError::NoDriver`], [`CoreError::InvalidConnection`].
     pub fn validate_connection(&self, connection: &Connection) -> Result<(), CoreError> {
         self.registry().validate_connection(connection)
+    }
+
+    /// The DBeaver importer of this session: the open project, the registered drivers, the
+    /// secret stores (default store: [`Self::secret_backend`]) and the session manager's DBeaver
+    /// roots. Its methods block; prefer [`Self::preview_import`] / [`Self::apply_import`].
+    #[must_use]
+    pub fn importer(&self) -> Importer {
+        Importer::new(
+            self.inner.workspace.clone(),
+            self.registry().clone(),
+            self.inner.stores.clone(),
+            self.inner.manager.dbeaver_roots().clone(),
+            self.inner.backend.store(),
+        )
+    }
+
+    /// Runs `f` on the runtime's blocking pool and answers through a [`Reply`].
+    fn blocking<T, F>(&self, what: &'static str, f: F) -> Reply<Result<T, ImportError>>
+    where
+        T: Send + 'static,
+        F: FnOnce() -> Result<T, ImportError> + Send + 'static,
+    {
+        let (tx, reply) = Reply::channel();
+        let task = self.inner.manager.runtime().handle().spawn_blocking(f);
+        self.inner.manager.runtime().spawn(async move {
+            let result = task
+                .await
+                .unwrap_or_else(|_| Err(ImportError::Runtime(format!("the {what} task failed"))));
+            let _ = tx.send(result);
+        });
+        reply
+    }
+
+    /// DBeaver import, step 1 (P2-B / P2-C): reads `source` read-only (I4) and answers with
+    /// the [`ImportPreview`] (no secret value, I1), on the blocking pool (I6). The source
+    /// workspace becomes a DBeaver root of the session: its database files open read-only.
+    pub fn preview_import(
+        &self,
+        source: ImportSource,
+    ) -> Reply<Result<ImportPreview, ImportError>> {
+        let importer = self.importer();
+        self.blocking("import preview", move || importer.preview(&source))
+    }
+
+    /// DBeaver import, step 2: applies `preview` with the user's `choices`, on the blocking
+    /// pool (I6). See [`Importer::apply`]. On [`ImportError::VaultLocked`], unlock the vault
+    /// ([`Self::unlock_vault`]) and call it again with the same preview; on
+    /// [`ImportError::VaultNotCreated`], create it ([`Self::create_vault`]) first; on
+    /// [`ImportError::SourceChanged`], preview again.
+    pub fn apply_import(
+        &self,
+        preview: ImportPreview,
+        choices: ImportChoices,
+    ) -> Reply<Result<ImportOutcome, ImportError>> {
+        let importer = self.importer();
+        let vault = self.vault().ok();
+        self.blocking("import", move || {
+            // A vault not created yet holds nothing and is not "locked": saving into it would
+            // fail half-way, so the UI is asked to create it first.
+            if choices.store == Some(StoreKind::Vault)
+                && preview.secret_count() > 0
+                && vault
+                    .as_ref()
+                    .is_some_and(|v| matches!(v.status(), Ok(VaultStatus::NotCreated)))
+            {
+                return Err(ImportError::VaultNotCreated);
+            }
+            importer.apply(&preview, &choices)
+        })
     }
 
     /// The secret stores (for [`Workspace::create_connection_checked`], run on a background

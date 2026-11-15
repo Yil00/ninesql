@@ -1,0 +1,40 @@
+project General credentials=Decrypted { passwords: 8 }
+type dev -> dev: builtin
+type prod -> prod: builtin
+type staging -> staging: create SafetyPolicy { auto_commit: false, confirm_destructive: true, confirm_every_write: true, read_only: false, log_query_text: true, production: false }
+type test -> test: builtin
+folder Analytics used=true
+folder Legacy used=true
+folder Team A used=true
+folder Team A/Production used=true
+folder Team B used=true
+connection clickhouse-analytics: ImportedDisabled create engine=clickhouse type=staging folder=["Analytics"] enabled=false reason=Some(NoDriver) read_only=None auto_commit=None schema=None marker=false init_sql=0 tls=VerifyFull ssh_hops=0 props=[] secrets=["Auth:Password"]
+  - Warning Disabled
+  - Warning TlsConverted
+connection mariadb-ssh-key: Imported create engine=mariadb type=dev folder=[] enabled=true reason=None read_only=None auto_commit=None schema=None marker=false init_sql=0 tls=Require ssh_hops=1 props=[] secrets=["SshServer:SshKeyPassphrase"]
+  - Info SshHostKeyToConfirm configuration.handlers.ssh_tunnel
+  - Warning TlsNotVerified
+connection mysql-test: Imported create engine=mysql type=test folder=["Team B"] enabled=true reason=None read_only=None auto_commit=Some(false) schema=None marker=false init_sql=0 tls=Require ssh_hops=0 props=[] secrets=["Auth:Password"]
+  - Info TlsConverted
+  - Info Unsupported configuration.bootstrap.autocommit
+  - Warning TlsNotVerified
+  - Warning Unsupported configuration.properties.connectTimeout
+connection oracle-legacy: ImportedDisabled create engine=oracle type=dev folder=["Legacy"] enabled=false reason=Some(NoDriver) read_only=None auto_commit=None schema=None marker=false init_sql=0 tls=VerifyFull ssh_hops=0 props=[] secrets=["Auth:Password"]
+  - Warning TlsConverted
+  - Warning UnsupportedEngine driver
+connection pg-dev: Imported create engine=postgresql type=dev folder=["Team A"] enabled=true reason=None read_only=None auto_commit=None schema=Some("app") marker=true init_sql=1 tls=VerifyFull ssh_hops=0 props=[] secrets=["Auth:Password"]
+  - Info Unsupported configuration.bootstrap.defaultSchema
+  - Warning InitSql configuration.bootstrap.query
+  - Warning TlsConverted
+  - Warning Unsupported configuration.properties.ApplicationName
+  - Warning Unsupported configuration.properties.connectTimeout
+connection pg-prod-ssh: Imported create engine=postgresql type=prod folder=["Team A", "Production"] enabled=true reason=None read_only=Some(true) auto_commit=None schema=None marker=false init_sql=0 tls=VerifyFull ssh_hops=1 props=[] secrets=["Auth:Password", "SshServer:SshPassword"]
+  - Info SshHostKeyToConfirm configuration.handlers.ssh_tunnel
+  - Warning TlsConverted
+connection pg-url-tls: Imported create engine=postgresql type=dev folder=["Team B"] enabled=true reason=None read_only=None auto_commit=None schema=None marker=false init_sql=0 tls=VerifyFull ssh_hops=0 props=[] secrets=[]
+connection roundtrip-marker: Imported create engine=postgresql type=dev folder=[] enabled=true reason=None read_only=None auto_commit=None schema=None marker=false init_sql=0 tls=VerifyFull ssh_hops=0 props=[] secrets=[]
+  - Warning TlsConverted
+connection sqlite-local: Imported create engine=sqlite type=dev folder=[] enabled=true reason=None read_only=None auto_commit=None schema=None marker=false init_sql=0 tls=VerifyFull ssh_hops=0 props=[] secrets=[]
+connection timescale-metrics: ImportedDisabled create engine=timescaledb type=dev folder=["Team B"] enabled=false reason=Some(NoDriver) read_only=None auto_commit=None schema=None marker=false init_sql=0 tls=VerifyFull ssh_hops=0 props=[] secrets=["Auth:Password"]
+  - Warning Disabled
+  - Warning TlsConverted
