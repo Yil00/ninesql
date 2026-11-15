@@ -416,8 +416,16 @@ async fn one_shot_read_write_transaction_cannot_write() {
             }
             _ => {}
         }
-        // Outside a transaction block PostgreSQL only warns; inside one it is accepted.
-        let _ = run(s.as_mut(), ONE_SHOT).await;
+        // The comma form is classified `ChangesAccessMode` since the reviewed driver-API PR:
+        // refused client-side. The driver's `SET TRANSACTION READ ONLY` re-assert stays as
+        // defence in depth.
+        assert!(
+            matches!(
+                run(s.as_mut(), ONE_SHOT).await,
+                Err(DriverError::ReadOnly(_))
+            ),
+            "{mode}: the comma form was not refused"
+        );
         match run(s.as_mut(), "SELECT ninesql_test.write_one()").await {
             Err(DriverError::ReadOnly(_)) => {}
             other => panic!(
@@ -437,7 +445,7 @@ async fn one_shot_read_write_transaction_cannot_write() {
     };
     // Savepoints: the one-shot READ WRITE, then SAVEPOINT, a write, ROLLBACK TO, a write.
     s.begin().await.unwrap();
-    let _ = run(s.as_mut(), ONE_SHOT).await;
+    assert!(run(s.as_mut(), ONE_SHOT).await.is_err());
     s.savepoint("sp").await.unwrap();
     write_refused(
         run(s.as_mut(), "SELECT ninesql_test.write_one()").await,
@@ -451,7 +459,7 @@ async fn one_shot_read_write_transaction_cannot_write() {
     s.rollback().await.unwrap();
     // An aborted transaction, then ROLLBACK TO, then a write.
     s.begin().await.unwrap();
-    let _ = run(s.as_mut(), ONE_SHOT).await;
+    assert!(run(s.as_mut(), ONE_SHOT).await.is_err());
     s.savepoint("sp").await.unwrap();
     assert!(run(s.as_mut(), "SELECT 1 / 0").await.is_err());
     s.rollback_to_savepoint("sp").await.unwrap();

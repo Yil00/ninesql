@@ -453,12 +453,13 @@ fn tunnel_through_jump_host_to_postgres() {
         let tunnel = Tunnel::open(spec(&creds, HostKeyPolicy::AcceptNew, HostKeyPolicy::AcceptNew), store2)
             .await
             .unwrap();
-        assert_eq!(tunnel.info().host_key, HostKeyVerification::Disabled);
-        // Accept-new is reported per hop as not verified (ADR-0016).
+        assert_eq!(tunnel.info().host_key, HostKeyVerification::AcceptNew);
+        // Accept-new is reported as such, per hop too (ADR-0016 §2.5).
         let w = driver_warnings(tunnel.info());
-        assert!(w.contains(&SecurityWarning::SshHostKeyNotVerified));
-        assert!(w.contains(&SecurityWarning::SshHopHostKeyNotVerified { hop: 0 }));
-        assert!(w.contains(&SecurityWarning::SshHopHostKeyNotVerified { hop: 1 }));
+        assert!(w.contains(&SecurityWarning::SshHostKeyAcceptNew));
+        assert!(!w.contains(&SecurityWarning::SshHostKeyNotVerified));
+        assert!(w.contains(&SecurityWarning::SshHopHostKeyAcceptNew { hop: 0 }));
+        assert!(w.contains(&SecurityWarning::SshHopHostKeyAcceptNew { hop: 1 }));
         let auto: Vec<_> = tunnel
             .security_warnings()
             .iter()

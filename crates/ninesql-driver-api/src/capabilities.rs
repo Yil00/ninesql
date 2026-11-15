@@ -603,10 +603,12 @@ mod tests {
         assert!(matches!(err, DriverError::InvalidParams(_)));
         assert!(!err.to_string().contains("pw-value"));
 
-        let mut c = ConnectCapabilities::default();
-        c.accepted_properties = Some(BTreeSet::from(["search_path".to_owned()]));
-        c.auth = BTreeSet::from([AuthKind::Password]);
-        c.client_certificates = true;
+        let mut c = ConnectCapabilities {
+            accepted_properties: Some(BTreeSet::from(["search_path".to_owned()])),
+            auth: BTreeSet::from([AuthKind::Password]),
+            client_certificates: true,
+            ..ConnectCapabilities::default()
+        };
         assert!(c.accepts_property("searchPath"));
         assert!(c.accepts_property("SEARCH-PATH"));
         assert!(!c.accepts_property("work_mem"));
