@@ -165,6 +165,95 @@ fn positions() {
     assert_eq!(items[2].start.offset, items[2].span.start);
 }
 
+/// Security review H2: after a statement that changes `standard_conforming_strings`, the rest
+/// of the script is re-split with the session's new dialect (reference loop
+/// `conformance::script_plan`), so statement boundaries and classes follow the new mode.
+#[test]
+fn script_is_resplit_after_a_lexical_mode_change() {
+    use ninesql_driver_api::conformance::script_plan;
+    let script = "SET standard_conforming_strings = off;\n\
+                  UPDATE t SET a = 'it\\'s' WHERE id = 1;\n\
+                  SELECT 1;";
+    // Split once with the starting mode, the UPDATE swallows the SELECT (stale boundaries).
+    let stale = PgDialect::new().split_script(script);
+    assert_eq!(stale.len(), 2);
+    let mut run = |text: &str| -> Option<Box<dyn Dialect>> {
+        text.starts_with("SET standard_conforming_strings")
+            .then(|| {
+                Box::new(PgDialect::with_standard_conforming_strings(false)) as Box<dyn Dialect>
+            })
+    };
+    let plan = script_plan(script, Box::new(PgDialect::new()), &mut run);
+    let got: Vec<_> = plan.iter().map(|p| (p.text.as_str(), p.class)).collect();
+    assert_eq!(
+        got,
+        [
+            (
+                "SET standard_conforming_strings = off",
+                Some(StatementClass::ChangesAccessMode)
+            ),
+            (
+                "UPDATE t SET a = 'it\\'s' WHERE id = 1",
+                Some(StatementClass::Write)
+            ),
+            ("SELECT 1", Some(StatementClass::Read)),
+        ]
+    );
+    // The SET is the item the helper flags.
+    assert!(ninesql_driver_api::item_may_change_lexical_modes(
+        &PgDialect::new(),
+        &stale[0],
+        script
+    ));
+    // `split_script_from` keeps whole-script offsets and positions.
+    let rest = PgDialect::with_standard_conforming_strings(false)
+        .split_script_from(script, stale[0].span.end);
+    assert_eq!(rest.len(), 2);
+    assert_eq!(rest[1].text(script), "SELECT 1");
+    assert_eq!((rest[1].start.line, rest[1].start.column), (3, 1));
+}
+
+/// Security review L1: the COPY data starts after the `;` the lexer found, not after a `;`
+/// inside a comment.
+#[test]
+fn copy_data_starts_after_the_lexed_terminator() {
+    let s = "COPY t FROM STDIN /* ;\n\\.\n*/;\n1\tx\n\\.\nSELECT 2;";
+    let got = split(s);
+    assert_eq!(got.len(), 2, "{got:?}");
+    assert_eq!(
+        got[0].0,
+        ScriptItemKind::Refused(ScriptRefusal::CopyFromStdin)
+    );
+    assert_eq!(got[1], (ScriptItemKind::Statement, "SELECT 2".into()));
+}
+
+/// Security review M4: a meta-command or COPY block every few bytes costs a small window, not a
+/// full one per item.
+#[test]
+fn meta_command_heavy_scripts_split_in_linear_time() {
+    let s = "\\echo x\n".repeat(32_768);
+    let start = std::time::Instant::now();
+    let items = PgDialect::new().split_script(&s);
+    let elapsed = start.elapsed();
+    assert_eq!(items.len(), 32_768);
+    assert!(elapsed < std::time::Duration::from_secs(5), "{elapsed:?}");
+    let s = "COPY t FROM stdin;\n1\n\\.\n".repeat(16_384);
+    let start = std::time::Instant::now();
+    assert_eq!(PgDialect::new().split_script(&s).len(), 16_384);
+    let elapsed = start.elapsed();
+    assert!(elapsed < std::time::Duration::from_secs(5), "{elapsed:?}");
+}
+
+/// Security review M3: one long line.
+#[test]
+fn one_long_line_splits_in_linear_time() {
+    let s = "SELECT 1;".repeat(200_000);
+    let start = std::time::Instant::now();
+    assert_eq!(PgDialect::new().split_script(&s).len(), 200_000);
+    let elapsed = start.elapsed();
+    assert!(elapsed < std::time::Duration::from_secs(5), "{elapsed:?}");
+}
+
 fn junk() -> impl Strategy<Value = String> {
     prop::collection::vec(
         prop::sample::select(vec![

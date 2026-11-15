@@ -105,8 +105,11 @@ impl Dialect for PgDialect {
         let rules = self.lexical_rules();
         let mut pieces = Vec::new();
         let mut base = 0;
-        let mut window = SCRIPT_WINDOW;
+        let mut window = MIN_WINDOW;
         'outer: while base < script.len() {
+            // The window follows what the last step consumed (twice it, within bounds), so a
+            // script with a meta-command or a COPY block every few bytes lexes a few hundred
+            // bytes per step, not a full window (security review M4).
             // Split a window of the rest. Every statement the window ends with a `;` is exactly
             // what splitting the whole rest gives (the lexer reads left to right, and under
             // PostgreSQL's rules no state crosses a statement boundary); the last one may be
@@ -117,19 +120,25 @@ impl Dialect for PgDialect {
                 end += 1;
             }
             let complete = end == script.len();
-            let mut spans = split_psql(&script[base..end], rules);
+            let step_base = base;
+            let mut spans = split_psql_terminated(&script[base..end], rules);
             // Where the next window starts: the first token of the statement the window may
             // have cut (a token start of the whole text, so the lexer restarts in step).
             let mut next = None;
-            if !complete {
-                next = spans.pop().map(|s| s.start + base);
+            // A statement's start is exact even when the window cuts it, and a meta-command
+            // only needs its start (it ends with its line): keep it.
+            let last_is_meta = spans
+                .last()
+                .is_some_and(|(sp, _)| script.as_bytes()[sp.start + base] == b'\\');
+            if !complete && !last_is_meta {
+                next = spans.pop().map(|(s, _)| s.start + base);
                 if spans.is_empty() {
                     window = window.saturating_mul(2);
                     continue;
                 }
             }
-            window = SCRIPT_WINDOW;
-            for span in spans {
+            for (span, terminator) in spans {
+                let terminator = terminator.map(|t| t + base);
                 let span = StatementSpan {
                     start: span.start + base,
                     end: span.end + base,
@@ -143,21 +152,27 @@ impl Dialect for PgDialect {
                         ScriptItemKind::Refused(ScriptRefusal::PsqlMetaCommand),
                     ));
                     base = eol;
+                    window = next_window(base - step_base);
                     continue 'outer;
                 }
                 if is_copy_from_stdin(text, rules) {
-                    let data_end = copy_data_end(script, span.end);
+                    // The data starts after the `;` the lexer found (none: no data).
+                    let data_end = terminator.map_or(span.end, |t| copy_data_end(script, t));
                     pieces.push((
                         trimmed(script, span.start, data_end),
                         ScriptItemKind::Refused(ScriptRefusal::CopyFromStdin),
                     ));
                     base = data_end;
+                    window = next_window(base - step_base);
                     continue 'outer;
                 }
                 pieces.push((span, ScriptItemKind::Statement));
             }
             match next {
-                Some(n) if !complete => base = n,
+                Some(n) if !complete => {
+                    base = n;
+                    window = next_window(base - step_base);
+                }
                 _ => break,
             }
         }
@@ -183,6 +198,15 @@ impl Dialect for PgDialect {
 /// on the server instead of running a second statement. The classifier still splits on every
 /// `;`, so nothing a merged piece holds escapes it.
 fn split_psql(script: &str, rules: LexicalRules) -> Vec<StatementSpan> {
+    split_psql_terminated(script, rules)
+        .into_iter()
+        .map(|(s, _)| s)
+        .collect()
+}
+
+/// [`split_psql`], with the offset of the `;` that ends each statement (`None` for the last
+/// one when the text ends without it).
+fn split_psql_terminated(script: &str, rules: LexicalRules) -> Vec<(StatementSpan, Option<usize>)> {
     let mut spans = Vec::new();
     let mut current: Option<StatementSpan> = None;
     let mut paren = 0u32;
@@ -192,7 +216,7 @@ fn split_psql(script: &str, rules: LexicalRules) -> Vec<StatementSpan> {
     for t in code_tokens(script, rules) {
         if t.kind == CodeTokenKind::Semicolon && paren == 0 && begin == 0 {
             if let Some(s) = current.take() {
-                spans.push(s);
+                spans.push((s, Some(t.start)));
             }
             words.clear();
             continue;
@@ -214,7 +238,7 @@ fn split_psql(script: &str, rules: LexicalRules) -> Vec<StatementSpan> {
         }
     }
     if let Some(s) = current {
-        spans.push(s);
+        spans.push((s, None));
     }
     spans
 }
@@ -248,6 +272,15 @@ fn track_routine_blocks(
 /// ends inside the window).
 const SCRIPT_WINDOW: usize = 64 * 1024;
 
+/// Smallest split window.
+const MIN_WINDOW: usize = 512;
+
+/// The next window: twice what the last step consumed, between [`MIN_WINDOW`] and
+/// [`SCRIPT_WINDOW`].
+fn next_window(consumed: usize) -> usize {
+    consumed.saturating_mul(2).clamp(MIN_WINDOW, SCRIPT_WINDOW)
+}
+
 /// `COPY … FROM STDIN` (top-level `FROM` followed by `STDIN`).
 fn is_copy_from_stdin(text: &str, rules: LexicalRules) -> bool {
     let toks = code_tokens(text, rules);
@@ -272,13 +305,10 @@ fn line_end(script: &str, from: usize) -> usize {
     script[from..].find('\n').map_or(script.len(), |p| from + p)
 }
 
-/// End of the inline data of a `COPY … FROM STDIN` whose text ends at `stmt_end`: the data
-/// starts on the line after the terminating `;` and ends with a line holding only `\.` (psql);
-/// without one, it runs to the end of the script. Without a `;`, there is no data.
-fn copy_data_end(script: &str, stmt_end: usize) -> usize {
-    let Some(semi) = script[stmt_end..].find(';').map(|p| stmt_end + p) else {
-        return script.len();
-    };
+/// End of the inline data of a `COPY … FROM STDIN` whose terminating `;` (as the lexer found
+/// it) is at `semi`: the data starts on the line after it and ends with a line holding only
+/// `\.` (psql); without one, it runs to the end of the script.
+fn copy_data_end(script: &str, semi: usize) -> usize {
     let mut line_start = line_end(script, semi);
     while line_start < script.len() {
         line_start += 1; // past the `\n`

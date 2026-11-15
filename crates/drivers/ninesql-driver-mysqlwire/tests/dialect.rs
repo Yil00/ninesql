@@ -224,6 +224,120 @@ fn delimiter_heavy_scripts_split_in_linear_time() {
     assert_eq!(a, d.split_statements(&plain));
 }
 
+fn nbe_after_set(text: &str) -> Option<Box<dyn Dialect>> {
+    text.to_ascii_uppercase()
+        .starts_with("SET SESSION SQL_MODE")
+        .then(|| {
+            Box::new(MyDialect::mysql().with_sql_mode("NO_BACKSLASH_ESCAPES")) as Box<dyn Dialect>
+        })
+}
+
+/// Security review H2: after `SET sql_mode`, the rest is re-split with the session's new
+/// dialect (reference loop `conformance::script_plan`), also under a custom `DELIMITER`.
+#[test]
+fn script_is_resplit_after_a_lexical_mode_change() {
+    use ninesql_driver_api::conformance::script_plan;
+    let script = "SET SESSION sql_mode='NO_BACKSLASH_ESCAPES';\n\
+                  UPDATE t SET a='x\\' -- ' WHERE id=1;\n\
+                  SELECT 2;";
+    // The stale split keeps the WHERE in the UPDATE: classified with the old rules, a Write.
+    let stale = MyDialect::mysql().split_script(script);
+    assert_eq!(
+        stale[1].text(script),
+        "UPDATE t SET a='x\\' -- ' WHERE id=1"
+    );
+    assert_eq!(
+        MyDialect::mysql().classify(stale[1].text(script)),
+        StatementClass::Write
+    );
+    let plan = script_plan(script, Box::new(MyDialect::mysql()), &mut nbe_after_set);
+    let got: Vec<_> = plan.iter().map(|p| (p.text.as_str(), p.class)).collect();
+    assert_eq!(
+        got,
+        [
+            (
+                "SET SESSION sql_mode='NO_BACKSLASH_ESCAPES'",
+                Some(StatementClass::ChangesAccessMode)
+            ),
+            // With NO_BACKSLASH_ESCAPES the WHERE is in a comment: every row is updated.
+            (
+                "UPDATE t SET a='x\\' -- ' WHERE id=1;\nSELECT 2",
+                Some(StatementClass::Destructive)
+            ),
+        ]
+    );
+    // Under a custom delimiter, the delimiter in force survives the re-split.
+    let script = "DELIMITER //\n\
+                  SET SESSION sql_mode='NO_BACKSLASH_ESCAPES' //\n\
+                  UPDATE t SET a='x\\' -- ' WHERE id=1 //\n\
+                  SELECT 2 //";
+    let plan = script_plan(script, Box::new(MyDialect::mysql()), &mut nbe_after_set);
+    let got: Vec<_> = plan.iter().map(|p| (p.text.as_str(), p.class)).collect();
+    assert_eq!(got.len(), 2, "{got:?}");
+    assert_eq!(got[1].1, Some(StatementClass::Destructive));
+    let rest = MyDialect::mysql()
+        .with_sql_mode("NO_BACKSLASH_ESCAPES")
+        .split_script_from(script, MyDialect::mysql().split_script(script)[1].span.end);
+    assert!(rest.iter().all(|i| i.kind == S), "{rest:?}");
+    // ANSI_QUOTES shows in the lexical rules, so a caller comparing them re-splits.
+    assert_ne!(
+        MyDialect::mysql().lexical_rules(),
+        MyDialect::mysql()
+            .with_sql_mode("ANSI_QUOTES")
+            .lexical_rules()
+    );
+}
+
+/// Security review M4: a long stored-program body is counted once (it used to be rescanned
+/// for every `;`), and directives every few bytes cost a small window each.
+#[test]
+fn long_bodies_and_many_directives_split_in_linear_time() {
+    let body = format!(
+        "CREATE PROCEDURE p() BEGIN {} END",
+        "SELECT 1; ".repeat(32_768)
+    );
+    let d = MyDialect::mysql();
+    let start = std::time::Instant::now();
+    assert_eq!(d.split_statements(&body).len(), 1);
+    assert!(ninesql_driver_api::ensure_single_statement(&d, &body).is_ok());
+    let elapsed = start.elapsed();
+    assert!(elapsed < std::time::Duration::from_secs(5), "{elapsed:?}");
+    let s = "DELIMITER //\nSELECT 1 //\nDELIMITER ;\nSELECT 2;\n".repeat(8_192);
+    let start = std::time::Instant::now();
+    let items = d.split_script(&s);
+    let elapsed = start.elapsed();
+    assert_eq!(items.len(), 4 * 8_192);
+    assert!(elapsed < std::time::Duration::from_secs(5), "{elapsed:?}");
+}
+
+/// Security review L3: a stored program needs its kind right after the `CREATE` clauses.
+#[test]
+fn stored_program_kind_must_follow_create() {
+    let d = MyDialect::mysql();
+    let two =
+        "CREATE VIEW v AS SELECT procedure_name AS procedure, 1 AS begin FROM t; DROP TABLE x";
+    assert_eq!(d.split_statements(two).len(), 2);
+    for one in [
+        "CREATE DEFINER = root@localhost PROCEDURE p() BEGIN SELECT 1; END",
+        "CREATE DEFINER = CURRENT_USER TRIGGER tr BEFORE INSERT ON t FOR EACH ROW BEGIN SET NEW.a = 1; END",
+        "CREATE OR REPLACE DEFINER = `u`@`%` SQL SECURITY INVOKER PROCEDURE p() BEGIN SELECT 1; END",
+        "CREATE AGGREGATE FUNCTION f(x INT) RETURNS INT BEGIN DECLARE s INT; RETURN s; END",
+        "CREATE EVENT e ON SCHEDULE EVERY 1 DAY DO BEGIN DELETE FROM t WHERE a = 1; END",
+    ] {
+        assert_eq!(d.split_statements(one).len(), 1, "{one}");
+    }
+}
+
+/// Security review M3: one long line.
+#[test]
+fn one_long_line_splits_in_linear_time() {
+    let s = "SELECT 1;".repeat(200_000);
+    let start = std::time::Instant::now();
+    assert_eq!(MyDialect::mysql().split_script(&s).len(), 200_000);
+    let elapsed = start.elapsed();
+    assert!(elapsed < std::time::Duration::from_secs(5), "{elapsed:?}");
+}
+
 fn junk() -> impl Strategy<Value = String> {
     prop::collection::vec(
         prop::sample::select(vec![

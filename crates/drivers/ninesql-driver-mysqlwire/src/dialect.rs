@@ -150,8 +150,12 @@ impl MyDialect {
 
 impl Dialect for MyDialect {
     fn lexical_rules(&self) -> LexicalRules {
+        // With `ANSI_QUOTES`, `"…"` is an identifier without backslash escapes (the text is
+        // also normalized, see the module documentation); the rules then differ, so a caller
+        // comparing `lexical_rules()` sees every mode change.
         LexicalRules::MYSQL
             .with_backslash_escapes(!self.modes.no_backslash_escapes.load(Ordering::SeqCst))
+            .with_double_quote_backslash(!self.modes.ansi_quotes.load(Ordering::SeqCst))
     }
 
     fn quote_identifier(&self, ident: &str) -> String {
@@ -181,7 +185,20 @@ impl Dialect for MyDialect {
     }
 
     fn split_script(&self, script: &str) -> Vec<ScriptItem> {
-        split_script_with_delimiters(self, script, self.scan_rules())
+        let (pieces, _) = split_with_delimiters(self, script, self.scan_rules(), 0, None);
+        script_items(script, pieces)
+    }
+
+    fn split_script_from(&self, script: &str, from: usize) -> Vec<ScriptItem> {
+        let mut from = from.min(script.len());
+        while !script.is_char_boundary(from) {
+            from -= 1;
+        }
+        let rules = self.scan_rules();
+        // The `DELIMITER` in force at `from`, rebuilt from the text before it.
+        let (_, delim) = split_with_delimiters(self, &script[..from], rules, 0, None);
+        let (pieces, _) = split_with_delimiters(self, script, rules, from, delim);
+        script_items(script, pieces)
     }
 
     fn explain(&self, query: &str, format: ExplainFormat) -> Option<String> {
@@ -316,11 +333,13 @@ fn scan_with(text: &str, rules: ScanRules, mut f: impl FnMut(Segment) -> bool) {
             return false;
         }
         *code_start = e;
-        f(Segment {
-            kind,
-            start: s,
-            end: e,
-        })
+        // `s == e`: only the code before `s` is handed over.
+        s == e
+            || f(Segment {
+                kind,
+                start: s,
+                end: e,
+            })
     };
     while i < b.len() {
         let c = b[i];
@@ -376,6 +395,12 @@ fn scan_with(text: &str, rules: ScanRules, mut f: impl FnMut(Segment) -> bool) {
             }
             i = e;
         } else {
+            // Code is handed over line by line, so a caller that stops early (the delimiter
+            // search) never waits for the end of a script without quotes or comments. No word
+            // and no delimiter spans a line feed.
+            if c == b'\n' && !push(&mut code_start, Seg::Code, i + 1, i + 1) {
+                return;
+            }
             i += 1;
         }
     }
@@ -407,6 +432,10 @@ fn code_words(text: &str, rules: ScanRules) -> Vec<String> {
 
 /// `CREATE … PROCEDURE | FUNCTION | TRIGGER | EVENT` with a `BEGIN` after it, or a MariaDB
 /// anonymous block `BEGIN NOT ATOMIC …`.
+/// `CREATE [OR REPLACE] [DEFINER = user] [ALGORITHM = …] [SQL SECURITY …] [AGGREGATE]
+/// PROCEDURE | FUNCTION | TRIGGER | EVENT … BEGIN`, the object kind right after those clauses
+/// (security review L3), or a MariaDB anonymous block `BEGIN NOT ATOMIC …`. The definer's
+/// user and host are at most two unquoted words (quoted parts are not code words).
 fn is_stored_program(words: &[String]) -> bool {
     if words.len() >= 3 && words[0] == "BEGIN" && words[1] == "NOT" && words[2] == "ATOMIC" {
         return true;
@@ -414,30 +443,70 @@ fn is_stored_program(words: &[String]) -> bool {
     if words.first().map(String::as_str) != Some("CREATE") {
         return false;
     }
-    let begin = words.iter().position(|w| w == "BEGIN");
-    let kind = words
-        .iter()
-        .position(|w| matches!(w.as_str(), "PROCEDURE" | "FUNCTION" | "TRIGGER" | "EVENT"));
-    matches!((kind, begin), (Some(k), Some(b)) if k < b)
-}
-
-/// Open `BEGIN … END` / `CASE … END` blocks at the end of `words` (`END IF`, `END LOOP`,
-/// `END WHILE`, `END REPEAT`, `END FOR` close blocks whose openers are not counted).
-fn open_blocks(words: &[String]) -> i64 {
-    let mut depth = 0i64;
-    for (i, w) in words.iter().enumerate() {
-        let prev = i.checked_sub(1).map(|p| words[p].as_str());
-        let next = words.get(i + 1).map(String::as_str);
-        match w.as_str() {
-            "BEGIN" => depth += 1,
-            "CASE" if prev != Some("END") => depth += 1,
-            "END" if !matches!(next, Some("IF" | "LOOP" | "WHILE" | "REPEAT" | "FOR")) => {
-                depth -= 1;
+    let mut i = 1;
+    let at = |i: usize| words.get(i).map(String::as_str);
+    if at(i) == Some("OR") && at(i + 1) == Some("REPLACE") {
+        i += 2;
+    }
+    if at(i) == Some("DEFINER") {
+        i += 1;
+        // `CURRENT_USER`, `user`, `user` `host`: up to two words before the next clause.
+        for _ in 0..2 {
+            match at(i) {
+                Some(
+                    "ALGORITHM" | "SQL" | "AGGREGATE" | "PROCEDURE" | "FUNCTION" | "TRIGGER"
+                    | "EVENT",
+                )
+                | None => break,
+                Some(_) => i += 1,
             }
-            _ => {}
         }
     }
-    depth
+    if at(i) == Some("ALGORITHM") {
+        i += 2;
+    }
+    if at(i) == Some("SQL") && at(i + 1) == Some("SECURITY") {
+        i += 3;
+    }
+    if at(i) == Some("AGGREGATE") {
+        i += 1;
+    }
+    matches!(at(i), Some("PROCEDURE" | "FUNCTION" | "TRIGGER" | "EVENT"))
+        && words[i + 1..].iter().any(|w| w == "BEGIN")
+}
+
+/// Counts open `BEGIN … END` / `CASE … END` blocks over words fed in order, with one word of
+/// look-ahead (`END IF`, `END LOOP`, `END WHILE`, `END REPEAT`, `END FOR` close blocks whose
+/// openers are not counted), so a growing definition is counted once, not rescanned
+/// (security review M4).
+#[derive(Default)]
+struct BlockCounter {
+    depth: i64,
+    prev_end: bool,
+    pending_end: bool,
+}
+
+impl BlockCounter {
+    fn feed(&mut self, w: &str) {
+        if self.pending_end {
+            if !matches!(w, "IF" | "LOOP" | "WHILE" | "REPEAT" | "FOR") {
+                self.depth -= 1;
+            }
+            self.pending_end = false;
+        }
+        match w {
+            "BEGIN" => self.depth += 1,
+            "CASE" if !self.prev_end => self.depth += 1,
+            "END" => self.pending_end = true,
+            _ => {}
+        }
+        self.prev_end = w == "END";
+    }
+
+    /// Open blocks now (a trailing `END` closes one).
+    fn open(&self) -> i64 {
+        self.depth - i64::from(self.pending_end)
+    }
 }
 
 /// Joins the spans of a stored-program definition whose `BEGIN … END` body holds `;`: the
@@ -449,11 +518,17 @@ fn merge_compound(text: &str, spans: Vec<StatementSpan>, rules: ScanRules) -> Ve
     let mut i = 0;
     while i < spans.len() {
         let mut span = spans[i];
-        if is_stored_program(&code_words(span.text(text), rules)) {
-            while i + 1 < spans.len()
-                && open_blocks(&code_words(&text[span.start..span.end], rules)) > 0
-            {
+        let words = code_words(span.text(text), rules);
+        if is_stored_program(&words) {
+            let mut blocks = BlockCounter::default();
+            for w in &words {
+                blocks.feed(w);
+            }
+            while i + 1 < spans.len() && blocks.open() > 0 {
                 i += 1;
+                for w in code_words(spans[i].text(text), rules) {
+                    blocks.feed(&w);
+                }
                 span.end = spans[i].end;
             }
         }
@@ -569,11 +644,29 @@ fn find_delimiter(text: &str, from: usize, delim: &str, rules: ScanRules) -> Opt
 /// ends inside the window).
 const SCRIPT_WINDOW: usize = 64 * 1024;
 
-fn split_script_with_delimiters(d: &MyDialect, script: &str, rules: ScanRules) -> Vec<ScriptItem> {
+/// Smallest split window.
+const MIN_WINDOW: usize = 512;
+
+/// The next window: twice what the last step consumed, between [`MIN_WINDOW`] and
+/// [`SCRIPT_WINDOW`] (security review M4: a directive every few bytes costs a few hundred
+/// bytes of lexing, not a full window).
+fn next_window(consumed: usize) -> usize {
+    consumed.saturating_mul(2).clamp(MIN_WINDOW, SCRIPT_WINDOW)
+}
+
+/// The pieces of `script` from byte `start`, with `delim` in force there (`None`: `;`), and
+/// the delimiter in force at the end.
+fn split_with_delimiters(
+    d: &MyDialect,
+    script: &str,
+    rules: ScanRules,
+    start: usize,
+    delim: Option<String>,
+) -> (Vec<(StatementSpan, ScriptItemKind)>, Option<String>) {
     let mut pieces: Vec<(StatementSpan, ScriptItemKind)> = Vec::new();
-    let mut delim: Option<String> = None; // `None`: the default `;`
-    let mut base = 0;
-    let mut window = SCRIPT_WINDOW;
+    let mut delim = delim;
+    let mut base = start;
+    let mut window = MIN_WINDOW;
     let shifted = |s: StatementSpan, by: usize| StatementSpan {
         start: s.start + by,
         end: s.end + by,
@@ -636,7 +729,6 @@ fn split_script_with_delimiters(d: &MyDialect, script: &str, rules: ScanRules) -
                         continue;
                     }
                 }
-                window = SCRIPT_WINDOW;
                 for s in spans {
                     let s = shifted(s, p);
                     let first = s.start;
@@ -644,18 +736,22 @@ fn split_script_with_delimiters(d: &MyDialect, script: &str, rules: ScanRules) -
                         || script.as_bytes()[first] == b'\\'
                     {
                         base = first;
+                        window = next_window(first - p);
                         continue 'outer;
                     }
                     pieces.push((s, ScriptItemKind::Statement));
                 }
                 match next {
-                    Some(n) => base = n,
+                    Some(n) => {
+                        window = next_window(n - p);
+                        base = n;
+                    }
                     None => break,
                 }
             }
         }
     }
-    script_items(script, pieces)
+    (pieces, delim)
 }
 
 // ---------------------------------------------------------------------------------------------

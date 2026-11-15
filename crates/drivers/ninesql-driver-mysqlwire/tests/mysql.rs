@@ -1317,6 +1317,13 @@ async fn scripts_split_as_the_engines_parse_them() {
                 "{sql}"
             );
         }
+        // A NUL byte is refused before anything is sent (security review L5).
+        assert!(matches!(
+            run(s.as_mut(), "SELECT 1\0; DELETE FROM p3d_t").await,
+            Err(DriverError::InvalidParams(_))
+        ));
+        let c = run(s.as_mut(), "SELECT COUNT(*) FROM p3d_t").await.unwrap();
+        assert_eq!(scalar(&c).as_deref(), Some("3"), "{}", dev.engine);
         for sql in [
             "DROP TRIGGER p3d_tr",
             "DROP PROCEDURE p3d_p",
