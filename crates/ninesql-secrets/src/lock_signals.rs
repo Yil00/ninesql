@@ -1235,7 +1235,7 @@ mod tests {
         );
         vault
             .create(
-                &SecretString::from("master-pw".to_owned()),
+                &SecretString::from("master-pw-0123".to_owned()),
                 KdfParams::insecure_for_tests(),
             )
             .unwrap();

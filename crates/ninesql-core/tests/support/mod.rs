@@ -43,6 +43,8 @@ pub struct Wrap {
     pub mock: MockDriver,
     pub seen: Arc<Mutex<Vec<Seen>>>,
     pub ignore_read_only: bool,
+    /// Also drops `inside_dbeaver_workspace` (a file driver that does not know the flag).
+    pub ignore_dbeaver_flag: bool,
     pub busy_until: Arc<Mutex<Option<Instant>>>,
 }
 
@@ -52,6 +54,7 @@ impl Wrap {
             mock,
             seen: Arc::default(),
             ignore_read_only: false,
+            ignore_dbeaver_flag: false,
             busy_until: Arc::default(),
         }
     }
@@ -101,6 +104,9 @@ impl Driver for Wrap {
         });
         if self.ignore_read_only {
             params.read_only = false;
+        }
+        if self.ignore_dbeaver_flag {
+            params.inside_dbeaver_workspace = false;
         }
         let inner = self.mock.connect(params).await?;
         Ok(Box::new(WrapSession {

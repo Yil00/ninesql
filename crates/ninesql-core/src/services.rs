@@ -316,6 +316,7 @@ impl CoreServices {
 
         // 3. The session manager.
         let manager = SessionManager::new(manager_config, registry, stores.clone())?;
+        manager.set_workspace(workspace.clone())?;
 
         // 4. Lock hooks: the vault, the "ask every time" cache, and the UI event.
         let cache = Arc::new(SessionSecretCache::new());
@@ -714,7 +715,7 @@ mod tests {
         let vault = Arc::new(
             Vault::open_at(dir.path().join("vault.bin"), &dir.path().join("vault.lock")).unwrap(),
         );
-        let master = SecretString::from("master-pw".to_owned());
+        let master = SecretString::from("master-pw-0123".to_owned());
         vault
             .create(&master, KdfParams::insecure_for_tests())
             .unwrap();

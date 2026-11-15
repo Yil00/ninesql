@@ -482,10 +482,15 @@ impl ConnectionHub {
         let workspace = self.workspace.clone();
         let current = self.connections.clone();
         let BuiltConnection {
-            connection,
+            mut connection,
             to_store,
             to_delete,
         } = built;
+        // The UI never sets the imported init SQL marker (only the import does): an edit keeps
+        // it only when the hub's current copy still has it, so a form opened before the user
+        // confirmed the init SQL does not bring it back.
+        connection.init_sql_needs_confirmation =
+            connection.init_sql_needs_confirmation && self.init_sql_marker(connection.id);
         self.saving = true;
         cx.notify();
         let work = move || -> Result<(Connections, ConnectionId), String> {
@@ -677,10 +682,38 @@ impl ConnectionHub {
                 self.secrets_locked = Some(reason);
                 cx.emit(HubEvent::SecretsLocked(reason));
             }
+            CoreEvent::ImportedInitSqlConfirmed {
+                connection,
+                statements,
+                cleared,
+            } => {
+                // The hub's copy follows the core only for the statements the user confirmed,
+                // and only when `connections.json` holds them without the marker (`None`: the
+                // core has no workspace, the statements alone decide). A copy with other init
+                // SQL (re-imported meanwhile) or a failed write keeps the marker, so the next
+                // connect asks again; a later save then does not write a cleared marker.
+                // A save that started before the event may still write its snapshot back
+                // with the marker: that only asks once more (fail-closed).
+                if cleared != Some(false)
+                    && let Some(c) = self.connections.get_mut(connection)
+                    && c.init_sql == statements
+                {
+                    c.init_sql_needs_confirmation = false;
+                }
+            }
             _ => {}
         }
         self.check_dropped_events();
         cx.notify();
+    }
+
+    /// Whether the hub's copy of connection `id` still carries the imported init SQL marker
+    /// (`Connection::init_sql_needs_confirmation`). `false` for an unknown connection.
+    #[must_use]
+    pub fn init_sql_marker(&self, id: ConnectionId) -> bool {
+        self.connections
+            .get(id)
+            .is_some_and(|c| c.init_sql_needs_confirmation)
     }
 
     /// When the core dropped events (its channel was full), rebuilds the list of open sessions

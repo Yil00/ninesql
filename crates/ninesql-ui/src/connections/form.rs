@@ -819,6 +819,9 @@ impl ConnectionForm {
 
         let mut connection = match &self.existing {
             Some(existing) => {
+                // Keeps what the form does not edit, the init SQL and its imported marker
+                // included: an edit keeps the marker, a new connection never has it (the UI
+                // never sets it; `ConnectionHub::save` drops it once confirmed).
                 let mut c = existing.clone();
                 c.engine = engine;
                 c.endpoint = endpoint;

@@ -1169,3 +1169,144 @@ fn init_sql_that_changes_the_lexical_mode_or_follows_a_setting_is_confirmed() {
     );
     assert!(flagged(&["SELECT * FROM numbers(1)", "SELECT * FROM numbers(2)"]).is_empty());
 }
+
+/// P1-E review (for P2-C): imported init SQL is confirmed once whatever the connection type, so
+/// a crafted DBeaver workspace cannot skip the confirmation by typing its connection "dev".
+#[test]
+fn imported_init_sql_is_confirmed_once_whatever_the_type() {
+    let tmp = tempfile::tempdir().unwrap();
+    let wrap = Wrap::new(mock_driver());
+    let stats = wrap.mock.stats();
+    let (manager, _) = manager(Arc::new(wrap.clone()), tmp.path());
+    let mut events = manager.take_events().unwrap();
+    let types = ConnectionTypes::default();
+    ui(async {
+        // Dev, harmless statements: no confirmation without the marker.
+        let mut c = mock_connection(ConnectionTypeId::dev());
+        c.init_sql = vec![
+            "SELECT * FROM numbers(1)".into(),
+            "SET search_path TO app".into(),
+        ];
+        let h = open_ok(&manager, c.clone(), &types).await;
+        h.close().await.unwrap().unwrap();
+
+        // With the marker: every statement is flagged, as imported, before anything is dialled.
+        c.init_sql_needs_confirmation = true;
+        let connects = stats.connects();
+        let out = open(&manager, OpenRequest::new(c.clone(), &types))
+            .await
+            .unwrap();
+        let OpenOutcome::InitSqlNeedsConfirmation(ic) = out else {
+            panic!("{out:?}");
+        };
+        assert!(ic.imported);
+        assert!(!ic.production);
+        assert_eq!(ic.statements, c.init_sql);
+        let flagged: Vec<_> = ic.flagged.iter().map(|f| (f.index, f.reason)).collect();
+        assert_eq!(
+            flagged,
+            [(0, ConfirmReason::Imported), (1, ConfirmReason::Imported)]
+        );
+        assert_eq!(stats.connects(), connects, "nothing was dialled");
+
+        // Confirmed: opens, and the core reports the confirmation (no workspace here).
+        let out = open(
+            &manager,
+            OpenRequest::new(c.clone(), &types).with_init_sql_confirmation(ic.token),
+        )
+        .await
+        .unwrap();
+        let OpenOutcome::Opened(h) = out else {
+            panic!("{out:?}");
+        };
+        assert_eq!(wrap.last_seen().init_statements, 2);
+        let mut confirmed = false;
+        while let Ok(Some(ev)) = tokio::time::timeout(Duration::from_secs(5), events.recv()).await {
+            if ev
+                == (CoreEvent::ImportedInitSqlConfirmed {
+                    connection: c.id,
+                    statements: c.init_sql.clone(),
+                    cleared: None,
+                })
+            {
+                confirmed = true;
+                break;
+            }
+        }
+        assert!(confirmed, "no ImportedInitSqlConfirmed event");
+        h.close().await.unwrap().unwrap();
+
+        // An empty init SQL needs nothing, marker or not.
+        let mut empty = c.clone();
+        empty.init_sql.clear();
+        let h = open_ok(&manager, empty, &types).await;
+        h.close().await.unwrap().unwrap();
+
+        // Production keeps its own rule: the destructive entry stays `Destructive`, the others
+        // are flagged as imported; without the marker only the destructive one is flagged.
+        let mut prod = mock_connection(ConnectionTypeId::prod());
+        prod.init_sql = vec![
+            "SELECT * FROM numbers(1)".into(),
+            "DROP TABLE scratch".into(),
+        ];
+        prod.init_sql_needs_confirmation = true;
+        let OpenOutcome::InitSqlNeedsConfirmation(ic) =
+            open(&manager, OpenRequest::new(prod.clone(), &types))
+                .await
+                .unwrap()
+        else {
+            panic!("no confirmation");
+        };
+        assert!(ic.imported && ic.production);
+        let flagged: Vec<_> = ic.flagged.iter().map(|f| (f.index, f.reason)).collect();
+        assert_eq!(
+            flagged,
+            [
+                (0, ConfirmReason::Imported),
+                (1, ConfirmReason::Destructive)
+            ]
+        );
+        // L1: a token issued with the imported notice does not open the connection once the
+        // request says otherwise, and the reverse.
+        let imported_token = ic.token;
+        let mut unmarked = prod.clone();
+        unmarked.init_sql_needs_confirmation = false;
+        assert!(matches!(
+            open(
+                &manager,
+                OpenRequest::new(unmarked.clone(), &types)
+                    .with_init_sql_confirmation(imported_token)
+            )
+            .await,
+            Err(CoreError::InvalidConfirmation)
+        ));
+        let OpenOutcome::InitSqlNeedsConfirmation(plain) =
+            open(&manager, OpenRequest::new(unmarked, &types))
+                .await
+                .unwrap()
+        else {
+            panic!("no confirmation");
+        };
+        assert!(!plain.imported);
+        assert!(matches!(
+            open(
+                &manager,
+                OpenRequest::new(prod.clone(), &types).with_init_sql_confirmation(plain.token)
+            )
+            .await,
+            Err(CoreError::InvalidConfirmation)
+        ));
+
+        prod.init_sql_needs_confirmation = false;
+        let OpenOutcome::InitSqlNeedsConfirmation(ic) =
+            open(&manager, OpenRequest::new(prod, &types))
+                .await
+                .unwrap()
+        else {
+            panic!("no confirmation");
+        };
+        assert!(!ic.imported);
+        let flagged: Vec<_> = ic.flagged.iter().map(|f| (f.index, f.reason)).collect();
+        assert_eq!(flagged, [(1, ConfirmReason::Destructive)]);
+    });
+}

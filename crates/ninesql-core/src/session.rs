@@ -309,6 +309,22 @@ pub enum CoreEvent {
         /// Its connection.
         connection: ConnectionId,
     },
+    /// The user confirmed the imported init SQL of a connection
+    /// ([`Connection::init_sql_needs_confirmation`]). The UI clears the marker in its own copy
+    /// only when that copy holds exactly `statements` and `cleared` is not `Some(false)`; a copy
+    /// with other init SQL (re-imported meanwhile) keeps it, and so does every copy when the
+    /// write failed, so the next open asks again.
+    ImportedInitSqlConfirmed {
+        /// The connection.
+        connection: ConnectionId,
+        /// The init statements the user confirmed, exactly as shown.
+        statements: Vec<String>,
+        /// Whether `connections.json` now holds these statements without the marker
+        /// ([`crate::MarkerClear::is_clear`]): `Some(false)` when the init SQL on disk changed,
+        /// the connection is not on disk or the write failed; `None` when the manager has no
+        /// workspace ([`SessionManager::set_workspace`]).
+        cleared: Option<bool>,
+    },
     /// A session ended; its handles now fail with [`CoreError::SessionClosed`].
     SessionClosed {
         /// Session.
@@ -541,6 +557,10 @@ pub struct InitSqlConfirmation {
     pub connection_name: String,
     /// The connection is typed production.
     pub production: bool,
+    /// The init SQL was imported and is not confirmed yet
+    /// ([`Connection::init_sql_needs_confirmation`]): every statement is flagged, and confirming
+    /// clears the marker.
+    pub imported: bool,
     /// Every init statement, exactly as it will run, in order.
     pub statements: Vec<String>,
     /// The statements that need confirmation.
@@ -552,6 +572,9 @@ pub struct InitSqlConfirmation {
 struct InitSqlKey {
     connection: ConnectionId,
     statements: Vec<String>,
+    /// The token was issued with the imported notice: only such a token clears the marker
+    /// (P1-E review, L1), and a token issued without it does not open a marked connection.
+    imported: bool,
 }
 
 struct Shared {
@@ -566,6 +589,8 @@ struct Shared {
     next_session: AtomicU64,
     host_keys: Mutex<Pending<UnknownHostKey>>,
     init_sql: Mutex<Pending<InitSqlKey>>,
+    /// Where a confirmed import marker is cleared ([`SessionManager::set_workspace`]).
+    workspace: std::sync::OnceLock<crate::workspace::Workspace>,
 }
 
 impl Shared {
@@ -727,6 +752,7 @@ impl SessionManager {
                 next_session: AtomicU64::new(1),
                 host_keys: Mutex::new(Pending::new(MAX_PENDING_OPEN_CONFIRMATIONS)),
                 init_sql: Mutex::new(Pending::new(MAX_PENDING_OPEN_CONFIRMATIONS)),
+                workspace: std::sync::OnceLock::new(),
             }),
             events_rx: Arc::new(Mutex::new(Some(events_rx))),
         })
@@ -742,6 +768,20 @@ impl SessionManager {
             .known_hosts
             .set(store)
             .map_err(|_| CoreError::Runtime("the known_hosts store is already loaded".into()))
+    }
+
+    /// The project whose `connections.json` records confirmed imported init SQL: once the user
+    /// confirms it, the core clears [`Connection::init_sql_needs_confirmation`] there
+    /// ([`crate::Workspace::clear_init_sql_marker`]). Set by [`crate::CoreServices`]; without
+    /// it, only [`CoreEvent::ImportedInitSqlConfirmed`] is emitted.
+    ///
+    /// # Errors
+    /// [`CoreError::Runtime`] when a workspace was already set.
+    pub fn set_workspace(&self, workspace: crate::workspace::Workspace) -> Result<(), CoreError> {
+        self.shared
+            .workspace
+            .set(workspace)
+            .map_err(|_| CoreError::Runtime("the workspace is already set".into()))
     }
 
     /// The driver registry.
@@ -953,7 +993,7 @@ async fn open_session(
 ) -> Result<OpenOutcome, CoreError> {
     let OpenRequest {
         connection,
-        policy,
+        mut policy,
         prompted,
         init_sql_confirmation,
     } = request;
@@ -965,6 +1005,31 @@ async fn open_session(
     let pre_caps = driver.capabilities(&engine, None)?;
     connection.validate_for_driver(&pre_caps)?;
     let target = connect::target(&connection)?;
+
+    // The imported init SQL marker is read from `connections.json` too, not only from the
+    // request (P1-E review, M2): a UI copy that lost it, or init SQL changed since it was
+    // saved, still asks. A failed read counts as marked (fail-closed).
+    let mut connection = connection;
+    if !connection.init_sql.is_empty()
+        && !connection.init_sql_needs_confirmation
+        && let Some(workspace) = shared.workspace.get().cloned()
+    {
+        let probe = connection.clone();
+        let marked =
+            tokio::task::spawn_blocking(move || workspace.init_sql_marked_on_disk(&probe)).await;
+        let marked = match marked {
+            Ok(Ok(m)) => m,
+            Ok(Err(e)) => {
+                tracing::warn!(connection = %connection.id, error = %e, "could not read the saved connection; init SQL counts as not confirmed");
+                true
+            }
+            Err(_) => true,
+        };
+        if marked {
+            tracing::debug!(connection = %connection.id, "init SQL not confirmed on disk");
+            connection.init_sql_needs_confirmation = true;
+        }
+    }
 
     // Init SQL that needs confirmation (ADR-0007): asked before anything touches a store or the
     // network. A valid token is only checked here and consumed right before the driver connect,
@@ -978,6 +1043,7 @@ async fn open_session(
             let key = InitSqlKey {
                 connection: connection.id,
                 statements: connection.init_sql.clone(),
+                imported: connection.init_sql_needs_confirmation,
             };
             let mut pending = lock(&shared.init_sql);
             match init_sql_confirmation {
@@ -998,6 +1064,7 @@ async fn open_session(
                         connection: connection.id,
                         connection_name: connection.name.clone(),
                         production: policy.production,
+                        imported: connection.init_sql_needs_confirmation,
                         statements: connection.init_sql.clone(),
                         flagged,
                     }));
@@ -1098,6 +1165,12 @@ async fn open_session(
             );
         }
         params.inside_dbeaver_workspace = inside;
+        if inside {
+            // Defence in depth (P1-E review, L2): the session is also asked to be read-only, and
+            // the check after connect refuses a driver that ignores either flag.
+            params.read_only = true;
+            policy.read_only = true;
+        }
     }
     // Every secret left the bag (into the params or the tunnel); drop it anyway, zeroized.
     drop(bag);
@@ -1117,11 +1190,17 @@ async fn open_session(
     let tunnel_info = params.tunnel.clone();
 
     // The confirmed init SQL runs now: the token is spent.
-    if let Some((token, key)) = init_key
-        && !lock(&shared.init_sql).redeem(token.0, &key)
-    {
-        close_tunnel(tunnel).await;
-        return Err(CoreError::InvalidConfirmation);
+    if let Some((token, key)) = init_key {
+        if !lock(&shared.init_sql).redeem(token.0, &key) {
+            close_tunnel(tunnel).await;
+            return Err(CoreError::InvalidConfirmation);
+        }
+        // Cleared at confirmation, before the driver connects: the user approved these exact
+        // statements, so a connect that then fails (wrong password, server down) does not ask
+        // again (docs/02, "Confirmations").
+        if key.imported {
+            record_imported_init_sql_confirmed(shared, &connection).await;
+        }
     }
 
     let connected = tokio::time::timeout(timeout + CONNECT_MARGIN, driver.connect(params)).await;
@@ -1136,8 +1215,12 @@ async fn open_session(
             return Err(CoreError::ConnectTimeout(timeout));
         }
     };
-    if policy.read_only && !session.is_read_only() {
-        tracing::warn!(connection = %connection.id, "driver did not enforce read-only; session closed");
+    if (policy.read_only || inside_dbeaver_workspace) && !session.is_read_only() {
+        tracing::warn!(
+            connection = %connection.id,
+            dbeaver_file = inside_dbeaver_workspace,
+            "driver did not enforce read-only; session closed"
+        );
         let _ = session.close().await;
         close_tunnel(tunnel).await;
         return Err(CoreError::ReadOnlyNotEnforced);
@@ -1211,6 +1294,49 @@ async fn open_session(
     Ok(OpenOutcome::Opened(handle))
 }
 
+/// The user confirmed imported init SQL: the marker is cleared on disk (blocking pool) when the
+/// manager has a workspace, and the UI is told. A failed write is logged: the next open asks
+/// again, which is the safe side.
+async fn record_imported_init_sql_confirmed(shared: &Arc<Shared>, connection: &Connection) {
+    let id = connection.id;
+    let cleared = match shared.workspace.get().cloned() {
+        None => None,
+        Some(workspace) => {
+            let statements = connection.init_sql.clone();
+            let outcome = tokio::task::spawn_blocking(move || {
+                workspace.clear_init_sql_marker(id, &statements)
+            })
+            .await;
+            Some(match outcome {
+                Ok(Ok(outcome)) => {
+                    tracing::debug!(connection = %id, outcome = ?outcome, "imported init SQL marker");
+                    outcome.is_clear()
+                }
+                Ok(Err(e)) => {
+                    tracing::warn!(
+                        connection = %id,
+                        error = %e,
+                        "could not record the confirmed init SQL; it will be asked again"
+                    );
+                    false
+                }
+                Err(_) => {
+                    tracing::warn!(
+                        connection = %id,
+                        "could not record the confirmed init SQL; it will be asked again"
+                    );
+                    false
+                }
+            })
+        }
+    };
+    shared.emit(CoreEvent::ImportedInitSqlConfirmed {
+        connection: id,
+        statements: connection.init_sql.clone(),
+        cleared,
+    });
+}
+
 async fn close_tunnel(tunnel: Option<Tunnel>) {
     if let Some(t) = tunnel {
         t.close().await;
@@ -1235,6 +1361,9 @@ pub enum ConfirmReason {
     Destructive,
     /// A write on a type that confirms every write.
     Write,
+    /// Init SQL imported from outside NineSQL (a DBeaver workspace) that the user has not
+    /// confirmed yet ([`crate::Connection::init_sql_needs_confirmation`]), whatever the type.
+    Imported,
 }
 
 /// A statement waiting for the user's confirmation. The UI shows [`Self::statement`] (exactly

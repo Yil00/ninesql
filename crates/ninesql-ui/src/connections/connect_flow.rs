@@ -27,7 +27,8 @@ use ninesql_core::{
 };
 
 use super::flow::{
-    HostKeyView, InitSqlView, SecretPromptView, StatementConfirmView, session_warning_text,
+    HostKeyView, IMPORTED_INIT_SQL_NOTICE, InitSqlView, SecretPromptView, StatementConfirmView,
+    session_warning_text,
 };
 use super::hub::ConnectionHub;
 use super::secret_input::{self, read_secret, secret_field};
@@ -579,6 +580,14 @@ fn open_prompt_dialog(flow: Entity<ConnectFlow>, window: &mut Window, cx: &mut A
                     .when(view.production, |el| {
                         let color = hsla(ninesql_core::ConnectionType::production().color);
                         el.border_2().border_color(color).p_2()
+                    })
+                    .when(view.imported, |el| {
+                        el.child(
+                            div()
+                                .id("init-sql-imported")
+                                .text_color(warn)
+                                .child(IMPORTED_INIT_SQL_NOTICE),
+                        )
                     })
                     .child(format!(
                         "\"{}\" runs these statements at every connect. {} of them need confirmation:",

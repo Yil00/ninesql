@@ -90,9 +90,15 @@ pub struct InitSqlView {
     pub connection_name: String,
     /// The connection is typed production (colored frame).
     pub production: bool,
+    /// The init SQL was imported (a DBeaver workspace) and is not confirmed yet
+    /// (`InitSqlConfirmation::imported`): the dialog shows `IMPORTED_INIT_SQL_NOTICE`.
+    pub imported: bool,
     /// Every statement, in order.
     pub rows: Vec<InitSqlRow>,
 }
+
+/// Notice of the init SQL dialog when the statements were imported and are not confirmed yet.
+pub const IMPORTED_INIT_SQL_NOTICE: &str = "These init statements were imported and have not been confirmed yet; they run on every connect once you confirm.";
 
 /// Short text of a statement class, for flags.
 #[must_use]
@@ -112,6 +118,9 @@ pub fn class_text(class: StatementClass) -> &'static str {
 fn reason_text(reason: ConfirmReason) -> &'static str {
     match reason {
         ConfirmReason::Write => "a write, and this connection type confirms every write",
+        ConfirmReason::Imported => {
+            "imported and not confirmed yet; it runs at every connect once you confirm"
+        }
         _ => "this connection type confirms destructive or unrecognized statements",
     }
 }
@@ -142,6 +151,7 @@ impl InitSqlView {
         Self {
             connection_name: connection_name.to_owned(),
             production,
+            imported: false,
             rows,
         }
     }
@@ -149,12 +159,14 @@ impl InitSqlView {
     /// From the core's confirmation.
     #[must_use]
     pub fn from_confirmation(c: &ninesql_core::InitSqlConfirmation) -> Self {
-        Self::new(
+        let mut view = Self::new(
             &c.connection_name,
             c.production,
             &c.statements,
             c.flagged.iter().map(|f| (f.index, f.class, f.reason)),
-        )
+        );
+        view.imported = c.imported;
+        view
     }
 
     /// Number of flagged statements.
@@ -319,6 +331,28 @@ mod tests {
         );
         assert_eq!(v.flagged(), 1);
         assert!(v.production);
+    }
+
+    #[test]
+    fn imported_init_sql_has_its_own_reason_and_notice() {
+        let text = reason_text(ConfirmReason::Imported);
+        assert!(text.contains("imported and not confirmed yet"), "{text}");
+        assert!(!text.contains("connection type"), "{text}");
+        let statements = vec!["SET search_path TO app".to_owned()];
+        let v = InitSqlView::new(
+            "Imported",
+            false,
+            &statements,
+            [(0, StatementClass::Session, ConfirmReason::Imported)],
+        );
+        assert!(!v.imported, "set from InitSqlConfirmation::imported only");
+        assert_eq!(
+            v.rows[0].flag.as_deref(),
+            Some(
+                "session setting: imported and not confirmed yet; it runs at every connect once you confirm"
+            )
+        );
+        assert!(IMPORTED_INIT_SQL_NOTICE.contains("have not been confirmed yet"));
     }
 
     #[test]

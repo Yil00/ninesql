@@ -92,13 +92,23 @@ fn changes_lexical_mode(text: &str) -> bool {
 ///   classifier lexes with the default rules;
 /// - every entry after the first session statement: once a setting ran, the classifier can no
 ///   longer vouch for how the server reads what follows.
+///
+/// The classification uses the engine's default lexical rules, not the server's `sql_mode` or
+/// `standard_conforming_strings` (docs/02, "Confirmations"); the rules above and the drivers
+/// (split with the session's dialect, one statement per call, read-only re-asserted) cover the
+/// gap.
+///
+/// Imported init SQL not confirmed yet ([`Connection::init_sql_needs_confirmation`]): every
+/// entry is flagged, whatever the type, with [`ConfirmReason::Imported`] unless the type's own
+/// rule already flags it.
 #[must_use]
 pub fn init_sql_needing_confirmation(
     connection: &Connection,
     policy: &SafetyPolicy,
     dialect: &dyn api::Dialect,
 ) -> Vec<FlaggedInitStatement> {
-    if !policy.confirm_destructive && !policy.confirm_every_write {
+    let imported = connection.init_sql_needs_confirmation;
+    if !policy.confirm_destructive && !policy.confirm_every_write && !imported {
         return Vec::new();
     }
     let mut after_setting = false;
@@ -122,7 +132,8 @@ pub fn init_sql_needing_confirmation(
         ) {
             after_setting = true;
         }
-        if let Some(reason) = confirm_reason(policy, class) {
+        let reason = confirm_reason(policy, class).or(imported.then_some(ConfirmReason::Imported));
+        if let Some(reason) = reason {
             out.push(FlaggedInitStatement {
                 index,
                 class,

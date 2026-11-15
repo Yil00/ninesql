@@ -434,7 +434,10 @@ pub struct TlsConfig {
     /// Verification mode.
     #[serde(default)]
     pub mode: TlsMode,
-    /// Extra CA bundle trusted for this connection, on top of the platform roots.
+    /// CA bundle for this connection. When set, it is the **only** trust anchor: the platform
+    /// roots are not added (ADR-0019 §1, libpq's `sslrootcert`). Required by `verify-ca`
+    /// (§2); `verify-full` without it uses the platform roots (§3); an unreadable or invalid
+    /// file fails the connect instead of falling back (§4); `require` and `disable` ignore it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ca_file: Option<PathBuf>,
     /// Client certificate, if the server asks for one.
@@ -533,6 +536,11 @@ fn is_true(b: &bool) -> bool {
     *b
 }
 
+#[allow(clippy::trivially_copy_pass_by_ref)] // serde's `skip_serializing_if` passes a reference.
+fn is_false(b: &bool) -> bool {
+    !*b
+}
+
 fn default_true() -> bool {
     true
 }
@@ -577,6 +585,14 @@ pub struct Connection {
     /// Statements run right after connecting.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub init_sql: Vec<String>,
+    /// The init SQL came from outside NineSQL (a DBeaver import, P2-C) and the user has not
+    /// confirmed it yet: the next open asks for confirmation of every init statement, whatever
+    /// the connection type says (a crafted workspace can type its connection "dev" to skip the
+    /// type's confirmation). Cleared by the core once the user confirms
+    /// ([`crate::CoreEvent::ImportedInitSqlConfirmed`]). `false` when absent
+    /// (`connections.json` schema 4).
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub init_sql_needs_confirmation: bool,
     /// Disabled connections are listed but cannot be opened (for example engines outside the v1
     /// set imported from DBeaver, ADR-0006 §5).
     #[serde(default = "default_true", skip_serializing_if = "is_true")]
@@ -614,6 +630,7 @@ impl Connection {
             folder: Vec::new(),
             properties: BTreeMap::new(),
             init_sql: Vec::new(),
+            init_sql_needs_confirmation: false,
             enabled: true,
             origin: Origin::Native,
         }

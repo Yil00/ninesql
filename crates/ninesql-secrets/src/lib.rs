@@ -53,7 +53,9 @@ pub use secrecy::{ExposeSecret, SecretString};
 pub use secret_service::SecretServiceStore;
 pub use session_cache::{CacheLifetime, MAX_TIMED_LIFETIME, SessionSecretCache};
 pub use store::{SecretMeta, SecretStore};
-pub use vault::{KdfParams, UnlockBackoff, Vault, VaultError, VaultStatus, VaultStore};
+pub use vault::{
+    KdfParams, MIN_MASTER_PASSWORD_CHARS, UnlockBackoff, Vault, VaultError, VaultStatus, VaultStore,
+};
 
 /// Service name used for every item NineSQL writes to a secret store (ADR-0005).
 pub const SERVICE: &str = "ninesql";
