@@ -426,10 +426,21 @@ mod tests {
             "PRAGMA table_info(t)",
             "EXPLAIN QUERY PLAN SELECT 1",
             "WITH c AS (SELECT 1) SELECT * FROM c",
+            // SQLite's EXPLAIN only compiles the statement, it never runs it (P1-E M1).
+            "EXPLAIN DELETE FROM t",
+            "EXPLAIN QUERY PLAN DELETE FROM t",
         ] {
             assert_eq!(d.classify(sql), StatementClass::Read, "{sql}");
         }
         assert_eq!(d.classify("BEGIN IMMEDIATE"), StatementClass::Transaction);
+        // `ANALYZE` writes statistics; `EXPLAIN ANALYZE` is not SQLite syntax: never below
+        // what it would run.
+        for sql in [
+            "EXPLAIN ANALYZE DELETE FROM t",
+            "EXPLAIN [analyze] DELETE FROM t",
+        ] {
+            assert!(d.classify(sql).needs_confirmation(), "{sql}");
+        }
     }
 
     #[test]

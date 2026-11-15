@@ -793,4 +793,88 @@ mod read_only_reassert {
         assert_eq!(count(&mut s).await, before, "rows were written");
         Box::new(s).close().await.unwrap();
     }
+
+    /// P1-E review M1: PostgreSQL runs the statement under `EXPLAIN ("analyze")` and its
+    /// `U&`-escaped forms. The classifier sees them as the destructive `DELETE` they run (the
+    /// production confirmation of the core is asked for `needs_confirmation` classes), a
+    /// read-only session refuses them client-side, and sent past the classifier with a forged
+    /// `Read` class they are still rejected engine-side (I3).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn explain_analyze_forms_are_destructive_and_refused_engine_side() {
+        const FORMS: &[&str] = &[
+            "EXPLAIN (\"analyze\") DELETE FROM ninesql_test.explain_victim",
+            "EXPLAIN (FORMAT JSON, \"analyze\" on) DELETE FROM ninesql_test.explain_victim",
+            "EXPLAIN (U&\"analyze\") DELETE FROM ninesql_test.explain_victim",
+            "EXPLAIN (U&\"\\0061nalyze\") DELETE FROM ninesql_test.explain_victim",
+        ];
+        async fn victims(s: &mut PgSession) -> i64 {
+            let mut stream = s
+                .execute(
+                    Statement::sql("SELECT count(*)::int8 FROM ninesql_test.explain_victim"),
+                    ExecOptions::default(),
+                )
+                .await
+                .unwrap();
+            let mut n = None;
+            while let Some(item) = stream.next().await {
+                if let ninesql_driver_api::ResultItem::Rows(b) = item.unwrap() {
+                    use ninesql_driver_api::arrow_array::cast::AsArray;
+                    n = Some(
+                        b.column(0)
+                            .as_primitive::<ninesql_driver_api::arrow_array::types::Int64Type>()
+                            .value(0),
+                    );
+                }
+            }
+            n.unwrap()
+        }
+
+        let Some(params) = dev_params() else { return };
+        let driver = PgWireDriver::new();
+        let mut w = driver.open(dev_params().unwrap()).await.unwrap();
+        for sql in [
+            "CREATE SCHEMA IF NOT EXISTS ninesql_test",
+            "CREATE TABLE IF NOT EXISTS ninesql_test.explain_victim (a int)",
+            "TRUNCATE ninesql_test.explain_victim",
+            "INSERT INTO ninesql_test.explain_victim VALUES (1), (2)",
+        ] {
+            drain(&mut w, sql, None).await.unwrap();
+        }
+        for sql in FORMS {
+            let class = w.dialect().classify(sql);
+            assert_eq!(class, StatementClass::Destructive, "{sql}");
+            assert!(class.needs_confirmation() && class.is_write(), "{sql}");
+        }
+        // Why it matters: in a writable session the engine really deletes the rows.
+        for sql in FORMS {
+            w.begin().await.unwrap();
+            drain(&mut w, sql, None).await.unwrap();
+            assert_eq!(victims(&mut w).await, 0, "{sql} did not run the DELETE");
+            w.rollback().await.unwrap();
+            assert_eq!(victims(&mut w).await, 2);
+        }
+        Box::new(w).close().await.unwrap();
+
+        let mut p = params;
+        p.read_only = true;
+        let mut s = driver.open(p).await.unwrap();
+        for sql in FORMS {
+            assert!(
+                matches!(
+                    drain(&mut s, sql, None).await,
+                    Err(ninesql_driver_api::DriverError::ReadOnly(_))
+                ),
+                "{sql}: not refused client-side"
+            );
+            match drain(&mut s, sql, Some(StatementClass::Read)).await {
+                Err(ninesql_driver_api::DriverError::ReadOnly(msg)) => {
+                    assert!(msg.contains("read-only"), "{sql}: {msg}");
+                }
+                other => panic!("{sql}: not refused engine-side: {other:?}"),
+            }
+            assert!(s.is_read_only());
+        }
+        assert_eq!(victims(&mut s).await, 2, "rows were deleted");
+        Box::new(s).close().await.unwrap();
+    }
 }
