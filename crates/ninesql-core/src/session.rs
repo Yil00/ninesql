@@ -310,12 +310,20 @@ pub enum CoreEvent {
         connection: ConnectionId,
     },
     /// The user confirmed the imported init SQL of a connection
-    /// ([`Connection::init_sql_needs_confirmation`]); the marker was cleared in
-    /// `connections.json` when the manager has a workspace ([`SessionManager::set_workspace`]).
-    /// The UI clears it in its own copy of the connection, or reloads the connections.
+    /// ([`Connection::init_sql_needs_confirmation`]). The UI clears the marker in its own copy
+    /// only when that copy holds exactly `statements` and `cleared` is not `Some(false)`; a copy
+    /// with other init SQL (re-imported meanwhile) keeps it, and so does every copy when the
+    /// write failed, so the next open asks again.
     ImportedInitSqlConfirmed {
         /// The connection.
         connection: ConnectionId,
+        /// The init statements the user confirmed, exactly as shown.
+        statements: Vec<String>,
+        /// Whether `connections.json` now holds these statements without the marker
+        /// ([`crate::MarkerClear::is_clear`]): `Some(false)` when the init SQL on disk changed,
+        /// the connection is not on disk or the write failed; `None` when the manager has no
+        /// workspace ([`SessionManager::set_workspace`]).
+        cleared: Option<bool>,
     },
     /// A session ended; its handles now fail with [`CoreError::SessionClosed`].
     SessionClosed {
@@ -564,6 +572,9 @@ pub struct InitSqlConfirmation {
 struct InitSqlKey {
     connection: ConnectionId,
     statements: Vec<String>,
+    /// The token was issued with the imported notice: only such a token clears the marker
+    /// (P1-E review, L1), and a token issued without it does not open a marked connection.
+    imported: bool,
 }
 
 struct Shared {
@@ -995,6 +1006,31 @@ async fn open_session(
     connection.validate_for_driver(&pre_caps)?;
     let target = connect::target(&connection)?;
 
+    // The imported init SQL marker is read from `connections.json` too, not only from the
+    // request (P1-E review, M2): a UI copy that lost it, or init SQL changed since it was
+    // saved, still asks. A failed read counts as marked (fail-closed).
+    let mut connection = connection;
+    if !connection.init_sql.is_empty()
+        && !connection.init_sql_needs_confirmation
+        && let Some(workspace) = shared.workspace.get().cloned()
+    {
+        let probe = connection.clone();
+        let marked =
+            tokio::task::spawn_blocking(move || workspace.init_sql_marked_on_disk(&probe)).await;
+        let marked = match marked {
+            Ok(Ok(m)) => m,
+            Ok(Err(e)) => {
+                tracing::warn!(connection = %connection.id, error = %e, "could not read the saved connection; init SQL counts as not confirmed");
+                true
+            }
+            Err(_) => true,
+        };
+        if marked {
+            tracing::debug!(connection = %connection.id, "init SQL not confirmed on disk");
+            connection.init_sql_needs_confirmation = true;
+        }
+    }
+
     // Init SQL that needs confirmation (ADR-0007): asked before anything touches a store or the
     // network. A valid token is only checked here and consumed right before the driver connect,
     // so a secret prompt or a host key confirmation in between does not ask again.
@@ -1007,6 +1043,7 @@ async fn open_session(
             let key = InitSqlKey {
                 connection: connection.id,
                 statements: connection.init_sql.clone(),
+                imported: connection.init_sql_needs_confirmation,
             };
             let mut pending = lock(&shared.init_sql);
             match init_sql_confirmation {
@@ -1158,7 +1195,10 @@ async fn open_session(
             close_tunnel(tunnel).await;
             return Err(CoreError::InvalidConfirmation);
         }
-        if connection.init_sql_needs_confirmation {
+        // Cleared at confirmation, before the driver connects: the user approved these exact
+        // statements, so a connect that then fails (wrong password, server down) does not ask
+        // again (docs/02, "Confirmations").
+        if key.imported {
             record_imported_init_sql_confirmed(shared, &connection).await;
         }
     }
@@ -1258,29 +1298,42 @@ async fn open_session(
 /// manager has a workspace, and the UI is told. A failed write is logged: the next open asks
 /// again, which is the safe side.
 async fn record_imported_init_sql_confirmed(shared: &Arc<Shared>, connection: &Connection) {
-    if let Some(workspace) = shared.workspace.get().cloned() {
-        let id = connection.id;
-        let statements = connection.init_sql.clone();
-        let cleared =
-            tokio::task::spawn_blocking(move || workspace.clear_init_sql_marker(id, &statements))
-                .await;
-        match cleared {
-            Ok(Ok(changed)) => {
-                tracing::debug!(connection = %id, changed, "imported init SQL marker cleared");
-            }
-            Ok(Err(e)) => tracing::warn!(
-                connection = %id,
-                error = %e,
-                "could not record the confirmed init SQL; it will be asked again"
-            ),
-            Err(_) => tracing::warn!(
-                connection = %id,
-                "could not record the confirmed init SQL; it will be asked again"
-            ),
+    let id = connection.id;
+    let cleared = match shared.workspace.get().cloned() {
+        None => None,
+        Some(workspace) => {
+            let statements = connection.init_sql.clone();
+            let outcome = tokio::task::spawn_blocking(move || {
+                workspace.clear_init_sql_marker(id, &statements)
+            })
+            .await;
+            Some(match outcome {
+                Ok(Ok(outcome)) => {
+                    tracing::debug!(connection = %id, outcome = ?outcome, "imported init SQL marker");
+                    outcome.is_clear()
+                }
+                Ok(Err(e)) => {
+                    tracing::warn!(
+                        connection = %id,
+                        error = %e,
+                        "could not record the confirmed init SQL; it will be asked again"
+                    );
+                    false
+                }
+                Err(_) => {
+                    tracing::warn!(
+                        connection = %id,
+                        "could not record the confirmed init SQL; it will be asked again"
+                    );
+                    false
+                }
+            })
         }
-    }
+    };
     shared.emit(CoreEvent::ImportedInitSqlConfirmed {
-        connection: connection.id,
+        connection: id,
+        statements: connection.init_sql.clone(),
+        cleared,
     });
 }
 

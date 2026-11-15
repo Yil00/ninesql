@@ -682,13 +682,22 @@ impl ConnectionHub {
                 self.secrets_locked = Some(reason);
                 cx.emit(HubEvent::SecretsLocked(reason));
             }
-            CoreEvent::ImportedInitSqlConfirmed { connection } => {
-                // The core cleared the marker in `connections.json`; the hub's copy follows,
-                // so the next connect in this run does not ask again and a later save does
-                // not write the marker back.
+            CoreEvent::ImportedInitSqlConfirmed {
+                connection,
+                statements,
+                cleared,
+            } => {
+                // The hub's copy follows the core only for the statements the user confirmed,
+                // and only when `connections.json` holds them without the marker (`None`: the
+                // core has no workspace, the statements alone decide). A copy with other init
+                // SQL (re-imported meanwhile) or a failed write keeps the marker, so the next
+                // connect asks again; a later save then does not write a cleared marker.
                 // A save that started before the event may still write its snapshot back
                 // with the marker: that only asks once more (fail-closed).
-                if let Some(c) = self.connections.get_mut(connection) {
+                if cleared != Some(false)
+                    && let Some(c) = self.connections.get_mut(connection)
+                    && c.init_sql == statements
+                {
                     c.init_sql_needs_confirmation = false;
                 }
             }

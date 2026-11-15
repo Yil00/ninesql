@@ -1437,20 +1437,45 @@ fn log_capture() -> &'static LogCapture {
     })
 }
 
-/// The result of the flow's next run for `purpose` (the previous run, if any, had the other
-/// purpose).
+/// Every file under `dir`; a directory or entry that cannot be read fails the test (an I1 scan
+/// must not skip what it cannot see).
+fn walk_strict(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
+    let mut out = Vec::new();
+    let entries =
+        std::fs::read_dir(dir).unwrap_or_else(|e| panic!("{} cannot be read: {e}", dir.display()));
+    for entry in entries {
+        let path = entry
+            .unwrap_or_else(|e| panic!("{} cannot be listed: {e}", dir.display()))
+            .path();
+        if path.is_dir() {
+            out.extend(walk_strict(&path));
+        } else {
+            out.push(path);
+        }
+    }
+    out
+}
+
+/// The flow's last result.
+fn last_flow(
+    vcx: &mut VisualTestContext,
+    flow: &Entity<super::connect_flow::ConnectFlow>,
+) -> Option<super::connect_flow::FlowFinished> {
+    flow.read_with(vcx, |f, _| f.last_result().cloned())
+}
+
+/// The result of the flow's next run: the first finished result that differs from `before`.
 fn wait_flow_result(
     vcx: &mut VisualTestContext,
     flow: &Entity<super::connect_flow::ConnectFlow>,
-    purpose: Purpose,
+    before: Option<super::connect_flow::FlowFinished>,
 ) -> FlowResult {
     let mut out = None;
     wait_until(vcx, |vcx| {
-        out = flow.read_with(vcx, |f, _| {
-            f.last_result()
-                .filter(|r| r.purpose == purpose)
-                .map(|r| r.result.clone())
-        });
+        let last = last_flow(vcx, flow);
+        if last != before && !flow.read_with(vcx, |f, _| f.is_busy()) {
+            out = last.map(|r| r.result);
+        }
         out.is_some()
     });
     out.unwrap_or_else(|| panic!("no result"))
@@ -1461,8 +1486,15 @@ fn hub_flows_leave_no_secret_in_files_or_logs(cx: &mut TestAppContext) {
     const DB_PASSWORD: &str = "L6-db-Pa55-7f3a91c2";
     const DB_PASSWORD_EDITED: &str = "L6-db-Pa55-edited-5b8e";
     const DB_PASSWORD_COPY: &str = "L6-db-Pa55-copy-0d4c";
+    const DB_PASSWORD_PROMPTED: &str = "L6-db-Pa55-asked-91e6";
     const L6_MASTER: &str = "L6-master-Pa55-e2a7b9";
-    let secrets = [DB_PASSWORD, DB_PASSWORD_EDITED, DB_PASSWORD_COPY, L6_MASTER];
+    let secrets = [
+        DB_PASSWORD,
+        DB_PASSWORD_EDITED,
+        DB_PASSWORD_COPY,
+        DB_PASSWORD_PROMPTED,
+        L6_MASTER,
+    ];
 
     let capture = log_capture();
     let tmp = tempfile::tempdir().unwrap_or_else(|e| panic!("{e}"));
@@ -1548,18 +1580,57 @@ fn hub_flows_leave_no_secret_in_files_or_logs(cx: &mut TestAppContext) {
     assert_eq!(hub.read_with(&vcx, |h, _| h.connections().len()), 2);
 
     // Test connection, with the saved (edited) password.
-    assert!(flow.read_with(&vcx, |f, _| f.last_result().is_none()));
+    let before = last_flow(&mut vcx, &flow);
     ws.update_in(&mut vcx, |ws, window, cx| {
         ws.connect(id, Purpose::Test, window, cx)
     });
-    let result = wait_flow_result(&mut vcx, &flow, Purpose::Test);
+    let result = wait_flow_result(&mut vcx, &flow, before);
     assert!(matches!(result, FlowResult::TestOk { .. }), "{result:?}");
+
+    // An "ask every time" password, typed at connect.
+    let asked = mock_connection(
+        "Asked",
+        ConnectionTypeId::dev(),
+        Auth::Password {
+            username: "app".into(),
+            secret: SecretSource::Prompt,
+        },
+    );
+    let task = hub.update(&mut vcx, |h, cx| {
+        h.save(
+            super::form::BuiltConnection {
+                connection: asked,
+                to_store: Vec::new(),
+                to_delete: Vec::new(),
+            },
+            cx,
+        )
+    });
+    let asked = await_task(&mut vcx, task).unwrap_or_else(|e| panic!("{e}"));
+    let before = last_flow(&mut vcx, &flow);
+    ws.update_in(&mut vcx, |ws, window, cx| {
+        ws.connect(asked, Purpose::Open, window, cx)
+    });
+    wait_until(&mut vcx, |vcx| {
+        matches!(
+            flow.read_with(vcx, |f, _| f.prompt().clone()),
+            PendingPrompt::Secrets(_)
+        )
+    });
+    let inputs = flow.read_with(&vcx, |f, _| f.secret_inputs());
+    set(inputs.first(), DB_PASSWORD_PROMPTED, &mut vcx);
+    vcx.update(|window, cx| flow.update(cx, |f, cx| f.submit_secrets(window, cx)));
+    let result = wait_flow_result(&mut vcx, &flow, before);
+    assert!(matches!(result, FlowResult::Opened { .. }), "{result:?}");
+    hub.update(&mut vcx, |h, cx| h.disconnect(asked, cx));
+    wait_until(&mut vcx, |vcx| hub.read_with(vcx, |h, _| !h.is_open(asked)));
 
     // Lock, then open: the vault unlock prompt, then the session.
     wait_reply(core.lock_now());
     wait_until(&mut vcx, |vcx| {
         hub.read_with(vcx, |h, _| h.secrets_locked().is_some())
     });
+    let before = last_flow(&mut vcx, &flow);
     ws.update_in(&mut vcx, |ws, window, cx| {
         ws.connect(copy, Purpose::Open, window, cx)
     });
@@ -1572,7 +1643,7 @@ fn hub_flows_leave_no_secret_in_files_or_logs(cx: &mut TestAppContext) {
     let (master, _) = prompt.read_with(&vcx, |p, _| p.inputs());
     set(Some(&master), L6_MASTER, &mut vcx);
     vcx.update(|window, cx| prompt.update(cx, |p, cx| p.submit(window, cx)));
-    let result = wait_flow_result(&mut vcx, &flow, Purpose::Open);
+    let result = wait_flow_result(&mut vcx, &flow, before);
     assert!(matches!(result, FlowResult::Opened { .. }), "{result:?}");
     hub.update(&mut vcx, |h, cx| h.disconnect(copy, cx));
     wait_reply(core.lock_now());
@@ -1583,7 +1654,7 @@ fn hub_flows_leave_no_secret_in_files_or_logs(cx: &mut TestAppContext) {
 
     // No file under the workspace, config, data, state, cache or home directories holds a
     // secret (the vault file is encrypted).
-    let files = walk(tmp.path());
+    let files = walk_strict(tmp.path());
     assert!(
         files.iter().any(|f| f.ends_with("vault.bin")),
         "the vault was written: {files:?}"
@@ -1593,7 +1664,8 @@ fn hub_flows_leave_no_secret_in_files_or_logs(cx: &mut TestAppContext) {
         "connections were written: {files:?}"
     );
     for file in &files {
-        let bytes = std::fs::read(file).unwrap_or_default();
+        let bytes = std::fs::read(file)
+            .unwrap_or_else(|e| panic!("{} cannot be read: {e}", file.display()));
         let text = String::from_utf8_lossy(&bytes);
         for s in secrets {
             assert!(!text.contains(s), "{} holds a secret", file.display());
@@ -1720,6 +1792,8 @@ fn edits_keep_the_imported_marker_and_never_set_it(cx: &mut TestAppContext) {
         h.on_core_event(
             ninesql_core::CoreEvent::ImportedInitSqlConfirmed {
                 connection: marked_id,
+                statements: marked.init_sql.clone(),
+                cleared: Some(true),
             },
             cx,
         );
@@ -1731,4 +1805,48 @@ fn edits_keep_the_imported_marker_and_never_set_it(cx: &mut TestAppContext) {
         "a stale form does not re-set the marker"
     );
     assert_eq!(saved.init_sql, marked.init_sql, "the init SQL is kept");
+}
+
+/// P1-E review, M1: the hub clears its marker only for the confirmed statements, and only when
+/// the core recorded the confirmation (or has no workspace).
+#[gpui::test]
+fn a_confirmation_of_other_init_sql_or_a_failed_write_keeps_the_marker(cx: &mut TestAppContext) {
+    let mut marked = imported_pg("Imported");
+    marked.init_sql = vec!["SET search_path TO s2".into()];
+    marked.init_sql_needs_confirmation = true;
+    let id = marked.id;
+    let mut config = HubConfig::empty();
+    config.registry = shipped();
+    config.connections =
+        ninesql_core::Connections::from_vec(vec![marked.clone()]).unwrap_or_else(|e| panic!("{e}"));
+    let hub = init(cx, config);
+    let deliver = |cx: &mut TestAppContext, statements: Vec<String>, cleared: Option<bool>| {
+        hub.update(cx, |h, cx| {
+            h.on_core_event(
+                ninesql_core::CoreEvent::ImportedInitSqlConfirmed {
+                    connection: id,
+                    statements,
+                    cleared,
+                },
+                cx,
+            );
+        });
+    };
+    // The dialog showed S1; a re-import changed the copy to S2 meanwhile.
+    for cleared in [Some(true), Some(false), None] {
+        deliver(cx, vec!["SET search_path TO s1".into()], cleared);
+        assert!(
+            hub.read_with(cx, |h, _| h.init_sql_marker(id)),
+            "{cleared:?}"
+        );
+    }
+    // The right statements, but the core could not record the confirmation.
+    deliver(cx, marked.init_sql.clone(), Some(false));
+    assert!(
+        hub.read_with(cx, |h, _| h.init_sql_marker(id)),
+        "failed write"
+    );
+    // No workspace in the core: the statements decide.
+    deliver(cx, marked.init_sql.clone(), None);
+    assert!(!hub.read_with(cx, |h, _| h.init_sql_marker(id)));
 }

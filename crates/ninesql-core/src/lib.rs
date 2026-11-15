@@ -41,8 +41,8 @@ pub use session::{
     TransactionState,
 };
 pub use workspace::{
-    ConnectionTypesFile, Connections, ConnectionsFile, LoadIssue, LoadedConnections, ProjectFile,
-    ProjectId, Workspace,
+    ConnectionTypesFile, Connections, ConnectionsFile, LoadIssue, LoadedConnections, MarkerClear,
+    ProjectFile, ProjectId, Workspace,
 };
 
 // Dependency graph of docs/02-architecture.md, made explicit until real code uses these crates.

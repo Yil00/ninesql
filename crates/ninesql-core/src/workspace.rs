@@ -380,6 +380,57 @@ fn check_for_driver(registry: &DriverRegistry, c: &Connection) -> Result<(), Wor
     })
 }
 
+/// The process-wide write guard of one `connections.json`, keyed by its canonical path (the
+/// path as given when it cannot be resolved), so two [`Workspace::open`] of the same project
+/// share it (P1-E review, L3). Entries whose guard is no longer used are dropped.
+fn connections_guard_for(file: &std::path::Path) -> Arc<Mutex<()>> {
+    static GUARDS: std::sync::OnceLock<
+        Mutex<std::collections::HashMap<std::path::PathBuf, std::sync::Weak<Mutex<()>>>>,
+    > = std::sync::OnceLock::new();
+    // The directory exists (created by `Workspace::open`); the file may not exist yet.
+    let key = match (file.parent(), file.file_name()) {
+        (Some(dir), Some(name)) => std::fs::canonicalize(dir)
+            .map(|d| d.join(name))
+            .unwrap_or_else(|_| file.to_path_buf()),
+        _ => file.to_path_buf(),
+    };
+    let mut guards = GUARDS
+        .get_or_init(Mutex::default)
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner);
+    guards.retain(|_, g| g.strong_count() > 0);
+    if let Some(guard) = guards.get(&key).and_then(std::sync::Weak::upgrade) {
+        return guard;
+    }
+    let guard = Arc::new(Mutex::new(()));
+    guards.insert(key, Arc::downgrade(&guard));
+    guard
+}
+
+/// What [`Workspace::clear_init_sql_marker`] found.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum MarkerClear {
+    /// The marker was set on these statements and is now cleared on disk.
+    Cleared,
+    /// The connection on disk holds these statements without the marker: nothing to do.
+    AlreadyClear,
+    /// The init SQL on disk is not the confirmed one (changed meanwhile, for example by a
+    /// re-import): the marker is left as it is.
+    Changed,
+    /// No connection with that id on disk.
+    NotFound,
+}
+
+impl MarkerClear {
+    /// Whether, after this, `connections.json` holds the confirmed statements without the
+    /// marker.
+    #[must_use]
+    pub fn is_clear(self) -> bool {
+        matches!(self, Self::Cleared | Self::AlreadyClear)
+    }
+}
+
 /// One project of the NineSQL workspace on disk. Holds the workspace lock while any clone is
 /// alive.
 #[derive(Debug, Clone)]
@@ -389,7 +440,8 @@ pub struct Workspace {
     project_id: ProjectId,
     project_paths: ProjectPaths,
     /// Serializes the writes of `connections.json` within the process, so a read-modify-write
-    /// ([`Self::clear_init_sql_marker`]) cannot lose a save made in between.
+    /// ([`Self::clear_init_sql_marker`]) cannot lose a save made in between. Shared by every
+    /// `Workspace` of the process that opened the same project ([`connections_guard_for`]).
     connections_guard: Arc<Mutex<()>>,
     _lock: Arc<DirLock>,
 }
@@ -434,12 +486,13 @@ impl Workspace {
                 file.id
             }
         };
+        let connections_guard = connections_guard_for(&project_paths.connections_file());
         Ok(Self {
             paths,
             project,
             project_id,
             project_paths,
-            connections_guard: Arc::default(),
+            connections_guard,
             _lock: lock,
         })
     }
@@ -587,10 +640,15 @@ impl Workspace {
 
     /// Clears [`Connection::init_sql_needs_confirmation`] of connection `id` in
     /// `connections.json`, if its init SQL on disk is still exactly `statements` (what the user
-    /// confirmed). Called by the session manager once the user confirmed imported init SQL;
-    /// returns whether the file changed. Load, change and save run under the in-process guard
-    /// of `connections.json`, so a save made meanwhile is not lost (a save of an older copy
-    /// afterwards may set the marker again: one more confirmation, never one less).
+    /// confirmed). Called by the session manager once the user confirmed imported init SQL.
+    /// Load, change and save run under the process-wide guard of `connections.json`, so a save
+    /// made meanwhile is not lost (a save of an older copy afterwards may set the marker again:
+    /// one more confirmation, never one less).
+    ///
+    /// Load issues (unsafe data found in the file, P1-E review L4): as with every
+    /// [`Self::load_connections`], they are removed from the file at once and logged at `warn`
+    /// level; they are not returned here. They can only come from an edit of the file made
+    /// outside NineSQL since the UI loaded it, and the UI reports them at its next load.
     ///
     /// # Errors
     /// Storage errors and the load / validation errors of [`Self::load_connections`].
@@ -598,19 +656,39 @@ impl Workspace {
         &self,
         id: ConnectionId,
         statements: &[String],
-    ) -> Result<bool, WorkspaceError> {
+    ) -> Result<MarkerClear, WorkspaceError> {
         let _guard = self.guard();
         let mut connections = self.load_connections_unguarded()?.connections;
         let Some(c) = connections.get_mut(id) else {
-            return Ok(false);
+            return Ok(MarkerClear::NotFound);
         };
-        if !c.init_sql_needs_confirmation || c.init_sql != statements {
-            return Ok(false);
+        if c.init_sql != statements {
+            return Ok(MarkerClear::Changed);
+        }
+        if !c.init_sql_needs_confirmation {
+            return Ok(MarkerClear::AlreadyClear);
         }
         c.init_sql_needs_confirmation = false;
         self.save_connections_unguarded(&connections)?;
         tracing::info!(project = %self.project, connection = %id, "imported init SQL confirmed");
-        Ok(true)
+        Ok(MarkerClear::Cleared)
+    }
+
+    /// Whether the init SQL of `connection` must be confirmed as imported, from what
+    /// `connections.json` holds (P1-E review, M2: the session manager does not trust the
+    /// request's marker alone). `true` when the connection on disk carries the marker, or holds
+    /// other init SQL than `connection` (an unsaved change of the init SQL counts as not
+    /// confirmed). `false` when it is not on disk (a connection tested before its first save:
+    /// the request's marker applies).
+    ///
+    /// # Errors
+    /// The load errors of [`Self::load_connections`] (the caller treats them as marked).
+    pub fn init_sql_marked_on_disk(&self, connection: &Connection) -> Result<bool, WorkspaceError> {
+        let loaded = self.load_connections()?;
+        Ok(loaded
+            .connections
+            .get(connection.id)
+            .is_some_and(|c| c.init_sql_needs_confirmation || c.init_sql != connection.init_sql))
     }
 
     /// [`Self::save_connections`] after [`DriverRegistry::validate_connection`] of every
@@ -772,5 +850,32 @@ impl Workspace {
         }
         tracing::info!(project = %self.project, connection = %id, "connection removed");
         Ok(removed)
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)] // Tests may panic (AGENTS.md).
+mod tests {
+    use super::*;
+
+    /// P1-E review, L3: two `Workspace` values of one project share the write guard of
+    /// `connections.json`; another project has its own. (Reaching the same project through
+    /// another path in one process is refused by the workspace lock already.)
+    #[test]
+    fn workspaces_of_one_project_share_the_connections_guard() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = |root: &std::path::Path| {
+            Paths::new(&ninesql_storage::XdgDirs {
+                config_home: root.join("config"),
+                data_home: root.join("data"),
+                state_home: root.join("state"),
+            })
+        };
+        let a = Workspace::open(paths(tmp.path()), ProjectName::default_project()).unwrap();
+        let b = Workspace::open(paths(tmp.path()), ProjectName::default_project()).unwrap();
+        assert!(Arc::ptr_eq(&a.connections_guard, &b.connections_guard));
+        let other = ProjectName::new("other").unwrap();
+        let c = Workspace::open(paths(tmp.path()), other).unwrap();
+        assert!(!Arc::ptr_eq(&a.connections_guard, &c.connections_guard));
     }
 }

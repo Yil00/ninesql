@@ -1222,7 +1222,13 @@ fn imported_init_sql_is_confirmed_once_whatever_the_type() {
         assert_eq!(wrap.last_seen().init_statements, 2);
         let mut confirmed = false;
         while let Ok(Some(ev)) = tokio::time::timeout(Duration::from_secs(5), events.recv()).await {
-            if ev == (CoreEvent::ImportedInitSqlConfirmed { connection: c.id }) {
+            if ev
+                == (CoreEvent::ImportedInitSqlConfirmed {
+                    connection: c.id,
+                    statements: c.init_sql.clone(),
+                    cleared: None,
+                })
+            {
                 confirmed = true;
                 break;
             }
@@ -1260,6 +1266,37 @@ fn imported_init_sql_is_confirmed_once_whatever_the_type() {
                 (1, ConfirmReason::Destructive)
             ]
         );
+        // L1: a token issued with the imported notice does not open the connection once the
+        // request says otherwise, and the reverse.
+        let imported_token = ic.token;
+        let mut unmarked = prod.clone();
+        unmarked.init_sql_needs_confirmation = false;
+        assert!(matches!(
+            open(
+                &manager,
+                OpenRequest::new(unmarked.clone(), &types)
+                    .with_init_sql_confirmation(imported_token)
+            )
+            .await,
+            Err(CoreError::InvalidConfirmation)
+        ));
+        let OpenOutcome::InitSqlNeedsConfirmation(plain) =
+            open(&manager, OpenRequest::new(unmarked, &types))
+                .await
+                .unwrap()
+        else {
+            panic!("no confirmation");
+        };
+        assert!(!plain.imported);
+        assert!(matches!(
+            open(
+                &manager,
+                OpenRequest::new(prod.clone(), &types).with_init_sql_confirmation(plain.token)
+            )
+            .await,
+            Err(CoreError::InvalidConfirmation)
+        ));
+
         prod.init_sql_needs_confirmation = false;
         let OpenOutcome::InitSqlNeedsConfirmation(ic) =
             open(&manager, OpenRequest::new(prod, &types))

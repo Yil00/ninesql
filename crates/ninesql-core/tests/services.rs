@@ -561,6 +561,116 @@ fn confirming_imported_init_sql_clears_the_marker_on_disk() {
     });
 }
 
+/// P1-E review, M2: the core reads the marker from `connections.json`, not only from the
+/// request; init SQL that differs from the saved one counts as not confirmed. L1 / M1: the event
+/// says what was confirmed and whether the file holds it cleared.
+#[test]
+fn the_marker_on_disk_wins_over_the_request() {
+    let tmp = tempfile::tempdir().unwrap();
+    let wrap = Wrap::new(mock_driver());
+    let services = start(config(tmp.path(), Arc::new(wrap.clone())));
+    let mut events = services.take_events().unwrap();
+    let types = ConnectionTypes::default();
+    let mut c = mock_connection(ConnectionTypeId::dev());
+    c.init_sql = vec!["SET search_path TO app".into()];
+    c.init_sql_needs_confirmation = true;
+    let ws = services.workspace();
+    ws.save_connections_checked(
+        &Connections::from_vec(vec![c.clone()]).unwrap(),
+        services.registry(),
+    )
+    .unwrap();
+
+    ui(async {
+        // A request that lost the marker still asks, as imported.
+        let mut stale = c.clone();
+        stale.init_sql_needs_confirmation = false;
+        let OpenOutcome::InitSqlNeedsConfirmation(ic) =
+            open(services.sessions(), OpenRequest::new(stale.clone(), &types))
+                .await
+                .unwrap()
+        else {
+            panic!("the marker on disk was not read");
+        };
+        assert!(ic.imported);
+        // Init SQL changed since it was saved, on an unmarked request: asks too, and confirming
+        // it leaves the marker of the saved statements.
+        let mut changed = stale.clone();
+        changed.init_sql = vec!["SET search_path TO other".into()];
+        let OpenOutcome::InitSqlNeedsConfirmation(ic2) = open(
+            services.sessions(),
+            OpenRequest::new(changed.clone(), &types),
+        )
+        .await
+        .unwrap() else {
+            panic!("changed init SQL was not asked");
+        };
+        assert!(ic2.imported);
+        let h = match open(
+            services.sessions(),
+            OpenRequest::new(changed.clone(), &types).with_init_sql_confirmation(ic2.token),
+        )
+        .await
+        .unwrap()
+        {
+            OpenOutcome::Opened(h) => h,
+            out => panic!("{out:?}"),
+        };
+        h.close().await.unwrap().unwrap();
+        let ev = next_confirmed(&mut events).await;
+        assert_eq!(
+            ev,
+            CoreEvent::ImportedInitSqlConfirmed {
+                connection: c.id,
+                statements: changed.init_sql.clone(),
+                cleared: Some(false),
+            }
+        );
+
+        // Confirming the saved statements (from the stale request) clears the file.
+        let h = match open(
+            services.sessions(),
+            OpenRequest::new(stale.clone(), &types).with_init_sql_confirmation(ic.token),
+        )
+        .await
+        .unwrap()
+        {
+            OpenOutcome::Opened(h) => h,
+            out => panic!("{out:?}"),
+        };
+        h.close().await.unwrap().unwrap();
+        let ev = next_confirmed(&mut events).await;
+        assert_eq!(
+            ev,
+            CoreEvent::ImportedInitSqlConfirmed {
+                connection: c.id,
+                statements: c.init_sql.clone(),
+                cleared: Some(true),
+            }
+        );
+        // Now the unmarked request opens without confirmation.
+        let h = open_ok(services.sessions(), stale, &types).await;
+        h.close().await.unwrap().unwrap();
+    });
+    let saved = ws
+        .load_connections()
+        .unwrap()
+        .connections
+        .get(c.id)
+        .cloned();
+    assert!(!saved.unwrap().init_sql_needs_confirmation);
+}
+
+async fn next_confirmed(events: &mut ninesql_core::CoreEvents) -> CoreEvent {
+    loop {
+        match tokio::time::timeout(Duration::from_secs(5), events.recv()).await {
+            Ok(Some(ev @ CoreEvent::ImportedInitSqlConfirmed { .. })) => return ev,
+            Ok(Some(_)) => {}
+            other => panic!("no ImportedInitSqlConfirmed: {other:?}"),
+        }
+    }
+}
+
 /// P1-E review, L2 (I4, defence in depth): a file inside a DBeaver workspace is also opened as
 /// a read-only session, and a driver that ignores both flags (a future file driver) is refused.
 #[test]
