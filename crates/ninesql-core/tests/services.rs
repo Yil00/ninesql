@@ -378,6 +378,14 @@ fn a_driver_without_tls_accepts_only_disable_on_network_endpoints() {
     ));
     c.tls.mode = TlsMode::Disable;
     c.validate_for_driver(&caps).unwrap();
+
+    // A driver that declares TLS modes but not `disable` refuses it.
+    let mut tls_only = mock_capabilities();
+    tls_only.tls = [api::TlsMode::VerifyFull].into_iter().collect();
+    assert!(matches!(
+        c.validate_for_driver(&tls_only),
+        Err(ConnectionError::InvalidField { field, .. }) if field == "tls.mode"
+    ));
 }
 
 #[test]
@@ -410,6 +418,8 @@ fn the_password_exchange_and_the_dbeaver_flag_reach_the_driver() {
         };
         let h = open_ok(services.sessions(), inside, &types).await;
         assert!(wrap.last_seen().inside_dbeaver_workspace);
+        // The UI can say why the file was opened read-only (review P1-D wiring, L3).
+        assert!(h.info().inside_dbeaver_workspace);
         assert_eq!(
             wrap.last_seen().password_exchange,
             api::PasswordExchange::Any
@@ -422,6 +432,22 @@ fn the_password_exchange_and_the_dbeaver_flag_reach_the_driver() {
         };
         let h = open_ok(services.sessions(), outside, &types).await;
         assert!(!wrap.last_seen().inside_dbeaver_workspace);
+        assert!(!h.info().inside_dbeaver_workspace);
+        h.close().await.unwrap().unwrap();
+
+        // The driver gets the canonical path that was checked (review P1-D wiring, L5).
+        let real = tmp.path().join("real");
+        std::fs::create_dir_all(&real).unwrap();
+        std::os::unix::fs::symlink(&real, tmp.path().join("via-link")).unwrap();
+        let mut linked = mock_connection(ConnectionTypeId::dev());
+        linked.endpoint = Endpoint::File {
+            path: tmp.path().join("via-link/../via-link/x.db"),
+        };
+        let h = open_ok(services.sessions(), linked, &types).await;
+        let api::Endpoint::File { path, .. } = wrap.last_seen().endpoint else {
+            panic!("not a file endpoint");
+        };
+        assert_eq!(path, std::fs::canonicalize(&real).unwrap().join("x.db"));
         h.close().await.unwrap().unwrap();
 
         // A folder picked for an import, added after startup.
@@ -435,4 +461,123 @@ fn the_password_exchange_and_the_dbeaver_flag_reach_the_driver() {
         assert!(wrap.last_seen().inside_dbeaver_workspace);
         h.close().await.unwrap().unwrap();
     });
+}
+
+/// Review P1-D wiring, L8 / L9: with the vault locked, `open` asks for the unlock before it
+/// asks for prompted secrets, and before anything dials the SSH hop.
+#[test]
+fn the_vault_unlock_comes_before_prompts_and_before_any_ssh_dial() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let tmp = tempfile::tempdir().unwrap();
+    let wrap = Wrap::new(mock_driver().with_password(Secret::new(DB_PASSWORD.into())));
+    let mut cfg = config(tmp.path(), Arc::new(wrap.clone()));
+    cfg.manager.connect_timeout = Duration::from_secs(3);
+    let services = start(cfg);
+    let types = ConnectionTypes::default();
+
+    // A stand-in SSH server that records every connection and closes it at once.
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let dials = Arc::new(AtomicUsize::new(0));
+    let counter = Arc::clone(&dials);
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            counter.fetch_add(1, Ordering::SeqCst);
+            drop(stream);
+        }
+    });
+
+    ui(async {
+        services
+            .create_vault_with(s(MASTER), KdfParams::insecure_for_tests())
+            .await
+            .unwrap()
+            .unwrap();
+    });
+    let mut c = mock_connection(ConnectionTypeId::dev());
+    c.auth = Auth::Password {
+        username: "app".into(),
+        secret: SecretSource::Prompt,
+    };
+    c.ssh = Some(ninesql_core::SshTunnel {
+        server: ninesql_core::SshHop::new(
+            "127.0.0.1",
+            port,
+            "deploy",
+            ninesql_core::SshAuth::Password {
+                secret: SecretSource::Prompt,
+            },
+        ),
+        jump_hosts: vec![],
+    });
+    let mut connections = Connections::default();
+    // The database password goes to the vault; the SSH password stays "ask every time".
+    let id = services
+        .workspace()
+        .create_connection_checked(
+            &mut connections,
+            c,
+            vec![(SecretSlot::Auth, s(DB_PASSWORD))],
+            StoreKind::Vault,
+            services.secret_stores(),
+            services.registry(),
+        )
+        .unwrap();
+    let c = connections.get(id).unwrap().clone();
+
+    ui(async {
+        services.lock_now().await.unwrap();
+        // L8: the unlock is asked for first, not the SSH password.
+        let out = open(services.sessions(), OpenRequest::new(c.clone(), &types))
+            .await
+            .unwrap();
+        assert!(
+            matches!(
+                out,
+                OpenOutcome::NeedsVaultUnlock {
+                    slot: SecretSlot::Auth,
+                    ..
+                }
+            ),
+            "{out:?}"
+        );
+        // L9: with every prompt answered, still the unlock first, and no dial.
+        let request =
+            OpenRequest::new(c.clone(), &types).with_secret(SecretSlot::SshServer, s("ssh-pw"));
+        let out = open(services.sessions(), request).await.unwrap();
+        assert!(
+            matches!(
+                out,
+                OpenOutcome::NeedsVaultUnlock {
+                    slot: SecretSlot::Auth,
+                    ..
+                }
+            ),
+            "{out:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert_eq!(dials.load(Ordering::SeqCst), 0, "the SSH hop was dialled");
+        assert!(wrap.seen.lock().unwrap().is_empty());
+
+        // Unlocked: now the SSH password is asked for…
+        services.unlock_vault(s(MASTER)).await.unwrap().unwrap();
+        let out = open(services.sessions(), OpenRequest::new(c.clone(), &types))
+            .await
+            .unwrap();
+        let OpenOutcome::NeedsSecrets(prompts) = out else {
+            panic!("{out:?}");
+        };
+        assert_eq!(prompts.len(), 1);
+        assert_eq!(prompts[0].slot, SecretSlot::SshServer);
+        // …and with it the hop is dialled (the stand-in is no SSH server: the open fails).
+        let request =
+            OpenRequest::new(c.clone(), &types).with_secret(SecretSlot::SshServer, s("ssh-pw"));
+        assert!(open(services.sessions(), request).await.is_err());
+        assert!(
+            dials.load(Ordering::SeqCst) >= 1,
+            "the listener records dials"
+        );
+    });
+    services.shutdown(Duration::from_secs(2));
 }

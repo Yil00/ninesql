@@ -203,6 +203,23 @@ impl fmt::Debug for CoreServices {
     }
 }
 
+/// After an unlock or a create that succeeded: when a lock started since `generation` was
+/// captured (at the UI's request), it may have run before the vault was unlocked and found
+/// nothing to lock. The vault is then locked again and the caller gets
+/// [`VaultError::Locked`](ninesql_secrets::VaultError::Locked) (review P1-D wiring, L2).
+fn relock_if_locked_since(
+    vault: &Vault,
+    hooks: &LockHooks,
+    generation: u64,
+) -> Result<(), CoreError> {
+    if hooks.generation() == generation {
+        return Ok(());
+    }
+    vault.lock();
+    tracing::info!("secrets were locked while the vault was being unlocked: locked again");
+    Err(CoreError::Vault(ninesql_secrets::VaultError::Locked))
+}
+
 /// Reports locks triggered through [`LockHooks`] (watcher, [`CoreServices::lock_now`]).
 struct EventHook(EventSink);
 
@@ -490,11 +507,18 @@ impl CoreServices {
     /// [`VaultError::TooManyAttempts`](ninesql_secrets::VaultError::TooManyAttempts),
     /// [`VaultError::NotCreated`](ninesql_secrets::VaultError::NotCreated) (call
     /// [`Self::create_vault`]) or a file error; [`CoreError::NoVault`].
+    ///
+    /// A lock (sleep, screen lock, "lock secrets") that arrives after this call, before the
+    /// unlock is done, wins: the vault is locked again and the answer is
+    /// [`VaultError::Locked`](ninesql_secrets::VaultError::Locked).
     pub fn unlock_vault(&self, master: SecretString) -> Reply<Result<(), CoreError>> {
+        let hooks = Arc::clone(&self.inner.hooks);
+        let generation = hooks.generation();
         self.with_vault(move |v| {
             let result = v.unlock(&master);
             drop(master);
-            Ok(result?)
+            result?;
+            relock_if_locked_since(v, &hooks, generation)
         })
     }
 
@@ -510,7 +534,10 @@ impl CoreServices {
         self.create_vault_with(master, KdfParams::DEFAULT)
     }
 
-    /// [`Self::create_vault`] with explicit Argon2id parameters.
+    /// [`Self::create_vault`] with explicit Argon2id parameters. As with
+    /// [`Self::unlock_vault`], a lock that arrives before the vault is created and unlocked
+    /// leaves it created but locked, and the answer is
+    /// [`VaultError::Locked`](ninesql_secrets::VaultError::Locked).
     ///
     /// # Errors
     /// As [`Self::create_vault`].
@@ -519,10 +546,13 @@ impl CoreServices {
         master: SecretString,
         params: KdfParams,
     ) -> Reply<Result<(), CoreError>> {
+        let hooks = Arc::clone(&self.inner.hooks);
+        let generation = hooks.generation();
         self.with_vault(move |v| {
             let result = v.create(&master, params);
             drop(master);
-            Ok(result?)
+            result?;
+            relock_if_locked_since(v, &hooks, generation)
         })
     }
 
@@ -667,4 +697,46 @@ fn spawn_idle_timer(
             }
         }
     })
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)] // Tests may panic (AGENTS.md).
+mod tests {
+    use super::*;
+
+    /// Review P1-D wiring, L2: a lock that lands after the unlock was asked for, before the
+    /// unlock runs (while it is queued, so the vault had nothing to lock), wins.
+    #[test]
+    fn a_lock_between_the_unlock_request_and_the_unlock_wins() {
+        let dir = tempfile::tempdir().unwrap();
+        let vault = Arc::new(
+            Vault::open_at(dir.path().join("vault.bin"), &dir.path().join("vault.lock")).unwrap(),
+        );
+        let master = SecretString::from("master-pw".to_owned());
+        vault
+            .create(&master, KdfParams::insecure_for_tests())
+            .unwrap();
+        vault.lock();
+        let hooks = LockHooks::new();
+        hooks.add(Arc::clone(&vault) as Arc<dyn LockHook>);
+
+        // Captured when the UI calls `unlock_vault`…
+        let generation = hooks.generation();
+        // …the screen locks while the task is queued: the vault is already locked, no-op…
+        hooks.lock_all(LockTrigger::SessionLock);
+        // …then the task unlocks.
+        vault.unlock(&master).unwrap();
+        let err = relock_if_locked_since(&vault, &hooks, generation).unwrap_err();
+        assert!(
+            matches!(err, CoreError::Vault(ninesql_secrets::VaultError::Locked)),
+            "{err:?}"
+        );
+        assert!(!vault.is_unlocked());
+
+        // Without a lock in between, the unlock stands.
+        let generation = hooks.generation();
+        vault.unlock(&master).unwrap();
+        relock_if_locked_since(&vault, &hooks, generation).unwrap();
+        assert!(vault.is_unlocked());
+    }
 }

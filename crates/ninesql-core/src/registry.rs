@@ -180,16 +180,20 @@ impl Connection {
                 reason: "is a policy the driver of this engine cannot enforce; use `any`",
             });
         }
-        if self.endpoint.is_network()
-            && self.tls.mode != TlsMode::Disable
-            && !capabilities.tls.contains(&api_tls_mode(self.tls.mode))
-        {
+        // A driver without TLS (empty set) accepts only `disable`; a driver with TLS accepts
+        // exactly the modes it declares, `disable` included (a TLS-only driver refuses it).
+        let tls_ok = if capabilities.tls.is_empty() {
+            self.tls.mode == TlsMode::Disable
+        } else {
+            capabilities.tls.contains(&api_tls_mode(self.tls.mode))
+        };
+        if self.endpoint.is_network() && !tls_ok {
             return Err(ConnectionError::InvalidField {
                 field: "tls.mode".to_owned(),
                 reason: if capabilities.tls.is_empty() {
                     "must be `disable`: the driver of this engine does not support TLS"
                 } else {
-                    "is a TLS mode the driver of this engine does not support"
+                    "is a TLS mode the driver of this engine does not support (a driver that requires TLS refuses `disable`)"
                 },
             });
         }

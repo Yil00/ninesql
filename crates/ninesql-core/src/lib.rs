@@ -25,7 +25,7 @@ pub use connection::{
     TlsConfig, TlsMode,
 };
 pub use connection_type::{Color, ConnectionType, ConnectionTypeId, ConnectionTypes, SafetyPolicy};
-pub use dbeaver_roots::DbeaverRoots;
+pub use dbeaver_roots::{DbeaverRoots, FileCheck};
 pub use error::{ConnectionError, CoreError, WorkspaceError};
 pub use registry::DriverRegistry;
 pub use runtime::DriverRuntime;

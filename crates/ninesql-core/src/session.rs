@@ -73,7 +73,7 @@ use uuid::Uuid;
 use crate::connect::{self, SecretPrompt};
 use crate::connection::{Connection, ConnectionId, Endpoint, EngineId, SecretSlot};
 use crate::connection_type::{ConnectionTypes, SafetyPolicy};
-use crate::dbeaver_roots::DbeaverRoots;
+use crate::dbeaver_roots::{DbeaverRoots, FileCheck};
 use crate::error::CoreError;
 use crate::registry::{DriverRegistry, api_engine};
 use crate::runtime::{DEFAULT_WORKERS, DriverRuntime};
@@ -395,6 +395,10 @@ pub struct SessionInfo {
     pub tunnel: Option<TunnelInfo>,
     /// Weakened security settings.
     pub warnings: Vec<SessionWarning>,
+    /// The database file lies inside a DBeaver workspace (or the check could not tell), so the
+    /// driver was asked to open it read-only (I4). The UI says so: "opened read-only: the file
+    /// is inside a DBeaver workspace". Always `false` for network endpoints.
+    pub inside_dbeaver_workspace: bool,
 }
 
 /// Transaction state of a session after a transaction command.
@@ -923,6 +927,25 @@ impl EventSink {
     }
 }
 
+/// The first credential field saved in the vault, when the vault is locked. The lock state is
+/// read on the blocking pool (the vault may be busy deriving a key); an unanswered check is
+/// `None` (the secret resolution then reports the lock).
+async fn locked_vault_slot(shared: &Arc<Shared>, connection: &Connection) -> Option<SecretSlot> {
+    let slot = connect::credential_fields(connection)
+        .into_iter()
+        .find(|(_, _, source)| source.stored().is_some_and(|r| r.store == StoreKind::Vault))
+        .map(|(slot, _, _)| slot)?;
+    let stores = shared.reads.stores().clone();
+    let locked = tokio::task::spawn_blocking(move || {
+        stores
+            .store(StoreKind::Vault)
+            .is_ok_and(|store| store.is_locked())
+    })
+    .await
+    .unwrap_or(false);
+    locked.then_some(slot)
+}
+
 async fn open_session(
     shared: &Arc<Shared>,
     request: OpenRequest,
@@ -986,6 +1009,15 @@ async fn open_session(
     let supplied: Vec<SecretSlot> = prompted.iter().map(|(s, _)| *s).collect();
     let missing = connect::missing_prompts(&connection, &supplied);
     if !missing.is_empty() {
+        // A saved secret in the locked vault is asked for first, so the prompted secrets are
+        // typed once, after the unlock (review P1-D wiring, L8).
+        if let Some(slot) = locked_vault_slot(shared, &connection).await {
+            tracing::debug!(connection = %connection.id, "the vault is locked; asking to unlock it");
+            return Ok(OpenOutcome::NeedsVaultUnlock {
+                connection: connection.id,
+                slot,
+            });
+        }
         return Ok(OpenOutcome::NeedsSecrets(missing));
     }
 
@@ -1037,14 +1069,27 @@ async fn open_session(
                 return Err(e);
             }
         };
+    let mut inside_dbeaver_workspace = false;
     if let Endpoint::File { path } = &connection.endpoint {
         // I4: a database file inside a DBeaver workspace is opened read-only by its driver.
         // File system checks: on the blocking pool; a failed check counts as inside.
         let roots = shared.config.dbeaver_roots.clone();
         let path = path.clone();
-        let inside = tokio::task::spawn_blocking(move || roots.contains(&path))
+        let check = tokio::task::spawn_blocking(move || roots.check(&path))
             .await
-            .unwrap_or(true);
+            .unwrap_or(FileCheck {
+                path: None,
+                inside: true,
+            });
+        // The driver opens the canonical path that was checked, so the check and the open name
+        // the same file (review P1-D wiring, L5). Unresolvable: the configured path, read-only.
+        if let (Some(checked), ninesql_driver_api::Endpoint::File { path, .. }) =
+            (check.path, &mut params.endpoint)
+        {
+            *path = checked;
+        }
+        let inside = check.inside;
+        inside_dbeaver_workspace = inside;
         if inside {
             tracing::info!(
                 connection = %connection.id,
@@ -1114,6 +1159,7 @@ async fn open_session(
         tunnel: tunnel_info,
         warnings,
         capabilities,
+        inside_dbeaver_workspace,
     };
     let (cmd_tx, cmd_rx) = mpsc::channel(shared.config.command_queue.max(1));
     let (close_tx, close_rx) = oneshot::channel();
