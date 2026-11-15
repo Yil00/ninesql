@@ -1152,27 +1152,43 @@ impl Importer {
             source_workspace: Some(source_workspace.to_path_buf()),
         };
 
-        // Driver properties: only what the engine's driver accepts reaches the connection
-        // (item 9: pgjdbc / Connector/J properties without an equivalent are refused at connect).
+        // Driver properties. `ninesql-dbeaver` already converted them to NineSQL names for the
+        // engines NineSQL has drivers for, and listed what it dropped (`dropped_properties`,
+        // each with a `PropertyDropped` / `ReservedProperty` / `SecretRemoved` / `InvalidValue`
+        // report entry). The core still checks every remaining key against the registered
+        // driver (defence in depth: a key the driver refuses never reaches it, item 9) and
+        // reports only what the crate has not reported already. Without a registered driver the
+        // properties are kept and `Connection::try_enable` checks them before enabling.
         let caps = self.registry.capabilities(&c.engine).ok();
+        let already_reported = |key: &str| {
+            m.dropped_properties
+                .iter()
+                .any(|d| d.key == key || d.key.ends_with(&format!(".{key}")))
+        };
         for (key, value) in &m.properties {
             if let Some(caps) = &caps {
-                if caps.is_reserved_property(key) {
-                    issues.push(issue(
-                        Severity::Warning,
+                let refused = if caps.is_reserved_property(key) {
+                    Some((
                         IssueKind::ReservedProperty,
-                        Some(&format!("configuration.properties.{key}")),
                         "reserved by the NineSQL driver of this engine: not imported",
-                    ));
-                    continue;
-                }
-                if !caps.connect.accepts_property(key) {
-                    issues.push(issue(
-                        Severity::Warning,
-                        IssueKind::Unsupported,
-                        Some(&format!("configuration.properties.{key}")),
+                    ))
+                } else if !caps.connect.accepts_property(key) {
+                    Some((
+                        IssueKind::PropertyDropped,
                         "no equivalent in the NineSQL driver of this engine: not imported",
-                    ));
+                    ))
+                } else {
+                    None
+                };
+                if let Some((kind, message)) = refused {
+                    if !already_reported(key) {
+                        issues.push(issue(
+                            Severity::Warning,
+                            kind,
+                            Some(&format!("configuration.properties.{key}")),
+                            message,
+                        ));
+                    }
                     continue;
                 }
             }

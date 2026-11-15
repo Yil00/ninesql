@@ -17,17 +17,17 @@ connection mariadb-ssh-key: Imported create engine=mariadb type=dev folder=[] en
 connection mysql-test: Imported create engine=mysql type=test folder=["Team B"] enabled=true reason=None read_only=None auto_commit=Some(false) schema=None marker=false init_sql=0 tls=Require ssh_hops=0 props=[] secrets=["Auth:Password"]
   - Info TlsConverted
   - Info Unsupported configuration.bootstrap.autocommit
+  - Warning PropertyDropped configuration.properties.connectTimeout
   - Warning TlsNotVerified
-  - Warning Unsupported configuration.properties.connectTimeout
 connection oracle-legacy: ImportedDisabled create engine=oracle type=dev folder=["Legacy"] enabled=false reason=Some(NoDriver) read_only=None auto_commit=None schema=None marker=false init_sql=0 tls=VerifyFull ssh_hops=0 props=[] secrets=["Auth:Password"]
   - Warning TlsConverted
   - Warning UnsupportedEngine driver
 connection pg-dev: Imported create engine=postgresql type=dev folder=["Team A"] enabled=true reason=None read_only=None auto_commit=None schema=Some("app") marker=true init_sql=1 tls=VerifyFull ssh_hops=0 props=[] secrets=["Auth:Password"]
   - Info Unsupported configuration.bootstrap.defaultSchema
   - Warning InitSql configuration.bootstrap.query
+  - Warning PropertyDropped configuration.properties.ApplicationName
+  - Warning PropertyDropped configuration.properties.connectTimeout
   - Warning TlsConverted
-  - Warning Unsupported configuration.properties.ApplicationName
-  - Warning Unsupported configuration.properties.connectTimeout
 connection pg-prod-ssh: Imported create engine=postgresql type=prod folder=["Team A", "Production"] enabled=true reason=None read_only=Some(true) auto_commit=None schema=None marker=false init_sql=0 tls=VerifyFull ssh_hops=1 props=[] secrets=["Auth:Password", "SshServer:SshPassword"]
   - Info SshHostKeyToConfirm configuration.handlers.ssh_tunnel
   - Warning TlsConverted

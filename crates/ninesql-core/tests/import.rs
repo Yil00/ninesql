@@ -1374,7 +1374,10 @@ fn a_disabled_reason_cannot_be_changed_through_the_ui_paths() {
     );
 }
 
-/// Review L4: a property kept on a connection without a driver is checked again at enable.
+/// Review L4, with the P2-A property mapping: an unvetted DBeaver property of a sqlite
+/// connection is dropped by the parser and reported once (not again by the core), a mapped one
+/// is kept; the core keeps the kept ones while no driver is registered, and enabling checks
+/// every property against the driver's allowlist (here a property added since).
 #[test]
 fn properties_of_a_connection_without_a_driver_are_checked_at_enable() {
     let tmp = tempfile::tempdir().unwrap();
@@ -1385,7 +1388,7 @@ fn properties_of_a_connection_without_a_driver_are_checked_at_enable() {
     only_pg.register(Arc::new(ninesql_driver_pgwire::PgWireDriver::new()));
     let importer = Importer::new(
         workspace.clone(),
-        only_pg,
+        only_pg.clone(),
         SecretStores::new(),
         DbeaverRoots::none().with_home(root.join("home")),
         None,
@@ -1396,27 +1399,52 @@ fn properties_of_a_connection_without_a_driver_are_checked_at_enable() {
         &format!(
             r#"{{ "connections": {{ "sqlite_jdbc-p": {{ "provider": "sqlite", "driver": "sqlite_jdbc",
                  "name": "p", "configuration": {{ "database": "{}", "type": "dev",
-                 "properties": {{ "unvetted_option": "1" }} }} }} }} }}"#,
+                 "properties": {{ "unvetted_option": "1", "busy_timeout": "3000" }} }} }} }} }}"#,
             db.display()
         ),
     );
     let preview = importer.preview(&ImportSource::Folder(source)).unwrap();
+    let p = plan(&preview, "p");
+    let reported = p
+        .issues
+        .iter()
+        .filter(|i| {
+            i.key
+                .as_deref()
+                .is_some_and(|k| k.ends_with("unvetted_option"))
+        })
+        .count();
+    assert_eq!(reported, 1, "{:?}", p.issues);
     importer.apply(&preview, &ImportChoices::all(None)).unwrap();
     let mut connections = saved(&workspace);
-    let c = connections.iter().next().unwrap().clone();
+    let mut c = connections.iter().next().unwrap().clone();
+    let id = c.id;
     assert_eq!(
         c.disabled_reason.as_ref().unwrap().kind,
         DisabledKind::NoDriver
     );
-    assert!(c.properties.contains_key("unvetted_option"));
-    {
-        // With the driver registered, enabling re-checks the property against its allowlist.
-        assert!(
-            workspace
-                .enable_connection(&mut connections, c.id, false, &registry())
-                .is_err()
-        );
-    }
+    assert!(!c.properties.contains_key("unvetted_option"));
+    assert!(c.properties.contains_key("busy_timeout"));
+
+    // A property the sqlite driver does not accept, added while it is disabled (model rules
+    // only), blocks the enable once the driver is registered.
+    c.properties.insert("unvetted_option".into(), "1".into());
+    workspace
+        .update_connection(&mut connections, c, &only_pg)
+        .unwrap();
+    assert!(
+        workspace
+            .enable_connection(&mut connections, id, false, &registry())
+            .is_err()
+    );
+    let mut c = saved(&workspace).get(id).unwrap().clone();
+    c.properties.remove("unvetted_option");
+    workspace
+        .update_connection(&mut connections, c, &only_pg)
+        .unwrap();
+    workspace
+        .enable_connection(&mut connections, id, false, &registry())
+        .unwrap();
 }
 
 fn pg_ssh(id: &str, auth: &str, jumps: &str) -> String {
@@ -1446,7 +1474,7 @@ fn the_update_diff_lists_properties_and_init_sql() {
     let first = pg(
         "postgres-jdbc-d",
         "d",
-        r#", "password": "Diff-Pa55-0031", "properties": { "search_path": "app" },
+        r#", "password": "Diff-Pa55-0031", "properties": { "currentSchema": "app" },
            "bootstrap": { "query": ["SET statement_timeout = 1000"] }"#,
     );
     let source = crafted(&e.root, &format!(r#"{{ "connections": {{ {first} }} }}"#));
@@ -1456,7 +1484,7 @@ fn the_update_diff_lists_properties_and_init_sql() {
         &[pg(
             "postgres-jdbc-d",
             "d",
-            r#", "properties": { "search_path": "evil, public" },
+            r#", "properties": { "currentSchema": "evil, public" },
                "bootstrap": { "query": ["SET statement_timeout = 0"] }"#,
         )],
     );
