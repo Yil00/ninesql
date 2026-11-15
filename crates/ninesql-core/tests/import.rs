@@ -351,7 +351,23 @@ fn fixture_workspaces_import_with_snapshots_and_untouched_files() {
                 .report_file
                 .starts_with(e.workspace.project_paths().dir())
         );
-        assert!(outcome.report_file.exists());
+        let report =
+            ninesql_storage::document::load::<ninesql_core::ImportReportFile>(&outcome.report_file)
+                .unwrap()
+                .unwrap();
+        assert!(
+            report.secret_like_keys.is_empty(),
+            "{:?}",
+            report.secret_like_keys
+        );
+        let moved: usize = report
+            .document
+            .projects
+            .iter()
+            .flat_map(|p| p.connections.iter())
+            .map(|c| c.moved_to_store)
+            .sum();
+        assert_eq!(moved, outcome.secrets_moved);
 
         let connections = saved(&e.workspace);
         assert_eq!(connections.len(), outcome.created);

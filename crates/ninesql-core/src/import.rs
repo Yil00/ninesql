@@ -867,6 +867,15 @@ impl Importer {
                 "folder descriptions are not imported",
             ));
         }
+        if plans.iter().any(|p| !p.secrets.is_empty()) {
+            issues.push(issue(
+                Severity::Info,
+                IssueKind::Credentials,
+                Some("credentials-config.json"),
+                "once you have switched, consider deleting the passwords DBeaver saved: its \
+                 credentials file is only obfuscated (NineSQL never changes DBeaver files)",
+            ));
+        }
         if project.path.join("Scripts").is_dir() {
             issues.push(issue(
                 Severity::Info,
@@ -1343,8 +1352,9 @@ impl Document for ImportReportFile {
 pub struct ReportProject {
     /// DBeaver project name.
     pub name: String,
-    /// Credentials file status.
-    pub credentials: String,
+    /// What happened to DBeaver's `credentials-config.json` (the key avoids the secret-like
+    /// fragments the storage layer strips on load).
+    pub saved_logins_file: String,
     /// Project-level entries.
     pub issues: Vec<ReportIssue>,
     /// Connections.
@@ -1355,7 +1365,7 @@ impl ReportProject {
     fn new(p: &ProjectPreview, connections: Vec<ReportConnection>) -> Self {
         Self {
             name: p.name.clone(),
-            credentials: match &p.credentials {
+            saved_logins_file: match &p.credentials {
                 CredentialsStatus::NotFound => "not-found".to_owned(),
                 CredentialsStatus::Decrypted { passwords } => {
                     format!("decrypted ({passwords} saved)")
@@ -1386,8 +1396,9 @@ pub struct ReportConnection {
     /// Why it is disabled or not imported.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
-    /// Secrets moved (a count, never values).
-    pub secrets_moved: usize,
+    /// Saved credentials moved to the store (a count, never values). The key name avoids the
+    /// secret-like fragments the storage layer strips on load.
+    pub moved_to_store: usize,
     /// Entries.
     pub issues: Vec<ReportIssue>,
 }
@@ -1415,7 +1426,7 @@ impl ReportConnection {
                     .and_then(|c| c.disabled_reason.as_ref())
                     .map(|r| r.message.clone())
             }),
-            secrets_moved: secrets,
+            moved_to_store: secrets,
             issues: plan.issues.iter().map(ReportIssue::from).collect(),
         }
     }
