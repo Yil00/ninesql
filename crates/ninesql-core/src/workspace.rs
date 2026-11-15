@@ -128,7 +128,7 @@ impl Document for ConnectionsFile {
     /// optional `init_sql_needs_confirmation` marker of imported init SQL (`false` when
     /// absent); version 5 adds `default_schema`, `default_catalog`, the per-connection
     /// `auto_commit` override and the `disabled_reason` of a connection (P2-C, all absent by
-    /// default). A bump adds a
+    /// default) and the `source_workspace` of a DBeaver origin. A bump adds a
     /// [`Migration`] here. An older NineSQL refuses a newer file instead of dropping a field it
     /// does not know and saving the connection weaker than the user set it.
     const SCHEMA_VERSION: u32 = 5;
@@ -239,7 +239,7 @@ fn connections_v3_to_v4(doc: &mut Value) -> Result<(), String> {
 }
 
 /// `connections.json` 4 → 5: connections gain `default_schema`, `default_catalog`,
-/// `auto_commit` and `disabled_reason` (P2-C). Version 4 files have no such keys, and absent
+/// `auto_commit` and `disabled_reason`, and a DBeaver origin gains `source_workspace` (P2-C). Version 4 files have no such keys, and absent
 /// keys mean exactly the version 4 behavior: nothing to rewrite. Keys already present in a
 /// version 4 file (hand edit) are removed, as in the 1 → 2 and 2 → 3 migrations, so these
 /// settings only ever come from a NineSQL that knows and validated them; `enabled` is left as
@@ -259,6 +259,9 @@ fn connections_v4_to_v5(doc: &mut Value) -> Result<(), String> {
                 if let Some(mut v) = connection.remove(key) {
                     zeroize_value(&mut v);
                 }
+            }
+            if let Some(origin) = connection.get_mut("origin").and_then(Value::as_object_mut) {
+                origin.remove("source_workspace");
             }
         }
     }
@@ -349,8 +352,28 @@ impl Connections {
         self.items.iter_mut().find(|c| c.id == id)
     }
 
-    /// The connection imported from that DBeaver data source, for idempotent re-import
-    /// (ADR-0006 §8).
+    /// The connection imported from that DBeaver data source, from that DBeaver project of
+    /// that workspace (canonical path), for idempotent re-import (ADR-0006 §8). Matching on the
+    /// id alone would let another workspace that reuses the id update this connection
+    /// (P2-C review, H1).
+    #[must_use]
+    pub fn find_dbeaver_origin(
+        &self,
+        dbeaver_id: &str,
+        project: &str,
+        source_workspace: &std::path::Path,
+    ) -> Option<&Connection> {
+        self.items.iter().find(|c| {
+            matches!(&c.origin, crate::connection::Origin::Dbeaver {
+                dbeaver_id: d,
+                project: Some(p),
+                source_workspace: Some(w),
+            } if d == dbeaver_id && p == project && w == source_workspace)
+        })
+    }
+
+    /// The first connection with that DBeaver data source id, whatever its project or
+    /// workspace. **Not** a re-import match: see [`Self::find_dbeaver_origin`].
     #[must_use]
     pub fn find_by_dbeaver_id(&self, dbeaver_id: &str) -> Option<&Connection> {
         self.items.iter().find(|c| {
@@ -422,9 +445,10 @@ fn check_for_driver(registry: &DriverRegistry, c: &Connection) -> Result<(), Wor
 /// - Marker: set again when the disk copy has it and the new copy holds the same init SQL. New
 ///   init SQL without the marker is checked at open against the disk anyway
 ///   ([`Workspace::init_sql_marked_on_disk`]).
-/// - Disabled reason: when the disk copy has one and the new copy has none, the save is refused
+/// - Disabled reason: any change of it (dropped, added, other kind or message) is refused
 ///   ([`ConnectionError::InvalidField`] on `disabled_reason`), unless `allow_reason_change` (the
-///   import, which recomputes the reason from the source).
+///   import, which recomputes the reason from the source). Turning a `route` reason into an
+///   `invalid` one would otherwise let a connection be enabled without confirming its route.
 fn carry_protected_state(
     disk: &Connections,
     next: &mut Connections,
@@ -437,12 +461,12 @@ fn carry_protected_state(
         if old.init_sql_needs_confirmation && !c.init_sql.is_empty() && old.init_sql == c.init_sql {
             c.init_sql_needs_confirmation = true;
         }
-        if !allow_reason_change && old.disabled_reason.is_some() && c.disabled_reason.is_none() {
+        if !allow_reason_change && old.disabled_reason != c.disabled_reason {
             return Err(WorkspaceError::InvalidConnection {
                 name: c.name.clone(),
                 source: ConnectionError::InvalidField {
                     field: "disabled_reason".to_owned(),
-                    reason: "can only be cleared by enabling the connection once its cause is fixed",
+                    reason: "is set by NineSQL and only cleared by enabling the connection once its cause is fixed",
                 },
             });
         }
@@ -864,19 +888,28 @@ impl Workspace {
     /// of `upserts` replace those with the same id or are appended, and the imported init SQL
     /// marker of the disk copy is kept like [`Self::save_connections_checked`] does. Unlike the
     /// UI paths, the import may set or clear a disabled reason (it recomputes it from the
-    /// source). Returns the connections as written.
+    /// source). Returns the connections as written, or `None` without writing anything when
+    /// the disk copy of an upserted connection is not `expected` (the saved copy the import
+    /// planned against; `None` for a new connection): a UI edit made since the preview is never
+    /// overwritten (P2-C review, L2).
     pub(crate) fn save_imported(
         &self,
-        upserts: Vec<Connection>,
+        upserts: Vec<(Connection, Option<Connection>)>,
         registry: &DriverRegistry,
-    ) -> Result<Connections, WorkspaceError> {
-        for c in &upserts {
+    ) -> Result<Option<Connections>, WorkspaceError> {
+        for (c, _) in &upserts {
             check_for_driver(registry, c)?;
         }
         let _guard = self.guard();
         let disk = self.load_connections_unguarded()?.connections;
+        if upserts
+            .iter()
+            .any(|(c, expected)| disk.get(c.id) != expected.as_ref())
+        {
+            return Ok(None);
+        }
         let mut next = disk.clone();
-        for c in upserts {
+        for (c, _) in upserts {
             match next.get_mut(c.id) {
                 Some(slot) => *slot = c,
                 None => next.insert(c)?,
@@ -884,7 +917,7 @@ impl Workspace {
         }
         carry_protected_state(&disk, &mut next, true)?;
         self.save_connections_unguarded(&next)?;
-        Ok(next)
+        Ok(Some(next))
     }
 
     /// [`Self::create_connection`] after [`DriverRegistry::validate_connection`]: nothing is
@@ -1033,6 +1066,51 @@ impl Workspace {
 #[allow(clippy::unwrap_used, clippy::expect_used)] // Tests may panic (AGENTS.md).
 mod tests {
     use super::*;
+
+    /// P2-C review, L2: the import's bulk write refuses (writes nothing) when a connection to
+    /// update is not on disk as planned.
+    #[test]
+    fn save_imported_refuses_a_connection_changed_since_the_plan() {
+        use crate::connection::{Auth, Endpoint, EngineId};
+        use crate::connection_type::ConnectionTypeId;
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = Paths::new(&ninesql_storage::XdgDirs {
+            config_home: tmp.path().join("config"),
+            data_home: tmp.path().join("data"),
+            state_home: tmp.path().join("state"),
+        });
+        let ws = Workspace::open(paths, ProjectName::default_project()).unwrap();
+        let registry = DriverRegistry::new();
+        let mut c = Connection::new(
+            "c",
+            EngineId::new("nodriver").unwrap(),
+            Endpoint::File {
+                path: "/tmp/x.db".into(),
+            },
+            Auth::None,
+            ConnectionTypeId::dev(),
+        );
+        c.enabled = false;
+        let written = ws
+            .save_imported(vec![(c.clone(), None)], &registry)
+            .unwrap()
+            .unwrap();
+        assert_eq!(written.len(), 1);
+        let planned = c.clone();
+        let mut edited = c.clone();
+        edited.name = "edited".into();
+        ws.save_connections(&Connections::from_vec(vec![edited]).unwrap())
+            .unwrap();
+        let mut update = c;
+        update.description = Some("import".into());
+        assert!(
+            ws.save_imported(vec![(update, Some(planned))], &registry)
+                .unwrap()
+                .is_none()
+        );
+        let on_disk = ws.load_connections().unwrap().connections;
+        assert_eq!(on_disk.iter().next().unwrap().name, "edited");
+    }
 
     /// P1-E review, L3: two `Workspace` values of one project share the write guard of
     /// `connections.json`; another project has its own. (Reaching the same project through

@@ -459,6 +459,12 @@ pub enum Origin {
         /// DBeaver project the connection came from.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         project: Option<String>,
+        /// Canonical path of the DBeaver workspace the connection came from
+        /// (`connections.json` schema 5). A re-import matches on the DBeaver id, the project
+        /// **and** this path, so another workspace reusing the id never updates this connection
+        /// (P2-C review, H1). `None` for connections imported before schema 5: they never match.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        source_workspace: Option<PathBuf>,
     },
 }
 
@@ -675,6 +681,11 @@ pub struct Connection {
     /// the notion. Imported from DBeaver's `bootstrap.defaultSchema` (P2-C) so the value is not
     /// lost; not passed to drivers yet (the driver API has no field for it). `connections.json`
     /// schema 5.
+    ///
+    /// **For the driver that applies it** (P2-C review, L3): the value comes from an imported
+    /// file and may hold any printable character. It must be bound as a parameter or quoted as
+    /// an identifier with the engine's dialect, never interpolated into SQL (`SET search_path`,
+    /// `USE`…). The same holds for [`Connection::default_catalog`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub default_schema: Option<String>,
     /// Default catalog to select after connecting, when the engine has the notion. Imported from
@@ -804,8 +815,16 @@ impl Connection {
                 return Err(ConnectionError::SecretInInitSql { index });
             }
         }
-        if let Origin::Dbeaver { dbeaver_id, .. } = &self.origin {
+        if let Origin::Dbeaver {
+            dbeaver_id,
+            source_workspace,
+            ..
+        } = &self.origin
+        {
             short_text("origin.dbeaver_id", dbeaver_id, false)?;
+            if let Some(path) = source_workspace {
+                non_empty_path("origin.source_workspace", path)?;
+            }
         }
         if let Some(schema) = &self.default_schema {
             short_text("default_schema", schema, false)?;

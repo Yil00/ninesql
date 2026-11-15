@@ -19,8 +19,8 @@ use std::time::{Duration, Instant, SystemTime};
 use ninesql_core::{
     ConnectionTypeId, Connections, CoreConfig, CoreServices, DbeaverRoots, DisabledKind,
     DriverRegistry, ImportChoices, ImportError, ImportPreview, ImportSource, ImportStatus,
-    Importer, KnownHostsFiles, OpenOutcome, OpenRequest, PlanAction, SecretSlot, TypeAction,
-    Workspace,
+    Importer, KnownHostsFiles, OpenOutcome, OpenRequest, PlanAction, SecretChange,
+    SecretChangeKind, SecretSlot, TlsMode, TypeAction, Workspace,
 };
 use ninesql_secrets::{KdfParams, MemoryStore, SecretStores, SecretString, StoreKind};
 use ninesql_storage::{Paths, ProjectName, XdgDirs};
@@ -206,17 +206,16 @@ impl tracing::Subscriber for Capture {
 
 fn summary(preview: &ImportPreview) -> String {
     let mut out = String::new();
+    for t in &preview.connection_types {
+        let action = match &t.action {
+            TypeAction::Create(t) => format!("create {:?}", t.policy()),
+            TypeAction::Tighten(t) => format!("tighten {:?}", t.policy()),
+            TypeAction::Keep => "keep".to_owned(),
+        };
+        let _ = writeln!(out, "type {} -> {}: {action}", t.dbeaver_id, t.id);
+    }
     for p in &preview.projects {
         let _ = writeln!(out, "project {} credentials={:?}", p.name, p.credentials);
-        for t in &p.connection_types {
-            let action = match &t.action {
-                TypeAction::Builtin => "builtin".to_owned(),
-                TypeAction::Create(t) => format!("create {:?}", t.policy()),
-                TypeAction::Tighten(t) => format!("tighten {:?}", t.policy()),
-                TypeAction::Keep => "keep".to_owned(),
-            };
-            let _ = writeln!(out, "type {} -> {}: {action}", t.dbeaver_id, t.id);
-        }
         for f in &p.folders {
             let _ = writeln!(out, "folder {} used={}", f.path.join("/"), f.used);
         }
@@ -386,11 +385,18 @@ fn fixture_workspaces_import_with_snapshots_and_untouched_files() {
         assert_eq!(pg_dev.secret_refs().len(), 1);
         // mysql-test: manual commit kept as the connection's override.
         assert_eq!(by_name("mysql-test").auto_commit, Some(false));
-        // The built-in Production type is never overwritten by DBeaver's.
+        // The built-in Production type is only made stricter (DBeaver's confirm-execute),
+        // keeping its name, color and production rules (review, M3).
         let types = e.workspace.load_connection_types().unwrap();
-        assert_eq!(
-            types.get(&ConnectionTypeId::prod()).unwrap(),
-            &ninesql_core::ConnectionType::production()
+        let prod = types.get(&ConnectionTypeId::prod()).unwrap();
+        let builtin = ninesql_core::ConnectionType::production();
+        assert_eq!((&prod.name, prod.color), (&builtin.name, builtin.color));
+        assert!(prod.is_production() && prod.confirm_destructive && !prod.auto_commit);
+        assert!(prod.confirm_every_write);
+        let test = types.get(&ConnectionTypeId::test()).unwrap();
+        assert!(
+            test.confirm_destructive,
+            "DBeaver's confirm-data-change is kept"
         );
         assert!(
             types
@@ -569,7 +575,9 @@ fn reimport_sets_the_marker_again_and_keeps_user_edits() {
         .unwrap();
 
     let again = e.importer.preview(&ImportSource::Folder(source)).unwrap();
-    assert!(matches!(plan(&again, "a").action, PlanAction::Update { existing } if existing == id));
+    assert!(
+        matches!(plan(&again, "a").action, PlanAction::Update { existing, .. } if existing == id)
+    );
     let outcome = e
         .importer
         .apply(&again, &ImportChoices::all(Some(StoreKind::Vault)))
@@ -1020,7 +1028,9 @@ fn reimport_replaces_imported_secrets_and_keeps_secrets_saved_in_ninesql() {
         .apply(&preview, &ImportChoices::all(Some(StoreKind::Vault)))
         .unwrap();
     let id = saved(&e.workspace).iter().next().unwrap().id;
-    let secret_id = ninesql_secrets::SecretId::new(format!("{id}:auth")).unwrap();
+    let first = saved(&e.workspace).get(id).unwrap().secret_refs()[0]
+        .2
+        .clone();
 
     std::fs::write(
         source.join("General/.dbeaver/data-sources.json"),
@@ -1034,9 +1044,15 @@ fn reimport_replaces_imported_secrets_and_keeps_secrets_saved_in_ninesql() {
     e.importer
         .apply(&preview, &ImportChoices::all(Some(StoreKind::Vault)))
         .unwrap();
+    // Written under a fresh reference; the replaced one is deleted after the write (M1).
+    let second = saved(&e.workspace).get(id).unwrap().secret_refs()[0]
+        .2
+        .clone();
+    assert_ne!(first, second);
+    assert!(second.id.as_str().starts_with(&format!("{id}:auth:")));
     assert_eq!(e.store.len(), 1);
     assert_eq!(
-        e.store.get(&secret_id).unwrap().expose_secret(),
+        e.store.get(&second.id).unwrap().expose_secret(),
         "Second-Pa55-0002"
     );
 
@@ -1061,4 +1077,344 @@ fn reimport_replaces_imported_secrets_and_keeps_secrets_saved_in_ninesql() {
         &e.root.join("ninesql"),
         &["First-Pa55-0001", "Second-Pa55-0002"],
     );
+}
+
+fn rewrite(source: &Path, connections: &[String]) {
+    std::fs::write(
+        source.join("General/.dbeaver/data-sources.json"),
+        format!(r#"{{ "connections": {{ {} }} }}"#, connections.join(",")),
+    )
+    .unwrap();
+}
+
+fn import_all(e: &Env, source: &Path, store: Option<StoreKind>) -> ImportPreview {
+    let preview = e
+        .importer
+        .preview(&ImportSource::Folder(source.to_path_buf()))
+        .unwrap();
+    e.importer
+        .apply(&preview, &ImportChoices::all(store))
+        .unwrap();
+    preview
+}
+
+/// Review H1 (a): another DBeaver workspace reusing the id never updates the saved connection,
+/// whose name, host and stored password stay as they were; the match is reported.
+#[test]
+fn a_foreign_workspace_with_the_same_dbeaver_id_never_updates_a_connection() {
+    let e = env();
+    let real = crafted(
+        &e.root.join("real"),
+        &format!(
+            r#"{{ "connections": {{ {} }} }}"#,
+            pg(
+                "postgres-jdbc-bill",
+                "billing",
+                r#", "password": "Real-Pa55-0042""#
+            )
+        ),
+    );
+    import_all(&e, &real, Some(StoreKind::Vault));
+    let mut connections = saved(&e.workspace);
+    let mut c = connections.iter().next().unwrap().clone();
+    let id = c.id;
+    c.name = "Prod billing".into();
+    e.workspace
+        .update_connection(&mut connections, c, &registry())
+        .unwrap();
+    let before = saved(&e.workspace).get(id).unwrap().clone();
+
+    let foreign = crafted(
+        &e.root.join("foreign"),
+        &format!(
+            r#"{{ "connections": {{ {} }} }}"#,
+            pg("postgres-jdbc-bill", "billing", "")
+                .replace("db.example.invalid", "evil.example.invalid")
+        ),
+    );
+    let preview = e
+        .importer
+        .preview(&ImportSource::Folder(foreign.clone()))
+        .unwrap();
+    let p = plan(&preview, "billing");
+    assert_eq!(p.action, PlanAction::Create);
+    let new = p.connection.as_ref().unwrap();
+    assert_ne!(new.id, id);
+    assert!(new.secret_refs().is_empty());
+    assert!(
+        p.issues
+            .iter()
+            .any(|i| i.message.contains("same DBeaver id"))
+    );
+    e.importer
+        .apply(&preview, &ImportChoices::all(Some(StoreKind::Vault)))
+        .unwrap();
+    let after = saved(&e.workspace);
+    assert_eq!(after.len(), 2);
+    assert_eq!(
+        after.get(id).unwrap(),
+        &before,
+        "the saved connection is untouched"
+    );
+}
+
+/// Review H1 (b): a re-import that moves the endpoint drops the saved password (and deletes
+/// it after the write) instead of sending it to the new host; the diff says so.
+#[test]
+fn a_reimport_to_another_host_drops_the_saved_password() {
+    let e = env();
+    let source = crafted(
+        &e.root,
+        &format!(
+            r#"{{ "connections": {{ {} }} }}"#,
+            pg("postgres-jdbc-h", "h", r#", "password": "Host-Pa55-0007""#)
+        ),
+    );
+    import_all(&e, &source, Some(StoreKind::Vault));
+    assert_eq!(e.store.len(), 1);
+    rewrite(
+        &source,
+        &[pg("postgres-jdbc-h", "h", "").replace("db.example.invalid", "evil.example.invalid")],
+    );
+    let preview = e
+        .importer
+        .preview(&ImportSource::Folder(source.clone()))
+        .unwrap();
+    let p = plan(&preview, "h");
+    let PlanAction::Update { diff, .. } = &p.action else {
+        panic!("{:?}", p.action);
+    };
+    assert!(diff.endpoint.is_some());
+    assert_eq!(
+        diff.secrets,
+        [SecretChange {
+            slot: SecretSlot::Auth,
+            change: SecretChangeKind::Dropped
+        }]
+    );
+    assert!(p.connection.as_ref().unwrap().secret_refs().is_empty());
+    e.importer
+        .apply(&preview, &ImportChoices::all(Some(StoreKind::Vault)))
+        .unwrap();
+    assert!(
+        saved(&e.workspace)
+            .iter()
+            .next()
+            .unwrap()
+            .secret_refs()
+            .is_empty()
+    );
+    assert!(e.store.is_empty(), "the dropped secret is deleted");
+}
+
+/// Review H1 (c, e): a re-import with a weaker TLS mode keeps the saved mode and password
+/// unless the user accepts the change, which then drops the password; the test-before-save
+/// connection never carries a saved secret.
+#[test]
+fn a_weaker_tls_on_reimport_is_kept_unless_accepted() {
+    let e = env();
+    let source = crafted(
+        &e.root,
+        &format!(
+            r#"{{ "connections": {{ {} }} }}"#,
+            pg("postgres-jdbc-t", "t", r#", "password": "Tls-Pa55-0009""#)
+        ),
+    );
+    import_all(&e, &source, Some(StoreKind::Vault));
+    let weak = pg(
+        "postgres-jdbc-t",
+        "t",
+        r#", "handlers": { "postgre_ssl": { "type": "CONFIG", "enabled": true,
+             "properties": { "sslMode": "disable" } } }"#,
+    );
+    rewrite(&source, &[weak]);
+    let preview = e
+        .importer
+        .preview(&ImportSource::Folder(source.clone()))
+        .unwrap();
+    let p = plan(&preview, "t");
+    let PlanAction::Update { diff, .. } = &p.action else {
+        panic!("{:?}", p.action);
+    };
+    let tls = diff.tls.as_ref().unwrap();
+    assert!(tls.kept_saved);
+    assert_eq!(tls.imported.0, TlsMode::Disable);
+    let c = p.connection.as_ref().unwrap();
+    assert_eq!(c.tls.mode, TlsMode::VerifyFull);
+    assert_eq!(c.secret_refs().len(), 1, "same server, same TLS: kept");
+    // (e) The test-before-save copy asks for every credential, marker kept.
+    let test = preview.connection_for_test("postgres-jdbc-t").unwrap();
+    assert!(test.secret_refs().is_empty());
+
+    // Default: saved TLS and password kept.
+    e.importer
+        .apply(&preview, &ImportChoices::all(Some(StoreKind::Vault)))
+        .unwrap();
+    let c = saved(&e.workspace).iter().next().unwrap().clone();
+    assert_eq!(c.tls.mode, TlsMode::VerifyFull);
+    assert_eq!(c.secret_refs().len(), 1);
+
+    // Accepted: the weaker mode applies and the password no longer does.
+    let preview = e
+        .importer
+        .preview(&ImportSource::Folder(source.clone()))
+        .unwrap();
+    let mut choices = ImportChoices::all(Some(StoreKind::Vault));
+    choices.accept_tls_changes.insert("postgres-jdbc-t".into());
+    e.importer.apply(&preview, &choices).unwrap();
+    let c = saved(&e.workspace).iter().next().unwrap().clone();
+    assert_eq!(c.tls.mode, TlsMode::Disable);
+    assert!(c.secret_refs().is_empty());
+    assert!(e.store.is_empty());
+}
+
+/// Review L1: a re-import with no store keeps the password saved earlier (same server).
+#[test]
+fn a_reimport_without_a_store_keeps_the_saved_password() {
+    let e = env();
+    let source = crafted(
+        &e.root,
+        &format!(
+            r#"{{ "connections": {{ {} }} }}"#,
+            pg("postgres-jdbc-n", "n", r#", "password": "Keep-Pa55-0011""#)
+        ),
+    );
+    import_all(&e, &source, Some(StoreKind::Vault));
+    import_all(&e, &source, None);
+    assert_eq!(
+        saved(&e.workspace)
+            .iter()
+            .next()
+            .unwrap()
+            .secret_refs()
+            .len(),
+        1
+    );
+    assert_eq!(e.store.len(), 1);
+}
+
+/// Review L2: a connection edited since the preview is not overwritten.
+#[test]
+fn an_edit_since_the_preview_stops_the_apply() {
+    let e = env();
+    let source = crafted(
+        &e.root,
+        &format!(
+            r#"{{ "connections": {{ {} }} }}"#,
+            pg("postgres-jdbc-l", "l", "")
+        ),
+    );
+    import_all(&e, &source, None);
+    let preview = e
+        .importer
+        .preview(&ImportSource::Folder(source.clone()))
+        .unwrap();
+    let mut connections = saved(&e.workspace);
+    let mut c = connections.iter().next().unwrap().clone();
+    c.name = "edited meanwhile".into();
+    e.workspace
+        .update_connection(&mut connections, c, &registry())
+        .unwrap();
+    let err = e
+        .importer
+        .apply(&preview, &ImportChoices::all(None))
+        .unwrap_err();
+    assert!(matches!(err, ImportError::SourceChanged), "{err:?}");
+    assert_eq!(
+        saved(&e.workspace).iter().next().unwrap().name,
+        "edited meanwhile"
+    );
+}
+
+/// Review M4a: a route reason cannot be turned into another reason through the UI paths
+/// (an `invalid` reason would be enabled without confirming the route).
+#[test]
+fn a_disabled_reason_cannot_be_changed_through_the_ui_paths() {
+    let e = env();
+    let source = crafted(
+        &e.root,
+        &format!(
+            r#"{{ "connections": {{ {} }} }}"#,
+            pg(
+                "postgres-jdbc-r2",
+                "r2",
+                r#", "handlers": { "proxy_http": { "type": "PROXY", "enabled": true,
+                     "properties": { "host": "proxy.example.invalid", "port": "3128" } } }"#
+            )
+        ),
+    );
+    import_all(&e, &source, None);
+    let mut connections = saved(&e.workspace);
+    let mut c = connections.iter().next().unwrap().clone();
+    let id = c.id;
+    c.disabled_reason = Some(ninesql_core::DisabledReason::new(
+        DisabledKind::Invalid,
+        "x",
+    ));
+    assert!(
+        e.workspace
+            .update_connection(&mut connections, c.clone(), &registry())
+            .is_err()
+    );
+    let list = Connections::from_vec(vec![c]).unwrap();
+    assert!(
+        e.workspace
+            .save_connections_checked(&list, &registry())
+            .is_err()
+    );
+    let kept = saved(&e.workspace);
+    assert_eq!(
+        kept.get(id).unwrap().disabled_reason.as_ref().unwrap().kind,
+        DisabledKind::Route
+    );
+    assert!(
+        e.workspace
+            .enable_connection(&mut connections, id, false, &registry())
+            .is_err()
+    );
+}
+
+/// Review L4: a property kept on a connection without a driver is checked again at enable.
+#[test]
+fn properties_of_a_connection_without_a_driver_are_checked_at_enable() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = std::fs::canonicalize(tmp.path()).unwrap();
+    let workspace =
+        Workspace::open(paths(&root.join("ninesql")), ProjectName::default_project()).unwrap();
+    let mut only_pg = DriverRegistry::new();
+    only_pg.register(Arc::new(ninesql_driver_pgwire::PgWireDriver::new()));
+    let importer = Importer::new(
+        workspace.clone(),
+        only_pg,
+        SecretStores::new(),
+        DbeaverRoots::none().with_home(root.join("home")),
+        None,
+    );
+    let db = root.join("x.sqlite");
+    let source = crafted(
+        &root,
+        &format!(
+            r#"{{ "connections": {{ "sqlite_jdbc-p": {{ "provider": "sqlite", "driver": "sqlite_jdbc",
+                 "name": "p", "configuration": {{ "database": "{}", "type": "dev",
+                 "properties": {{ "unvetted_option": "1" }} }} }} }} }}"#,
+            db.display()
+        ),
+    );
+    let preview = importer.preview(&ImportSource::Folder(source)).unwrap();
+    importer.apply(&preview, &ImportChoices::all(None)).unwrap();
+    let mut connections = saved(&workspace);
+    let c = connections.iter().next().unwrap().clone();
+    assert_eq!(
+        c.disabled_reason.as_ref().unwrap().kind,
+        DisabledKind::NoDriver
+    );
+    assert!(c.properties.contains_key("unvetted_option"));
+    {
+        // With the driver registered, enabling re-checks the property against its allowlist.
+        assert!(
+            workspace
+                .enable_connection(&mut connections, c.id, false, &registry())
+                .is_err()
+        );
+    }
 }

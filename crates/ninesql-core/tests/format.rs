@@ -244,6 +244,10 @@ fn connections_v5_fixture_keeps_the_import_fields() {
     assert_eq!(enabled.default_schema.as_deref(), Some("app"));
     assert_eq!(enabled.default_catalog.as_deref(), Some("main"));
     assert_eq!(enabled.auto_commit, Some(false));
+    assert!(
+        matches!(&enabled.origin, ninesql_core::Origin::Dbeaver { source_workspace: Some(w), .. }
+        if w.ends_with("workspace6"))
+    );
     assert!(!disabled.enabled);
     let reason = disabled.disabled_reason.as_ref().unwrap();
     assert_eq!(reason.kind, ninesql_core::DisabledKind::Route);
@@ -259,7 +263,8 @@ fn import_fields_in_a_v4_file_are_ignored() {
         "endpoint": { "kind": "tcp", "host": "h" }, "auth": { "method": "none" },
         "connection_type": "prod", "auto_commit": true, "default_schema": "s",
         "default_catalog": "c", "enabled": false,
-        "disabled_reason": { "kind": "route", "message": "m" }
+        "disabled_reason": { "kind": "route", "message": "m" },
+        "origin": { "kind": "dbeaver", "dbeaver_id": "d", "source_workspace": "/w" }
     } ] }"#;
     let loaded = document::decode::<ConnectionsFile>(Path::new("mem"), json).unwrap();
     assert_eq!(loaded.migrated_from, Some(4));
@@ -269,6 +274,13 @@ fn import_fields_in_a_v4_file_are_ignored() {
     assert_eq!(c.default_catalog, None);
     assert_eq!(c.disabled_reason, None);
     assert!(!c.enabled);
+    assert!(matches!(
+        &c.origin,
+        ninesql_core::Origin::Dbeaver {
+            source_workspace: None,
+            ..
+        }
+    ));
 }
 
 #[test]

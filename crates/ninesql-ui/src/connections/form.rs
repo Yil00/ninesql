@@ -13,9 +13,9 @@ use std::path::PathBuf;
 use ninesql_core::driver_api::{AuthKind, ReadOnlyMechanism};
 use ninesql_core::secrets::{SecretRef, SecretString, StoreKind};
 use ninesql_core::{
-    Auth, ClientCertificate, Connection, ConnectionTypeId, ConnectionTypes, Endpoint, EngineId,
-    HostKeyPolicy, PasswordExchange, SecretSlot, SecretSource, SecurityWarning, SshAuth, SshHop,
-    SshTunnel, TlsConfig, TlsMode,
+    Auth, ClientCertificate, Connection, ConnectionTypeId, ConnectionTypes, DisabledReason,
+    Endpoint, EngineId, HostKeyPolicy, PasswordExchange, SecretSlot, SecretSource, SecurityWarning,
+    SshAuth, SshHop, SshTunnel, TlsConfig, TlsMode,
 };
 
 use super::engines::EngineOffer;
@@ -314,6 +314,14 @@ pub struct ConnectionForm {
     /// `ConnectCapabilities::password_exchanges` ([`EngineOffer::scram_only`]) and for password
     /// authentication.
     pub scram_only: bool,
+    /// Enabled flag of a new connection. A duplicate copies its source's (P2-C review, M4b):
+    /// a copy of a connection disabled for a route NineSQL could not reproduce (a proxy or a
+    /// hop of a DBeaver import) must not connect without it. An edit keeps the edited
+    /// connection's own flag.
+    pub enabled: bool,
+    /// Disabled reason of a new connection, copied by a duplicate with `enabled` (only
+    /// `Workspace::enable_connection` clears a reason).
+    pub disabled_reason: Option<DisabledReason>,
 }
 
 impl ConnectionForm {
@@ -345,6 +353,8 @@ impl ConnectionForm {
             read_only: None,
             folder: String::new(),
             scram_only: false,
+            enabled: true,
+            disabled_reason: None,
         }
     }
 
@@ -412,6 +422,8 @@ impl ConnectionForm {
         form.connection_type = Some(c.connection_type.clone());
         form.read_only = c.read_only;
         form.folder = c.folder.join("/");
+        form.enabled = c.enabled;
+        form.disabled_reason.clone_from(&c.disabled_reason);
         form
     }
 
@@ -829,7 +841,12 @@ impl ConnectionForm {
                 c.connection_type = connection_type;
                 c
             }
-            None => Connection::new(String::new(), engine, endpoint, auth, connection_type),
+            None => {
+                let mut c = Connection::new(String::new(), engine, endpoint, auth, connection_type);
+                c.enabled = self.enabled && self.disabled_reason.is_none();
+                c.disabled_reason.clone_from(&self.disabled_reason);
+                c
+            }
         };
         connection.name = self.name.trim().to_owned();
         if connection.name.is_empty() {
@@ -1095,8 +1112,8 @@ fn is_loopback(host: &str) -> bool {
 mod tests {
     use std::sync::Arc;
 
-    use ninesql_core::DriverRegistry;
     use ninesql_core::secrets::SecretId;
+    use ninesql_core::{DisabledKind, DriverRegistry};
 
     use super::super::engines::offers;
     use super::*;
@@ -1619,6 +1636,39 @@ mod tests {
         assert!(d.existing.is_none());
         assert_eq!(d.name, "Sales (copy)");
         assert_eq!(d.auth_secret, SecretField::default());
+    }
+
+    /// P2-C review, M4b: a copy of a connection disabled for an unreproduced route stays
+    /// disabled with the same reason, so it never connects without its proxy or hop.
+    #[test]
+    fn duplicate_keeps_a_disabled_reason() {
+        let mut c = pg_form()
+            .build(
+                &offer("postgresql"),
+                vec![],
+                &ConnectionTypes::default(),
+                Some(StoreKind::Vault),
+            )
+            .unwrap()
+            .connection;
+        c.enabled = false;
+        c.disabled_reason = Some(DisabledReason::new(
+            DisabledKind::Route,
+            "a proxy was not imported",
+        ));
+        let copy = ConnectionForm::duplicate_of(&c)
+            .build(
+                &offer("postgresql"),
+                vec![],
+                &ConnectionTypes::default(),
+                Some(StoreKind::Vault),
+            )
+            .unwrap()
+            .connection;
+        assert_ne!(copy.id, c.id);
+        assert!(!copy.enabled);
+        assert_eq!(copy.disabled_reason, c.disabled_reason);
+        copy.validate().unwrap();
     }
 
     #[test]

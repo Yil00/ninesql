@@ -32,7 +32,9 @@
       "auto_commit": false,
       "origin": {
         "kind": "dbeaver",
-        "dbeaver_id": "postgres-jdbc-18c0f2d3a4b-5e6f7a8b9c0d1e2f"
+        "dbeaver_id": "postgres-jdbc-18c0f2d3a4b-5e6f7a8b9c0d1e2f",
+        "project": "General",
+        "source_workspace": "/home/nine_user/.local/share/DBeaverData/workspace6"
       }
     },
     {

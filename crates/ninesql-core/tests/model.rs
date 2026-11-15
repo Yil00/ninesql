@@ -143,6 +143,7 @@ fn validation_rejects_bad_fields() {
                 c.origin = Origin::Dbeaver {
                     dbeaver_id: String::new(),
                     project: None,
+                    source_workspace: None,
                 }
             }),
         ),
@@ -453,7 +454,11 @@ prop_compose! {
         c.init_sql = init_sql;
         c.enabled = enabled;
         if let Some((dbeaver_id, project)) = dbeaver {
-            c.origin = Origin::Dbeaver { dbeaver_id, project };
+            c.origin = Origin::Dbeaver {
+                dbeaver_id,
+                project,
+                source_workspace: None,
+            };
         }
         c
     }

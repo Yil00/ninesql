@@ -15,8 +15,8 @@
 //! 2. [`Importer::apply`] reads the source again, checks it still gives the same preview
 //!    (otherwise [`ImportError::SourceChanged`]: preview again), moves each selected secret to
 //!    the chosen store (keyring → vault, never plaintext; the imported values are zeroized when
-//!    dropped), merges the connection types (never overwriting a built-in, never weakening an
-//!    existing type), writes the connections in one checked bulk write that keeps the imported
+//!    dropped), merges the connection types (only ever making an existing type stricter,
+//!    built-ins included), writes the connections in one checked bulk write that keeps the imported
 //!    init SQL marker ([`Workspace`]), and saves the import report in the project
 //!    (`imports/dbeaver-<timestamp>.json`, no secret).
 //!
@@ -24,9 +24,10 @@
 //! [`crate::CoreServices::preview_import`] and [`crate::CoreServices::apply_import`], which run
 //! them on the driver runtime's blocking pool and answer through a [`crate::Reply`] (I6).
 //!
-//! Re-import is idempotent (ADR-0006 §8, F-CON-14): a connection whose `origin.dbeaver_id` is
-//! already saved is updated in place (same NineSQL id) instead of duplicated. What the update
-//! keeps from the saved connection is listed on [`PlanAction::Update`].
+//! Re-import is idempotent (ADR-0006 §8, F-CON-14): a connection whose `origin` matches the
+//! DBeaver id, project **and** canonical source workspace is updated in place (same NineSQL id)
+//! instead of duplicated; a match on the id alone is reported and imported as a new connection.
+//! What the update keeps from the saved connection is listed on [`PlanAction::Update`].
 //!
 //! Every imported connection with init SQL gets `init_sql_needs_confirmation = true`, on a
 //! re-import too, whatever the DBeaver file or the saved connection said (ADR-0022 §1): the
@@ -108,23 +109,93 @@ pub enum ImportStatus {
 pub enum PlanAction {
     /// A new NineSQL connection.
     Create,
-    /// Updates the connection already imported from the same DBeaver id (F-CON-14). Kept from
-    /// the saved connection: its id, name, description, folder, password-exchange policy,
-    /// per-hop SSH host key policies (same host and port), a stricter read-only or manual-commit
-    /// override, a stricter connection type (the imported type is taken only when its rules
-    /// are at least as strict on every point), a "disabled by the user" state, and saved secrets
-    /// of fields DBeaver has no saved value for. Taken from DBeaver: the endpoint, engine,
-    /// user names, SSH hops, TLS, driver properties, init SQL (marked again as needing
-    /// confirmation), default schema / catalog and auto-commit.
+    /// Updates the connection already imported from the same DBeaver id, **project and source
+    /// workspace** (F-CON-14; a match on the id alone is a conflict and gives a
+    /// [`PlanAction::Create`]). Kept from the saved connection: its id, name, description,
+    /// folder, password-exchange policy, per-hop SSH host key policies (same host and port), a
+    /// stricter read-only or manual-commit override, a stricter TLS mode and the saved CA file
+    /// (unless [`ImportChoices::accept_tls_changes`] lists the connection), a stricter
+    /// connection type, a "disabled by the user" state, and saved secrets of fields DBeaver has
+    /// no value for **only while everything they authenticate against is unchanged**
+    /// ([`SecretChangeKind`]). Taken from DBeaver: the endpoint, engine, user names, SSH hops,
+    /// driver properties, init SQL (marked again as needing confirmation), default schema /
+    /// catalog and auto-commit. `diff` lists what changes, for the preview screen.
     Update {
         /// The saved connection.
         existing: ConnectionId,
+        /// What the update changes.
+        diff: Box<UpdateDiff>,
     },
     /// Not imported (the parser failed it, or its converted settings break a model rule).
     NotImported {
         /// Why (no value from the file).
         reason: String,
     },
+}
+
+/// A saved value and the imported one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Change<T> {
+    /// In the saved connection.
+    pub saved: T,
+    /// From the DBeaver file.
+    pub imported: T,
+}
+
+/// A TLS difference on re-import.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TlsChange {
+    /// Mode and CA file of the saved connection.
+    pub saved: (TlsMode, Option<PathBuf>),
+    /// Mode and CA file from the DBeaver file.
+    pub imported: (TlsMode, Option<PathBuf>),
+    /// The saved settings are kept (the imported mode is weaker, or the CA file differs): the
+    /// imported ones apply only if [`ImportChoices::accept_tls_changes`] lists the connection.
+    pub kept_saved: bool,
+}
+
+/// What a re-import does with a secret the saved connection references.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum SecretChangeKind {
+    /// Kept: DBeaver has no value for the field and what it authenticates against (engine,
+    /// host, port, user, TLS mode and CA file, SSH route; for an SSH slot, the hop's host, port
+    /// and user) is unchanged.
+    Kept,
+    /// Replaced by the value DBeaver saved (when a store is chosen; with no store, kept if it
+    /// could be kept, else dropped).
+    Replaced,
+    /// Dropped: the field is gone or what it authenticates against changed. The secret is
+    /// deleted after the import is written; NineSQL asks for it at connect.
+    Dropped,
+}
+
+/// One saved secret of an updated connection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct SecretChange {
+    /// Credential field.
+    pub slot: SecretSlot,
+    /// What happens to it.
+    pub change: SecretChangeKind,
+}
+
+/// Field-level differences of a re-import ([`PlanAction::Update`]), for the preview screen.
+/// `None` / empty means unchanged. Never holds a secret value.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct UpdateDiff {
+    /// Engine.
+    pub engine: Option<Change<EngineId>>,
+    /// Endpoint (host, port, database or file).
+    pub endpoint: Option<Change<Endpoint>>,
+    /// Database user name.
+    pub username: Option<Change<Option<String>>>,
+    /// TLS mode / CA file.
+    pub tls: Option<TlsChange>,
+    /// SSH hops as `user@host:port`, jump hosts first.
+    pub ssh: Option<Change<Vec<String>>>,
+    /// Connection type, and whether the saved one is kept (the imported one is weaker).
+    pub connection_type: Option<(Change<ConnectionTypeId>, bool)>,
+    /// Saved secrets: kept, replaced or dropped.
+    pub secrets: Vec<SecretChange>,
 }
 
 /// A secret DBeaver saved that the import moves to the secret store (never the value, I1).
@@ -176,13 +247,11 @@ pub struct FolderPlan {
 /// What the import does with one DBeaver connection type.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TypeAction {
-    /// A NineSQL built-in type (`dev`, `test`, `prod`): its connections use the built-in as it
-    /// is in this project; the DBeaver settings never overwrite it.
-    Builtin,
     /// A new user-defined type.
     Create(ConnectionType),
-    /// A type of the same id exists and the DBeaver one is stricter on some point: the existing
-    /// type is made stricter there (never weaker).
+    /// A type of the same id exists (a built-in `dev` / `test` / `prod` included) and the
+    /// DBeaver one is stricter on some point: the existing type is made stricter there, never
+    /// weaker; its name and color stay (P2-C review, M3).
     Tighten(ConnectionType),
     /// A type of the same id exists and is at least as strict: unchanged.
     Keep,
@@ -214,8 +283,6 @@ pub struct ProjectPreview {
     pub credentials: CredentialsStatus,
     /// Folders.
     pub folders: Vec<FolderPlan>,
-    /// Connection types.
-    pub connection_types: Vec<TypePlan>,
     /// Connections, sorted by DBeaver id.
     pub connections: Vec<ConnectionPlan>,
     /// Report entries not tied to one connection.
@@ -232,6 +299,12 @@ pub struct ImportPreview {
     pub workspaces: Vec<PreviewWorkspace>,
     /// Projects, in workspace then name order.
     pub projects: Vec<ProjectPreview>,
+    /// Connection types of every project, folded together (a type id defined twice keeps the
+    /// stricter rules of both) and planned against the project's types, built-ins included
+    /// (only ever made stricter).
+    pub connection_types: Vec<TypePlan>,
+    /// Report entries not tied to one project (connection types).
+    pub issues: Vec<ImportIssue>,
     /// Where secrets go by default (the session's backend); `None`: no store, saved passwords
     /// are not imported and NineSQL asks for them at connect.
     pub default_store: Option<StoreKind>,
@@ -250,17 +323,19 @@ impl ImportPreview {
     }
 
     /// The connection to use for a test-before-save of the plan of `dbeaver_id`: the converted
-    /// connection, with the imported init SQL marker set when it has init SQL (ADR-0022 §1, the
-    /// connection is not on disk yet, so the core uses the request's marker). `None` when the
-    /// connection is not imported or is disabled. Its saved credentials are not in a store yet:
-    /// the open asks for them ([`crate::OpenOutcome::NeedsSecrets`]).
+    /// connection with the imported init SQL marker set when it has init SQL (ADR-0022 §1; a
+    /// new connection is not on disk yet, so the core uses the request's marker) and **every
+    /// credential field on "ask"**: no saved secret of a connection being updated is used
+    /// against settings the user has not accepted yet (P2-C review, H1). The open asks for them
+    /// ([`crate::OpenOutcome::NeedsSecrets`]). `None` when not imported or disabled.
     #[must_use]
     pub fn connection_for_test(&self, dbeaver_id: &str) -> Option<Connection> {
-        let c = self
+        let mut c = self
             .connections()
             .find(|c| c.dbeaver_id == dbeaver_id)?
             .connection
             .clone()?;
+        clear_secret_refs(&mut c);
         c.enabled.then_some(c)
     }
 
@@ -269,7 +344,7 @@ impl ImportPreview {
     #[must_use]
     pub fn types_after(&self, current: &ConnectionTypes) -> ConnectionTypes {
         let mut types = current.clone();
-        for t in self.projects.iter().flat_map(|p| p.connection_types.iter()) {
+        for t in &self.connection_types {
             if let TypeAction::Create(t) | TypeAction::Tighten(t) = &t.action {
                 types.upsert(t.clone());
             }
@@ -289,6 +364,10 @@ pub struct ImportChoices {
     pub skip: BTreeSet<String>,
     /// Update connections imported before (`true`, default), or leave them as they are.
     pub update_existing: bool,
+    /// DBeaver ids of updated connections whose imported TLS mode / CA file the user accepted
+    /// although they are weaker or different ([`TlsChange::kept_saved`]). Empty by default:
+    /// the saved TLS settings are kept.
+    pub accept_tls_changes: BTreeSet<String>,
 }
 
 impl ImportChoices {
@@ -299,6 +378,7 @@ impl ImportChoices {
             store,
             skip: BTreeSet::new(),
             update_existing: true,
+            accept_tls_changes: BTreeSet::new(),
         }
     }
 }
@@ -409,19 +489,23 @@ impl Importer {
     /// # Errors
     /// [`ImportError::Source`], [`ImportError::NothingFound`], [`ImportError::Workspace`].
     pub fn preview(&self, source: &ImportSource) -> Result<ImportPreview, ImportError> {
-        let (preview, payload) = self.plan(source, &BTreeMap::new())?;
+        let (preview, payload, _) = self.plan(source, &BTreeMap::new())?;
         drop(payload);
         Ok(preview)
     }
 
     /// Applies a preview with the user's choices. **Blocking.** See the module documentation.
     ///
+    /// Every imported secret is written under a fresh reference (`<id>:<slot>:<uuid>`); the
+    /// connections switch to the new references in one bulk write, and only then are the
+    /// references they replaced deleted. A failure therefore deletes only the new references
+    /// and leaves every saved secret as it was (P2-C review, M1).
+    ///
     /// # Errors
-    /// [`ImportError::SourceChanged`] (preview again), [`ImportError::VaultLocked`],
-    /// [`ImportError::NoStore`], [`ImportError::Secret`], [`ImportError::Workspace`], and the
-    /// source errors of [`Self::preview`]. Secrets stored before a failure are deleted again
-    /// (best effort; a value that replaced an earlier one at the same reference cannot be
-    /// restored).
+    /// [`ImportError::SourceChanged`] (preview again; also when a connection to update was
+    /// edited since the preview), [`ImportError::VaultLocked`], [`ImportError::NoStore`],
+    /// [`ImportError::Secret`], [`ImportError::Workspace`], and the source errors of
+    /// [`Self::preview`].
     pub fn apply(
         &self,
         preview: &ImportPreview,
@@ -431,7 +515,7 @@ impl Importer {
             .connections()
             .filter_map(|c| Some((c.dbeaver_id.clone(), c.connection.as_ref()?.id)))
             .collect();
-        let (fresh, mut payload) = self.plan(&preview.source, &ids)?;
+        let (fresh, mut payload, existing) = self.plan(&preview.source, &ids)?;
         if fresh != *preview {
             return Err(ImportError::SourceChanged);
         }
@@ -452,26 +536,8 @@ impl Importer {
             }
         }
 
-        // Connection types first: a connection never names a type that is not saved.
-        let mut types = self.workspace.load_connection_types()?;
-        let mut types_changed = 0;
-        for t in fresh
-            .projects
-            .iter()
-            .flat_map(|p| p.connection_types.iter())
-        {
-            if let TypeAction::Create(t) | TypeAction::Tighten(t) = &t.action {
-                types.upsert(t.clone());
-                types_changed += 1;
-            }
-        }
-        if types_changed > 0 {
-            self.workspace.save_connection_types(&types)?;
-        }
-
-        let existing = self.workspace.load_connections()?.connections;
         let mut stored: Vec<SecretRef> = Vec::new();
-        let mut upserts = Vec::new();
+        let mut upserts: Vec<(Connection, Option<Connection>)> = Vec::new();
         let mut entries = Vec::new();
         let (mut created, mut updated, mut disabled, mut failed, mut skipped, mut moved) =
             (0, 0, 0, 0, 0, 0);
@@ -493,31 +559,51 @@ impl Importer {
                         continue;
                     }
                     let mut connection = connection.clone();
-                    let mut count = 0;
-                    if let Some(store) = choices.store {
-                        for (slot, kind, value) in secrets {
-                            let reference = secret_ref(store, connection.id, slot)?;
-                            let meta = SecretMeta {
-                                connection_id: connection.id.to_string(),
-                                kind,
-                                label: format!("NineSQL: {}", connection.name),
-                            };
-                            self.stores.save(&reference, &meta, &value)?;
-                            drop(value);
-                            let previous = existing.get(connection.id).is_some_and(|e| {
-                                e.secret_refs().iter().any(|(_, _, r)| **r == reference)
-                            });
-                            if !previous {
-                                stored.push(reference.clone());
+                    let mut extra = Vec::new();
+                    let previous = match &plan.action {
+                        PlanAction::Update { existing: id, diff } => {
+                            let old = existing.get(*id).ok_or(ImportError::SourceChanged)?;
+                            if choices.accept_tls_changes.contains(&plan.dbeaver_id) {
+                                self.accept_tls(old, &mut connection, diff, &mut extra);
                             }
-                            connection
-                                .set_secret_ref(slot, reference)
-                                .map_err(WorkspaceError::from)?;
-                            count += 1;
+                            Some(old)
                         }
-                    } else {
-                        // No store chosen: the values are dropped (zeroized), the fields ask.
-                        drop(secrets);
+                        _ => None,
+                    };
+                    let mut count = 0;
+                    for (slot, kind, value) in secrets {
+                        match choices.store {
+                            Some(store) => {
+                                let reference = fresh_secret_ref(store, connection.id, slot)?;
+                                let meta = SecretMeta {
+                                    connection_id: connection.id.to_string(),
+                                    kind,
+                                    label: format!("NineSQL: {}", connection.name),
+                                };
+                                self.stores.save(&reference, &meta, &value)?;
+                                drop(value);
+                                stored.push(reference.clone());
+                                connection
+                                    .set_secret_ref(slot, reference)
+                                    .map_err(WorkspaceError::from)?;
+                                count += 1;
+                            }
+                            None => {
+                                // No store chosen: the value is dropped (zeroized). A secret
+                                // saved in NineSQL for this field stays if it still applies
+                                // (P2-C review, L1).
+                                drop(value);
+                                if let Some(old) = previous
+                                    && let Some((_, _, r)) = old
+                                        .secret_refs()
+                                        .into_iter()
+                                        .find(|(s, k, _)| *s == slot && *k == kind)
+                                    && secret_still_applies(old, &connection, slot)
+                                {
+                                    let _ = connection.set_secret_ref(slot, r.clone());
+                                }
+                            }
+                        }
                     }
                     moved += count;
                     match plan.action {
@@ -527,21 +613,33 @@ impl Importer {
                     if !connection.enabled {
                         disabled += 1;
                     }
-                    report_connections.push(ReportConnection::from_plan(
-                        plan,
-                        Some(&connection),
-                        count,
-                    ));
-                    upserts.push(connection);
+                    let mut entry = ReportConnection::from_plan(plan, Some(&connection), count);
+                    entry.issues.extend(extra.iter().map(ReportIssue::from));
+                    report_connections.push(entry);
+                    upserts.push((connection, previous.cloned()));
                 }
                 entries.push(ReportProject::new(project, report_connections));
             }
+            // Types first: a connection never names a type that is not saved. Only new or
+            // stricter types are written, so a later failure never leaves a weaker one.
+            let mut types = self.workspace.load_connection_types()?;
+            let mut types_changed = 0;
+            for t in &fresh.connection_types {
+                if let TypeAction::Create(t) | TypeAction::Tighten(t) = &t.action {
+                    types.upsert(t.clone());
+                    types_changed += 1;
+                }
+            }
+            if types_changed > 0 {
+                self.workspace.save_connection_types(&types)?;
+            }
             let written = self
                 .workspace
-                .save_imported(upserts.clone(), &self.registry)?;
-            Ok::<_, ImportError>(written)
+                .save_imported(upserts.clone(), &self.registry)?
+                .ok_or(ImportError::SourceChanged)?;
+            Ok::<_, ImportError>((written, types_changed))
         })();
-        let written = match result {
+        let (written, types_changed) = match result {
             Ok(w) => w,
             Err(e) => {
                 for reference in &stored {
@@ -554,9 +652,9 @@ impl Importer {
         };
         drop(payload);
 
-        // References of updated connections that the new version no longer uses.
-        for c in &upserts {
-            let Some(old) = existing.get(c.id) else {
+        // References the written connections no longer use (replaced or dropped).
+        for (c, old) in &upserts {
+            let Some(old) = old else {
                 continue;
             };
             let now: Vec<&SecretRef> = c.secret_refs().into_iter().map(|(_, _, r)| r).collect();
@@ -573,6 +671,7 @@ impl Importer {
             created_at: unix_now(),
             sources: fresh.workspaces.iter().map(|w| w.path.clone()).collect(),
             store: choices.store,
+            issues: fresh.issues.iter().map(ReportIssue::from).collect(),
             projects: entries,
         };
         let report_file = self.save_report(&report)?;
@@ -599,6 +698,46 @@ impl Importer {
         })
     }
 
+    /// The user accepted the imported TLS settings of an update: they replace the kept saved
+    /// ones if the driver accepts them (otherwise the saved ones stay, with a report entry), and
+    /// a kept secret whose TLS changed is dropped.
+    fn accept_tls(
+        &self,
+        old: &Connection,
+        c: &mut Connection,
+        diff: &UpdateDiff,
+        issues: &mut Vec<ImportIssue>,
+    ) {
+        let Some(tls) = diff.tls.as_ref().filter(|t| t.kept_saved) else {
+            return;
+        };
+        let saved = c.tls.clone();
+        c.tls.mode = tls.imported.0;
+        c.tls.ca_file.clone_from(&tls.imported.1);
+        if c.enabled && self.registry.validate_connection(c).is_err() {
+            c.tls = saved;
+            issues.push(issue(
+                Severity::Warning,
+                IssueKind::TlsConverted,
+                None,
+                "the accepted TLS settings are refused by the driver: the saved ones are kept",
+            ));
+            return;
+        }
+        issues.push(issue(
+            Severity::Warning,
+            IssueKind::TlsNotVerified,
+            None,
+            "the imported TLS settings replace the saved ones, as accepted",
+        ));
+        let kept: Vec<SecretSlot> = c.secret_refs().into_iter().map(|(s, _, _)| s).collect();
+        for slot in kept {
+            if !secret_still_applies(old, c, slot) {
+                clear_secret_ref(c, slot);
+            }
+        }
+    }
+
     /// Writes the report as `imports/dbeaver-<timestamp>.json` in the project directory (a new
     /// file; `-2`, `-3`… when the name is taken).
     fn save_report(&self, report: &ImportReportFile) -> Result<PathBuf, ImportError> {
@@ -616,12 +755,13 @@ impl Importer {
     }
 
     /// Reads the source and computes the preview, with the secrets of each connection on the
-    /// side. `ids` fixes the NineSQL id of new connections (from an earlier preview).
+    /// side and the saved connections it was planned against. `ids` fixes the NineSQL id of
+    /// new connections (from an earlier preview).
     fn plan(
         &self,
         source: &ImportSource,
         ids: &BTreeMap<String, ConnectionId>,
-    ) -> Result<(ImportPreview, SecretPayload), ImportError> {
+    ) -> Result<(ImportPreview, SecretPayload, Connections), ImportError> {
         let workspaces = match source {
             ImportSource::Detect(roots) => {
                 let found = ninesql_dbeaver::detect_workspaces(roots);
@@ -641,23 +781,35 @@ impl Importer {
         let existing = self.workspace.load_connections()?.connections;
         let current_types = self.workspace.load_connection_types()?;
 
+        // Every project is read first, so the connection types of all of them (all detected
+        // workspaces included) are folded before any connection is planned (review, M2).
+        let mut imports = Vec::new();
+        for w in &workspaces {
+            for project in &w.projects {
+                imports.push((project, ninesql_dbeaver::import_project(project)));
+            }
+        }
+        let mut issues = Vec::new();
+        let all_types: Vec<&ImportedConnectionType> = imports
+            .iter()
+            .flat_map(|(_, i)| i.connection_types.iter())
+            .collect();
+        let connection_types = plan_types(&all_types, &current_types, &mut issues);
+        let mut types_after = current_types.clone();
+        for t in &connection_types {
+            if let TypeAction::Create(t) | TypeAction::Tighten(t) = &t.action {
+                types_after.upsert(t.clone());
+            }
+        }
+
         let mut payload = SecretPayload::new();
         let mut projects = Vec::new();
         let mut seen_ids = BTreeSet::new();
-        for w in &workspaces {
-            for project in &w.projects {
-                let import = ninesql_dbeaver::import_project(project);
-                let (preview, secrets) = self.plan_project(
-                    project,
-                    import,
-                    &existing,
-                    &current_types,
-                    ids,
-                    &mut seen_ids,
-                );
-                payload.extend(secrets);
-                projects.push(preview);
-            }
+        for (project, import) in imports {
+            let (preview, secrets) =
+                self.plan_project(project, import, &existing, &types_after, ids, &mut seen_ids);
+            payload.extend(secrets);
+            projects.push(preview);
         }
         let preview = ImportPreview {
             source: source.clone(),
@@ -670,9 +822,11 @@ impl Importer {
                 })
                 .collect(),
             projects,
+            connection_types,
+            issues,
             default_store: self.default_store,
         };
-        Ok((preview, payload))
+        Ok((preview, payload, existing))
     }
 
     fn add_root(&self, path: &Path) {
@@ -687,7 +841,7 @@ impl Importer {
         project: &ninesql_dbeaver::Project,
         import: mirror::ProjectImport,
         existing: &Connections,
-        current_types: &ConnectionTypes,
+        types_after: &ConnectionTypes,
         ids: &BTreeMap<String, ConnectionId>,
         seen_ids: &mut BTreeSet<String>,
     ) -> (ProjectPreview, SecretPayload) {
@@ -695,19 +849,13 @@ impl Importer {
             project: project_name,
             credentials,
             folders,
-            connection_types,
             connections,
             mut issues,
             ..
         } = import;
-
-        let type_plans = plan_types(&connection_types, current_types, &mut issues);
-        let mut types_after = current_types.clone();
-        for t in &type_plans {
-            if let TypeAction::Create(t) | TypeAction::Tighten(t) = &t.action {
-                types_after.upsert(t.clone());
-            }
-        }
+        // The canonical source workspace, recorded in `origin` and part of the re-import match.
+        let source_workspace =
+            std::fs::canonicalize(&project.workspace).unwrap_or_else(|_| project.workspace.clone());
 
         let mut payload = SecretPayload::new();
         let mut plans = Vec::with_capacity(connections.len());
@@ -744,12 +892,30 @@ impl Importer {
                 continue;
             }
             let secrets = std::mem::take(&mut imported.secrets);
-            let previous = existing.find_by_dbeaver_id(&dbeaver_id);
+            let previous =
+                existing.find_dbeaver_origin(&dbeaver_id, &project_name, &source_workspace);
+            if previous.is_none() && existing.find_by_dbeaver_id(&dbeaver_id).is_some() {
+                // Same DBeaver id, other project or workspace (or imported before schema 5):
+                // never an update of that connection (review, H1).
+                conn_issues.push(issue(
+                    Severity::Warning,
+                    IssueKind::Unsupported,
+                    None,
+                    "a saved connection has the same DBeaver id but comes from another DBeaver \
+                     workspace or project: this one is imported as a new connection",
+                ));
+            }
             let id = previous
                 .map(|c| c.id)
                 .or_else(|| ids.get(&dbeaver_id).copied())
                 .unwrap_or_else(ConnectionId::new_random);
-            let converted = self.convert(&imported, id, &project_name, &mut conn_issues);
+            let converted = self.convert(
+                &imported,
+                id,
+                &project_name,
+                &source_workspace,
+                &mut conn_issues,
+            );
             let mut connection = match converted {
                 Ok(c) => c,
                 Err(reason) => {
@@ -757,16 +923,19 @@ impl Importer {
                     continue;
                 }
             };
+            let mut diff = None;
             if let Some(previous) = previous {
                 let imported_slots: Vec<SecretSlot> =
                     secrets.iter().map(|s| core_slot(s.slot)).collect();
-                connection = merge_update(
+                let (merged, d) = merge_update(
                     previous,
                     connection,
                     &imported_slots,
-                    &types_after,
+                    types_after,
                     &mut conn_issues,
                 );
+                connection = merged;
+                diff = Some(d);
             }
             // The driver check of an update runs on the merged connection.
             self.check_enabled(&mut connection, &mut conn_issues);
@@ -817,9 +986,12 @@ impl Importer {
                 ));
             }
             payload.insert((project_name.clone(), dbeaver_id.clone()), values);
-            let action = match previous {
-                Some(p) => PlanAction::Update { existing: p.id },
-                None => PlanAction::Create,
+            let action = match (previous, diff) {
+                (Some(p), Some(diff)) => PlanAction::Update {
+                    existing: p.id,
+                    diff: Box::new(diff),
+                },
+                _ => PlanAction::Create,
             };
             let status = if connection.enabled {
                 ImportStatus::Imported
@@ -891,7 +1063,6 @@ impl Importer {
                 dbeaver_workspace: project.workspace.clone(),
                 credentials,
                 folders: folder_plans,
-                connection_types: type_plans,
                 connections: plans,
                 issues,
             },
@@ -907,6 +1078,7 @@ impl Importer {
         m: &ImportedConnection,
         id: ConnectionId,
         project: &str,
+        source_workspace: &Path,
         issues: &mut Vec<ImportIssue>,
     ) -> Result<Connection, String> {
         let engine = EngineId::new(m.engine.as_str()).map_err(|e| e.to_string())?;
@@ -973,6 +1145,7 @@ impl Importer {
         c.origin = Origin::Dbeaver {
             dbeaver_id: m.origin.dbeaver_id.clone(),
             project: Some(project.to_owned()),
+            source_workspace: Some(source_workspace.to_path_buf()),
         };
 
         // Driver properties: only what the engine's driver accepts reaches the connection
@@ -1167,12 +1340,19 @@ fn prompt_kind(c: &Connection, slot: SecretSlot) -> Option<SecretKind> {
     }
 }
 
-fn secret_ref(
+/// A fresh reference `<connection id>:<slot>:<uuid>` (like the UI hub): never the reference of
+/// a saved secret, so writing it cannot lose an old value (review, M1).
+fn fresh_secret_ref(
     store: StoreKind,
     id: ConnectionId,
     slot: SecretSlot,
 ) -> Result<SecretRef, ImportError> {
-    let sid = SecretId::new(format!("{id}:{}", slot.id_suffix())).map_err(|_| {
+    let sid = SecretId::new(format!(
+        "{id}:{}:{}",
+        slot.id_suffix(),
+        uuid::Uuid::new_v4()
+    ))
+    .map_err(|_| {
         ImportError::Workspace(WorkspaceError::Model(
             crate::error::ConnectionError::InvalidField {
                 field: "id".to_owned(),
@@ -1181,6 +1361,125 @@ fn secret_ref(
         ))
     })?;
     Ok(SecretRef::new(store, sid))
+}
+
+/// Puts the credential field at `slot` back on "ask every time".
+fn clear_secret_ref(c: &mut Connection, slot: SecretSlot) {
+    fn hop_clear(h: &mut SshHop) {
+        match &mut h.auth {
+            SshAuth::Password { secret } => *secret = SecretSource::Prompt,
+            SshAuth::PublicKey {
+                passphrase: Some(p),
+                ..
+            } => *p = SecretSource::Prompt,
+            SshAuth::PublicKey { .. } | SshAuth::Agent => {}
+        }
+    }
+    match slot {
+        SecretSlot::Auth => match &mut c.auth {
+            Auth::Password { secret, .. } | Auth::Token { secret, .. } => {
+                *secret = SecretSource::Prompt;
+            }
+            Auth::None | Auth::Username { .. } => {}
+        },
+        SecretSlot::SshServer => {
+            if let Some(t) = &mut c.ssh {
+                hop_clear(&mut t.server);
+            }
+        }
+        SecretSlot::SshJump(i) => {
+            if let Some(h) = c.ssh.as_mut().and_then(|t| t.jump_hosts.get_mut(i)) {
+                hop_clear(h);
+            }
+        }
+        SecretSlot::TlsClientKey => {
+            if let Some(p) = c
+                .tls
+                .client_certificate
+                .as_mut()
+                .and_then(|cc| cc.passphrase.as_mut())
+            {
+                *p = SecretSource::Prompt;
+            }
+        }
+    }
+}
+
+/// Every credential field back on "ask every time".
+fn clear_secret_refs(c: &mut Connection) {
+    let slots: Vec<SecretSlot> = c.secret_refs().into_iter().map(|(s, _, _)| s).collect();
+    for slot in slots {
+        clear_secret_ref(c, slot);
+    }
+}
+
+/// Where a connection's database credentials go: the endpoint without the database name.
+fn endpoint_target(c: &Connection) -> Endpoint {
+    match &c.endpoint {
+        Endpoint::Tcp { host, port, .. } => Endpoint::Tcp {
+            host: host.clone(),
+            port: *port,
+            database: None,
+        },
+        Endpoint::UnixSocket { path, .. } => Endpoint::UnixSocket {
+            path: path.clone(),
+            database: None,
+        },
+        Endpoint::File { path } => Endpoint::File { path: path.clone() },
+    }
+}
+
+fn hop_label(h: &SshHop) -> String {
+    format!("{}@{}:{}", h.username, h.host, h.port)
+}
+
+fn ssh_route(c: &Connection) -> Vec<String> {
+    c.ssh
+        .as_ref()
+        .map(|t| t.hops().map(hop_label).collect())
+        .unwrap_or_default()
+}
+
+/// Whether a secret saved for `slot` of `old` may keep being used by `new`: everything it
+/// authenticates against is unchanged (review, H1).
+/// - database password / token: engine, host, port (or socket / file), user name, TLS mode and
+///   CA file, and the SSH route it travels through;
+/// - SSH password / key passphrase: the hop's host, port and user name;
+/// - TLS client key passphrase: the certificate and key files and the database host.
+fn secret_still_applies(old: &Connection, new: &Connection, slot: SecretSlot) -> bool {
+    let hop = |c: &Connection| -> Option<SshHop> {
+        let t = c.ssh.as_ref()?;
+        match slot {
+            SecretSlot::SshServer => Some(t.server.clone()),
+            SecretSlot::SshJump(i) => t.jump_hosts.get(i).cloned(),
+            _ => None,
+        }
+    };
+    match slot {
+        SecretSlot::Auth => {
+            old.engine == new.engine
+                && endpoint_target(old) == endpoint_target(new)
+                && old.auth.username() == new.auth.username()
+                && old.tls.mode == new.tls.mode
+                && old.tls.ca_file == new.tls.ca_file
+                && ssh_route(old) == ssh_route(new)
+        }
+        SecretSlot::SshServer | SecretSlot::SshJump(_) => match (hop(old), hop(new)) {
+            (Some(a), Some(b)) => a.host == b.host && a.port == b.port && a.username == b.username,
+            _ => false,
+        },
+        SecretSlot::TlsClientKey => {
+            let files = |c: &Connection| {
+                c.tls
+                    .client_certificate
+                    .as_ref()
+                    .map(|cc| (cc.cert_file.clone(), cc.key_file.clone()))
+            };
+            files(old).is_some()
+                && files(old) == files(new)
+                && endpoint_target(old) == endpoint_target(new)
+        }
+    }
 }
 
 /// Whether `a` is at least as strict as `b` on every rule.
@@ -1193,14 +1492,50 @@ fn at_least_as_strict(a: &SafetyPolicy, b: &SafetyPolicy) -> bool {
         && (!a.log_query_text || b.log_query_text)
 }
 
+/// Tightens `base` with the rules of `other`: never weaker on any rule. Name and color stay.
+fn tighten(base: &mut ConnectionType, other: &ConnectionType) {
+    base.auto_commit &= other.auto_commit;
+    base.confirm_destructive |= other.confirm_destructive;
+    base.confirm_every_write |= other.confirm_every_write;
+    base.read_only |= other.read_only;
+    base.log_query_text &= other.log_query_text;
+    base.production |= other.production;
+}
+
 /// A re-import: the saved connection's user-owned fields win (see [`PlanAction::Update`]).
+/// Returns the merged connection and the field-level diff.
 fn merge_update(
     old: &Connection,
     mut new: Connection,
     imported_slots: &[SecretSlot],
     types: &ConnectionTypes,
     issues: &mut Vec<ImportIssue>,
-) -> Connection {
+) -> (Connection, UpdateDiff) {
+    let mut diff = UpdateDiff::default();
+    if old.engine != new.engine {
+        diff.engine = Some(Change {
+            saved: old.engine.clone(),
+            imported: new.engine.clone(),
+        });
+    }
+    if old.endpoint != new.endpoint {
+        diff.endpoint = Some(Change {
+            saved: old.endpoint.clone(),
+            imported: new.endpoint.clone(),
+        });
+    }
+    if old.auth.username() != new.auth.username() {
+        diff.username = Some(Change {
+            saved: old.auth.username().map(str::to_owned),
+            imported: new.auth.username().map(str::to_owned),
+        });
+    }
+    if ssh_route(old) != ssh_route(&new) {
+        diff.ssh = Some(Change {
+            saved: ssh_route(old),
+            imported: ssh_route(&new),
+        });
+    }
     new.id = old.id;
     new.name.clone_from(&old.name);
     new.description.clone_from(&old.description);
@@ -1234,10 +1569,42 @@ fn merge_update(
     if old.auto_commit == Some(false) {
         new.auto_commit = Some(false);
     }
+    // TLS (review, H1 c): a weaker mode or another CA file (a CA file is the only trust anchor,
+    // ADR-0019) is not taken without the user's acceptance.
+    if old.endpoint.is_network()
+        && new.endpoint.is_network()
+        && (old.tls.mode != new.tls.mode || old.tls.ca_file != new.tls.ca_file)
+    {
+        let kept_saved = new.tls.mode < old.tls.mode || new.tls.ca_file != old.tls.ca_file;
+        diff.tls = Some(TlsChange {
+            saved: (old.tls.mode, old.tls.ca_file.clone()),
+            imported: (new.tls.mode, new.tls.ca_file.clone()),
+            kept_saved,
+        });
+        if kept_saved {
+            new.tls.mode = new.tls.mode.max(old.tls.mode);
+            new.tls.ca_file.clone_from(&old.tls.ca_file);
+            issues.push(issue(
+                Severity::Warning,
+                IssueKind::TlsConverted,
+                None,
+                "the DBeaver TLS settings are weaker than or differ from the saved ones: the \
+                 saved TLS mode and CA file are kept unless you accept the change",
+            ));
+        }
+    }
     if new.connection_type != old.connection_type {
         let imported = types.resolve(&new.connection_type).policy();
         let saved = types.resolve(&old.connection_type).policy();
-        if !at_least_as_strict(&imported, &saved) {
+        let keep = !at_least_as_strict(&imported, &saved);
+        diff.connection_type = Some((
+            Change {
+                saved: old.connection_type.clone(),
+                imported: new.connection_type.clone(),
+            },
+            keep,
+        ));
+        if keep {
             new.connection_type = old.connection_type.clone();
             issues.push(issue(
                 Severity::Warning,
@@ -1251,28 +1618,40 @@ fn merge_update(
         // Disabled by the user: stays disabled.
         new.enabled = false;
     }
-    // Saved secrets of fields DBeaver has no value for (typed in NineSQL) stay.
+    // Saved secrets: replaced by DBeaver's value, kept while they still apply, else dropped.
     for (slot, kind, reference) in old.secret_refs() {
-        if !imported_slots.contains(&slot) && prompt_kind(&new, slot) == Some(kind) {
+        let field = prompt_kind(&new, slot) == Some(kind);
+        let change = if field && imported_slots.contains(&slot) {
+            SecretChangeKind::Replaced
+        } else if field && secret_still_applies(old, &new, slot) {
             let _ = new.set_secret_ref(slot, reference.clone());
-        }
+            SecretChangeKind::Kept
+        } else {
+            issues.push(issue(
+                Severity::Warning,
+                IssueKind::Credentials,
+                None,
+                "a secret saved in NineSQL is not kept: what it authenticates against changed \
+                 (it is deleted after the import; NineSQL asks for it at connect)",
+            ));
+            SecretChangeKind::Dropped
+        };
+        diff.secrets.push(SecretChange { slot, change });
     }
     // Init SQL is marked again, even if the saved copy was confirmed (ADR-0022 §1).
     new.init_sql_needs_confirmation = !new.init_sql.is_empty();
-    new
+    (new, diff)
 }
 
-/// DBeaver types → actions against the project's types.
+/// DBeaver types of every project → actions against the project's types. A type id defined
+/// more than once is folded tighten-only (review, M2); the result only ever tightens an
+/// existing type, the built-in ones included (review, M3), each reported.
 fn plan_types(
-    imported: &[ImportedConnectionType],
+    imported: &[&ImportedConnectionType],
     current: &ConnectionTypes,
     issues: &mut Vec<ImportIssue>,
 ) -> Vec<TypePlan> {
-    let builtins: Vec<ConnectionTypeId> = ConnectionType::builtins()
-        .into_iter()
-        .map(|t| t.id)
-        .collect();
-    let mut out = Vec::new();
+    let mut folded: BTreeMap<ConnectionTypeId, (String, String, ConnectionType)> = BTreeMap::new();
     for t in imported {
         let Ok(id) = ConnectionTypeId::new(t.id.clone()) else {
             issues.push(issue(
@@ -1294,28 +1673,48 @@ fn plan_types(
             log_query_text: t.log_query_text,
             production: t.production,
         };
-        let action = if t.builtin || builtins.contains(&id) {
-            TypeAction::Builtin
-        } else if let Some(have) = current.get(&id) {
-            let mut merged = have.clone();
-            merged.auto_commit &= wanted.auto_commit;
-            merged.confirm_destructive |= wanted.confirm_destructive;
-            merged.confirm_every_write |= wanted.confirm_every_write;
-            merged.read_only |= wanted.read_only;
-            merged.log_query_text &= wanted.log_query_text;
-            merged.production |= wanted.production;
-            if merged == *have {
-                TypeAction::Keep
-            } else {
-                TypeAction::Tighten(merged)
+        match folded.get_mut(&id) {
+            Some((_, _, have)) => tighten(have, &wanted),
+            None => {
+                folded.insert(id, (t.dbeaver_id.clone(), t.name.clone(), wanted));
             }
-        } else {
-            TypeAction::Create(wanted)
+        }
+    }
+    let builtins: Vec<ConnectionTypeId> = ConnectionType::builtins()
+        .into_iter()
+        .map(|t| t.id)
+        .collect();
+    let mut out = Vec::new();
+    for (id, (dbeaver_id, name, wanted)) in folded {
+        let action = match current.get(&id) {
+            Some(have) => {
+                let mut merged = have.clone();
+                tighten(&mut merged, &wanted);
+                if merged == *have {
+                    TypeAction::Keep
+                } else {
+                    issues.push(issue(
+                        Severity::Warning,
+                        IssueKind::Unsupported,
+                        Some(&format!("connection-types.{dbeaver_id}")),
+                        if builtins.contains(&id) {
+                            "the NineSQL built-in type of the same id is made stricter to keep \
+                             DBeaver's rules (confirmations, manual commit); this applies to \
+                             every connection of that type"
+                        } else {
+                            "the existing type of the same id is made stricter to keep DBeaver's \
+                             rules; this applies to every connection of that type"
+                        },
+                    ));
+                    TypeAction::Tighten(merged)
+                }
+            }
+            None => TypeAction::Create(wanted),
         };
         out.push(TypePlan {
-            dbeaver_id: t.dbeaver_id.clone(),
+            dbeaver_id,
             id,
-            name: t.name.clone(),
+            name,
             action,
         });
     }
@@ -1337,6 +1736,9 @@ pub struct ImportReportFile {
     /// Store the secrets went to.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub store: Option<StoreKind>,
+    /// Entries not tied to one project (connection types).
+    #[serde(default)]
+    pub issues: Vec<ReportIssue>,
     /// Per project.
     pub projects: Vec<ReportProject>,
 }
@@ -1547,41 +1949,88 @@ mod tests {
                 log_query_text: true,
                 production: false,
             };
+        let by_id = |plans: &[TypePlan], id: &str| {
+            plans
+                .iter()
+                .find(|p| p.id.as_str() == id)
+                .unwrap()
+                .action
+                .clone()
+        };
         let mut staging = ConnectionType::development();
         staging.id = ConnectionTypeId::new("staging").unwrap();
         staging.auto_commit = false;
         staging.confirm_destructive = true;
         let current = ConnectionTypes::from_saved(vec![staging.clone()]);
         let mut issues = Vec::new();
+        let (prod, dev, weak_staging, qa, test) = (
+            // A crafted `prod` that would relax the built-in: never weaker.
+            mk("prod", true, true, false),
+            // Not flagged built-in, same id: the built-in, untouched (nothing stricter).
+            mk("dev", false, true, false),
+            // Weaker than the saved one: kept.
+            mk("staging", false, true, false),
+            mk("qa", false, true, true),
+            // DBeaver's `test` confirms data changes: the built-in is tightened (review, M3).
+            mk("test", true, true, true),
+        );
         let plans = plan_types(
-            &[
-                // A crafted `prod` that would relax the built-in: never applied.
-                mk("prod", true, true, false),
-                // Not flagged built-in but the same id: still the built-in.
-                mk("dev", false, true, false),
-                // Weaker than the saved one: kept.
-                mk("staging", false, true, false),
-                mk("qa", false, true, true),
-            ],
+            &[&prod, &dev, &weak_staging, &qa, &test],
             &current,
             &mut issues,
         );
-        assert_eq!(plans[0].action, TypeAction::Builtin);
-        assert_eq!(plans[1].action, TypeAction::Builtin);
-        assert_eq!(plans[2].action, TypeAction::Keep);
-        assert!(matches!(&plans[3].action, TypeAction::Create(t) if t.confirm_destructive));
+        assert_eq!(by_id(&plans, "prod"), TypeAction::Keep);
+        assert_eq!(by_id(&plans, "dev"), TypeAction::Keep);
+        assert_eq!(by_id(&plans, "staging"), TypeAction::Keep);
+        assert!(matches!(by_id(&plans, "qa"), TypeAction::Create(t) if t.confirm_destructive));
+        match by_id(&plans, "test") {
+            TypeAction::Tighten(t) => {
+                assert!(t.confirm_destructive);
+                assert_eq!(t.name, "Test", "name and color stay");
+            }
+            other => panic!("{other:?}"),
+        }
+        assert!(issues.iter().any(|i| i.message.contains("built-in")));
 
         let mut relaxed = staging;
         relaxed.confirm_destructive = false;
         relaxed.auto_commit = true;
         let current = ConnectionTypes::from_saved(vec![relaxed]);
-        let plans = plan_types(&[mk("staging", false, false, true)], &current, &mut issues);
+        let strict = mk("staging", false, false, true);
+        let plans = plan_types(&[&strict], &current, &mut issues);
         match &plans[0].action {
             TypeAction::Tighten(t) => {
                 assert!(t.confirm_destructive);
                 assert!(!t.auto_commit);
             }
             other => panic!("{other:?}"),
+        }
+    }
+
+    /// Review M2: the same new type id in two projects folds tighten-only, in either order.
+    #[test]
+    fn a_type_defined_twice_keeps_the_stricter_rules() {
+        let mk = |confirm: bool, auto_commit: bool| ImportedConnectionType {
+            id: "qa".to_owned(),
+            dbeaver_id: "qa".to_owned(),
+            builtin: false,
+            name: "QA".to_owned(),
+            color: mirror::Rgb { r: 1, g: 2, b: 3 },
+            auto_commit,
+            confirm_destructive: confirm,
+            confirm_every_write: false,
+            read_only: false,
+            log_query_text: true,
+            production: false,
+        };
+        let (strict, weak) = (mk(true, false), mk(false, true));
+        for order in [[&strict, &weak], [&weak, &strict]] {
+            let plans = plan_types(&order, &ConnectionTypes::default(), &mut Vec::new());
+            assert_eq!(plans.len(), 1);
+            match &plans[0].action {
+                TypeAction::Create(t) => assert!(t.confirm_destructive && !t.auto_commit),
+                other => panic!("{other:?}"),
+            }
         }
     }
 }

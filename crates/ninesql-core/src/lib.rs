@@ -29,9 +29,10 @@ pub use connection_type::{Color, ConnectionType, ConnectionTypeId, ConnectionTyp
 pub use dbeaver_roots::{DbeaverRoots, FileCheck};
 pub use error::{ConnectionError, CoreError, WorkspaceError};
 pub use import::{
-    ConnectionPlan, FolderPlan, ImportChoices, ImportError, ImportOutcome, ImportPreview,
+    Change, ConnectionPlan, FolderPlan, ImportChoices, ImportError, ImportOutcome, ImportPreview,
     ImportReportFile, ImportSource, ImportStatus, Importer, PlanAction, PreviewWorkspace,
-    ProjectPreview, SecretToMove, TypeAction, TypePlan,
+    ProjectPreview, SecretChange, SecretChangeKind, SecretToMove, TlsChange, TypeAction, TypePlan,
+    UpdateDiff,
 };
 pub use registry::{DriverRegistry, EnableError};
 pub use runtime::DriverRuntime;
