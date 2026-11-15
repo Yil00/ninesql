@@ -426,18 +426,41 @@ pub enum FetchMode {
     All,
 }
 
-#[derive(Debug)]
-enum Control {
-    Fetch(usize, FetchMode),
-    Release(usize),
+/// Release requests kept until the run reads them.
+const MAX_PENDING_RELEASES: usize = 64;
+
+/// Pending paging requests, coalesced (review L3): memory stays constant however many
+/// requests the UI sends before the run reads them.
+#[derive(Debug, Default)]
+struct ControlState {
+    /// Statement the pending fetch is for; a fetch for another statement replaces it.
+    fetch_for: Option<usize>,
+    /// Extra rows asked for by `Page` requests (summed, saturating).
+    extra_rows: u64,
+    /// An `All` request is pending.
+    all: bool,
+    /// Statement indexes released (at most [`MAX_PENDING_RELEASES`], the highest kept).
+    release: std::collections::BTreeSet<usize>,
+}
+
+#[derive(Debug, Default)]
+struct ControlShared {
+    state: std::sync::Mutex<ControlState>,
+    notify: tokio::sync::Notify,
+}
+
+impl ControlShared {
+    fn take(&self) -> ControlState {
+        std::mem::take(&mut *self.state.lock().unwrap_or_else(PoisonError::into_inner))
+    }
 }
 
 /// Paging and release of a run's results, usable from any thread; every method returns at
-/// once. Cheap to clone (the grid's result source holds one). Requests for a statement that is
-/// not the running one are ignored.
+/// once. Cheap to clone (the grid's result source holds one). Requests are coalesced (bounded
+/// memory); requests for a statement that is not the running one are ignored.
 #[derive(Clone)]
 pub struct RunControl {
-    tx: mpsc::UnboundedSender<Control>,
+    shared: Arc<ControlShared>,
     cancel: CancelToken,
 }
 
@@ -450,14 +473,43 @@ impl fmt::Debug for RunControl {
 impl RunControl {
     /// Delivers more of statement `index`'s result (its next page, or all of it).
     pub fn fetch(&self, index: usize, mode: FetchMode) {
-        let _ = self.tx.send(Control::Fetch(index, mode));
+        {
+            let mut st = self
+                .shared
+                .state
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            if st.fetch_for != Some(index) {
+                st.fetch_for = Some(index);
+                st.extra_rows = 0;
+                st.all = false;
+            }
+            match mode {
+                FetchMode::Page(rows) => {
+                    st.extra_rows = st.extra_rows.saturating_add(u64::from(rows.max(1)));
+                }
+                FetchMode::All => st.all = true,
+            }
+        }
+        self.shared.notify.notify_one();
     }
 
     /// Closes statement `index`'s stream early (server-side cancel when the engine has one);
     /// [`RunEvent::StatementClosed`] follows, and a script goes on with its next statement.
     /// Does nothing once the statement ended.
     pub fn release(&self, index: usize) {
-        let _ = self.tx.send(Control::Release(index));
+        {
+            let mut st = self
+                .shared
+                .state
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            st.release.insert(index);
+            while st.release.len() > MAX_PENDING_RELEASES {
+                st.release.pop_first();
+            }
+        }
+        self.shared.notify.notify_one();
     }
 
     /// Stops the whole run, as [`Run::cancel`].
@@ -629,7 +681,7 @@ impl ExecutionService {
     #[must_use]
     pub fn run(&self, session: &SessionHandle, request: RunRequest) -> Run {
         let (tx, events) = mpsc::channel(RUN_QUEUE + 1);
-        let (control_tx, control) = mpsc::unbounded_channel();
+        let control = Arc::new(ControlShared::default());
         let cancel = CancelToken::new();
         let prefs = self.preferences();
         let job = RunJob {
@@ -637,8 +689,7 @@ impl ExecutionService {
             history: self.inner.history.clone(),
             out: RunOutput::new(tx, cancel.clone()),
             cancel: cancel.clone(),
-            control,
-            control_open: true,
+            control: Arc::clone(&control),
             started: Instant::now(),
         };
         let dialect = self
@@ -652,7 +703,7 @@ impl ExecutionService {
         Run {
             events,
             control: RunControl {
-                tx: control_tx,
+                shared: control,
                 cancel: cancel.clone(),
             },
             cancel,
@@ -833,8 +884,7 @@ struct RunJob {
     history: Option<History>,
     out: RunOutput,
     cancel: CancelToken,
-    control: mpsc::UnboundedReceiver<Control>,
-    control_open: bool,
+    control: Arc<ControlShared>,
     started: Instant,
 }
 
@@ -1064,29 +1114,21 @@ impl RunJob {
                     cancel_sent = true;
                     continue;
                 }
-                control = self.control.recv(), if self.control_open => {
-                    match control {
-                        None => self.control_open = false,
-                        Some(Control::Release(i))
-                            if i == index && is_read && !releasing && !cancel_sent =>
+                () = self.control.notify.notified() => {
+                    let st = self.control.take();
+                    if st.release.contains(&index) && is_read && !releasing && !cancel_sent {
+                        execution.cancel();
+                        releasing = true;
+                    }
+                    if st.fetch_for == Some(index) {
+                        if st.all {
+                            allowed = None;
+                        } else if st.extra_rows > 0
+                            && let Some(a) = allowed
                         {
-                            execution.cancel();
-                            releasing = true;
+                            allowed = Some(a.max(delivered).saturating_add(st.extra_rows));
                         }
-                        Some(Control::Fetch(i, mode)) if i == index => match mode {
-                            FetchMode::Page(rows) => {
-                                let base_rows = allowed.unwrap_or(delivered).max(delivered);
-                                if allowed.is_some() {
-                                    allowed = Some(base_rows.saturating_add(u64::from(rows.max(1))));
-                                }
-                                page_end_sent = false;
-                            }
-                            FetchMode::All => {
-                                allowed = None;
-                                page_end_sent = false;
-                            }
-                        },
-                        Some(_) => {}
+                        page_end_sent = false;
                     }
                     continue;
                 }

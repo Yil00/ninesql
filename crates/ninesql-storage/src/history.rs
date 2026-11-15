@@ -17,8 +17,14 @@
 //! - **Versioned.** The schema version is SQLite's `user_version`; a newer one is refused
 //!   ([`StorageError::NewerVersion`]) and left untouched; every bump adds a step to
 //!   [`MIGRATIONS`].
-//! - **Hygiene.** `secure_delete` is on (pruned and deleted entries are overwritten, not left in
-//!   free pages), temporary tables stay in memory, `trusted_schema` is off.
+//! - **Hygiene.** `secure_delete` is on: a deleted entry is overwritten in the database pages.
+//!   In WAL mode the write-ahead log still holds older images of those pages until a
+//!   checkpoint, so every delete ([`HistoryDb::delete`], [`HistoryDb::delete_connection`],
+//!   [`HistoryDb::clear`], a [`HistoryDb::prune`] that removed entries) is followed by a
+//!   `wal_checkpoint(TRUNCATE)`, and `journal_size_limit = 0` truncates the log after every
+//!   checkpoint. Residual: a checkpoint that another connection blocks (a second NineSQL
+//!   process reading the file) leaves the old images in the log until the next one. Temporary
+//!   tables stay in memory; `trusted_schema` is off.
 //! - **Bounded.** A statement longer than [`MAX_STATEMENT_BYTES`] is stored cut (flagged); a
 //!   query returns at most [`MAX_QUERY_LIMIT`] entries.
 
@@ -441,6 +447,7 @@ impl HistoryDb {
         for pragma in [
             "PRAGMA synchronous = NORMAL",
             "PRAGMA secure_delete = ON",
+            "PRAGMA journal_size_limit = 0",
             "PRAGMA temp_store = MEMORY",
             "PRAGMA trusted_schema = OFF",
         ] {
@@ -620,6 +627,9 @@ impl HistoryDb {
             )
             .map_err(|e| sql_error(&path, &e))?;
         tx.commit().map_err(|e| sql_error(&path, &e))?;
+        if deleted > 0 {
+            self.checkpoint()?;
+        }
         Ok(deleted as u64)
     }
 
@@ -637,6 +647,7 @@ impl HistoryDb {
                 .map_err(|e| sql_error(&path, &e))?;
         }
         tx.commit().map_err(|e| sql_error(&path, &e))?;
+        self.checkpoint()?;
         Ok(deleted as u64)
     }
 
@@ -650,6 +661,7 @@ impl HistoryDb {
             .conn
             .execute("DELETE FROM entries WHERE connection = ?1", [connection])
             .map_err(|e| sql_error(&self.path, &e))?;
+        self.checkpoint()?;
         Ok(n as u64)
     }
 
@@ -662,10 +674,12 @@ impl HistoryDb {
             .conn
             .execute("DELETE FROM entries", [])
             .map_err(|e| sql_error(&self.path, &e))?;
+        self.checkpoint()?;
         Ok(n as u64)
     }
 
-    /// Writes the write-ahead log back into the main file and truncates it. **Blocking.**
+    /// Writes the write-ahead log back into the main file and truncates it. Run after every
+    /// delete, so older page images of deleted entries do not stay in the log. **Blocking.**
     ///
     /// # Errors
     /// [`StorageError::History`].
@@ -820,6 +834,65 @@ mod tests {
         db.insert(&entry("c", 1, "x")).unwrap();
         assert_eq!(db.clear().unwrap(), 1);
         assert_eq!(db.count().unwrap(), 0);
+    }
+
+    /// Review L1: deleted text is gone from the main file and from the write-ahead log.
+    #[test]
+    fn deleted_text_leaves_the_file_and_the_log() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("h.sqlite");
+        let mut db = HistoryDb::open(&path).unwrap();
+        let bytes = |path: &Path| {
+            let mut all = std::fs::read(path).unwrap();
+            for side in side_files(path) {
+                if let Ok(b) = std::fs::read(&side) {
+                    all.extend(b);
+                }
+            }
+            all
+        };
+        let has =
+            |hay: &[u8], needle: &str| hay.windows(needle.len()).any(|w| w == needle.as_bytes());
+        // One entry checkpointed into the main file, one still in the log only.
+        let a = db
+            .insert(&entry("c", 1, "SELECT 'marker-in-main-file'"))
+            .unwrap();
+        db.checkpoint().unwrap();
+        let b = db
+            .insert(&entry("c", 2, "SELECT 'marker-in-the-log'"))
+            .unwrap();
+        db.insert(&entry("d", 3, "SELECT 'marker-cleared'"))
+            .unwrap();
+        let before = bytes(&path);
+        assert!(has(&before, "marker-in-main-file") && has(&before, "marker-in-the-log"));
+        assert_eq!(db.delete(&[a, b]).unwrap(), 2);
+        let after = bytes(&path);
+        assert!(
+            !has(&after, "marker-in-main-file"),
+            "deleted text left in the file"
+        );
+        assert!(
+            !has(&after, "marker-in-the-log"),
+            "deleted text left in the log"
+        );
+        assert!(has(&after, "marker-cleared"));
+        assert_eq!(db.delete_connection("d").unwrap(), 1);
+        assert!(!has(&bytes(&path), "marker-cleared"));
+        db.insert(&entry("e", 4, "SELECT 'marker-clear-all'"))
+            .unwrap();
+        db.clear().unwrap();
+        db.insert(&entry("f", 1, "SELECT 'marker-pruned'")).unwrap();
+        db.prune(
+            &Retention {
+                max_entries_per_connection: 10,
+                max_age: Some(Duration::from_millis(1)),
+            },
+            1_000,
+        )
+        .unwrap();
+        let after = bytes(&path);
+        assert!(!has(&after, "marker-clear-all"));
+        assert!(!has(&after, "marker-pruned"));
     }
 
     #[test]

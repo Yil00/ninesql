@@ -1307,3 +1307,51 @@ fn a_secrets_lock_stops_a_reconnect_holding_prompted_secrets() {
     });
     manager.shutdown(Duration::from_secs(5));
 }
+
+/// Review L3, L4: requests are coalesced, and a commit-and-close does not hang behind a paused
+/// paged result.
+#[test]
+fn coalesced_fetches_and_close_with_commit_behind_a_paused_result() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (manager, _) = manager(Arc::new(mock_driver()), tmp.path());
+    let types = ConnectionTypes::default();
+    let exec = service(&manager, None);
+    ui(async {
+        let mut dev = mock_connection(ConnectionTypeId::dev());
+        dev.auto_commit = Some(false);
+        let h = open_ok(&manager, dev, &types).await;
+        let (_, s) =
+            collect_run(exec.run(&h, RunRequest::statement("INSERT INTO t VALUES (1)"))).await;
+        assert!(s.transaction.in_transaction);
+        let mut run = exec.run(
+            &h,
+            RunRequest::statement("SELECT * FROM numbers(100000)")
+                .with_budget(FetchBudget::default().with_batch_rows(10))
+                .with_paging(10),
+        );
+        let mut n = 0;
+        until(&mut run, &mut n, |e| matches!(e, RunEvent::PageEnd { .. })).await;
+        // Many requests before the run reads them: summed, not queued.
+        for _ in 0..10_000 {
+            run.fetch(0, FetchMode::Page(1));
+        }
+        until(&mut run, &mut n, |e| matches!(e, RunEvent::PageEnd { .. })).await;
+        assert!(n <= 10 + 10_000 + 10, "{n}");
+        assert!(n > 10, "{n}");
+        // Paused: commit-and-close answers at once instead of waiting.
+        let answer =
+            tokio::time::timeout(Duration::from_secs(2), h.close_with(TransactionEnd::Commit))
+                .await
+                .expect("close_with hung behind the paused result");
+        assert!(
+            matches!(answer, Err(CoreError::Driver(DriverError::Busy))),
+            "{answer:?}"
+        );
+        assert!(!h.is_closed());
+        run.release(0);
+        until(&mut run, &mut n, |e| matches!(e, RunEvent::Done(_))).await;
+        h.close_with(TransactionEnd::Commit).await.unwrap();
+        assert!(!h.transaction_state().in_transaction);
+    });
+    manager.shutdown(Duration::from_secs(5));
+}

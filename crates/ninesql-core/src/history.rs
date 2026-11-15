@@ -208,16 +208,27 @@ enum Job {
     Delete(Vec<i64>, Answer<u64>),
     DeleteConnection(String, Answer<u64>),
     Clear(Answer<u64>),
-    Prune(Retention, Option<Answer<u64>>),
+    Prune(Option<Answer<u64>>),
     Flush(Answer<()>),
+    /// Wakes the writer to apply a retention change ([`WriterShared::retention_changed`]).
+    Wake,
+}
+
+/// What the writer and the handles share.
+struct WriterShared {
+    retention: Mutex<Retention>,
+    /// Set when the retention changed; the writer prunes at its next job, so a change is never
+    /// lost when the queue is full (review L5).
+    retention_changed: AtomicBool,
+    /// Entries not written: dropped on a full queue, or failed to write (disk full…).
+    dropped: AtomicU64,
 }
 
 struct Inner {
     jobs: SyncSender<Job>,
     project: String,
     enabled: AtomicBool,
-    retention: Mutex<Retention>,
-    dropped: AtomicU64,
+    shared: Arc<WriterShared>,
 }
 
 /// The query history of the application. Cheap to clone; the writer thread stops when the last
@@ -258,18 +269,22 @@ impl History {
         prefs: &HistoryPreferences,
     ) -> Result<Self, HistoryError> {
         let (jobs, rx) = mpsc::sync_channel(HISTORY_QUEUE);
-        let retention = prefs.retention();
+        let shared = Arc::new(WriterShared {
+            retention: Mutex::new(prefs.retention()),
+            retention_changed: AtomicBool::new(false),
+            dropped: AtomicU64::new(0),
+        });
+        let for_writer = Arc::clone(&shared);
         std::thread::Builder::new()
             .name("ninesql-history".into())
-            .spawn(move || writer(db, &rx, retention))
+            .spawn(move || writer(db, &rx, &for_writer))
             .map_err(|_| HistoryError::Closed)?;
         Ok(Self {
             inner: Arc::new(Inner {
                 jobs,
                 project: project.into(),
                 enabled: AtomicBool::new(prefs.enabled),
-                retention: Mutex::new(retention),
-                dropped: AtomicU64::new(0),
+                shared,
             }),
         })
     }
@@ -281,6 +296,7 @@ impl History {
         let changed = {
             let mut current = self
                 .inner
+                .shared
                 .retention
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner);
@@ -289,14 +305,20 @@ impl History {
             changed
         };
         if changed {
-            let _ = self.inner.jobs.try_send(Job::Prune(retention, None));
+            self.inner
+                .shared
+                .retention_changed
+                .store(true, Ordering::SeqCst);
+            // A full queue still holds jobs: the writer sees the flag at the next one.
+            let _ = self.inner.jobs.try_send(Job::Wake);
         }
     }
 
-    /// Entries dropped because the writer's queue was full.
+    /// Entries not written: dropped because the writer's queue was full, or whose write failed
+    /// (disk full, damaged file).
     #[must_use]
     pub fn dropped(&self) -> u64 {
-        self.inner.dropped.load(Ordering::Relaxed)
+        self.inner.shared.dropped.load(Ordering::Relaxed)
     }
 
     /// Records a finished statement if [`may_record`] allows it; never blocks.
@@ -327,7 +349,7 @@ impl History {
         match self.inner.jobs.try_send(Job::Insert(entry)) {
             Ok(()) => Recorded::Queued,
             Err(TrySendError::Full(_) | TrySendError::Disconnected(_)) => {
-                self.inner.dropped.fetch_add(1, Ordering::Relaxed);
+                self.inner.shared.dropped.fetch_add(1, Ordering::Relaxed);
                 tracing::debug!("history queue full: entry dropped");
                 Recorded::Dropped
             }
@@ -381,12 +403,7 @@ impl History {
 
     /// Applies the retention now; answers how many entries were deleted.
     pub fn prune(&self) -> Reply<Result<u64, HistoryError>> {
-        let retention = *self
-            .inner
-            .retention
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner);
-        self.ask(|tx| Job::Prune(retention, Some(tx)))
+        self.ask(|tx| Job::Prune(Some(tx)))
     }
 
     /// Answers once every entry queued before it is written (and the write-ahead log is
@@ -396,8 +413,14 @@ impl History {
     }
 }
 
-fn writer(mut db: HistoryDb, jobs: &mpsc::Receiver<Job>, mut retention: Retention) {
-    let prune = |db: &mut HistoryDb, retention: &Retention| match db.prune(retention, now_ms()) {
+fn writer(mut db: HistoryDb, jobs: &mpsc::Receiver<Job>, shared: &WriterShared) {
+    let retention = || {
+        *shared
+            .retention
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+    };
+    let prune = |db: &mut HistoryDb| match db.prune(&retention(), now_ms()) {
         Ok(n) => {
             if n > 0 {
                 tracing::debug!(deleted = n, "history pruned");
@@ -409,18 +432,23 @@ fn writer(mut db: HistoryDb, jobs: &mpsc::Receiver<Job>, mut retention: Retentio
             Err(HistoryError::from(e))
         }
     };
-    let _ = prune(&mut db, &retention);
+    let _ = prune(&mut db);
     let mut since_prune = 0u64;
     while let Ok(job) = jobs.recv() {
+        if shared.retention_changed.swap(false, Ordering::SeqCst) {
+            since_prune = 0;
+            let _ = prune(&mut db);
+        }
         match job {
             Job::Insert(entry) => {
                 if let Err(e) = db.insert(&entry) {
+                    shared.dropped.fetch_add(1, Ordering::Relaxed);
                     tracing::warn!(error = %e, "history entry not written");
                 }
                 since_prune += 1;
                 if since_prune >= PRUNE_EVERY {
                     since_prune = 0;
-                    let _ = prune(&mut db, &retention);
+                    let _ = prune(&mut db);
                 }
             }
             Job::Query(q, tx) => {
@@ -435,10 +463,9 @@ fn writer(mut db: HistoryDb, jobs: &mpsc::Receiver<Job>, mut retention: Retentio
             Job::Clear(tx) => {
                 let _ = tx.send(db.clear().map_err(HistoryError::from));
             }
-            Job::Prune(r, tx) => {
-                retention = r;
+            Job::Prune(tx) => {
                 since_prune = 0;
-                let result = prune(&mut db, &retention);
+                let result = prune(&mut db);
                 if let Some(tx) = tx {
                     let _ = tx.send(result);
                 }
@@ -446,6 +473,7 @@ fn writer(mut db: HistoryDb, jobs: &mpsc::Receiver<Job>, mut retention: Retentio
             Job::Flush(tx) => {
                 let _ = tx.send(db.checkpoint().map_err(HistoryError::from));
             }
+            Job::Wake => {}
         }
     }
     let _ = db.checkpoint();
@@ -457,6 +485,7 @@ fn writer(mut db: HistoryDb, jobs: &mpsc::Receiver<Job>, mut retention: Retentio
 mod tests {
     use super::*;
     use crate::connection_type::ConnectionType;
+    use ninesql_storage::history::HistoryQuery;
 
     #[test]
     fn credential_words_are_found_anywhere_ignoring_case() {
@@ -486,6 +515,63 @@ mod tests {
         ] {
             assert!(!has_credential_word(text), "{text}");
         }
+    }
+
+    /// Review L5: a write that fails is counted, and a retention change is applied.
+    #[test]
+    fn failed_writes_are_counted_and_retention_changes_apply() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("h.sqlite");
+        let db = HistoryDb::open(&path).unwrap();
+        let prefs = HistoryPreferences::default();
+        let history = History::start(db, "p", &prefs).unwrap();
+        let policy = ConnectionType::development().policy();
+        let record = |text: &str| {
+            StatementRecord::new(
+                ConnectionId::new_random(),
+                EngineId::new("mock").unwrap(),
+                text,
+                SystemTime::now(),
+                Duration::from_millis(1),
+                EntryStatus::Succeeded,
+            )
+        };
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            assert_eq!(
+                history.record(&policy, record("SELECT 1")),
+                Recorded::Queued
+            );
+            assert_eq!(
+                history.record(&policy, record("SELECT 2")),
+                Recorded::Queued
+            );
+            history.flush().await.unwrap().unwrap();
+            // Keep no entry per connection: the change prunes both.
+            history.set_preferences(&HistoryPreferences {
+                max_entries_per_connection: 0,
+                ..prefs
+            });
+            history.flush().await.unwrap().unwrap();
+            let left = history
+                .query(HistoryQuery::recent(10))
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(left.is_empty(), "retention change applied");
+            assert_eq!(history.dropped(), 0);
+            // The table disappears under the writer (a damaged file): the write fails.
+            rusqlite::Connection::open(&path)
+                .unwrap()
+                .execute_batch("DROP TABLE entries")
+                .unwrap();
+            history.record(&policy, record("SELECT 3"));
+            let _ = history.flush().await;
+            assert_eq!(history.dropped(), 1, "failed write counted");
+        });
     }
 
     #[test]

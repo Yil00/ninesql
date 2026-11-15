@@ -2165,8 +2165,17 @@ impl SessionHandle {
     /// [`Self::close`] (the driver rolls back on close). Executor-agnostic.
     ///
     /// # Errors
-    /// The commit error, [`CoreError::SessionClosed`], or the close error.
+    /// `CoreError::Driver(DriverError::Busy)` with [`TransactionEnd::Commit`] while a
+    /// statement runs on the session (a paged result paused for the grid included): release or
+    /// cancel it first; nothing was committed or closed. The commit error,
+    /// [`CoreError::SessionClosed`], or the close error.
     pub async fn close_with(&self, end: TransactionEnd) -> Result<(), CoreError> {
+        // A running statement (a paged result paused for the grid, a long query) would hold
+        // the commit behind it indefinitely: answer at once instead (review L4). The UI
+        // releases or cancels the result, then commits.
+        if end == TransactionEnd::Commit && lock(&self.inner.current).is_some() {
+            return Err(CoreError::Driver(DriverError::Busy));
+        }
         if end == TransactionEnd::Commit && self.transaction_state().in_transaction {
             self.commit().await.ok_or(CoreError::SessionClosed)??;
         }
