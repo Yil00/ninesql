@@ -17,7 +17,12 @@
 //!   with the exact statement, the connection in its type color and the editor's count of
 //!   bidirectional controls; "Run" resumes with
 //!   `resume_from(span.start).with_script_state(state).confirmed(token)`,
-//!   "Cancel" stops the run there.
+//!   "Cancel" stops the run there. A run is bound to the session it started on: resumes go
+//!   there only (a closed session ends the run), the connection picker is disabled and
+//!   `set_session` refuses while it lasts, and the dialog's color comes from that session. A
+//!   dialog that goes away without an answer ends the run and drops its bind values.
+//! - **Transactions.** Commit and roll back are refused while a run lasts, so they never land
+//!   between two statements of a script.
 //! - **Transactions (F-SQL-07).** The indicator follows `CoreEvent::TransactionChanged`
 //!   (through the hub) and the state reported after each statement; commit and roll back are
 //!   offered only when the driver declares manual commit (I8).
@@ -33,7 +38,7 @@ use std::ops::Range;
 use std::rc::Rc;
 use std::sync::Arc;
 
-use gpui_kit::base::async_util::unbounded;
+use gpui_kit::base::async_util::{Sender, unbounded};
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::resizable::{resizable_panel, v_resizable};
 use gpui_kit::component::{
@@ -90,6 +95,10 @@ struct PendingConfirmation {
 
 /// The run of one editor request, across confirmations.
 struct ActiveRun {
+    /// The session the run started on: every core run of it (resumes after a confirmation
+    /// included) goes there and nowhere else (ADR-0007: what was confirmed is what runs, where
+    /// the dialog said).
+    session: SessionHandle,
     /// The editor's request (bind values included: kept only while the run lasts, for a resume
     /// after a confirmation; never logged).
     request: ExecutionRequest,
@@ -114,6 +123,20 @@ pub struct TabMessage {
     pub error: bool,
 }
 
+/// Dropped with the statement confirmation dialog (its builder owns it): tells the tab the
+/// dialog is gone, so a run whose dialog vanished without an answer (closed by other code,
+/// replaced, its window closed) ends and drops its bind values instead of waiting forever.
+struct ConfirmationGuard {
+    generation: u64,
+    dropped: Sender<u64>,
+}
+
+impl Drop for ConfirmationGuard {
+    fn drop(&mut self) {
+        let _ = self.dropped.try_send(self.generation);
+    }
+}
+
 /// One editor tab.
 pub struct SqlEditorTab {
     title: SharedString,
@@ -127,6 +150,8 @@ pub struct SqlEditorTab {
     transaction: Option<TransactionState>,
     message: Option<TabMessage>,
     budget: GridBudget,
+    /// Where [`ConfirmationGuard`]s report their dialog gone.
+    confirmation_dropped: Sender<u64>,
     _tasks: Vec<Task<()>>,
     _subscriptions: Vec<Subscription>,
 }
@@ -169,6 +194,19 @@ impl SqlEditorTab {
                 }
             }
         });
+        let (dropped_tx, dropped_rx) = unbounded::<u64>();
+        let dropped = cx.spawn_in(window, async move |this, cx| {
+            while let Ok(generation) = dropped_rx.recv().await {
+                if this
+                    .update_in(cx, |tab, window, cx| {
+                        tab.on_confirmation_dropped(generation, window, cx);
+                    })
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        });
         let subscriptions = vec![
             cx.subscribe(&hub, Self::on_hub_event),
             cx.observe(&hub, |_, _, cx| cx.notify()),
@@ -186,7 +224,8 @@ impl SqlEditorTab {
             transaction,
             message: None,
             budget,
-            _tasks: vec![requests],
+            confirmation_dropped: dropped_tx,
+            _tasks: vec![requests, dropped],
             _subscriptions: subscriptions,
         }
     }
@@ -278,8 +317,24 @@ impl SqlEditorTab {
         }
     }
 
-    /// Runs go to `session` from now on; the editor follows its dialect.
-    pub fn set_session(&mut self, session: Option<SessionHandle>, cx: &mut Context<Self>) {
+    /// The session the current run started on (where it goes on after a confirmation).
+    #[must_use]
+    pub fn run_session(&self) -> Option<&SessionHandle> {
+        self.run.as_ref().map(|r| &r.session)
+    }
+
+    /// Runs go to `session` from now on; the editor follows its dialect. Refused while a run
+    /// is going on (a statement waiting for confirmation included): the rest of the run must
+    /// go to the session it started on. Returns whether the session changed.
+    pub fn set_session(&mut self, session: Option<SessionHandle>, cx: &mut Context<Self>) -> bool {
+        if self.run.is_some() {
+            self.say(
+                "A run is going on in this editor: cancel it before choosing another connection.",
+                true,
+                cx,
+            );
+            return false;
+        }
         let connection = session.as_ref().map(|s| s.info().connection);
         let setup = setup_for(session.as_ref());
         self.transaction = session.as_ref().map(SessionHandle::transaction_state);
@@ -291,6 +346,7 @@ impl SqlEditorTab {
             e.set_notice(None, cx);
         });
         cx.notify();
+        true
     }
 
     /// Whether closing this tab must ask first: its session has an open transaction and the
@@ -371,6 +427,7 @@ impl SqlEditorTab {
         self.message = None;
         self.grid(ExecutionEvent::Started, window, cx);
         self.run = Some(ActiveRun {
+            session,
             request,
             template: template.clone(),
             base: 0,
@@ -379,24 +436,41 @@ impl SqlEditorTab {
             generation: 0,
             task: None,
         });
-        self.spawn_run(&service, &session, template, window, cx);
+        self.spawn_run(&service, template, window, cx);
     }
 
+    /// Why the run's session can no longer take the run, if so: it closed, or the tab's
+    /// session is no longer the one the run started on.
+    fn run_session_problem(&self) -> Option<&'static str> {
+        let active = self.run.as_ref()?;
+        if active.session.is_closed() {
+            Some("The session of this run closed: the rest of the run was not run.")
+        } else if self.session_id() != Some(active.session.id()) {
+            Some("The editor's connection changed during the run: the rest of the run was not run.")
+        } else {
+            None
+        }
+    }
+
+    /// Starts a core run of the active run, on the session the run started on.
     fn spawn_run(
         &mut self,
         service: &ninesql_core::ExecutionService,
-        session: &SessionHandle,
         request: RunRequest,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if let Some(why) = self.run_session_problem() {
+            self.say(why, true, cx);
+            return self.end_run(window, cx);
+        }
         self.generation += 1;
         let generation = self.generation;
         let Some(active) = self.run.as_mut() else {
             return;
         };
         // Never blocks: the core runs the statements on the driver runtime.
-        let run = service.run(session, request);
+        let run = service.run(&active.session, request);
         *self.current.borrow_mut() = Some(CurrentRun {
             request: active.request.id,
             control: run.control(),
@@ -603,11 +677,22 @@ impl SqlEditorTab {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let bidi = self.run.as_ref().map_or(0, |r| r.request.bidi_controls);
+        let Some(active) = self.run.as_ref() else {
+            return;
+        };
+        let bidi = active.request.bidi_controls;
         let view = StatementConfirmView::new(&pending.request, bidi);
-        let color = self
-            .type_color(cx)
-            .unwrap_or_else(|| hsla(ninesql_core::ConnectionType::production().color));
+        // The color of the session the statement will run on (the run's), never another one.
+        let badges = ConnectionBadges::of_open_session(self.hub.read(cx), &active.session);
+        let color = if pending.request.production && !badges.production {
+            hsla(ninesql_core::ConnectionType::production().color)
+        } else {
+            badges.color
+        };
+        let guard: Rc<dyn std::any::Any> = Rc::new(ConfirmationGuard {
+            generation: active.generation,
+            dropped: self.confirmation_dropped.clone(),
+        });
         let confirm: crate::connections::connect_flow::ConfirmCallback = {
             let this = cx.entity().downgrade();
             Rc::new(move |window: &mut Window, cx: &mut App| {
@@ -620,8 +705,40 @@ impl SqlEditorTab {
                 let _ = this.update(cx, |tab, cx| tab.decline(window, cx));
             })
         };
-        open_statement_confirmation(view, color, confirm, cancel, window, cx);
+        open_statement_confirmation(view, color, confirm, cancel, Some(guard), window, cx);
         cx.notify();
+    }
+
+    /// The confirmation dialog of core run `generation` is gone: if it was never answered, the
+    /// run ends there (nothing more runs) and its bind values are dropped.
+    fn on_confirmation_dropped(
+        &mut self,
+        generation: u64,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let unanswered = self
+            .run
+            .as_ref()
+            .is_some_and(|r| r.generation == generation && r.confirmation.is_some());
+        if unanswered {
+            self.say(
+                "Not run: the confirmation closed without an answer.",
+                false,
+                cx,
+            );
+            self.end_run(window, cx);
+        }
+    }
+
+    /// The type color and badges of the session the dialog of the current run shows (tests).
+    #[cfg(test)]
+    fn run_badges(&self, cx: &App) -> Option<ConnectionBadges> {
+        let active = self.run.as_ref()?;
+        Some(ConnectionBadges::of_open_session(
+            self.hub.read(cx),
+            &active.session,
+        ))
     }
 
     /// "Run" in the confirmation: resumes the run at the confirmed statement with its token.
@@ -629,11 +746,20 @@ impl SqlEditorTab {
         let Some(pending) = self.run.as_mut().and_then(|r| r.confirmation.take()) else {
             return;
         };
-        let Some(session) = self.session().cloned() else {
-            self.say("The session closed: nothing was run.", true, cx);
+        if let Some(why) = self.run_session_problem() {
+            self.say(
+                format!("{why} The confirmed statement was not run."),
+                true,
+                cx,
+            );
             return self.end_run(window, cx);
-        };
+        }
         let Some(service) = self.hub.update(cx, |h, _| h.execution()) else {
+            self.say(
+                "The driver runtime is not running: nothing was run.",
+                true,
+                cx,
+            );
             return self.end_run(window, cx);
         };
         let Some(active) = self.run.as_mut() else {
@@ -648,7 +774,7 @@ impl SqlEditorTab {
             .resume_from(pending.span.start)
             .with_script_state(pending.script_state)
             .confirmed(pending.request.token);
-        self.spawn_run(&service, &session, request, window, cx);
+        self.spawn_run(&service, request, window, cx);
     }
 
     /// "Cancel" in the confirmation: the run stops before the statement.
@@ -672,20 +798,40 @@ impl SqlEditorTab {
 
     // --- transactions ------------------------------------------------------------------------
 
-    /// Commits (`commit = true`) or rolls back the session's transaction.
-    pub fn end_transaction(&mut self, commit: bool, cx: &mut Context<Self>) {
-        let Some(session) = self.session().cloned() else {
-            return self.say("No open connection for this editor.", false, cx);
+    /// Commits (`commit = true`) or rolls back the session's transaction. Refused while a run
+    /// is going on (between two statements of a script, or at a confirmation): the transaction
+    /// command would land in the middle of the run. The task resolves to `Ok` once the
+    /// transaction ended (or when there was none to end), to the error shown otherwise.
+    pub fn end_transaction(
+        &mut self,
+        commit: bool,
+        cx: &mut Context<Self>,
+    ) -> Task<Result<(), String>> {
+        let refuse = |this: &mut Self, why: &str, cx: &mut Context<Self>| {
+            this.say(why.to_owned(), true, cx);
+            Task::ready(Err(why.to_owned()))
         };
-        if !self.offers_transactions() {
-            return self.say(
-                "This driver does not offer manual transactions: every statement is committed on its own.",
-                false,
+        if self.is_running() {
+            return refuse(
+                self,
+                "A run is going on in this editor: cancel it or let it finish, then commit or roll back.",
                 cx,
             );
         }
+        let Some(session) = self.session().cloned() else {
+            self.say("No open connection for this editor.", false, cx);
+            return Task::ready(Ok(()));
+        };
         if !session.transaction_state().in_transaction {
-            return self.say("No transaction is open on this session.", false, cx);
+            self.say("No transaction is open on this session.", false, cx);
+            return Task::ready(Ok(()));
+        }
+        if !self.offers_transactions() {
+            return refuse(
+                self,
+                "This driver does not offer manual transactions: every statement is committed on its own.",
+                cx,
+            );
         }
         let reply = if commit {
             session.commit()
@@ -694,7 +840,7 @@ impl SqlEditorTab {
         };
         cx.spawn(async move |this, cx| {
             let result = reply.await;
-            let _ = this.update(cx, |tab, cx| match result {
+            this.update(cx, |tab, cx| match result {
                 Some(Ok(state)) => {
                     tab.transaction = Some(state);
                     tab.say(
@@ -706,24 +852,32 @@ impl SqlEditorTab {
                         false,
                         cx,
                     );
+                    Ok(())
                 }
-                Some(Err(e)) => tab.say(run::core_error_text(&e), true, cx),
-                None => tab.say(run::core_error_text(&CoreError::SessionClosed), true, cx),
-            });
+                Some(Err(e)) => {
+                    let text = run::core_error_text(&e);
+                    tab.say(text.clone(), true, cx);
+                    Err(text)
+                }
+                None => {
+                    let text = run::core_error_text(&CoreError::SessionClosed);
+                    tab.say(text.clone(), true, cx);
+                    Err(text)
+                }
+            })
+            .map_err(|_| "the editor was closed".to_owned())?
         })
-        .detach();
     }
 
     // --- rendering ---------------------------------------------------------------------------
 
+    /// Badges of the tab's session: from its saved connection, or from the session alone when
+    /// the connection is gone (a production session always shows its badge and frame).
     fn badges(&self, cx: &App) -> Option<ConnectionBadges> {
         let session = self.session()?;
-        let hub = self.hub.read(cx);
-        let c = hub.connection(session.info().connection)?;
-        Some(ConnectionBadges::of(
-            c,
-            hub.types(),
-            std::slice::from_ref(session),
+        Some(ConnectionBadges::of_open_session(
+            self.hub.read(cx),
+            session,
         ))
     }
 
@@ -732,10 +886,6 @@ impl SqlEditorTab {
     #[must_use]
     pub fn frame_color(&self, cx: &App) -> Option<Hsla> {
         self.badges(cx).filter(|b| b.production).map(|b| b.color)
-    }
-
-    fn type_color(&self, cx: &App) -> Option<Hsla> {
-        self.badges(cx).map(|b| b.color)
     }
 
     fn render_toolbar(&self, cx: &mut Context<Self>) -> Stateful<Div> {
@@ -769,7 +919,12 @@ impl SqlEditorTab {
                     .xsmall()
                     .ghost()
                     .label(label)
-                    .tooltip("Choose editor connection")
+                    .tooltip(if running {
+                        "Choose editor connection (not during a run)"
+                    } else {
+                        "Choose editor connection"
+                    })
+                    .disabled(running)
                     .on_click(move |_, window, cx| {
                         window
                             .dispatch_action(Box::new(crate::actions::ChooseEditorConnection), cx);
@@ -800,7 +955,7 @@ impl SqlEditorTab {
                         .label("Commit")
                         .disabled(!in_tx || running)
                         .on_click(move |_, _, cx| {
-                            let _ = commit.update(cx, |t, cx| t.end_transaction(true, cx));
+                            let _ = commit.update(cx, |t, cx| t.end_transaction(true, cx).detach());
                         }),
                 )
                 .child(
@@ -809,7 +964,8 @@ impl SqlEditorTab {
                         .label("Roll back")
                         .disabled(!in_tx || running)
                         .on_click(move |_, _, cx| {
-                            let _ = rollback.update(cx, |t, cx| t.end_transaction(false, cx));
+                            let _ =
+                                rollback.update(cx, |t, cx| t.end_transaction(false, cx).detach());
                         }),
                 );
         }

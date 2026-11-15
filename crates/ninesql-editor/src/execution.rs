@@ -61,6 +61,10 @@ pub struct ExecutionPlan {
     pub kind: ExecutionKind,
     /// Items in order.
     pub items: Vec<PlannedItem>,
+    /// The document text from the first item's start to the last item's end when the plan was
+    /// built: a script runs this range, so the run is refused if any byte of it changed since
+    /// (between the items included).
+    pub range_text: String,
 }
 
 impl ExecutionPlan {
@@ -117,10 +121,18 @@ impl ExecutionPlan {
                 }
             })
             .collect();
-        if items.is_empty() {
+        let (Some(first), Some(last)) = (items.first(), items.last()) else {
             return Err(PlanError::NothingToRun);
-        }
-        Ok(Self { kind, items })
+        };
+        let range_text = document
+            .get(first.span.start..last.span.end)
+            .unwrap_or("")
+            .to_owned();
+        Ok(Self {
+            kind,
+            items,
+            range_text,
+        })
     }
 
     /// Whether any item has a placeholder (the parameters prompt is needed).
@@ -176,6 +188,7 @@ impl ExecutionPlan {
             kind: self.kind,
             connection,
             items,
+            range_text: self.range_text,
             bidi_controls,
         }
     }
@@ -245,6 +258,9 @@ pub struct ExecutionRequest {
     pub connection: Option<ConnectionId>,
     /// Items in order.
     pub items: Vec<ExecutionItem>,
+    /// The document text from the first item's start to the last item's end when the request
+    /// was made (see [`ExecutionPlan::range_text`]).
+    pub range_text: String,
     /// Bidirectional control characters in the document when the request was made; the
     /// confirmation dialogs mention them.
     pub bidi_controls: usize,
@@ -257,6 +273,7 @@ impl fmt::Debug for ExecutionRequest {
             .field("kind", &self.kind)
             .field("connection", &self.connection)
             .field("items", &self.items)
+            .field("range_text_len", &self.range_text.len())
             .field("bidi_controls", &self.bidi_controls)
             .finish()
     }
@@ -419,6 +436,20 @@ mod tests {
         // With a selection, "statement" runs the selection (DBeaver behaviour).
         let p = plan(DOC, 10..18, 18, ExecutionKind::Statement);
         assert_eq!(p.as_ref().map(texts).ok(), Some(vec!["select 2"]));
+    }
+
+    #[test]
+    fn the_range_from_first_to_last_item_is_kept() {
+        let Ok(p) = plan(DOC, 0..0, 0, ExecutionKind::Script) else {
+            panic!("plan")
+        };
+        assert_eq!(p.range_text, "select 1;\nselect 2;\n\nselect 3");
+        let Ok(p) = plan(DOC, 7..18, 18, ExecutionKind::Selection) else {
+            panic!("plan")
+        };
+        assert_eq!(p.range_text, "1;\nselect 2");
+        let req = p.into_request(RequestId(1), None, None, 0);
+        assert_eq!(req.range_text, "1;\nselect 2");
     }
 
     #[test]

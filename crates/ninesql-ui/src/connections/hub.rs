@@ -303,6 +303,14 @@ impl ConnectionHub {
         self.connections.get(id)
     }
 
+    /// Tests: drops a saved connection from memory only, keeping its open sessions (a session
+    /// whose connection is gone).
+    #[cfg(test)]
+    pub(crate) fn forget_connection(&mut self, id: ConnectionId, cx: &mut Context<Self>) {
+        let _ = self.connections.remove(id);
+        cx.notify();
+    }
+
     /// Connection types.
     #[must_use]
     pub fn types(&self) -> &ConnectionTypes {
