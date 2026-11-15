@@ -63,6 +63,10 @@ pub(crate) fn classify(scope: Scope, key: &str) -> Class {
         (Scope::Bootstrap, "txnIsolation") => {
             Unsupported("a default transaction isolation level is not supported yet")
         }
+        (Scope::Bootstrap, "defaultObject") => Unsupported(
+            "legacy default-object setting: DBeaver reads it only when `defaultSchema` is empty, \
+             through an indirection NineSQL does not reproduce",
+        ),
         (Scope::Bootstrap, "ignoreErrors") => {
             Unsupported("NineSQL stops at the first failing init statement")
         }

@@ -11,6 +11,9 @@
 //!    PRO master password, corruption) are detected and skipped.
 //! 4. [`mapping`]: turn both into an import model mirroring `ninesql-core`'s connection model,
 //!    with per-connection issues ([`report`]) and the secrets to move to `ninesql-secrets`.
+//!    JDBC driver properties and URL parameters are converted to the property names of the
+//!    NineSQL driver that serves the engine, or dropped with a report entry
+//!    ([`ImportedConnection::dropped_properties`]).
 //!
 //! [`import_project`] runs the whole pipeline for one project.
 //!
@@ -38,12 +41,16 @@ mod fsread;
 mod jdbc;
 pub mod mapping;
 pub mod model;
+mod properties;
 pub mod report;
 
 pub use credentials::{Credentials, CredentialsError, decrypt_credentials};
 pub use detect::{InstallKind, Project, SearchRoots, Workspace, detect_workspaces, open_folder};
 pub use error::DbeaverError;
-pub use mapping::{ConnectionImport, ImportedConnection, ImportedSecret, Outcome, ProjectImport};
+pub use mapping::{
+    ConnectionImport, DroppedProperty, ImportedConnection, ImportedSecret, Outcome, ProjectImport,
+    PropertyDropReason,
+};
 pub use model::{DataSources, parse_data_sources};
 pub use report::{ImportIssue, IssueKind, Severity};
 
