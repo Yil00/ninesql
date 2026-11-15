@@ -208,7 +208,7 @@ pub struct ManagerConfig {
     pub workers: usize,
     /// Connect timeout, per SSH hop and for the driver's connect.
     pub connect_timeout: Duration,
-    /// How long an open waits for its saved secrets (every store call together) before failing with [`SecretError::Unavailable`](ninesql_secrets::SecretError::Unavailable).
+    /// How long an open waits for its saved secrets (every store call together) before failing with [`SecretError::Unavailable`].
     /// Default: [`connect::DEFAULT_SECRET_TIMEOUT`] (60 s).
     pub secret_timeout: Duration,
     /// How long a statement waits for the previous, cancelled one to be confirmed ended before
@@ -794,7 +794,7 @@ impl SessionManager {
     /// read-only session (I3). Secrets are dropped (zeroized) before the driver returns.
     ///
     /// Saved secrets get at most [`ManagerConfig::secret_timeout`] (a store that does not answer
-    /// fails the open with [`SecretError::Unavailable`](ninesql_secrets::SecretError::Unavailable));
+    /// fails the open with [`SecretError::Unavailable`]);
     /// reads are single-flight per secret and bounded in number ([`connect::SecretReads`]).
     /// If the [`Reply`] is dropped before the answer, the open is abandoned where it stands (no
     /// more waiting on a secret store, the tunnel or the driver; a tunnel already opened is shut
