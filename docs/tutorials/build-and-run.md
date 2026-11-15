@@ -21,7 +21,7 @@ macOS is a development platform, not a release target. `make deps-macos` prints 
 - For the dev databases: Docker Desktop or OrbStack.
 - `make` is the one macOS ships (`/usr/bin/make`); GNU `gmake` from Homebrew works too. macOS has no `timeout` command: the Makefile then runs long commands without a time limit, or uses `gtimeout` if GNU coreutils is installed (`brew install coreutils`).
 
-The macOS build has not been verified yet: a CI job builds it on Apple Silicon but is not required to pass while it is new ([ROADMAP, phase 1 follow-ups](../ROADMAP.md#phase-1-follow-ups)). Report a failure as an issue.
+A required CI job builds, tests and lints `ninesql-ui` on Apple Silicon ([docs/10](../10-supported-platforms.md)); Intel Macs are not built in CI. Report a failure as an issue.
 
 ## 2. Get the code and build
 ```bash

@@ -46,5 +46,5 @@ It needs Docker ([Start the dev databases](dev-databases.md#1-requirements)) and
 - Commits are signed off (`git commit -s`) and follow Conventional Commits (`feat(ui): …`, `fix(pgwire): …`).
 
 ## What CI runs that `make` does not
-- The **macOS build** (`cargo build` and `cargo test` of `ninesql-ui` on Apple Silicon). It is not required to pass yet; you cannot reproduce it from Linux, because cross-compiling needs the Apple SDK.
+- The **macOS build** (`cargo build`, `cargo test` and `cargo clippy` of `ninesql-ui` on Apple Silicon). It is required to pass; you cannot reproduce it from Linux, because cross-compiling needs the Apple SDK.
 - The dev-environment workflow, which brings up every profile (`make dev-up PROFILE=sql`, `nosql`, `heavy` are the local equivalents), and CodeQL.

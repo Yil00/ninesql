@@ -79,13 +79,12 @@ jobs:
         run: python3 dev/ready.py down
 
   # macOS build of the application (docs/10-supported-platforms.md: development only, kept
-  # compiling for UI iteration; GPUI renders with Metal there). Never verified so far:
-  # cross-compiling from Linux fails without the Apple SDK (ring needs it). Deliberately NOT in
-  # the needs of "CI result" below: make it required once it is green (ROADMAP, phase 1
-  # follow-ups). deny.toml checks Linux targets only, so macOS-only dependencies are not
-  # license-checked by the deny job.
+  # compiling for UI iteration; GPUI renders with Metal there). It cannot be checked from Linux:
+  # cross-compiling fails without the Apple SDK (ring needs it). Part of the needs of
+  # "CI result" below since it went green on GitHub Actions (PR #9). deny.toml checks Linux
+  # targets only, so macOS-only dependencies are not license-checked by the deny job.
   macos:
-    name: macOS build (ninesql-ui, not required)
+    name: macOS build (ninesql-ui)
     runs-on: macos-15
     timeout-minutes: 60
     steps:
@@ -137,7 +136,7 @@ jobs:
   ci-result:
     name: CI result
     if: always()
-    needs: [rust, driver-integration, deny, docs]
+    needs: [rust, driver-integration, macos, deny, docs]
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     steps:
