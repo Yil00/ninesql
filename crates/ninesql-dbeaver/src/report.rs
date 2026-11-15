@@ -50,8 +50,13 @@ pub enum IssueKind {
     Credentials,
     /// A data-sources file could not be read or parsed.
     File,
-    /// A per-project limit was reached (files, bytes, connections, folders, report entries).
+    /// A per-project limit (files, bytes, connections, folders, report entries) or a
+    /// whole-source limit ([`crate::SourceLimits`]: projects, connections, bytes, report entries)
+    /// was reached: the rest is not read or not imported.
     Truncated,
+    /// A workspace or project resolves to a folder already read in the same import (symbolic
+    /// link, `..`, the same workspace found through two install locations): read once.
+    Duplicate,
     /// A database file lives inside the DBeaver workspace: imported read-only (I4).
     FileInsideDbeaver,
     /// Init statements were imported: the user should review them.

@@ -495,10 +495,87 @@ impl fmt::Debug for ImportedConnection {
 // ---------------------------------------------------------------------------------------------
 
 pub(crate) fn import_project(project: &Project) -> ProjectImport {
+    let mut budget = ReadBudget::per_project(None);
+    match import_project_limited(project, &mut budget) {
+        Ok(out) => out,
+        // Unreachable without a cancel flag; an empty, reported result keeps this total.
+        Err(e) => ProjectImport {
+            project: project.name.clone(),
+            source_files: Vec::new(),
+            credentials: CredentialsStatus::NotFound,
+            folders: Vec::new(),
+            connection_types: Vec::new(),
+            connections: Vec::new(),
+            issues: vec![ImportIssue::new(
+                crate::report::Severity::Error,
+                IssueKind::File,
+                None,
+                format!("{e}; nothing of the project is imported"),
+            )],
+        },
+    }
+}
+
+/// What is left to read in one import: shared by the projects of a source
+/// ([`crate::source::import_source_with_limits`]), or the per-project limits alone
+/// ([`ReadBudget::per_project`]).
+pub(crate) struct ReadBudget<'a> {
+    /// Bytes left (data-sources and credentials files together).
+    pub(crate) bytes: u64,
+    /// Connection entries left.
+    pub(crate) connections: usize,
+    /// Report entries left.
+    pub(crate) issues: usize,
+    /// The configured whole-source limits, for the report messages; `None` for a lone project.
+    pub(crate) source: Option<crate::source::SourceLimits>,
+    /// Checked between files and every [`crate::source::CANCEL_CHECK_INTERVAL`] connections.
+    pub(crate) cancel: Option<&'a crate::source::CancelFlag>,
+    /// A whole-source limit cut something short.
+    pub(crate) source_limit_hit: bool,
+}
+
+impl<'a> ReadBudget<'a> {
+    /// The per-project limits only (the behaviour of [`crate::import_project`]).
+    pub(crate) fn per_project(cancel: Option<&'a crate::source::CancelFlag>) -> Self {
+        Self {
+            bytes: u64::MAX,
+            connections: MAX_CONNECTIONS,
+            issues: MAX_ISSUES,
+            source: None,
+            cancel,
+            source_limit_hit: false,
+        }
+    }
+
+    pub(crate) fn cancelled(&self) -> bool {
+        self.cancel
+            .is_some_and(crate::source::CancelFlag::is_cancelled)
+    }
+
+    pub(crate) fn check_cancel(&self) -> Result<(), crate::DbeaverError> {
+        if self.cancelled() {
+            Err(crate::DbeaverError::Cancelled)
+        } else {
+            Ok(())
+        }
+    }
+
+    fn source_bytes(&self) -> u64 {
+        self.source.map_or(u64::MAX, |s| s.max_bytes)
+    }
+}
+
+/// Reads one project under `budget`, which it decrements. `Err` only for
+/// [`crate::DbeaverError::Cancelled`]; every other problem is an issue of the result.
+pub(crate) fn import_project_limited(
+    project: &Project,
+    budget: &mut ReadBudget<'_>,
+) -> Result<ProjectImport, crate::DbeaverError> {
+    budget.check_cancel()?;
     let mut issues = Issues::default();
     let mut sources = Vec::new();
     let mut source_files = Vec::new();
-    let mut budget = MAX_PROJECT_BYTES;
+    let mut project_left = MAX_PROJECT_BYTES;
     if project.data_source_files.len() > MAX_DATA_SOURCE_FILES {
         issues.warn(
             IssueKind::Truncated,
@@ -510,7 +587,21 @@ pub(crate) fn import_project(project: &Project) -> ProjectImport {
         );
     }
     for path in project.data_source_files.iter().take(MAX_DATA_SOURCE_FILES) {
-        if budget == 0 {
+        budget.check_cancel()?;
+        if budget.bytes == 0 {
+            budget.source_limit_hit = true;
+            issues.warn(
+                IssueKind::Truncated,
+                None,
+                format!(
+                    "the import limit of {} bytes read for the whole source was reached: the \
+                     remaining data-sources files of this project are not read",
+                    budget.source_bytes()
+                ),
+            );
+            break;
+        }
+        if project_left == 0 {
             issues.warn(
                 IssueKind::Truncated,
                 None,
@@ -521,9 +612,31 @@ pub(crate) fn import_project(project: &Project) -> ProjectImport {
             );
             break;
         }
-        let limit = budget.min(MAX_DATA_SOURCES_BYTES);
-        let parsed = fsread::read_limited(path, limit).map(|bytes| {
-            budget = budget.saturating_sub(bytes.len() as u64);
+        let limit = project_left.min(budget.bytes).min(MAX_DATA_SOURCES_BYTES);
+        let by_source = budget.bytes < project_left.min(MAX_DATA_SOURCES_BYTES);
+        let read = match fsread::read_limited(path, limit) {
+            Err(crate::DbeaverError::TooLarge { .. }) if by_source => {
+                // Larger than what is left of the whole-source budget: nothing more is read.
+                budget.bytes = 0;
+                budget.source_limit_hit = true;
+                issues.warn(
+                    IssueKind::Truncated,
+                    None,
+                    format!(
+                        "the import limit of {} bytes read for the whole source was reached: \
+                         {} and the remaining data-sources files of this project are not read",
+                        budget.source_bytes(),
+                        path.display()
+                    ),
+                );
+                break;
+            }
+            other => other,
+        };
+        let parsed = read.map(|bytes| {
+            let n = bytes.len() as u64;
+            project_left = project_left.saturating_sub(n);
+            budget.bytes = budget.bytes.saturating_sub(n);
             parse_data_sources(&bytes).map_err(|e| match e {
                 crate::model::ParseError::InvalidJson { line, column } => {
                     crate::DbeaverError::InvalidJson {
@@ -549,22 +662,66 @@ pub(crate) fn import_project(project: &Project) -> ProjectImport {
             ),
         }
     }
+    budget.check_cancel()?;
     let (credentials, read_failed) = match &project.credentials_file {
         None => (None, false),
-        Some(path) => match fsread::read_limited(path, MAX_CREDENTIALS_BYTES) {
-            Ok(bytes) => (Some(decrypt_credentials(&bytes)), false),
-            Err(e) => {
-                issues.warn(
-                    IssueKind::Credentials,
-                    None,
-                    format!("{e}; connections are imported without saved passwords"),
-                );
-                (None, true)
+        Some(_) if budget.bytes == 0 => {
+            budget.source_limit_hit = true;
+            issues.warn(
+                IssueKind::Truncated,
+                None,
+                format!(
+                    "the import limit of {} bytes read for the whole source was reached: \
+                     credentials-config.json is not read and connections are imported without \
+                     saved passwords",
+                    budget.source_bytes()
+                ),
+            );
+            (None, true)
+        }
+        Some(path) => {
+            let limit = MAX_CREDENTIALS_BYTES.min(budget.bytes);
+            match fsread::read_limited(path, limit) {
+                Ok(bytes) => {
+                    budget.bytes = budget.bytes.saturating_sub(bytes.len() as u64);
+                    (Some(decrypt_credentials(&bytes)), false)
+                }
+                Err(e) => {
+                    if matches!(e, crate::DbeaverError::TooLarge { .. })
+                        && limit < MAX_CREDENTIALS_BYTES
+                    {
+                        budget.bytes = 0;
+                        budget.source_limit_hit = true;
+                        issues.warn(
+                            IssueKind::Truncated,
+                            None,
+                            format!(
+                                "the import limit of {} bytes read for the whole source was \
+                                 reached",
+                                budget.source_bytes()
+                            ),
+                        );
+                    }
+                    issues.warn(
+                        IssueKind::Credentials,
+                        None,
+                        format!("{e}; connections are imported without saved passwords"),
+                    );
+                    (None, true)
+                }
             }
-        },
+        }
     };
-    let mut out = map_sources(&project.name, &sources, credentials);
+    let limits = MapLimits {
+        connections: budget.connections.min(MAX_CONNECTIONS),
+        issues: budget.issues.min(MAX_ISSUES),
+        source: budget.source,
+        cancel: budget.cancel,
+    };
+    let (mut out, source_hit) = map_sources_limited(&project.name, &sources, credentials, &limits);
     drop(sources);
+    budget.check_cancel()?;
+    budget.source_limit_hit |= source_hit;
     if read_failed {
         out.credentials = CredentialsStatus::ReadFailed;
     }
@@ -572,7 +729,23 @@ pub(crate) fn import_project(project: &Project) -> ProjectImport {
     check_file_endpoints(&mut out, &project.workspace);
     issues.0.append(&mut out.issues);
     out.issues = issues.0;
-    out
+    budget.connections = budget.connections.saturating_sub(out.connections.len());
+    let issue_count = out.issues.len()
+        + out
+            .connections
+            .iter()
+            .map(|c| c.issues.len())
+            .sum::<usize>();
+    budget.issues = budget.issues.saturating_sub(issue_count);
+    Ok(out)
+}
+
+/// Limits of one [`map_sources_limited`] call.
+struct MapLimits<'a> {
+    connections: usize,
+    issues: usize,
+    source: Option<crate::source::SourceLimits>,
+    cancel: Option<&'a crate::source::CancelFlag>,
 }
 
 /// Canonicalizes file endpoints and forces read-only on database files that live inside the
@@ -644,7 +817,30 @@ pub fn map_sources(
     sources: &[DataSources],
     credentials: Option<Result<Credentials, CredentialsError>>,
 ) -> ProjectImport {
-    let budget = Budget::new(MAX_ISSUES);
+    let limits = MapLimits {
+        connections: MAX_CONNECTIONS,
+        issues: MAX_ISSUES,
+        source: None,
+        cancel: None,
+    };
+    map_sources_limited(project, sources, credentials, &limits).0
+}
+
+/// [`map_sources`] under `limits`. The flag is `true` when a whole-source limit cut the
+/// project short. When the cancel flag is set, mapping stops early and the partial result must
+/// be discarded by the caller.
+fn map_sources_limited(
+    project: &str,
+    sources: &[DataSources],
+    credentials: Option<Result<Credentials, CredentialsError>>,
+    limits: &MapLimits<'_>,
+) -> (ProjectImport, bool) {
+    let max_connections = limits.connections;
+    let max_issues = limits.issues;
+    let by_source_connections = max_connections < MAX_CONNECTIONS;
+    let by_source_issues = max_issues < MAX_ISSUES;
+    let mut source_hit = false;
+    let budget = Budget::new(max_issues);
     let mut issues = Issues::with_budget(&budget);
     let (credentials_status, mut creds) = match credentials {
         None => (CredentialsStatus::NotFound, None),
@@ -720,14 +916,25 @@ pub fn map_sources(
                     Some(format!("connections.{}", c.id)),
                     "defined in several data-sources files: only the first one is imported",
                 );
-            } else if conn_defs.len() >= MAX_CONNECTIONS {
+            } else if conn_defs.len() >= max_connections {
                 truncated_connections = true;
             } else {
                 conn_defs.insert(&c.id, c);
             }
         }
     }
-    if truncated_connections {
+    if truncated_connections && by_source_connections {
+        source_hit = true;
+        issues.warn(
+            IssueKind::Truncated,
+            None,
+            format!(
+                "the import limit of {} connections for the whole source was reached: the other \
+                 connections of this project are not imported",
+                limits.source.map_or(max_connections, |s| s.max_connections)
+            ),
+        );
+    } else if truncated_connections {
         issues.warn(
             IssueKind::Truncated,
             None,
@@ -767,7 +974,14 @@ pub fn map_sources(
     };
     let mut folder_paths: BTreeSet<Vec<String>> = folders.iter().map(|f| f.path.clone()).collect();
     let mut connections = Vec::with_capacity(conn_defs.len());
-    for (id, def) in conn_defs {
+    for (i, (id, def)) in conn_defs.into_iter().enumerate() {
+        if i % crate::source::CANCEL_CHECK_INTERVAL == 0
+            && limits
+                .cancel
+                .is_some_and(crate::source::CancelFlag::is_cancelled)
+        {
+            break;
+        }
         let saved = creds.as_mut().and_then(|c| c.connections.remove(id));
         let import = map_connection(def, saved, &ctx);
         if let Some(c) = import.imported()
@@ -810,11 +1024,21 @@ pub fn map_sources(
     if budget.exhausted() {
         // One entry beyond the cap, so the report says it is incomplete. Connection state
         // (disabled, read-only, TLS mode) is never affected: only explanations are dropped.
+        let message = if by_source_issues {
+            source_hit = true;
+            format!(
+                "the import limit of {} report entries for the whole source was reached: the \
+                 others are not shown",
+                limits.source.map_or(max_issues, |s| s.max_issues)
+            )
+        } else {
+            format!("more than {MAX_ISSUES} report entries: the others are not shown")
+        };
         out.issues.push(ImportIssue::new(
             crate::report::Severity::Warning,
             IssueKind::Truncated,
             None,
-            format!("more than {MAX_ISSUES} report entries: the others are not shown"),
+            message,
         ));
     }
     tracing::debug!(
@@ -823,7 +1047,7 @@ pub fn map_sources(
         issues = out.issues.len(),
         "DBeaver project mapped"
     );
-    out
+    (out, source_hit)
 }
 
 struct Ctx<'a> {
@@ -3400,5 +3624,32 @@ mod tests {
         ] {
             assert_eq!(key_name_hint(path), hint, "{path}");
         }
+    }
+
+    #[test]
+    fn mapping_stops_at_a_cancel_check() {
+        let mut json = String::from(r#"{"connections":{"#);
+        for i in 0..200 {
+            if i > 0 {
+                json.push(',');
+            }
+            json.push_str(&format!(
+                r#""pg-{i:03}":{{"provider":"postgresql","driver":"postgres-jdbc","configuration":{{"host":"db.example.test"}}}}"#
+            ));
+        }
+        json.push_str("}}");
+        let ds = parse_data_sources(json.as_bytes()).unwrap_or_else(|_| panic!("valid JSON"));
+        let cancel = crate::source::CancelFlag::new();
+        let limits = MapLimits {
+            connections: MAX_CONNECTIONS,
+            issues: MAX_ISSUES,
+            source: None,
+            cancel: Some(&cancel),
+        };
+        let (all, _) = map_sources_limited("General", std::slice::from_ref(&ds), None, &limits);
+        assert_eq!(all.connections.len(), 200);
+        cancel.cancel();
+        let (cut, _) = map_sources_limited("General", std::slice::from_ref(&ds), None, &limits);
+        assert!(cut.connections.is_empty());
     }
 }

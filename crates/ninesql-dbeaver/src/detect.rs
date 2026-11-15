@@ -16,6 +16,8 @@ use std::path::{Path, PathBuf};
 
 use crate::error::DbeaverError;
 use crate::fsread::{self, MAX_SMALL_FILE_BYTES};
+use crate::mapping::MAX_DATA_SOURCE_FILES;
+use crate::source::MAX_SOURCE_PROJECTS;
 
 /// How DBeaver was installed, deduced from the workspace location.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -74,7 +76,8 @@ pub struct Project {
     /// Project folder.
     pub path: PathBuf,
     /// `data-sources.json` first, then the other `data-sources*.json`, by name. Dot-files
-    /// (`.data-sources.json.bak`) and `*.bak` files are never listed.
+    /// (`.data-sources.json.bak`) and `*.bak` files are never listed. At most 65 are listed,
+    /// one more than an import reads, so the import can report that there are more.
     pub data_source_files: Vec<PathBuf>,
     /// `credentials-config.json`, when present.
     pub credentials_file: Option<PathBuf>,
@@ -168,7 +171,12 @@ pub fn open_folder(path: &Path) -> Result<Workspace, DbeaverError> {
     })
 }
 
-/// Projects of a workspace: its non-hidden sub-folders that hold `.dbeaver/data-sources*.json`.
+/// Projects of a workspace: its non-hidden sub-folders that hold `.dbeaver/data-sources*.json`,
+/// in name order.
+///
+/// At most [`MAX_SOURCE_PROJECTS`] + 1 projects are listed: one more than an import reads, so
+/// [`crate::import_source`] can report that the folder holds more. Symbolic links to project
+/// folders are followed and listed; an import reads each canonical folder once.
 ///
 /// Projects linked from outside the workspace folder (registered in Eclipse metadata) are not
 /// found; the user can pick them with [`open_folder`] (to verify against a real workspace).
@@ -181,6 +189,7 @@ pub fn list_projects(workspace: &Path) -> Vec<Project> {
         .into_iter()
         .filter(|e| e.is_dir && !e.name.starts_with('.'))
         .filter_map(|e| read_project(&e.path, workspace))
+        .take(MAX_SOURCE_PROJECTS + 1)
         .collect()
 }
 
@@ -206,6 +215,8 @@ fn read_project(path: &Path, workspace: &Path) -> Option<Project> {
         return None;
     }
     data_source_files.sort();
+    // One more than an import reads, so the import can report that there are more.
+    data_source_files.truncate(MAX_DATA_SOURCE_FILES + 1);
     let credentials = dot_dbeaver.join("credentials-config.json");
     let name = path
         .file_name()
