@@ -14,8 +14,13 @@
 
 use std::path::{Path, PathBuf};
 
+use std::collections::HashMap;
+
 use crate::error::DbeaverError;
-use crate::fsread::{self, MAX_SMALL_FILE_BYTES};
+use crate::fsread::{self, FileId, MAX_SMALL_FILE_BYTES, ScanBudget};
+use crate::mapping::MAX_DATA_SOURCE_FILES;
+use crate::source::CancelFlag;
+use crate::source::MAX_SOURCE_PROJECTS;
 
 /// How DBeaver was installed, deduced from the workspace location.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -74,7 +79,9 @@ pub struct Project {
     /// Project folder.
     pub path: PathBuf,
     /// `data-sources.json` first, then the other `data-sources*.json`, by name. Dot-files
-    /// (`.data-sources.json.bak`) and `*.bak` files are never listed.
+    /// (`.data-sources.json.bak`) and `*.bak` files are never listed. At most 65 are listed,
+    /// one more than an import reads, so the import can report that there are more (a
+    /// `.dbeaver` listing cut by its own limits always leaves more than 64).
     pub data_source_files: Vec<PathBuf>,
     /// `credentials-config.json`, when present.
     pub credentials_file: Option<PathBuf>,
@@ -84,8 +91,16 @@ pub struct Project {
     pub workspace: PathBuf,
 }
 
+/// Most directories one detection ([`detect_workspaces`], [`open_folder`]) lists.
+pub const MAX_DETECT_DIRS: usize = 2_048;
+/// Most directory entries one detection reads or `stat`s, all listings together.
+pub const MAX_DETECT_ENTRIES: usize = 200_000;
+/// Most skipped duplicate project folders recorded per workspace; the others are counted.
+pub const MAX_LISTED_DUPLICATES: usize = 256;
+
 /// A DBeaver workspace and its projects.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct Workspace {
     /// Install kind deduced from the location.
     pub kind: InstallKind,
@@ -93,45 +108,128 @@ pub struct Workspace {
     pub path: PathBuf,
     /// `product-version` from `.metadata/dbeaver-workspace.properties`, when readable.
     pub product_version: Option<String>,
-    /// Projects with at least one data-sources file.
+    /// Projects with at least one data-sources file, at most [`MAX_SOURCE_PROJECTS`].
     pub projects: Vec<Project>,
+    /// Project folders not listed because their `.dbeaver` directory is the same directory
+    /// (same device and inode) as a listed project's: a symbolic link, a `..` path. At most
+    /// [`MAX_LISTED_DUPLICATES`]; [`Workspace::more_duplicates`] counts the others.
+    pub duplicate_projects: Vec<DuplicateProject>,
+    /// Duplicate project folders past [`MAX_LISTED_DUPLICATES`], counted only.
+    pub more_duplicates: usize,
+    /// The listing was cut: the folder may hold more projects than [`Workspace::projects`]
+    /// (more than [`MAX_SOURCE_PROJECTS`] candidates, a directory over its entry limits, or the
+    /// detection budget [`MAX_DETECT_DIRS`] / [`MAX_DETECT_ENTRIES`] spent). **A caller that
+    /// imports the projects must report it**; [`crate::import_source`] does.
+    pub listing_truncated: bool,
+}
+
+/// A project folder skipped while listing because it is the same folder as a listed project.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DuplicateProject {
+    /// The folder skipped.
+    pub path: PathBuf,
+    /// The listed project folder it resolves to.
+    pub same_as: PathBuf,
+}
+
+/// Projects found in one folder.
+struct ProjectListing {
+    projects: Vec<Project>,
+    duplicates: Vec<DuplicateProject>,
+    more_duplicates: usize,
+    truncated: bool,
+}
+
+impl ProjectListing {
+    fn into_workspace(
+        self,
+        kind: InstallKind,
+        path: PathBuf,
+        product_version: Option<String>,
+    ) -> Workspace {
+        Workspace {
+            kind,
+            path,
+            product_version,
+            projects: self.projects,
+            duplicate_projects: self.duplicates,
+            more_duplicates: self.more_duplicates,
+            listing_truncated: self.truncated,
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.projects.is_empty() && self.duplicates.is_empty() && !self.truncated
+    }
+}
+
+fn detect_budget(cancel: Option<&CancelFlag>) -> ScanBudget<'_> {
+    ScanBudget::new(MAX_DETECT_DIRS, MAX_DETECT_ENTRIES, cancel)
 }
 
 /// Workspaces found in the known locations. Locations that do not exist or hold no project are
-/// skipped; nothing is created.
+/// skipped; nothing is created. Not cancellable: see [`detect_workspaces_with`].
 #[must_use]
 pub fn detect_workspaces(roots: &SearchRoots) -> Vec<Workspace> {
+    detect_workspaces_with(roots, &CancelFlag::new()).unwrap_or_default()
+}
+
+/// [`detect_workspaces`], stopping when `cancel` is set. All locations share one detection
+/// budget ([`MAX_DETECT_DIRS`], [`MAX_DETECT_ENTRIES`]).
+///
+/// # Errors
+/// Only [`DbeaverError::Cancelled`].
+pub fn detect_workspaces_with(
+    roots: &SearchRoots,
+    cancel: &CancelFlag,
+) -> Result<Vec<Workspace>, DbeaverError> {
+    let mut budget = detect_budget(Some(cancel));
     let mut found = Vec::new();
     for (kind, path) in roots.candidates() {
+        budget.check_cancel()?;
         if !fsread::is_dir(&path) {
             continue;
         }
-        let projects = list_projects(&path);
+        let listing = match list_projects_in(&path, &mut budget) {
+            Ok(l) => l,
+            Err(DbeaverError::Cancelled) => return Err(DbeaverError::Cancelled),
+            Err(_) => continue,
+        };
         tracing::debug!(
             ?kind,
-            projects = projects.len(),
+            projects = listing.projects.len(),
+            truncated = listing.truncated,
             "DBeaver workspace location checked"
         );
-        if projects.is_empty() {
+        if listing.is_empty() {
             continue;
         }
-        found.push(Workspace {
-            kind,
-            product_version: product_version(&path),
-            path,
-            projects,
-        });
+        let version = product_version(&path);
+        found.push(listing.into_workspace(kind, path, version));
     }
-    found
+    Ok(found)
 }
 
 /// Opens a folder chosen by the user: a workspace (its project sub-folders are listed) or a
-/// single project folder (with a `.dbeaver/` directory).
+/// single project folder (with a `.dbeaver/` directory). Not cancellable: see
+/// [`open_folder_with`].
 ///
 /// # Errors
 /// [`DbeaverError::Io`] when the folder cannot be listed, [`DbeaverError::NotDbeaver`] when it
 /// holds no DBeaver project.
 pub fn open_folder(path: &Path) -> Result<Workspace, DbeaverError> {
+    open_folder_with(path, &CancelFlag::new())
+}
+
+/// [`open_folder`], stopping when `cancel` is set, under one detection budget
+/// ([`MAX_DETECT_DIRS`], [`MAX_DETECT_ENTRIES`]). A folder whose listing was cut before any
+/// project was found is returned with no project and [`Workspace::listing_truncated`] set, so
+/// the cut is reported instead of "not DBeaver".
+///
+/// # Errors
+/// As [`open_folder`], and [`DbeaverError::Cancelled`].
+pub fn open_folder_with(path: &Path, cancel: &CancelFlag) -> Result<Workspace, DbeaverError> {
+    let mut budget = detect_budget(Some(cancel));
     if !fsread::is_dir(path) {
         return Err(DbeaverError::NotDbeaver {
             path: path.to_path_buf(),
@@ -144,56 +242,124 @@ pub fn open_folder(path: &Path) -> Result<Workspace, DbeaverError> {
         Some(parent) if parent_is_workspace => parent.to_path_buf(),
         _ => path.to_path_buf(),
     };
-    if let Some(project) = read_project(path, &workspace) {
-        return Ok(Workspace {
-            kind: InstallKind::Custom,
-            path: path.to_path_buf(),
-            product_version: path.parent().and_then(product_version),
+    let (single, truncated) = read_project(path, &workspace, &mut budget)?;
+    if let Some(project) = single {
+        let listing = ProjectListing {
             projects: vec![project],
-        });
+            duplicates: Vec::new(),
+            more_duplicates: 0,
+            truncated,
+        };
+        let version = path.parent().and_then(product_version);
+        return Ok(listing.into_workspace(InstallKind::Custom, path.to_path_buf(), version));
     }
-    // Propagate a listing error (permissions) instead of reporting "not DBeaver".
-    fsread::list_dir(path)?;
-    let projects = list_projects(path);
-    if projects.is_empty() {
+    // A listing error (permissions) is propagated instead of reporting "not DBeaver".
+    let listing = list_projects_in(path, &mut budget)?;
+    if listing.is_empty() {
         return Err(DbeaverError::NotDbeaver {
             path: path.to_path_buf(),
         });
     }
-    Ok(Workspace {
-        kind: InstallKind::Custom,
-        product_version: product_version(path),
-        path: path.to_path_buf(),
-        projects,
-    })
+    let version = product_version(path);
+    Ok(listing.into_workspace(InstallKind::Custom, path.to_path_buf(), version))
 }
 
-/// Projects of a workspace: its non-hidden sub-folders that hold `.dbeaver/data-sources*.json`.
+/// Projects of a workspace: its non-hidden sub-folders that hold `.dbeaver/data-sources*.json`,
+/// in name order, at most [`MAX_SOURCE_PROJECTS`]. Folders whose `.dbeaver` directory is the
+/// same as a listed project's (symbolic links) are not listed twice.
+///
+/// This function does not say whether the listing was cut or what it skipped; the
+/// [`Workspace`] values of [`detect_workspaces`] and [`open_folder`] do.
 ///
 /// Projects linked from outside the workspace folder (registered in Eclipse metadata) are not
 /// found; the user can pick them with [`open_folder`] (to verify against a real workspace).
 #[must_use]
 pub fn list_projects(workspace: &Path) -> Vec<Project> {
-    let Ok(entries) = fsread::list_dir(workspace) else {
-        return Vec::new();
-    };
-    entries
-        .into_iter()
-        .filter(|e| e.is_dir && !e.name.starts_with('.'))
-        .filter_map(|e| read_project(&e.path, workspace))
-        .collect()
+    let mut budget = detect_budget(None);
+    list_projects_in(workspace, &mut budget)
+        .map(|l| l.projects)
+        .unwrap_or_default()
 }
 
-/// Reads one project folder, if it holds at least one data-sources file.
-fn read_project(path: &Path, workspace: &Path) -> Option<Project> {
+/// Lists the projects of `workspace` under `budget`.
+///
+/// Each candidate costs one `stat` of its `.dbeaver` directory; a candidate whose `.dbeaver`
+/// was already seen (same device and inode) is recorded as a duplicate without being listed.
+fn list_projects_in(
+    workspace: &Path,
+    budget: &mut ScanBudget<'_>,
+) -> Result<ProjectListing, DbeaverError> {
+    let listing = fsread::list_dir(workspace, |n| !n.starts_with('.'), budget)?;
+    let mut out = ProjectListing {
+        projects: Vec::new(),
+        duplicates: Vec::new(),
+        more_duplicates: 0,
+        truncated: listing.truncated,
+    };
+    let mut seen: HashMap<FileId, Option<PathBuf>> = HashMap::new();
+    for entry in listing.entries.into_iter().filter(|e| e.is_dir) {
+        budget.check_cancel()?;
+        let dot = entry.path.join(".dbeaver");
+        let Some(id) = fsread::dir_id(&dot, budget) else {
+            if budget.exhausted {
+                out.truncated = true;
+                break;
+            }
+            continue;
+        };
+        if let Some(first) = seen.get(&id) {
+            // A link to a folder that is not a project: nothing to read, nothing to report.
+            let Some(first) = first else { continue };
+            if out.duplicates.len() < MAX_LISTED_DUPLICATES {
+                out.duplicates.push(DuplicateProject {
+                    path: entry.path.clone(),
+                    same_as: first.clone(),
+                });
+            } else {
+                out.more_duplicates += 1;
+            }
+            continue;
+        }
+        if out.projects.len() >= MAX_SOURCE_PROJECTS {
+            // Another candidate with a `.dbeaver` directory: there may be more projects.
+            out.truncated = true;
+            break;
+        }
+        let (project, truncated) = read_project(&entry.path, workspace, budget)?;
+        out.truncated |= truncated;
+        // Recorded even when it is not a project, so links to it are not listed again.
+        seen.insert(id, project.as_ref().map(|_| entry.path.clone()));
+        if let Some(project) = project {
+            out.projects.push(project);
+        }
+        if budget.exhausted {
+            out.truncated = true;
+            break;
+        }
+    }
+    Ok(out)
+}
+
+/// Reads one project folder, if it holds at least one data-sources file. The flag is `true`
+/// when the `.dbeaver` listing was cut.
+fn read_project(
+    path: &Path,
+    workspace: &Path,
+    budget: &mut ScanBudget<'_>,
+) -> Result<(Option<Project>, bool), DbeaverError> {
     let dot_dbeaver = path.join(".dbeaver");
     if !fsread::is_dir(&dot_dbeaver) {
-        return None;
+        return Ok((None, false));
     }
-    let entries = fsread::list_dir(&dot_dbeaver).ok()?;
-    let mut data_source_files: Vec<(bool, String, PathBuf)> = entries
+    let listing = match fsread::list_dir(&dot_dbeaver, is_data_sources_name, budget) {
+        Ok(l) => l,
+        Err(DbeaverError::Cancelled) => return Err(DbeaverError::Cancelled),
+        Err(_) => return Ok((None, false)),
+    };
+    let mut data_source_files: Vec<(bool, String, PathBuf)> = listing
+        .entries
         .iter()
-        .filter(|e| e.is_file && is_data_sources_name(&e.name))
+        .filter(|e| e.is_file)
         .map(|e| {
             (
                 e.name != "data-sources.json",
@@ -202,22 +368,33 @@ fn read_project(path: &Path, workspace: &Path) -> Option<Project> {
             )
         })
         .collect();
+    // A cut listing may have left out the main file (`-` sorts before `.`).
+    let main = dot_dbeaver.join("data-sources.json");
+    if listing.truncated
+        && !data_source_files.iter().any(|(other, _, _)| !other)
+        && fsread::is_file(&main)
+    {
+        data_source_files.push((false, "data-sources.json".to_owned(), main));
+    }
     if data_source_files.is_empty() {
-        return None;
+        return Ok((None, listing.truncated));
     }
     data_source_files.sort();
+    // One more than an import reads, so the import can report that there are more.
+    data_source_files.truncate(MAX_DATA_SOURCE_FILES + 1);
     let credentials = dot_dbeaver.join("credentials-config.json");
     let name = path
         .file_name()
         .map(|n| n.to_string_lossy().into_owned())
         .unwrap_or_default();
-    Some(Project {
+    let project = Project {
         name,
         path: path.to_path_buf(),
         data_source_files: data_source_files.into_iter().map(|(_, _, p)| p).collect(),
         credentials_file: fsread::is_file(&credentials).then_some(credentials),
         workspace: workspace.to_path_buf(),
-    })
+    };
+    Ok((Some(project), listing.truncated))
 }
 
 /// `data-sources.json` or `data-sources*.json`; never a dot-file or a backup.

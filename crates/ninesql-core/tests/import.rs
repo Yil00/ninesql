@@ -1818,3 +1818,101 @@ fn a_changed_route_resets_the_host_key_policy_and_drops_the_server_secret() {
             .all(|(s, _, _)| *s != SecretSlot::SshServer)
     );
 }
+
+/// P2-D M1 (core side): a cancelled preview stops and says so; nothing is written.
+#[test]
+fn a_cancelled_preview_answers_cancelled() {
+    let e = env();
+    let source = fixture("24.3.5");
+    let cancel = ninesql_core::ImportCancel::new();
+    cancel.cancel();
+    let err = e
+        .importer
+        .preview_cancellable(&ImportSource::Folder(source.clone()), &cancel)
+        .unwrap_err();
+    assert!(matches!(err, ImportError::Cancelled), "{err:?}");
+    // Without a cancel the same source previews.
+    e.importer
+        .preview_cancellable(
+            &ImportSource::Folder(source.clone()),
+            &ninesql_core::ImportCancel::new(),
+        )
+        .unwrap();
+
+    // Through the services: an explicit cancel answers `Cancelled` (or the preview finished
+    // first), and a dropped reply stops the work.
+    let root = tempfile::tempdir().unwrap();
+    ui(async move {
+        let services = tokio::time::timeout(
+            Duration::from_secs(20),
+            CoreServices::start(core_config(root.path())),
+        )
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+        let (reply, cancel) =
+            services.preview_import_cancellable(ImportSource::Folder(source.clone()));
+        cancel.cancel();
+        match tokio::time::timeout(Duration::from_secs(20), reply)
+            .await
+            .unwrap()
+            .unwrap()
+        {
+            Err(ImportError::Cancelled) | Ok(_) => {}
+            Err(other) => panic!("{other:?}"),
+        }
+        let (reply, cancel) = services.preview_import_cancellable(ImportSource::Folder(source));
+        drop(reply);
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !cancel.is_cancelled() && Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(
+            cancel.is_cancelled(),
+            "dropping the reply cancels the preview"
+        );
+    });
+}
+
+/// P2-D M1: a cut source is visible on the preview, and a cut listing that found no project is
+/// an explained error, never an empty preview.
+#[test]
+fn truncated_sources_are_reported_and_an_empty_cut_listing_is_explained() {
+    let e = env();
+    let ws = e.root.join("many-projects");
+    for i in 0..ninesql_core::dbeaver::source::MAX_SOURCE_PROJECTS + 2 {
+        let dot = ws.join(format!("p{i:04}/.dbeaver"));
+        std::fs::create_dir_all(&dot).unwrap();
+        std::fs::write(
+            dot.join("data-sources.json"),
+            format!(
+                r#"{{"folders":{{}},"connections":{{"postgres-jdbc-p{i}":{{"provider":"postgresql","driver":"postgres-jdbc","name":"p{i}","configuration":{{"host":"db.example.test","port":"5432","database":"nine","user":"u","type":"dev"}}}}}}}}"#
+            ),
+        )
+        .unwrap();
+    }
+    let preview = e.importer.preview(&ImportSource::Folder(ws)).unwrap();
+    assert!(preview.truncated());
+    assert_eq!(
+        preview.projects.len(),
+        ninesql_core::dbeaver::source::MAX_SOURCE_PROJECTS
+    );
+
+    let empty = e.root.join("cut-before-any-project");
+    for i in 0..ninesql_core::dbeaver::detect::MAX_DETECT_DIRS + 10 {
+        std::fs::create_dir_all(empty.join(format!("b{i:05}/.dbeaver"))).unwrap();
+    }
+    let err = e
+        .importer
+        .preview(&ImportSource::Folder(empty))
+        .unwrap_err();
+    assert!(matches!(err, ImportError::ListingTruncated), "{err:?}");
+
+    // A complete source is not truncated.
+    let preview = e
+        .importer
+        .preview(&ImportSource::Folder(fixture("24.3.5")))
+        .unwrap();
+    assert!(!preview.truncated());
+}

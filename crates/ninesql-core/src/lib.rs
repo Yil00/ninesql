@@ -1,5 +1,6 @@
 //! Application core: connection model, workspace services, Tokio driver runtime and the bridge to
-//! the UI (ADR-0004). ROADMAP: P0-D (connection model, workspace), P1-D, P3-C.
+//! the UI (ADR-0004). ROADMAP: P0-D (connection model, workspace), P1-D, P3-C (execution
+//! service [`execution`], query history [`history`], preferences [`preferences`]).
 //!
 //! The application starts it with [`CoreServices::start`] ([`services`]): workspace, secret
 //! backend (keyring → vault → ask every time), session manager, sleep / screen-lock locking and
@@ -11,7 +12,10 @@ pub mod connection;
 pub mod connection_type;
 pub mod dbeaver_roots;
 mod error;
+pub mod execution;
+pub mod history;
 pub mod import;
+pub mod preferences;
 pub mod properties;
 pub mod registry;
 pub mod runtime;
@@ -28,11 +32,20 @@ pub use connection::{
 pub use connection_type::{Color, ConnectionType, ConnectionTypeId, ConnectionTypes, SafetyPolicy};
 pub use dbeaver_roots::{DbeaverRoots, FileCheck};
 pub use error::{ConnectionError, CoreError, WorkspaceError};
+pub use execution::{
+    ErrorPosition, ExecutionService, FetchMode, Run, RunControl, RunEnd, RunEvent, RunKind,
+    RunRequest, RunSummary, TimeoutChoice,
+};
+pub use history::{History, HistoryError, Recorded, StatementRecord};
 pub use import::{
-    Change, ConnectionPlan, FolderPlan, ImportChoices, ImportError, ImportOutcome, ImportPreview,
-    ImportReportFile, ImportSource, ImportStatus, Importer, PlanAction, PreviewWorkspace,
-    ProjectPreview, SecretChange, SecretChangeKind, SecretToMove, TlsChange, TypeAction, TypePlan,
-    UpdateDiff,
+    Change, ConnectionPlan, FolderPlan, ImportCancel, ImportChoices, ImportError, ImportOutcome,
+    ImportPreview, ImportReportFile, ImportSource, ImportStatus, Importer, PlanAction,
+    PreviewWorkspace, ProjectPreview, SecretChange, SecretChangeKind, SecretToMove, TlsChange,
+    TypeAction, TypePlan, UpdateDiff,
+};
+pub use preferences::{
+    ConfirmationPreferences, ExecutionPreferences, HistoryPreferences, OnError, PreferenceChange,
+    PreferenceIssue, Preferences, PreferencesError,
 };
 pub use registry::{DriverRegistry, EnableError};
 pub use runtime::DriverRuntime;
@@ -43,9 +56,10 @@ pub use services::{
 pub use session::{
     CloseReason, ConfirmReason, ConfirmationRequest, ConfirmationToken, CoreEvent, CoreEvents,
     ExecEvent, ExecuteRequest, Execution, HostKeyConfirmation, HostKeyToken, InitSqlConfirmation,
-    InitSqlToken, KnownHostsFiles, ManagerConfig, Next, OpenOutcome, OpenRequest, Reply,
-    SecretsLockReason, SessionHandle, SessionId, SessionInfo, SessionManager, SessionWarning,
-    TransactionState,
+    InitSqlToken, KnownHostsFiles, MAX_RECONNECT_ATTEMPTS, MAX_RECONNECT_DELAY, MAX_RECONNECT_TIME,
+    ManagerConfig, Next, OpenOutcome, OpenRequest, Reconnect, ReconnectEvent, ReconnectPolicy,
+    Reply, SecretsLockReason, SessionHandle, SessionId, SessionInfo, SessionManager,
+    SessionWarning, TransactionEnd, TransactionState,
 };
 pub use workspace::{
     ConnectionTypesFile, Connections, ConnectionsFile, LoadIssue, LoadedConnections, MarkerClear,

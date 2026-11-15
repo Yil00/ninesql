@@ -35,6 +35,9 @@ serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
+# Execution preferences in settings.toml (P3-C): lenient read, comment-preserving edits.
+toml.workspace = true
+toml_edit.workspace = true
 uuid.workspace = true
 secrecy.workspace = true
 zeroize.workspace = true

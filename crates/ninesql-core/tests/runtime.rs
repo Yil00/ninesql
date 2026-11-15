@@ -98,6 +98,12 @@ fn open_execute_stream_close_lifecycle() {
 
         h.close().await.unwrap().unwrap();
         assert!(h.close().await.unwrap().is_ok(), "idempotent");
+        // The auto-commit switch above reported its new transaction state (P3-C).
+        assert!(matches!(
+            events.recv().await,
+            Some(CoreEvent::TransactionChanged { session, state, .. })
+                if session == h.id() && !state.auto_commit
+        ));
         match tokio::time::timeout(Duration::from_secs(5), events.recv()).await {
             Ok(Some(CoreEvent::SessionClosed {
                 session, reason, ..

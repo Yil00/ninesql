@@ -50,8 +50,13 @@ pub enum IssueKind {
     Credentials,
     /// A data-sources file could not be read or parsed.
     File,
-    /// A per-project limit was reached (files, bytes, connections, folders, report entries).
+    /// A per-project limit (files, bytes, connections, folders, report entries) or a
+    /// whole-source limit ([`crate::SourceLimits`]: projects, connections, bytes, report entries)
+    /// was reached: the rest is not read or not imported.
     Truncated,
+    /// A workspace or project resolves to a folder already read in the same import (symbolic
+    /// link, `..`, the same workspace found through two install locations): read once.
+    Duplicate,
     /// A database file lives inside the DBeaver workspace: imported read-only (I4).
     FileInsideDbeaver,
     /// Init statements were imported: the user should review them.
@@ -90,13 +95,24 @@ impl ImportIssue {
             severity,
             kind,
             key: key.map(|k| ident(&k, MAX_KEY_PATH)),
-            message: message.into(),
+            // Messages embed paths and error texts: no control character, bounded length.
+            message: ident(&message.into(), MAX_MESSAGE),
         }
     }
 }
 
 /// Longest key path kept in an issue, in bytes.
 const MAX_KEY_PATH: usize = 512;
+/// Longest issue message, in bytes.
+const MAX_MESSAGE: usize = 4096;
+/// Longest path embedded in an issue message, in bytes.
+const MAX_PATH_SHOWN: usize = 512;
+
+/// A path made safe to show in an issue message ([`ident`] of its display form).
+pub(crate) fn shown_path(path: &std::path::Path) -> String {
+    ident(&path.display().to_string(), MAX_PATH_SHOWN)
+}
+
 /// Longest identifier embedded in an issue message, in bytes.
 pub(crate) const MAX_IDENT: usize = 96;
 

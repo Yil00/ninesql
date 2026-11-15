@@ -307,7 +307,8 @@ pub struct ImportPreview {
     /// stricter rules of both) and planned against the project's types, built-ins included
     /// (only ever made stricter).
     pub connection_types: Vec<TypePlan>,
-    /// Report entries not tied to one project (connection types).
+    /// Report entries not tied to one project: connection types, and the source-level entries
+    /// of the read (duplicate folders read once, whole-source limits reached).
     pub issues: Vec<ImportIssue>,
     /// Where secrets go by default (the session's backend); `None`: no store, saved passwords
     /// are not imported and NineSQL asks for them at connect.
@@ -318,6 +319,17 @@ impl ImportPreview {
     /// Every connection plan, all projects together.
     pub fn connections(&self) -> impl Iterator<Item = &ConnectionPlan> {
         self.projects.iter().flat_map(|p| p.connections.iter())
+    }
+
+    /// A whole-source limit was reached or a folder listing was cut (P2-D M1): the source may
+    /// hold more than this preview shows. The UI says so; the [`IssueKind::Truncated`] entries
+    /// of [`Self::issues`] and of the projects say what was left out.
+    #[must_use]
+    pub fn truncated(&self) -> bool {
+        self.issues
+            .iter()
+            .chain(self.projects.iter().flat_map(|p| p.issues.iter()))
+            .any(|i| i.kind == IssueKind::Truncated)
     }
 
     /// Number of secrets the import would move.
@@ -447,9 +459,60 @@ pub enum ImportError {
     /// Workspace files could not be read or written.
     #[error(transparent)]
     Workspace(#[from] WorkspaceError),
+    /// The folder listing was cut (too many entries, the detection budget spent) before any
+    /// DBeaver project could be read. Pick the DBeaver workspace folder, or one project folder,
+    /// directly.
+    #[error(
+        "the folder holds too many entries to look for DBeaver projects in it; pick the DBeaver workspace folder or a project folder directly"
+    )]
+    ListingTruncated,
+    /// The preview was cancelled ([`ImportCancel::cancel`], or its reply was dropped). Nothing
+    /// was written.
+    #[error("the import preview was cancelled")]
+    Cancelled,
     /// The blocking task failed.
     #[error("import task: {0}")]
     Runtime(String),
+}
+
+/// Cancels a running import preview (P2-D M1). Cheap to clone; every clone shares one flag.
+///
+/// The flag is an `Arc<AtomicBool>`, so the DBeaver reader's own cancel flag can share it
+/// (`ninesql_dbeaver::CancelFlag::from_shared`, see [`ImportCancel::shared`]).
+#[derive(Debug, Clone, Default)]
+pub struct ImportCancel(std::sync::Arc<std::sync::atomic::AtomicBool>);
+
+impl ImportCancel {
+    /// A flag not cancelled yet.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Asks the preview to stop. Idempotent, never blocks.
+    pub fn cancel(&self) {
+        self.0.store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// Whether [`Self::cancel`] was called.
+    #[must_use]
+    pub fn is_cancelled(&self) -> bool {
+        self.0.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// The shared flag, for the DBeaver reader's cancel hook.
+    #[must_use]
+    pub fn shared(&self) -> std::sync::Arc<std::sync::atomic::AtomicBool> {
+        std::sync::Arc::clone(&self.0)
+    }
+
+    fn check(&self) -> Result<(), ImportError> {
+        if self.is_cancelled() {
+            Err(ImportError::Cancelled)
+        } else {
+            Ok(())
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -497,8 +560,24 @@ impl Importer {
     /// # Errors
     /// [`ImportError::Source`], [`ImportError::NothingFound`], [`ImportError::Workspace`].
     pub fn preview(&self, source: &ImportSource) -> Result<ImportPreview, ImportError> {
-        let (preview, payload, _) = self.plan(source, &BTreeMap::new())?;
+        self.preview_cancellable(source, &ImportCancel::new())
+    }
+
+    /// [`Self::preview`], stopping with [`ImportError::Cancelled`] once `cancel` is set: the
+    /// DBeaver reader checks it during detection, folder listing and every project read, and the
+    /// core before planning each project. Secrets already read are dropped (zeroized) with the
+    /// partial result. **Blocking.**
+    ///
+    /// # Errors
+    /// As [`Self::preview`], and [`ImportError::Cancelled`].
+    pub fn preview_cancellable(
+        &self,
+        source: &ImportSource,
+        cancel: &ImportCancel,
+    ) -> Result<ImportPreview, ImportError> {
+        let (preview, payload, _) = self.plan(source, &BTreeMap::new(), cancel)?;
         drop(payload);
+        cancel.check()?;
         Ok(preview)
     }
 
@@ -523,7 +602,8 @@ impl Importer {
             .connections()
             .filter_map(|c| Some((c.dbeaver_id.clone(), c.connection.as_ref()?.id)))
             .collect();
-        let (fresh, mut payload, existing) = self.plan(&preview.source, &ids)?;
+        let (fresh, mut payload, existing) =
+            self.plan(&preview.source, &ids, &ImportCancel::new())?;
         if fresh != *preview {
             return Err(ImportError::SourceChanged);
         }
@@ -783,38 +863,77 @@ impl Importer {
         &self,
         source: &ImportSource,
         ids: &BTreeMap<String, ConnectionId>,
+        cancel: &ImportCancel,
     ) -> Result<(ImportPreview, SecretPayload, Connections), ImportError> {
+        cancel.check()?;
+        // One flag for the whole read: detection, folder listing and project reads stop when
+        // the preview is cancelled (P2-D M1).
+        let flag = ninesql_dbeaver::CancelFlag::from_shared(cancel.shared());
+        let dbeaver = |e: ninesql_dbeaver::DbeaverError| match e {
+            ninesql_dbeaver::DbeaverError::Cancelled => ImportError::Cancelled,
+            other => ImportError::Source(other),
+        };
         let workspaces = match source {
             ImportSource::Detect(roots) => {
-                let found = ninesql_dbeaver::detect_workspaces(roots);
+                let found =
+                    ninesql_dbeaver::detect_workspaces_with(roots, &flag).map_err(dbeaver)?;
                 if found.is_empty() {
                     return Err(ImportError::NothingFound);
                 }
                 found
             }
-            ImportSource::Folder(path) => vec![ninesql_dbeaver::open_folder(path)?],
+            ImportSource::Folder(path) => {
+                vec![ninesql_dbeaver::open_folder_with(path, &flag).map_err(dbeaver)?]
+            }
         };
+        // Every folder becomes a DBeaver root before anything is read (I4).
         for w in &workspaces {
             self.add_root(&w.path);
             for p in &w.projects {
                 self.add_root(&p.workspace);
             }
         }
+        let listing_cut = workspaces.iter().any(|w| w.listing_truncated);
         let existing = self.workspace.load_connections()?.connections;
         let current_types = self.workspace.load_connection_types()?;
 
-        // Every project is read first, so the connection types of all of them (all detected
-        // workspaces included) are folded before any connection is planned (review, M2).
-        let mut imports = Vec::new();
-        for w in &workspaces {
-            for project in &w.projects {
-                imports.push((project, ninesql_dbeaver::import_project(project)));
-            }
+        // Every project is read once, under the whole-source limits, before anything is
+        // planned, so the connection types of all of them (all detected workspaces included)
+        // are folded before any connection is planned (review, M2).
+        let read = ninesql_dbeaver::import_source(workspaces, &flag).map_err(dbeaver)?;
+        cancel.check()?;
+        if read.projects.is_empty() {
+            // Never an empty preview without a reason.
+            return Err(if read.truncated || listing_cut {
+                ImportError::ListingTruncated
+            } else {
+                ImportError::NothingFound
+            });
         }
-        let mut issues = Vec::new();
+        let ninesql_dbeaver::SourceImport {
+            workspaces,
+            projects: imports,
+            issues: source_issues,
+            truncated,
+        } = read;
+        let mut issues = source_issues;
+        // The cut is always reported, so `ImportPreview::truncated` sees it.
+        let reported = issues.iter().any(|i| i.kind == IssueKind::Truncated)
+            || imports
+                .iter()
+                .flat_map(|p| p.import.issues.iter())
+                .any(|i| i.kind == IssueKind::Truncated);
+        if (truncated || listing_cut) && !reported {
+            issues.push(issue(
+                Severity::Warning,
+                IssueKind::Truncated,
+                None,
+                "the DBeaver source holds more than NineSQL reads in one import: some projects or connections were not read",
+            ));
+        }
         let all_types: Vec<&ImportedConnectionType> = imports
             .iter()
-            .flat_map(|(_, i)| i.connection_types.iter())
+            .flat_map(|p| p.import.connection_types.iter())
             .collect();
         let connection_types = plan_types(&all_types, &current_types, &mut issues);
         let mut types_after = current_types.clone();
@@ -827,9 +946,16 @@ impl Importer {
         let mut payload = SecretPayload::new();
         let mut projects = Vec::new();
         let mut seen_ids = BTreeSet::new();
-        for (project, import) in imports {
-            let (preview, secrets) =
-                self.plan_project(project, import, &existing, &types_after, ids, &mut seen_ids);
+        for ninesql_dbeaver::SourceProject { project, import } in imports {
+            cancel.check()?;
+            let (preview, secrets) = self.plan_project(
+                &project,
+                import,
+                &existing,
+                &types_after,
+                ids,
+                &mut seen_ids,
+            );
             payload.extend(secrets);
             projects.push(preview);
         }

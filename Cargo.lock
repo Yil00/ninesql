@@ -4561,6 +4561,8 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.21",
  "tokio",
+ "toml 0.8.23",
+ "toml_edit 0.22.27",
  "tracing",
  "uuid",
  "zeroize",
@@ -4736,6 +4738,7 @@ version = "0.0.0"
 dependencies = [
  "libc",
  "proptest",
+ "rusqlite",
  "rustix",
  "serde",
  "serde_json",
