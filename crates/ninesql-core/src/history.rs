@@ -13,8 +13,9 @@
 //!
 //! - the statement text holds no credential word ([`has_credential_word`]): `ALTER ROLE …
 //!   PASSWORD '…'`, `CREATE USER … IDENTIFIED BY …`, `SET PASSWORD`, `CREATE USER MAPPING …
-//!   OPTIONS (password …)`, `CREATE SECRET`, `pgp_sym_encrypt(…)` and the like are never
-//!   recorded (I1: no password in history), and their text is not logged either.
+//!   OPTIONS (password …)`, `CREATE SECRET`, `pgp_sym_encrypt(…)`, a URI with credentials
+//!   (`dblink_connect('postgresql://u:pw@h/db')`, [`has_uri_credentials`]) and the like are
+//!   never recorded (I1: no password in history), and their text is not logged either.
 //!
 //! The first three are the rule that decides whether query text may be logged (AGENTS.md,
 //! ADR-0007 §6), and like ADR-0008 §4 says, nothing at all is stored otherwise: no redacted
@@ -71,6 +72,33 @@ pub fn may_record(policy: &SafetyPolicy, prefs: &HistoryPreferences) -> bool {
     prefs.enabled && policy.log_query_text && !policy.production
 }
 
+/// Whether `text` holds a URI with credentials, `scheme://user:password@…`: the pattern
+/// `://[^\s/@]*:[^\s@]*@` (`dblink_connect('postgresql://u:pw@h/db')`, `CREATE SUBSCRIPTION …
+/// CONNECTION '…'`, `postgres_fdw` options).
+#[must_use]
+pub fn has_uri_credentials(text: &str) -> bool {
+    let mut rest = text;
+    while let Some(at) = rest.find("://") {
+        let after = &rest[at + 3..];
+        // `[^\s/@]*` then `:`.
+        let user_end = after
+            .find(|c: char| c.is_whitespace() || c == '/' || c == '@' || c == ':')
+            .unwrap_or(after.len());
+        if after[user_end..].starts_with(':') {
+            // `[^\s@]*` then `@`.
+            let pass = &after[user_end + 1..];
+            let pass_end = pass
+                .find(|c: char| c.is_whitespace() || c == '@')
+                .unwrap_or(pass.len());
+            if pass[pass_end..].starts_with('@') {
+                return true;
+            }
+        }
+        rest = after;
+    }
+    false
+}
+
 /// Words that mark a statement as handling a credential (lower case). See
 /// [`has_credential_word`].
 pub const CREDENTIAL_WORDS: &[&str] = &[
@@ -97,9 +125,11 @@ pub const CREDENTIAL_WORDS: &[&str] = &[
 /// in the history and its text is never logged.
 #[must_use]
 pub fn has_credential_word(text: &str) -> bool {
-    text.split(|c: char| !c.is_alphanumeric())
-        .filter(|w| (3..=16).contains(&w.len()))
-        .any(|w| CREDENTIAL_WORDS.iter().any(|k| w.eq_ignore_ascii_case(k)))
+    has_uri_credentials(text)
+        || text
+            .split(|c: char| !c.is_alphanumeric())
+            .filter(|w| (3..=16).contains(&w.len()))
+            .any(|w| CREDENTIAL_WORDS.iter().any(|k| w.eq_ignore_ascii_case(k)))
 }
 
 /// Why the history could not answer.
@@ -503,6 +533,10 @@ mod tests {
             "SELECT \"Password\" FROM t",
             "UPDATE s SET aws_secret_access_key = 'x'",
             "ALTER ROLE bob PASSWORD$$x$$",
+            "SELECT dblink_connect('postgresql://u:pw@h/db')",
+            "CREATE SUBSCRIPTION s CONNECTION 'postgres://repl:s3cr3t@primary:5432/app' PUBLICATION p",
+            "SELECT * FROM t WHERE url = 'mysql://root:@localhost'",
+            "SELECT 'https://u:p/q@host'",
         ] {
             assert!(has_credential_word(text), "{text}");
         }
@@ -511,6 +545,10 @@ mod tests {
             "DELETE FROM t WHERE id = 1",
             "SELECT passwordless FROM t",
             "CREATE TABLE tokens (id int)",
+            "SELECT 'https://example.test/a@b'",
+            "SELECT 'postgresql://host:5432/db'",
+            "SELECT 'mailto:user@example.test'",
+            "SELECT 'a://b c:d@e'",
             "",
         ] {
             assert!(!has_credential_word(text), "{text}");

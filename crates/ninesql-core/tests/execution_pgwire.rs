@@ -282,23 +282,29 @@ fn big_select_streams_first_rows_fast_and_cancels_and_production_deletes_ask() {
         let (events, end) = collect_all(exec.run(&p, RunRequest::script(script))).await;
         assert_eq!(end, RunEnd::NeedsConfirmation { index: 2 }, "{events:?}");
         assert!(p.transaction_state().in_transaction);
-        let token = events
+        let (start, token) = events
             .iter()
             .find_map(|e| match e {
-                RunEvent::NeedsConfirmation { request, .. } => Some(request.token),
+                RunEvent::NeedsConfirmation { span, request, .. } => {
+                    Some((span.start, request.token))
+                }
                 _ => None,
             })
             .unwrap();
-        let (events, end) = collect_all(exec.run(
-            &p,
-            RunRequest::script(script).resume_at(2).confirmed(2, token),
-        ))
+        let (events, end) = collect_all(
+            exec.run(
+                &p,
+                RunRequest::script(script)
+                    .resume_from(start)
+                    .confirmed(token),
+            ),
+        )
         .await;
         assert_eq!(end, RunEnd::Completed);
         assert!(events.iter().any(|e| matches!(
             e,
             RunEvent::StatementFinished {
-                index: 2,
+                index: 0,
                 update_count: Some(2),
                 ..
             }

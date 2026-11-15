@@ -324,13 +324,18 @@ fn production_scripts_stop_for_confirmation_and_resume() {
         let (events, summary) = collect_run(exec.run(&h, RunRequest::script(script))).await;
         assert_eq!(summary.end, RunEnd::NeedsConfirmation { index: 1 });
         assert_eq!(summary.executed, 1);
-        let request = events
+        let (span, request) = events
             .iter()
             .find_map(|e| match e {
-                RunEvent::NeedsConfirmation { index: 1, request } => Some(request.clone()),
+                RunEvent::NeedsConfirmation {
+                    index: 1,
+                    span,
+                    request,
+                } => Some((span.clone(), request.clone())),
                 _ => None,
             })
             .unwrap();
+        assert_eq!(&script[span.clone()], "DELETE FROM t");
         assert_eq!(request.statement, "DELETE FROM t");
         assert!(request.production);
         assert!(
@@ -339,26 +344,30 @@ fn production_scripts_stop_for_confirmation_and_resume() {
                 .any(|e| matches!(e, RunEvent::StatementStarted { index: 1, .. }))
         );
 
+        // Resumed by offset: the run starts at the DELETE (index 0 of this run).
         let (events, summary) = collect_run(
             exec.run(
                 &h,
                 RunRequest::script(script)
-                    .resume_at(1)
-                    .confirmed(1, request.token),
+                    .resume_from(span.start)
+                    .confirmed(request.token),
             ),
         )
         .await;
         assert_eq!(summary.end, RunEnd::Completed);
         assert_eq!(summary.executed, 2);
-        assert!(
-            !events
-                .iter()
-                .any(|e| matches!(e, RunEvent::StatementStarted { index: 0, .. }))
-        );
+        let started: Vec<_> = events
+            .iter()
+            .filter_map(|e| match e {
+                RunEvent::StatementStarted { span, .. } => Some(&script[span.clone()]),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(started, ["DELETE FROM t", "SELECT * FROM numbers(2)"]);
         assert!(events.iter().any(|e| matches!(
             e,
             RunEvent::Item {
-                index: 1,
+                index: 0,
                 item: ResultItem::UpdateCount(Some(1))
             }
         )));
@@ -367,12 +376,32 @@ fn production_scripts_stop_for_confirmation_and_resume() {
             exec.run(
                 &h,
                 RunRequest::script(script)
-                    .resume_at(1)
-                    .confirmed(1, request.token),
+                    .resume_from(span.start)
+                    .confirmed(request.token),
             ),
         )
         .await;
-        assert_eq!(summary.end, RunEnd::Failed { index: 1 });
+        assert_eq!(summary.end, RunEnd::Failed { index: 0 });
+        // A token never goes to a statement that does not start at the resume offset.
+        let (events, summary) = collect_run(
+            exec.run(
+                &h,
+                RunRequest::script(script)
+                    .resume_from(0)
+                    .confirmed(request.token),
+            ),
+        )
+        .await;
+        assert_eq!(
+            summary.end,
+            RunEnd::NeedsConfirmation { index: 1 },
+            "{events:?}"
+        );
+        // An offset that is not a position in the text is refused.
+        let (_, summary) =
+            collect_run(exec.run(&h, RunRequest::script(script).resume_from(script.len() + 1)))
+                .await;
+        assert_eq!(summary.end, RunEnd::Refused);
     });
     manager.shutdown(Duration::from_secs(5));
 }
@@ -1352,6 +1381,202 @@ fn coalesced_fetches_and_close_with_commit_behind_a_paused_result() {
         until(&mut run, &mut n, |e| matches!(e, RunEvent::Done(_))).await;
         h.close_with(TransactionEnd::Commit).await.unwrap();
         assert!(!h.transaction_state().in_transaction);
+    });
+    manager.shutdown(Duration::from_secs(5));
+}
+
+// ---------------------------------------------------------------------------------------------
+// Resume by offset after a lexical mode change (review N1)
+
+/// A session whose dialect follows a simulated MySQL `NO_BACKSLASH_ESCAPES`, switched on by
+/// `SET sql_mode`; writes are answered locally.
+#[derive(Clone)]
+struct ModeDriver {
+    mock: MockDriver,
+}
+
+struct ModeDialect {
+    backslash: Arc<AtomicBool>,
+}
+
+impl Dialect for ModeDialect {
+    fn lexical_rules(&self) -> api::LexicalRules {
+        api::LexicalRules::MYSQL.with_backslash_escapes(self.backslash.load(Ordering::SeqCst))
+    }
+}
+
+#[async_trait::async_trait]
+impl Driver for ModeDriver {
+    fn family(&self) -> &'static str {
+        "mode-mock"
+    }
+    fn engines(&self) -> &[api::EngineId] {
+        self.mock.engines()
+    }
+    fn capabilities(&self, engine: &api::EngineId, v: Option<&str>) -> DriverResult<Capabilities> {
+        self.mock.capabilities(engine, v)
+    }
+    fn dialect(&self, _: &api::EngineId) -> DriverResult<Arc<dyn Dialect>> {
+        Ok(Arc::new(ModeDialect {
+            backslash: Arc::new(AtomicBool::new(true)),
+        }))
+    }
+    async fn connect(&self, params: ConnectParams) -> DriverResult<Box<dyn Session>> {
+        let inner = self.mock.connect(params).await?;
+        Ok(Box::new(ModeSession {
+            inner,
+            dialect: Arc::new(ModeDialect {
+                backslash: Arc::new(AtomicBool::new(true)),
+            }),
+            executed: Arc::default(),
+        }))
+    }
+}
+
+struct ModeSession {
+    inner: Box<dyn Session>,
+    dialect: Arc<ModeDialect>,
+    executed: Arc<std::sync::Mutex<Vec<String>>>,
+}
+
+#[async_trait::async_trait]
+impl Session for ModeSession {
+    fn capabilities(&self) -> &Capabilities {
+        self.inner.capabilities()
+    }
+    fn server_version(&self) -> Option<&str> {
+        self.inner.server_version()
+    }
+    fn dialect(&self) -> Arc<dyn Dialect> {
+        Arc::clone(&self.dialect) as Arc<dyn Dialect>
+    }
+    fn metadata(&self) -> Arc<dyn Metadata> {
+        self.inner.metadata()
+    }
+    async fn execute(&mut self, s: Statement, o: ExecOptions) -> DriverResult<ResultStream> {
+        api::ensure_single_statement(&*self.dialect, &s.text)?;
+        self.executed.lock().unwrap().push(s.text.clone());
+        let upper = s.text.to_ascii_uppercase();
+        if upper.starts_with("SET SQL_MODE") {
+            self.dialect.backslash.store(false, Ordering::SeqCst);
+            return Ok(ResultStream::from_items(Vec::new(), &o));
+        }
+        if upper.starts_with("INSERT") || upper.starts_with("DELETE") {
+            return Ok(ResultStream::from_items(
+                vec![Ok(ResultItem::UpdateCount(Some(1)))],
+                &o,
+            ));
+        }
+        self.inner.execute(s, o).await
+    }
+    fn cancel_handle(&self) -> Arc<dyn CancelHandle> {
+        self.inner.cancel_handle()
+    }
+    fn auto_commit(&self) -> bool {
+        self.inner.auto_commit()
+    }
+    fn in_transaction(&self) -> bool {
+        self.inner.in_transaction()
+    }
+    async fn set_auto_commit(&mut self, on: bool) -> DriverResult<()> {
+        self.inner.set_auto_commit(on).await
+    }
+    fn is_read_only(&self) -> bool {
+        self.inner.is_read_only()
+    }
+    async fn set_read_only(&mut self, ro: bool) -> DriverResult<()> {
+        self.inner.set_read_only(ro).await
+    }
+    async fn ping(&mut self) -> DriverResult<()> {
+        self.inner.ping().await
+    }
+    async fn close(self: Box<Self>) -> DriverResult<()> {
+        self.inner.close().await
+    }
+}
+
+/// Review N1: after `SET sql_mode = 'NO_BACKSLASH_ESCAPES'`, splitting the whole text again
+/// would move statement indexes (the `'a\';b'` literal splits differently); resuming by offset
+/// runs exactly the confirmed statement.
+#[test]
+fn resume_by_offset_survives_a_lexical_mode_change() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (manager, _) = manager(
+        Arc::new(ModeDriver {
+            mock: mock_driver(),
+        }),
+        tmp.path(),
+    );
+    let types = ConnectionTypes::default();
+    let exec = service(&manager, None);
+    ui(async {
+        let h = open_ok(&manager, mock_connection(ConnectionTypeId::prod()), &types).await;
+        let script = "INSERT INTO t VALUES ('a\\';b');\nSET sql_mode = 'NO_BACKSLASH_ESCAPES';\nDELETE FROM t";
+        let confirmation = |events: &[RunEvent]| {
+            events
+                .iter()
+                .find_map(|e| match e {
+                    RunEvent::NeedsConfirmation { span, request, .. } => {
+                        Some((span.clone(), request.token))
+                    }
+                    _ => None,
+                })
+                .unwrap()
+        };
+        // Production confirms the access-mode change first…
+        let (events, summary) = collect_run(exec.run(&h, RunRequest::script(script))).await;
+        assert_eq!(
+            summary.end,
+            RunEnd::NeedsConfirmation { index: 1 },
+            "{events:?}"
+        );
+        let (span, token) = confirmation(&events);
+        assert!(script[span.clone()].starts_with("SET sql_mode"));
+        // …then, resumed at the SET, the DELETE after it.
+        let (events, summary) = collect_run(
+            exec.run(
+                &h,
+                RunRequest::script(script)
+                    .resume_from(span.start)
+                    .confirmed(token),
+            ),
+        )
+        .await;
+        assert_eq!(
+            summary.end,
+            RunEnd::NeedsConfirmation { index: 1 },
+            "{events:?}"
+        );
+        let (span, token) = confirmation(&events);
+        assert_eq!(&script[span.clone()], "DELETE FROM t");
+        // With the new mode, the whole text no longer splits the same way: index 2 is not the
+        // DELETE any more, so an index-based resume would land elsewhere.
+        let now = h.dialect().split_statements(script);
+        assert!(
+            now.get(2).is_none_or(|s| s.text(script) != "DELETE FROM t"),
+            "{:?}",
+            now.iter().map(|s| s.text(script)).collect::<Vec<_>>()
+        );
+
+        let (events, summary) = collect_run(
+            exec.run(
+                &h,
+                RunRequest::script(script)
+                    .resume_from(span.start)
+                    .confirmed(token),
+            ),
+        )
+        .await;
+        assert_eq!(summary.end, RunEnd::Completed, "{events:?}");
+        assert_eq!(summary.executed, 1);
+        assert!(events.iter().any(|e| matches!(
+            e,
+            RunEvent::StatementFinished {
+                index: 0,
+                update_count: Some(1),
+                ..
+            }
+        )));
     });
     manager.shutdown(Duration::from_secs(5));
 }

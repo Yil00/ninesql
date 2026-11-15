@@ -37,8 +37,10 @@
 //!   queued are dropped; the statement end and `Done` still arrive.
 //! - **Confirmation.** A statement that needs confirmation is not sent: the run ends with
 //!   [`RunEnd::NeedsConfirmation`]. The UI shows the dialog and calls `run` again with the same
-//!   text, [`RunRequest::resume_at`] the statement's index and the token
-//!   ([`RunRequest::confirmed`]): statements before it are not run again.
+//!   text, [`RunRequest::resume_from`] the statement's start offset
+//!   ([`RunEvent::NeedsConfirmation::span`]) and the token ([`RunRequest::confirmed`]):
+//!   statements before it are not run again. Resuming is by byte offset, never by index:
+//!   indexes depend on the lexical modes in force when the text is split (review N1).
 //! - **Timeouts.** [`TimeoutChoice::Default`] uses the connection's default from the
 //!   preferences, else the global default (none unless set, ADR-0004); a request may ask for
 //!   another one or none. The timeout covers each statement, fetch included.
@@ -121,10 +123,12 @@ pub struct RunRequest {
     pub budget: Option<FetchBudget>,
     /// What to do after a failed statement; `None`: from the preferences.
     pub on_error: Option<OnError>,
-    /// Index of the first statement to run (resuming after a confirmation).
-    pub start_at: usize,
-    /// Confirmation of the statement at this index.
-    pub confirmation: Option<(usize, ConfirmationToken)>,
+    /// Byte offset in the editor buffer ([`Self::offset`] included) where the run starts:
+    /// only `text` from there on is split and run (resuming after a confirmation).
+    pub resume_from: Option<usize>,
+    /// Confirmation of the first statement of the run; used only when that statement starts
+    /// exactly at [`Self::resume_from`] (or, without it, for the first statement of the text).
+    pub confirmation: Option<ConfirmationToken>,
     /// Pull-based paging: deliver this many rows after each result-set header, then pause
     /// until [`RunControl::fetch`]; `None` (default): stream every row (still bounded by the
     /// budget and back-pressure).
@@ -139,8 +143,8 @@ impl fmt::Debug for RunRequest {
             .field("kind", &self.kind)
             .field("params", &self.params.len())
             .field("timeout", &self.timeout)
-            .field("start_at", &self.start_at)
-            .field("confirmed", &self.confirmation.map(|(i, _)| i))
+            .field("resume_from", &self.resume_from)
+            .field("confirmed", &self.confirmation.is_some())
             .finish_non_exhaustive()
     }
 }
@@ -156,7 +160,7 @@ impl RunRequest {
             timeout: TimeoutChoice::Default,
             budget: None,
             on_error: None,
-            start_at: 0,
+            resume_from: None,
             confirmation: None,
             page_rows: None,
         }
@@ -234,18 +238,23 @@ impl RunRequest {
         self
     }
 
-    /// Starts at statement `index` (0-based), skipping the ones before.
+    /// Starts at byte `offset` of the editor buffer (the `span.start` of a
+    /// [`RunEvent::NeedsConfirmation`]): `text` from there on is split with the session's
+    /// current lexical modes and run; nothing before it runs again. An offset outside the
+    /// text or not on a character boundary refuses the run.
     #[must_use]
-    pub fn resume_at(mut self, index: usize) -> Self {
-        self.start_at = index;
+    pub fn resume_from(mut self, offset: usize) -> Self {
+        self.resume_from = Some(offset);
         self
     }
 
-    /// Attaches the user's confirmation of statement `index`
-    /// ([`RunEvent::NeedsConfirmation`]).
+    /// Attaches the user's confirmation ([`RunEvent::NeedsConfirmation`]). It is given to the
+    /// first statement of the run only, and only when that statement starts exactly at
+    /// [`Self::resume_from`] (or, without it, to the first statement of the text); the session
+    /// also checks that the token was issued for exactly that text.
     #[must_use]
-    pub fn confirmed(mut self, index: usize, token: ConfirmationToken) -> Self {
-        self.confirmation = Some((index, token));
+    pub fn confirmed(mut self, token: ConfirmationToken) -> Self {
+        self.confirmation = Some(token);
         self
     }
 }
@@ -314,9 +323,10 @@ pub struct RunSummary {
 
 /// Event of one run. Exactly one [`RunEvent::Done`] ends it. `index` is the 0-based index of
 /// the item in the request text as the dialect splits it (client directives, never sent, keep
-/// their index, so indexes are stable for [`RunRequest::resume_at`]). After a `Session` or
-/// `ChangesAccessMode` statement the rest of the text is split again with the session's lexical
-/// modes as they are then (review H2), so the indexes that follow come from that split.
+/// their index). Indexes are per run: after a `Session` or `ChangesAccessMode` statement the rest
+/// of the text is split again with the session's lexical modes as they are then (review H2), so
+/// the indexes that follow come from that split. Resume by offset
+/// ([`RunRequest::resume_from`]), never by index.
 #[derive(Debug)]
 #[non_exhaustive]
 pub enum RunEvent {
@@ -411,7 +421,10 @@ pub enum RunEvent {
     NeedsConfirmation {
         /// Statement index.
         index: usize,
-        /// What to show; resume with [`RunRequest::resume_at`] and [`RunRequest::confirmed`].
+        /// Its byte range in the editor buffer: resume with
+        /// [`RunRequest::resume_from`]`(span.start)` and [`RunRequest::confirmed`].
+        span: Range<usize>,
+        /// What to show.
         request: ConfirmationRequest,
     },
     /// The run ended (terminal).
@@ -962,7 +975,22 @@ impl RunJob {
             Ok(d) => d,
             Err(e) => return self.refuse(e, 0),
         };
-        let mut items = script_items(&*dialect, &request.text, 0);
+        // Where the run starts in `text` (review N1: by offset, never by index).
+        let from = match request.resume_from {
+            None => 0,
+            Some(offset) => match offset.checked_sub(request.offset) {
+                Some(from) if request.text.is_char_boundary(from) => from,
+                _ => {
+                    return self.refuse(
+                        CoreError::InvalidRequest(
+                            "the resume offset is not a position in the text",
+                        ),
+                        0,
+                    );
+                }
+            },
+        };
+        let mut items = script_items(&*dialect, &request.text, from);
         let mut last_statement = match check_items(&items, request.kind, !request.params.is_empty())
         {
             Ok(last) => last,
@@ -985,7 +1013,8 @@ impl RunJob {
             .await;
         let (mut executed, mut succeeded, mut failed) = (0usize, 0usize, 0usize);
         let mut end = RunEnd::Completed;
-        let mut index = request.start_at;
+        let mut index = 0;
+        let mut first_statement = true;
         while let Some(item) = items.get(index).copied() {
             let span = &item.span;
             if item.kind != ItemKind::Statement {
@@ -1003,11 +1032,15 @@ impl RunJob {
                 .with_params(request.params.clone())
                 .with_timeout(timeout)
                 .with_budget(budget);
-            if let Some((i, token)) = request.confirmation
-                && i == index
+            // The token goes to the first statement of the run only, and only when it starts
+            // exactly where the run was asked to resume.
+            if first_statement
+                && let Some(token) = request.confirmation
+                && (request.resume_from.is_none() || span.start == from)
             {
                 exec_request = exec_request.confirmed(token);
             }
+            first_statement = false;
             let last = index == last_statement;
             // Classified now, with the lexical modes in force now (review H2); the session task
             // classifies it again for the confirmation, at the moment it sends it. Only reads
@@ -1063,28 +1096,21 @@ impl RunJob {
                 let rest = script_items(&*dialect, &request.text, span.end);
                 items.truncate(index + 1);
                 items.extend(rest);
-                if items
-                    .iter()
-                    .skip(index + 1)
-                    .any(|i| i.kind == ItemKind::Refused)
-                {
-                    // The re-split found something a script cannot run: stop before it.
-                    let next = index + 1;
-                    let _ = self.out.events.try_send(RunEvent::StatementFailed {
-                        index: next,
-                        error: CoreError::InvalidRequest(
-                            "the script holds a statement that cannot run as part of a script",
-                        ),
-                        position: None,
-                        elapsed: Duration::ZERO,
-                    });
-                    end = RunEnd::Refused;
-                    break;
+                // The merged list is checked like the first split (review N2): a refused item,
+                // or a "single statement" request that now holds several, stops the run here.
+                match check_items(&items, request.kind, !request.params.is_empty()) {
+                    Ok(last) => last_statement = last,
+                    Err(error) => {
+                        let _ = self.out.events.try_send(RunEvent::StatementFailed {
+                            index: index + 1,
+                            error,
+                            position: None,
+                            elapsed: Duration::ZERO,
+                        });
+                        end = RunEnd::Refused;
+                        break;
+                    }
                 }
-                last_statement = items
-                    .iter()
-                    .rposition(|i| i.kind == ItemKind::Statement)
-                    .unwrap_or(index);
             }
             index += 1;
         }
@@ -1270,7 +1296,11 @@ impl RunJob {
                 }
                 ExecEvent::NeedsConfirmation(request) => {
                     self.out
-                        .send_end(RunEvent::NeedsConfirmation { index, request })
+                        .send_end(RunEvent::NeedsConfirmation {
+                            index,
+                            span: base + span.start..base + span.end,
+                            request,
+                        })
                         .await;
                     return StatementEnd::NeedsConfirmation;
                 }
