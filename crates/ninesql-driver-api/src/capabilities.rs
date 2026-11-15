@@ -31,7 +31,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use crate::error::{DriverError, DriverResult};
 use crate::params::{
     AuthKind, ConnectParams, Endpoint, EngineId, PasswordExchange, PropertyValue, TlsMode,
-    check_properties, is_reserved_property, normalize_property_key,
+    check_properties, echo_key, is_reserved_property, normalize_property_key,
 };
 
 /// Everything one engine supports through its driver. See the module documentation.
@@ -258,7 +258,8 @@ impl ConnectCapabilities {
                 accepted.join(", ")
             };
             return Err(DriverError::InvalidParams(format!(
-                "property `{key}` is not supported by the driver of this engine; accepted: {list}"
+                "property `{}` is not supported by the driver of this engine; accepted: {list}",
+                echo_key(key)
             )));
         }
         let kind = params.auth.kind();

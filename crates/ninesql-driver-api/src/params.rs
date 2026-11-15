@@ -221,6 +221,12 @@ pub enum PasswordExchange {
     /// Only a SCRAM exchange in which the server proves it knows the password verifier
     /// (PostgreSQL `SCRAM-SHA-256`, as libpq's `require_auth=scram-sha-256`): md5, cleartext and
     /// a server that skips authentication are refused, whatever the transport.
+    ///
+    /// This stops **method downgrades** only. Without channel binding (the client sends the
+    /// GS2 header `n,,`; `SCRAM-SHA-256-PLUS` is not implemented), a man in the middle that
+    /// relays the exchange to the real server still passes when TLS is `require` or `disable`.
+    /// Only TLS `verify-full` (or `verify-ca` with a private CA) protects against a man in
+    /// the middle; the UI should flag `ScramOnly` combined with TLS below `verify-ca`.
     ScramOnly,
 }
 
@@ -614,6 +620,29 @@ pub(crate) fn normalize_property_key(key: &str) -> String {
         .collect()
 }
 
+/// Longest property key echoed in an error message, in characters.
+const MAX_ECHOED_KEY_CHARS: usize = 64;
+
+/// A property key as error messages show it: control and other non-printable characters
+/// escaped (`\u{…}`), cut to [`MAX_ECHOED_KEY_CHARS`] characters with `…`, so a hostile or
+/// misplaced key cannot forge log lines or flood the UI.
+#[must_use]
+pub(crate) fn echo_key(key: &str) -> String {
+    let mut out = String::new();
+    for (n, c) in key.chars().enumerate() {
+        if n == MAX_ECHOED_KEY_CHARS {
+            out.push('…');
+            break;
+        }
+        if c == ' ' || c.is_ascii_graphic() || (!c.is_ascii() && c.is_alphanumeric()) {
+            out.push(c);
+        } else {
+            out.extend(c.escape_unicode());
+        }
+    }
+    out
+}
+
 /// `true` when `key` controls a security-relevant setting that only the typed
 /// [`ConnectParams`] fields may set (H3 / N3 of the P0-B security review).
 ///
@@ -664,8 +693,9 @@ pub fn check_properties(
     for key in properties.keys() {
         if is_reserved_property(key) || extra.contains(&normalize_property_key(key)) {
             return Err(DriverError::InvalidParams(format!(
-                "property `{key}` cannot be set as a driver property; use the connection's \
-                 TLS, authentication, read-only or endpoint settings"
+                "property `{}` cannot be set as a driver property; use the connection's \
+                 TLS, authentication, read-only or endpoint settings",
+                echo_key(key)
             )));
         }
     }
@@ -1168,6 +1198,22 @@ mod tests {
         ] {
             assert!(!is_reserved_property(key), "{key:?}");
         }
+    }
+
+    #[test]
+    fn echoed_keys_are_escaped_and_cut() {
+        assert_eq!(echo_key("search_path"), "search_path");
+        assert_eq!(echo_key("a\nb"), "a\\u{a}b");
+        assert_eq!(echo_key("a\u{1b}[2J"), "a\\u{1b}[2J");
+        assert_eq!(echo_key("x\u{200b}y"), "x\\u{200b}y");
+        let long = "k".repeat(200);
+        let shown = echo_key(&long);
+        assert_eq!(shown.chars().count(), MAX_ECHOED_KEY_CHARS + 1);
+        assert!(shown.ends_with('…'));
+        let mut props = BTreeMap::new();
+        props.insert(format!("ssl\n{long}"), PropertyValue::Plain("v".into()));
+        let msg = check_properties(&props, &[]).unwrap_err().to_string();
+        assert!(!msg.contains('\n') && msg.len() < 300, "{msg}");
     }
 
     #[test]
