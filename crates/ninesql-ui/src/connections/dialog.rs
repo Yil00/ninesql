@@ -8,6 +8,7 @@
 //! into a masked input and read only when saving or testing. "Test connection" goes through the
 //! window's [`ConnectFlow`] on the driver runtime (I6).
 
+use super::secret_input::{self, masked_input as masked, read_secret, secret_field};
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::input::{Input, InputState};
 use gpui_kit::component::{
@@ -56,6 +57,10 @@ pub enum TestState {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ConnectionSaved(pub ConnectionId);
 
+/// Emitted when the user cancels the dialog (its secret inputs are already cleared).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ConnectionDialogCancelled;
+
 /// The connection dialog.
 pub struct ConnectionDialog {
     hub: Entity<ConnectionHub>,
@@ -83,6 +88,7 @@ pub struct ConnectionDialog {
 }
 
 impl EventEmitter<ConnectionSaved> for ConnectionDialog {}
+impl EventEmitter<ConnectionDialogCancelled> for ConnectionDialog {}
 
 fn input(window: &mut Window, cx: &mut App, value: &str, placeholder: &str) -> Entity<InputState> {
     let value = value.to_owned();
@@ -90,15 +96,6 @@ fn input(window: &mut Window, cx: &mut App, value: &str, placeholder: &str) -> E
     cx.new(|cx| {
         InputState::new(window, cx)
             .default_value(value)
-            .placeholder(placeholder)
-    })
-}
-
-fn masked(window: &mut Window, cx: &mut App, placeholder: &str) -> Entity<InputState> {
-    let placeholder = placeholder.to_owned();
-    cx.new(|cx| {
-        InputState::new(window, cx)
-            .masked(true)
             .placeholder(placeholder)
     })
 }
@@ -259,22 +256,65 @@ impl ConnectionDialog {
                 SecretSlot::SshServer => self.hops.last().map(|h| &h.secret),
                 SecretSlot::SshJump(i) => self.hops.get(i).map(|h| &h.secret),
             };
-            if let Some(input) = input {
-                let value = input.read(cx).value();
-                if !value.is_empty() {
-                    out.push((slot, SecretString::from(value.to_string())));
-                }
+            if let Some(secret) = input.and_then(|i| read_secret(i, cx)) {
+                out.push((slot, secret));
             }
         }
         out
     }
 
-    fn clear_secret_inputs(&self, window: &mut Window, cx: &mut App) {
+    /// Empties every secret input (save, cancel, close).
+    pub fn clear_secret_inputs(&self, window: &mut Window, cx: &mut App) {
         let all = [&self.secret, &self.client_key_secret]
             .into_iter()
             .chain(self.hops.iter().map(|h| &h.secret));
         for input in all {
-            input.update(cx, |s, cx| s.set_value("", window, cx));
+            secret_input::clear(input, window, cx);
+        }
+    }
+
+    /// The masked inputs, for tests: database secret, client key passphrase, then each hop.
+    #[must_use]
+    pub fn secret_inputs(&self) -> Vec<Entity<InputState>> {
+        [self.secret.clone(), self.client_key_secret.clone()]
+            .into_iter()
+            .chain(self.hops.iter().map(|h| h.secret.clone()))
+            .collect()
+    }
+
+    /// "Cancel": clears the secret inputs, tells the window and closes the dialog.
+    pub fn cancel(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.clear_secret_inputs(window, cx);
+        cx.emit(ConnectionDialogCancelled);
+        window.close_dialog(cx);
+    }
+
+    /// Changes the database authentication: the credential field and its input are reset
+    /// (a saved password is never reused as a token).
+    pub fn set_auth(&mut self, choice: AuthChoice, window: &mut Window, cx: &mut Context<Self>) {
+        if self.form.auth != choice {
+            self.form.set_auth(choice);
+            secret_input::clear(&self.secret, window, cx);
+            cx.notify();
+        }
+    }
+
+    /// Changes the authentication of SSH hop `index`: its credential field and input are reset.
+    pub fn set_hop_auth(
+        &mut self,
+        index: usize,
+        choice: SshAuthChoice,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(h) = self.form.hops.get_mut(index)
+            && h.auth != choice
+        {
+            h.set_auth(choice);
+            if let Some(i) = self.hops.get(index) {
+                secret_input::clear(&i.secret, window, cx);
+            }
+            cx.notify();
         }
     }
 
@@ -301,6 +341,14 @@ impl ConnectionDialog {
         match probe.build(&offer, Vec::new(), hub.types(), hub.store_for_new_secrets()) {
             Ok(built) => {
                 let mut out = notices(&built.connection, &offer, hub.types(), self.form.scram_only);
+                if let Some(existing) = &self.form.existing
+                    && hub.is_open(existing.id)
+                {
+                    out.push(Notice {
+                        severity: Severity::Info,
+                        text: "This connection is open: its sessions keep their current settings until you reconnect.".to_owned(),
+                    });
+                }
                 if let Err(e) = hub.validate(&built.connection)
                     && !out.iter().any(|n| n.severity == Severity::Error)
                 {
@@ -406,11 +454,13 @@ impl ConnectionDialog {
         cx.notify();
     }
 
-    /// Removes the SSH hop at `index`.
-    pub fn remove_hop(&mut self, index: usize, cx: &mut Context<Self>) {
+    /// Removes the SSH hop at `index` (its typed secret is cleared; a saved one is deleted when
+    /// the connection is saved).
+    pub fn remove_hop(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
         if index < self.form.hops.len() {
             self.form.hops.remove(index);
-            self.hops.remove(index);
+            let inputs = self.hops.remove(index);
+            secret_input::clear(&inputs.secret, window, cx);
             if self.form.hops.is_empty() {
                 self.form.ssh_enabled = false;
             }
@@ -517,7 +567,7 @@ impl ConnectionDialog {
         id: &'static str,
         options: Vec<(T, SharedString, bool)>,
         selected: T,
-        on_pick: fn(&mut Self, T, &mut Context<Self>),
+        on_pick: fn(&mut Self, T, &mut Window, &mut Context<Self>),
         cx: &mut Context<Self>,
     ) -> Div {
         h_flex()
@@ -534,8 +584,8 @@ impl ConnectionDialog {
                             .label(label)
                             .selected(value == selected)
                             .disabled(!enabled)
-                            .on_click(cx.listener(move |this, _, _, cx| {
-                                on_pick(this, value, cx);
+                            .on_click(cx.listener(move |this, _, window, cx| {
+                                on_pick(this, value, window, cx);
                                 cx.notify();
                             }))
                     }),
@@ -548,7 +598,7 @@ impl ConnectionDialog {
         mode: SecretMode,
         status: &'static str,
         input: &Entity<InputState>,
-        on_pick: fn(&mut Self, SecretMode, &mut Context<Self>),
+        on_pick: fn(&mut Self, SecretMode, &mut Window, &mut Context<Self>),
         cx: &mut Context<Self>,
     ) -> Div {
         let store = self.hub.read(cx).store_for_new_secrets();
@@ -572,7 +622,7 @@ impl ConnectionDialog {
                 h_flex()
                     .gap_2()
                     .when(mode == SecretMode::Save, |el| {
-                        el.child(div().flex_1().child(Input::new(input).mask_toggle()))
+                        el.child(div().flex_1().child(secret_field(input)))
                     })
                     .child(
                         div()
@@ -643,9 +693,9 @@ impl ConnectionDialog {
                                 .ghost()
                                 .xsmall()
                                 .label("Remove")
-                                .on_click(
-                                    cx.listener(move |this, _, _, cx| this.remove_hop(i, cx)),
-                                ),
+                                .on_click(cx.listener(move |this, _, window, cx| {
+                                    this.remove_hop(i, window, cx)
+                                })),
                         ),
                 )
                 .child(
@@ -670,11 +720,8 @@ impl ConnectionDialog {
                                 .outline()
                                 .label(choice.label())
                                 .selected(hop.auth == choice)
-                                .on_click(cx.listener(move |this, _, _, cx| {
-                                    if let Some(h) = this.form.hops.get_mut(i) {
-                                        h.auth = choice;
-                                    }
-                                    cx.notify();
+                                .on_click(cx.listener(move |this, _, window, cx| {
+                                    this.set_hop_auth(i, choice, window, cx);
                                 }))
                         }),
                     ),
@@ -686,9 +733,13 @@ impl ConnectionDialog {
                         .outline()
                         .label("Key has a passphrase")
                         .selected(hop.key_has_passphrase)
-                        .on_click(cx.listener(move |this, _, _, cx| {
+                        .on_click(cx.listener(move |this, _, window, cx| {
                             if let Some(h) = this.form.hops.get_mut(i) {
-                                h.key_has_passphrase = !h.key_has_passphrase;
+                                let on = !h.key_has_passphrase;
+                                h.set_key_has_passphrase(on);
+                            }
+                            if let Some(inputs) = this.hops.get(i) {
+                                secret_input::clear(&inputs.secret, window, cx);
                             }
                             cx.notify();
                         })),
@@ -713,20 +764,21 @@ impl ConnectionDialog {
                                         })
                                         .selected(hop.secret.mode == mode)
                                         .disabled(mode == SecretMode::Save && store.is_none())
-                                        .on_click(cx.listener(move |this, _, _, cx| {
+                                        .on_click(cx.listener(move |this, _, window, cx| {
                                             if let Some(h) = this.form.hops.get_mut(i) {
                                                 h.secret.mode = mode;
+                                            }
+                                            if mode == SecretMode::Ask
+                                                && let Some(inputs) = this.hops.get(i)
+                                            {
+                                                secret_input::clear(&inputs.secret, window, cx);
                                             }
                                             cx.notify();
                                         }))
                                 }),
                         )
                         .when(hop.secret.mode == SecretMode::Save, |el| {
-                            el.child(
-                                div()
-                                    .flex_1()
-                                    .child(Input::new(&inputs.secret).mask_toggle()),
-                            )
+                            el.child(div().flex_1().child(secret_field(&inputs.secret)))
                         })
                         .child(div().text_xs().text_color(muted).child(hop.secret.status())),
                 );
@@ -834,7 +886,7 @@ impl Render for ConnectionDialog {
                     (EndpointInput::Url, "URL".into(), true),
                 ],
                 self.form.endpoint_input,
-                |this, v, _| this.form.endpoint_input = v,
+                |this, v, _, _| this.form.endpoint_input = v,
                 cx,
             );
             let port_label = match offer.default_port {
@@ -884,7 +936,7 @@ impl Render for ConnectionDialog {
                     "auth",
                     auth_choices,
                     self.form.auth,
-                    |this, v, _| this.form.auth = v,
+                    |this, v, window, cx| this.set_auth(v, window, cx),
                     cx,
                 ))
             })
@@ -903,7 +955,12 @@ impl Render for ConnectionDialog {
                         self.form.auth_secret.mode,
                         self.form.auth_secret.status(),
                         &self.secret,
-                        |this, m, _| this.form.auth_secret.mode = m,
+                        |this, m, window, cx| {
+                            this.form.auth_secret.mode = m;
+                            if m == SecretMode::Ask {
+                                secret_input::clear(&this.secret, window, cx);
+                            }
+                        },
                         cx,
                     ))
                 },
@@ -936,7 +993,7 @@ impl Render for ConnectionDialog {
                         "tls",
                         modes,
                         self.form.tls_mode,
-                        |this, v, _| this.form.tls_mode = v,
+                        |this, v, _, _| this.form.tls_mode = v,
                         cx,
                     ))
                     .when(
@@ -976,9 +1033,14 @@ impl Render for ConnectionDialog {
                                         .outline()
                                         .label("Key has a passphrase")
                                         .selected(self.form.client_key_has_passphrase)
-                                        .on_click(cx.listener(|this, _, _, cx| {
-                                            this.form.client_key_has_passphrase =
-                                                !this.form.client_key_has_passphrase;
+                                        .on_click(cx.listener(|this, _, window, cx| {
+                                            let on = !this.form.client_key_has_passphrase;
+                                            this.form.set_client_key_has_passphrase(on);
+                                            secret_input::clear(
+                                                &this.client_key_secret,
+                                                window,
+                                                cx,
+                                            );
                                             cx.notify();
                                         })),
                                 )
@@ -990,7 +1052,16 @@ impl Render for ConnectionDialog {
                                             self.form.client_key_secret.mode,
                                             self.form.client_key_secret.status(),
                                             &self.client_key_secret,
-                                            |this, m, _| this.form.client_key_secret.mode = m,
+                                            |this, m, window, cx| {
+                                                this.form.client_key_secret.mode = m;
+                                                if m == SecretMode::Ask {
+                                                    secret_input::clear(
+                                                        &this.client_key_secret,
+                                                        window,
+                                                        cx,
+                                                    );
+                                                }
+                                            },
                                             cx,
                                         ))
                                     },
@@ -1065,21 +1136,30 @@ impl Render for ConnectionDialog {
                             .child(t.name.clone()),
                     )
                     .on_click(cx.listener(move |this, _, _, cx| {
-                        this.form.connection_type = Some(id.clone());
+                        let types = this.hub.read(cx).types().clone();
+                        this.form.set_connection_type(id.clone(), &types);
                         cx.notify();
                     }))
             }));
-        let read_only_row = self.choice_row(
-            "read-only",
-            vec![
-                (None, "Type default".into(), true),
-                (Some(true), "Read-only".into(), true),
-                (Some(false), "Read-write".into(), true),
-            ],
-            self.form.read_only,
-            |this, v, _| this.form.read_only = v,
-            cx,
-        );
+        let read_write_allowed = self.form.read_write_allowed(self.hub.read(cx).types());
+        let read_only_row = v_flex()
+            .gap_1()
+            .child(self.choice_row(
+                "read-only",
+                vec![
+                    (None, "Type default".into(), true),
+                    (Some(true), "Read-only".into(), true),
+                    (Some(false), "Read-write".into(), read_write_allowed),
+                ],
+                self.form.read_only,
+                |this, v, _, _| this.form.read_only = v,
+                cx,
+            ))
+            .when(!read_write_allowed, |el| {
+                el.child(div().id("read-write-hint").text_xs().text_color(muted).child(
+                    "Read-write is not available for a production type: its read-only setting comes from the type.",
+                ))
+            });
         let init_sql = self.form.existing.as_ref().map_or(0, |c| c.init_sql.len());
 
         let test_status: Option<(SharedString, Hsla)> = match &self.test {
@@ -1194,7 +1274,7 @@ impl Render for ConnectionDialog {
                     .child(
                         Button::new("connection-cancel")
                             .label("Cancel")
-                            .on_click(|_, window, cx| window.close_dialog(cx)),
+                            .on_click(cx.listener(|this, _, window, cx| this.cancel(window, cx))),
                     )
                     .child(
                         Button::new("connection-save")

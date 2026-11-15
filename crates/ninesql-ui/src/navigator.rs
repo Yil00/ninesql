@@ -214,8 +214,7 @@ impl Render for Navigator {
                             return row.child(label);
                         };
                         let sessions = hub.sessions(id);
-                        let session_ro = sessions.first().map(|s| s.info().read_only);
-                        let b = ConnectionBadges::of(c, hub.types(), session_ro);
+                        let b = ConnectionBadges::of(c, hub.types(), sessions);
                         let open = !sessions.is_empty();
                         let key = id.to_string();
                         row.child(

@@ -9,6 +9,37 @@ use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 use ninesql_core::TlsMode;
+use ninesql_core::driver_api::echo_property_key;
+
+/// Fragments of a normalized query key that name a credential: the credential fragments of the
+/// driver API's reserved-property rule (`RESERVED_PROPERTY_FRAGMENTS`) plus the short forms
+/// `pass` and `pwd`. Such a parameter is refused outright instead of becoming a driver property,
+/// where its value would sit in a plain text field until validation refused it.
+const CREDENTIAL_FRAGMENTS: &[&str] = &[
+    "password",
+    "passwd",
+    "pass",
+    "pwd",
+    "secret",
+    "token",
+    "apikey",
+    "auth",
+    "credential",
+];
+
+/// Whether a query key may carry a credential. Fails closed: a key the normalization cannot
+/// judge (any character other than printable ASCII) counts as one.
+fn is_credential_key(key: &str) -> bool {
+    if key.chars().any(|c| !c.is_ascii_graphic()) {
+        return true;
+    }
+    let norm: String = key
+        .chars()
+        .filter(char::is_ascii_alphanumeric)
+        .map(|c| c.to_ascii_lowercase())
+        .collect();
+    CREDENTIAL_FRAGMENTS.iter().any(|f| norm.contains(f))
+}
 
 /// What a URL filled in.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -40,7 +71,7 @@ pub enum UrlError {
     /// No `scheme://`.
     #[error("not a connection URL: expected scheme://host… (for example postgresql://host/db)")]
     NoScheme,
-    /// Scheme of an engine NineSQL does not know.
+    /// Scheme of an engine NineSQL does not know (echoed bounded and escaped).
     #[error("unknown URL scheme `{0}`")]
     UnknownScheme(String),
     /// The URL carries a password.
@@ -57,10 +88,11 @@ pub enum UrlError {
     /// Bad percent-encoding.
     #[error("the URL has an invalid %-escape")]
     BadEscape,
-    /// A TLS mode with no NineSQL equivalent.
+    /// A TLS mode with no NineSQL equivalent (echoed bounded and escaped).
     #[error("the TLS mode `{0}` is not supported: use disable, require, verify-ca or verify-full")]
     UnsupportedTlsMode(String),
-    /// A query parameter that carries a credential.
+    /// A query parameter that carries a credential (its key, bounded and escaped; never the
+    /// value).
     #[error("the URL parameter `{0}` carries a credential; type it in the password field instead")]
     CredentialParameter(String),
     /// No file path.
@@ -121,7 +153,7 @@ fn tls_mode(value: &str) -> Result<TlsMode, UrlError> {
             "require" | "required" => TlsMode::Require,
             "verify-ca" => TlsMode::VerifyCa,
             "verify-full" | "verify-identity" => TlsMode::VerifyFull,
-            other => return Err(UrlError::UnsupportedTlsMode(other.to_owned())),
+            other => return Err(UrlError::UnsupportedTlsMode(echo_property_key(other))),
         },
     )
 }
@@ -135,7 +167,8 @@ pub fn parse(text: &str) -> Result<ParsedUrl, UrlError> {
     let text = text.strip_prefix("jdbc:").unwrap_or(text);
     let (scheme, rest) = text.split_once(':').ok_or(UrlError::NoScheme)?;
     let scheme = scheme.to_ascii_lowercase();
-    let engine = engine_of(&scheme).ok_or_else(|| UrlError::UnknownScheme(scheme.clone()))?;
+    let engine =
+        engine_of(&scheme).ok_or_else(|| UrlError::UnknownScheme(echo_property_key(&scheme)))?;
     let mut parsed = ParsedUrl {
         engine: engine.to_owned(),
         ..ParsedUrl::default()
@@ -223,13 +256,13 @@ pub fn parse(text: &str) -> Result<ParsedUrl, UrlError> {
         let (k, v) = pair.split_once('=').unwrap_or((pair, ""));
         let key = percent_decode(k)?;
         let value = percent_decode(v)?;
+        if is_credential_key(&key) {
+            return Err(UrlError::CredentialParameter(echo_property_key(&key)));
+        }
         let norm = key.to_ascii_lowercase().replace('_', "-");
         match norm.as_str() {
             "sslmode" | "ssl-mode" => parsed.tls_mode = Some(tls_mode(&value)?),
             "sslrootcert" | "ssl-ca" => parsed.ca_file = Some(PathBuf::from(value)),
-            "password" | "pass" | "pwd" | "sslpassword" => {
-                return Err(UrlError::CredentialParameter(key));
-            }
             "user" | "username" => parsed.username = Some(value),
             _ => {
                 parsed.properties.insert(key, value);
@@ -307,6 +340,52 @@ mod tests {
         let err = parse("postgresql://db/x?password=hunter2").unwrap_err();
         assert!(matches!(err, UrlError::CredentialParameter(_)));
         assert!(!err.to_string().contains("hunter2"));
+    }
+
+    #[test]
+    fn every_credential_like_parameter_is_refused() {
+        for key in [
+            "password",
+            "sslpassword",
+            "PGPASSWORD",
+            "db_passwd",
+            "pass",
+            "pwd",
+            "api_key",
+            "apiKey",
+            "access-token",
+            "client_secret",
+            "authSource",
+            "credentials",
+            "pass\u{200b}word",
+        ] {
+            let url = format!("postgresql://h/db?{}=s3cr3t", percent_encode(key));
+            assert!(
+                matches!(parse(&url), Err(UrlError::CredentialParameter(_))),
+                "{key}"
+            );
+            let msg = parse(&url).unwrap_err().to_string();
+            assert!(!msg.contains("s3cr3t"), "{msg}");
+        }
+        // Ordinary parameters still become properties.
+        let p = parse("postgresql://h/db?application_name=x&connect_timeout=5").unwrap();
+        assert_eq!(p.properties.len(), 2);
+    }
+
+    #[test]
+    fn echoed_text_is_bounded_and_escaped() {
+        let long = "x".repeat(500);
+        let msg = parse(&format!("{long}://h")).unwrap_err().to_string();
+        assert!(msg.len() < 200, "{msg}");
+        let msg = parse("postgresql://h/db?sslmode=evil%0Aforged%20line")
+            .unwrap_err()
+            .to_string();
+        assert!(!msg.contains('\n'), "{msg}");
+        let key = format!("{}token", "k".repeat(300));
+        let msg = parse(&format!("postgresql://h/db?{key}=v"))
+            .unwrap_err()
+            .to_string();
+        assert!(msg.len() < 200, "{msg}");
     }
 
     #[test]

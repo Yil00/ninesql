@@ -17,7 +17,7 @@ use ninesql_core::secrets::{SecretId, SecretMeta, SecretRef, SecretStores, Store
 use ninesql_core::storage::{Paths, ProjectName};
 use ninesql_core::{
     Connection, ConnectionId, ConnectionTypes, Connections, CoreEvent, CoreEvents, DriverRegistry,
-    ManagerConfig, SessionHandle, SessionManager, Workspace,
+    ManagerConfig, SecretSlot, SessionHandle, SessionManager, Workspace,
 };
 
 use super::engines::{self, EngineOffer};
@@ -115,20 +115,80 @@ pub fn assemble(registry: DriverRegistry) -> HubConfig {
         }
     }
     let manager_config = match &paths {
-        Some(p) => ManagerConfig::new(p),
-        None => ManagerConfig::with_known_hosts(ninesql_core::KnownHostsFiles {
-            own: std::env::temp_dir().join("ninesql-known_hosts-unsaved"),
-            user: None,
-        }),
+        Some(p) => Some(ManagerConfig::new(p)),
+        None => match unsaved_known_hosts(&std::env::temp_dir()) {
+            Ok(own) => {
+                config.problems.push(
+                    "SSH host keys you trust are kept only until NineSQL exits (no workspace location)."
+                        .to_owned(),
+                );
+                Some(ManagerConfig::with_known_hosts(
+                    ninesql_core::KnownHostsFiles { own, user: None },
+                ))
+            }
+            Err(e) => {
+                config.problems.push(format!(
+                    "No private directory for SSH host keys ({e}): connections cannot be opened."
+                ));
+                None
+            }
+        },
     };
-    match SessionManager::new(manager_config, registry.clone(), config.stores.clone()) {
-        Ok(m) => config.manager = Some(m),
-        Err(e) => config.problems.push(format!(
-            "The driver runtime did not start ({e}): connections cannot be opened."
-        )),
+    if let Some(manager_config) = manager_config {
+        match SessionManager::new(manager_config, registry.clone(), config.stores.clone()) {
+            Ok(m) => config.manager = Some(m),
+            Err(e) => config.problems.push(format!(
+                "The driver runtime did not start ({e}): connections cannot be opened."
+            )),
+        }
     }
     config.registry = registry;
     config
+}
+
+/// The `known_hosts` file used when there is no workspace location: inside a new directory of
+/// `base` that only this process created, mode 0700, named with the process id and a random
+/// suffix. Never a fixed path in a shared directory, so the SSH layer never tightens the
+/// permissions of `base` itself (for example `/tmp` when run as root) and nobody else can
+/// plant or read the file.
+///
+/// # Errors
+/// The directory could not be created (it is never reused if it already exists).
+pub fn unsaved_known_hosts(base: &std::path::Path) -> std::io::Result<std::path::PathBuf> {
+    use std::os::unix::fs::DirBuilderExt as _;
+    let dir = base.join(format!(
+        "ninesql-{}-{}",
+        std::process::id(),
+        uuid::Uuid::new_v4().simple()
+    ));
+    std::fs::DirBuilder::new().mode(0o700).create(&dir)?;
+    Ok(dir.join("known_hosts"))
+}
+
+/// A fresh reference for a secret about to be stored: `<connection>:<slot>:<random>`. Never
+/// reuses the id of another slot or of an earlier value, so writing it can never overwrite a
+/// secret that some field (of this or another connection) still points at.
+fn fresh_reference(
+    kind: StoreKind,
+    connection: ConnectionId,
+    slot: SecretSlot,
+) -> Result<SecretRef, String> {
+    let id = SecretId::new(format!(
+        "{connection}:{}:{}",
+        slot.id_suffix(),
+        uuid::Uuid::new_v4().simple()
+    ))
+    .map_err(|e| e.to_string())?;
+    Ok(SecretRef::new(kind, id))
+}
+
+/// Whether `id` is referenced by any saved connection or by `connection` (the version being
+/// saved).
+fn is_referenced(id: &SecretId, connections: &Connections, connection: &Connection) -> bool {
+    connections
+        .iter()
+        .chain(std::iter::once(connection))
+        .any(|c| c.secret_refs().iter().any(|(_, _, r)| &r.id == id))
 }
 
 /// The hub entity, as a GPUI global.
@@ -330,9 +390,12 @@ impl ConnectionHub {
         }
     }
 
-    /// Saves a connection built by the dialog: validated with `validate_connection`, typed
-    /// secrets stored in the keyring / vault and the fields pointed at them, `connections.json`
-    /// written, then unused saved secrets deleted. Resolves to the connection id.
+    /// Saves a connection built by the dialog: validated with `validate_connection`; each typed
+    /// secret written to the keyring / vault under a fresh id and its field pointed at it;
+    /// `connections.json` written; only then the hub's list is replaced and the secrets that
+    /// no connection references any more are deleted. If anything fails before the file is
+    /// written, the secrets just stored are deleted again and nothing else changes (the saved
+    /// file still points at the old ones). Resolves to the connection id.
     pub fn save(
         &mut self,
         built: BuiltConnection,
@@ -353,29 +416,26 @@ impl ConnectionHub {
             to_store,
             to_delete,
         } = built;
-        let is_new = current.get(connection.id).is_none();
         self.saving = true;
         cx.notify();
         let work = move || -> Result<(Connections, ConnectionId), String> {
             let mut next = current;
-            if is_new && let (Some(ws), Some(kind)) = (&workspace, store) {
-                // The core's own create path (stores, points, saves, rolls back on failure).
-                let id = ws
-                    .create_connection(&mut next, connection, to_store, kind, &stores)
-                    .map_err(|e| e.to_string())?;
-                return Ok((next, id));
-            }
             let mut connection = connection;
-            // INTEGRATION POINT (core): there is no `Workspace::update_connection`; editing
-            // mirrors `create_connection` here (same secret id scheme `<id>:<slot>`). Hook-up:
-            // `create_connection_checked` / `save_connections_checked(&conns, &registry)`.
+            // INTEGRATION POINT (core): there is no `Workspace::update_connection`; this path
+            // serves both create and edit. Hook-up: `create_connection_checked` /
+            // `save_connections_checked(&conns, &registry)` for the file write, keeping the
+            // fresh-id / write-then-swap order below.
             let mut stored: Vec<SecretRef> = Vec::new();
             let result = (|| {
                 for (slot, secret) in &to_store {
                     let kind = store.ok_or("no keyring or vault is available")?;
-                    let id = SecretId::new(format!("{}:{}", connection.id, slot.id_suffix()))
-                        .map_err(|e| e.to_string())?;
-                    let reference = SecretRef::new(kind, id);
+                    let reference = fresh_reference(kind, connection.id, *slot)?;
+                    if is_referenced(&reference.id, &next, &connection) {
+                        return Err(
+                            "a saved secret with this id is still in use; nothing was written"
+                                .to_owned(),
+                        );
+                    }
                     let secret_kind = connection
                         .set_secret_ref(*slot, reference.clone())
                         .map_err(|e| e.to_string())?;
@@ -402,12 +462,10 @@ impl ConnectionHub {
             drop(to_store);
             match result {
                 Ok(id) => {
-                    let still_used: Vec<SecretRef> = connection
-                        .secret_refs()
-                        .into_iter()
-                        .map(|(_, _, r)| r.clone())
-                        .collect();
-                    for r in to_delete.iter().filter(|r| !still_used.contains(r)) {
+                    for r in &to_delete {
+                        if is_referenced(&r.id, &next, &connection) {
+                            continue;
+                        }
                         if let Err(e) = stores.delete(r) {
                             tracing::warn!(reference = %r, error = %e, "could not delete an unused secret");
                         }
@@ -415,9 +473,10 @@ impl ConnectionHub {
                     Ok((next, id))
                 }
                 Err(e) => {
-                    if is_new {
-                        for r in &stored {
-                            let _ = stores.delete(r);
+                    // Fresh ids: nothing on disk points at them.
+                    for r in &stored {
+                        if let Err(del) = stores.delete(r) {
+                            tracing::warn!(reference = %r, error = %del, "could not roll back a stored secret");
                         }
                     }
                     Err(e)

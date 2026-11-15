@@ -220,6 +220,25 @@ impl HopForm {
         form
     }
 
+    /// Changes the authentication. The credential field is reset, so a saved SSH password is
+    /// never reused as a key passphrase (or the other way round); the old secret is deleted
+    /// when the connection is saved.
+    pub fn set_auth(&mut self, choice: SshAuthChoice) {
+        if self.auth != choice {
+            self.auth = choice;
+            self.secret = SecretField::default();
+            self.key_has_passphrase = false;
+        }
+    }
+
+    /// Ticks or unticks "key has a passphrase"; unticking forgets the saved passphrase.
+    pub fn set_key_has_passphrase(&mut self, on: bool) {
+        if self.key_has_passphrase != on {
+            self.key_has_passphrase = on;
+            self.secret = SecretField::default();
+        }
+    }
+
     /// Whether this hop has a credential field.
     #[must_use]
     pub fn has_secret(&self) -> bool {
@@ -456,6 +475,41 @@ impl ConnectionForm {
         Ok(())
     }
 
+    /// Changes the database authentication. The credential field is reset, so a saved password
+    /// is never reused as a token (or the other way round); the old secret is deleted when the
+    /// connection is saved.
+    pub fn set_auth(&mut self, choice: AuthChoice) {
+        if self.auth != choice {
+            self.auth = choice;
+            self.auth_secret = SecretField::default();
+        }
+    }
+
+    /// Ticks or unticks "client key has a passphrase"; unticking forgets the saved passphrase.
+    pub fn set_client_key_has_passphrase(&mut self, on: bool) {
+        if self.client_key_has_passphrase != on {
+            self.client_key_has_passphrase = on;
+            self.client_key_secret = SecretField::default();
+        }
+    }
+
+    /// Whether "Read-write" can be chosen: production types ignore a read-write override (the
+    /// core keeps their read-only default), so the dialog does not offer it.
+    #[must_use]
+    pub fn read_write_allowed(&self, types: &ConnectionTypes) -> bool {
+        self.connection_type
+            .as_ref()
+            .is_none_or(|t| !types.resolve(t).is_production())
+    }
+
+    /// Sets the connection type; a read-write override is dropped for a production type.
+    pub fn set_connection_type(&mut self, id: ConnectionTypeId, types: &ConnectionTypes) {
+        self.connection_type = Some(id);
+        if self.read_only == Some(false) && !self.read_write_allowed(types) {
+            self.read_only = None;
+        }
+    }
+
     /// Makes the form consistent with an engine's offer after an engine change: unsupported
     /// choices fall back to supported ones (I8). A downgraded TLS mode is never chosen
     /// silently: an unsupported mode moves to the strongest offered one.
@@ -465,7 +519,7 @@ impl ConnectionForm {
         if !offered.contains(&self.auth)
             && let Some(first) = offered.first()
         {
-            self.auth = *first;
+            self.set_auth(*first);
         }
         if offer.offers_tls()
             && !offer.tls_modes.contains(&self.tls_mode)
@@ -569,7 +623,6 @@ impl ConnectionForm {
         };
 
         let mut pending: Vec<(SecretSlot, SecretString)> = Vec::new();
-        let mut to_delete: Vec<SecretRef> = Vec::new();
         let mut typed = typed;
         let mut source_for = |slot: SecretSlot,
                               field: &SecretField,
@@ -580,27 +633,18 @@ impl ConnectionForm {
                 .position(|(s, _)| *s == slot)
                 .map(|i| typed.swap_remove(i).1);
             match field.mode {
-                SecretMode::Ask => {
-                    if let Some(r) = &field.stored {
-                        to_delete.push(r.clone());
-                    }
-                    Ok(SecretSource::Prompt)
-                }
+                SecretMode::Ask => Ok(SecretSource::Prompt),
                 SecretMode::Save => match (new_value, &field.stored) {
-                    (Some(value), stored) => {
-                        let Some(kind) = store else {
+                    (Some(value), _) => {
+                        if store.is_none() {
                             return Err(FormError::new(
                                 "secret",
                                 "no keyring or vault is available: choose \"ask every time\"",
                             ));
-                        };
-                        if let Some(old) = stored
-                            && old.store != kind
-                        {
-                            to_delete.push(old.clone());
                         }
                         pending.push((slot, value));
-                        // Pointed at its reference when it is stored.
+                        // Pointed at a fresh reference when it is stored (the old secret, if
+                        // any, is no longer referenced and lands in `to_delete`).
                         Ok(SecretSource::Prompt)
                     }
                     (None, Some(r)) => Ok(SecretSource::Stored(r.clone())),
@@ -785,6 +829,23 @@ impl ConnectionForm {
         connection.read_only = self.read_only;
         connection.folder = folder;
         connection.properties = properties;
+        // Every saved secret of the previous version that the new one no longer references:
+        // a value replaced, a field switched to "ask", or a credential field gone (auth kind
+        // changed, SSH off, hop removed, passphrase unticked, client certificate cleared, TLS
+        // disabled, engine changed). The hub deletes them after saving, unless still used.
+        let kept: Vec<&SecretRef> = connection
+            .secret_refs()
+            .into_iter()
+            .map(|(_, _, r)| r)
+            .collect();
+        let mut to_delete: Vec<SecretRef> = Vec::new();
+        if let Some(existing) = &self.existing {
+            for (_, _, r) in existing.secret_refs() {
+                if !kept.contains(&r) && !to_delete.contains(r) {
+                    to_delete.push(r.clone());
+                }
+            }
+        }
         Ok(BuiltConnection {
             connection,
             to_store: pending,
@@ -974,6 +1035,17 @@ pub fn notices(
             "The SSH tunnel protects only the way to the SSH server: from there to the database, the credentials cross the network in clear unless the database runs on the SSH server itself (host localhost). Enable TLS.",
         ));
     }
+    if let Endpoint::File { path } = &c.endpoint
+        && inside_dbeaver_directory(path)
+    {
+        // INTEGRATION POINT (core, M5 of the P1-C review): core sets
+        // `ConnectParams::inside_dbeaver_workspace` from the canonical path at connect, and
+        // sqlite then opens the file read-only and immutable. This notice is the dialog's
+        // lexical early warning only (no file system access on the foreground thread, I6).
+        out.push(Notice::warning(
+            "This database file is inside a DBeaver directory. NineSQL never modifies DBeaver files (I4): keep this connection read-only, or copy the file elsewhere.",
+        ));
+    }
     let policy = c.policy(types);
     if policy.read_only && offer.capabilities.read_only == ReadOnlyMechanism::ClientSideOnly {
         out.push(Notice::warning(
@@ -987,6 +1059,16 @@ pub fn notices(
         });
     }
     out
+}
+
+/// Whether a path lies, by its components, inside a DBeaver data directory (`DBeaverData`,
+/// `workspace6`, the legacy `.dbeaver4` / `.dbeaver`). Lexical only: no file system access.
+#[must_use]
+pub fn inside_dbeaver_directory(path: &std::path::Path) -> bool {
+    path.components().any(|c| {
+        let name = c.as_os_str();
+        name == "DBeaverData" || name == "workspace6" || name == ".dbeaver4" || name == ".dbeaver"
+    })
 }
 
 fn is_loopback(host: &str) -> bool {
@@ -1122,23 +1204,227 @@ mod tests {
         assert_eq!(SecretField::default().status(), "Asked at every connect");
     }
 
-    #[test]
-    fn switching_to_ask_deletes_the_saved_secret() {
-        let r = SecretRef::new(StoreKind::Vault, SecretId::new("x:auth").unwrap());
+    fn vault_ref(id: &str) -> SecretRef {
+        SecretRef::new(StoreKind::Vault, SecretId::new(id).unwrap())
+    }
+
+    /// A saved PostgreSQL connection with every credential slot saved: database password, a
+    /// password jump host, a key file with passphrase on the SSH server, an encrypted client
+    /// key.
+    fn saved_with_every_secret() -> Connection {
         let mut f = pg_form();
-        f.auth_secret = SecretField {
-            mode: SecretMode::Ask,
-            stored: Some(r.clone()),
-        };
-        let built = f
+        f.client_cert = "/etc/ninesql/client.crt".into();
+        f.client_key = "/etc/ninesql/client.key".into();
+        f.client_key_has_passphrase = true;
+        f.ssh_enabled = true;
+        f.hops = vec![
+            HopForm {
+                host: "jump.example.test".into(),
+                username: "me".into(),
+                auth: SshAuthChoice::Password,
+                ..HopForm::default()
+            },
+            HopForm {
+                host: "bastion.example.test".into(),
+                username: "me".into(),
+                auth: SshAuthChoice::KeyFile,
+                key_path: "/home/me/.ssh/id_ed25519".into(),
+                key_has_passphrase: true,
+                ..HopForm::default()
+            },
+        ];
+        let mut c = f
             .build(
                 &offer("postgresql"),
                 vec![],
                 &ConnectionTypes::default(),
-                None,
+                Some(StoreKind::Vault),
+            )
+            .unwrap()
+            .connection;
+        for (slot, id) in [
+            (SecretSlot::Auth, "c:auth:1"),
+            (SecretSlot::SshJump(0), "c:ssh-jump-0:1"),
+            (SecretSlot::SshServer, "c:ssh:1"),
+            (SecretSlot::TlsClientKey, "c:tls-client-key:1"),
+        ] {
+            c.set_secret_ref(slot, vault_ref(id)).unwrap();
+        }
+        assert_eq!(c.secret_refs().len(), 4);
+        c
+    }
+
+    fn deleted_after(edit: impl FnOnce(&mut ConnectionForm), engine: &str) -> Vec<String> {
+        let mut f = ConnectionForm::from_connection(&saved_with_every_secret());
+        edit(&mut f);
+        let built = f
+            .build(
+                &offer(engine),
+                vec![],
+                &ConnectionTypes::default(),
+                Some(StoreKind::Vault),
             )
             .unwrap();
-        assert_eq!(built.to_delete, [r]);
+        let mut ids: Vec<String> = built
+            .to_delete
+            .iter()
+            .map(|r| r.id.as_str().to_owned())
+            .collect();
+        ids.sort();
+        ids
+    }
+
+    #[test]
+    fn unchanged_edit_deletes_nothing() {
+        assert!(deleted_after(|_| {}, "postgresql").is_empty());
+    }
+
+    #[test]
+    fn switching_to_ask_deletes_the_saved_secret() {
+        let deleted = deleted_after(|f| f.auth_secret.mode = SecretMode::Ask, "postgresql");
+        assert_eq!(deleted, ["c:auth:1"]);
+    }
+
+    #[test]
+    fn a_replaced_value_deletes_the_old_secret() {
+        let mut f = ConnectionForm::from_connection(&saved_with_every_secret());
+        f.auth_secret.mode = SecretMode::Save;
+        let built = f
+            .build(
+                &offer("postgresql"),
+                vec![(SecretSlot::Auth, secret("new-value"))],
+                &ConnectionTypes::default(),
+                Some(StoreKind::Vault),
+            )
+            .unwrap();
+        assert_eq!(built.to_store.len(), 1);
+        assert_eq!(built.to_delete, [vault_ref("c:auth:1")]);
+    }
+
+    #[test]
+    fn credential_fields_that_go_away_orphan_nothing() {
+        // M2 of the P1-C review: every way a credential field can disappear.
+        assert_eq!(
+            deleted_after(|f| f.set_auth(AuthChoice::UserOnly), "postgresql"),
+            ["c:auth:1"]
+        );
+        assert_eq!(
+            deleted_after(|f| f.ssh_enabled = false, "postgresql"),
+            ["c:ssh-jump-0:1", "c:ssh:1"]
+        );
+        assert_eq!(
+            deleted_after(
+                |f| {
+                    f.hops.remove(0);
+                },
+                "postgresql"
+            ),
+            ["c:ssh-jump-0:1"]
+        );
+        assert_eq!(
+            deleted_after(|f| f.hops[1].set_key_has_passphrase(false), "postgresql"),
+            ["c:ssh:1"]
+        );
+        assert_eq!(
+            deleted_after(|f| f.set_client_key_has_passphrase(false), "postgresql"),
+            ["c:tls-client-key:1"]
+        );
+        assert_eq!(
+            deleted_after(|f| f.client_cert.clear(), "postgresql"),
+            ["c:tls-client-key:1"]
+        );
+        assert_eq!(
+            deleted_after(|f| f.tls_mode = TlsMode::Disable, "postgresql"),
+            ["c:tls-client-key:1"]
+        );
+        // SQLite: a file engine, no SSH and no TLS; only the database password could stay, and
+        // the sqlite driver takes none.
+        let o = offer("sqlite");
+        let deleted = deleted_after(
+            |f| {
+                f.adapt_to(&o);
+                f.file_path = "/tmp/x.db".into();
+            },
+            "sqlite",
+        );
+        assert!(deleted.contains(&"c:ssh:1".to_owned()));
+        assert!(deleted.contains(&"c:ssh-jump-0:1".to_owned()));
+        assert!(deleted.contains(&"c:tls-client-key:1".to_owned()));
+    }
+
+    #[test]
+    fn a_new_hop_never_inherits_a_moved_hops_secret() {
+        // M1: removing jump 0 moves jump 1 down; the moved hop keeps its own reference and the
+        // new hop starts without one.
+        let mut c = saved_with_every_secret();
+        let ssh = c.ssh.as_mut().unwrap();
+        ssh.jump_hosts.push(SshHop::new(
+            "jump2.example.test",
+            22,
+            "me",
+            SshAuth::Password {
+                secret: SecretSource::Stored(vault_ref("c:ssh-jump-1:1")),
+            },
+        ));
+        let mut f = ConnectionForm::from_connection(&c);
+        f.hops.remove(0);
+        f.hops.insert(1, HopForm::default());
+        assert_eq!(f.hops[0].secret.stored, Some(vault_ref("c:ssh-jump-1:1")));
+        assert_eq!(f.hops[1].secret.stored, None);
+    }
+
+    #[test]
+    fn changing_auth_kind_resets_the_secret_field() {
+        // L6: a saved password is never reused as a token or a key passphrase.
+        let mut f = ConnectionForm::from_connection(&saved_with_every_secret());
+        f.set_auth(AuthChoice::Token);
+        assert_eq!(f.auth_secret, SecretField::default());
+        f.set_auth(AuthChoice::Token);
+        let mut hop = f.hops[0].clone();
+        assert!(hop.secret.stored.is_some());
+        hop.set_auth(SshAuthChoice::KeyFile);
+        assert_eq!(hop.secret, SecretField::default());
+        assert!(!hop.key_has_passphrase);
+        let mut same = f.hops[0].clone();
+        same.set_auth(SshAuthChoice::Password);
+        assert!(same.secret.stored.is_some(), "no change, no reset");
+    }
+
+    #[test]
+    fn read_write_is_not_offered_for_production() {
+        let types = ConnectionTypes::default();
+        let mut f = pg_form();
+        assert!(f.read_write_allowed(&types));
+        f.read_only = Some(false);
+        f.set_connection_type(ConnectionTypeId::prod(), &types);
+        assert!(!f.read_write_allowed(&types));
+        assert_eq!(f.read_only, None, "the ignored override is dropped");
+        f.read_only = Some(true);
+        f.set_connection_type(ConnectionTypeId::dev(), &types);
+        assert_eq!(f.read_only, Some(true));
+    }
+
+    #[test]
+    fn dbeaver_directories_are_flagged() {
+        assert!(inside_dbeaver_directory(std::path::Path::new(
+            "/home/me/.local/share/DBeaverData/workspace6/General/db.sqlite"
+        )));
+        assert!(inside_dbeaver_directory(std::path::Path::new(
+            "/home/me/.dbeaver4/x.db"
+        )));
+        assert!(!inside_dbeaver_directory(std::path::Path::new(
+            "/home/me/data/dbeaver-notes.db"
+        )));
+        let mut f = ConnectionForm::new("sqlite");
+        f.name = "x".into();
+        f.connection_type = Some(ConnectionTypeId::dev());
+        f.file_path = "/home/me/.local/share/DBeaverData/workspace6/db.sqlite".into();
+        let o = offer("sqlite");
+        f.adapt_to(&o);
+        let types = ConnectionTypes::default();
+        let built = f.build(&o, vec![], &types, None).unwrap();
+        let n = notices(&built.connection, &o, &types, false);
+        assert!(n.iter().any(|n| n.text.contains("DBeaver directory")));
     }
 
     #[test]

@@ -14,7 +14,7 @@
 use std::rc::Rc;
 
 use gpui_kit::component::button::{Button, ButtonVariants as _};
-use gpui_kit::component::input::{Input, InputState};
+use gpui_kit::component::input::InputState;
 use gpui_kit::component::{ActiveTheme as _, WindowExt as _, h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
@@ -28,6 +28,7 @@ use super::flow::{
     HostKeyView, InitSqlView, SecretPromptView, StatementConfirmView, session_warning_text,
 };
 use super::hub::ConnectionHub;
+use super::secret_input::{self, read_secret, secret_field};
 use super::visuals::{hsla, text_on};
 
 /// Why a connection is being opened.
@@ -180,10 +181,11 @@ impl ConnectFlow {
         };
         let hub = self.hub.read(cx);
         let Some(manager) = hub.manager().cloned() else {
-            self.finish(
+            self.finish_in(
                 FlowResult::Failed(
                     "the driver runtime is not running: connections cannot be opened".to_owned(),
                 ),
+                window,
                 cx,
             );
             return;
@@ -217,11 +219,12 @@ impl ConnectFlow {
         };
         let purpose = run.purpose;
         match outcome {
-            None => self.finish(
+            None => self.finish_in(
                 FlowResult::Failed("the connection attempt stopped".to_owned()),
+                window,
                 cx,
             ),
-            Some(Err(e)) => self.finish(FlowResult::Failed(error_text(&e)), cx),
+            Some(Err(e)) => self.finish_in(FlowResult::Failed(error_text(&e)), window, cx),
             Some(Ok(OpenOutcome::Opened(handle))) => {
                 let info = handle.info();
                 let warnings: Vec<String> = info
@@ -248,15 +251,12 @@ impl ConnectFlow {
                         }
                     }
                 };
-                self.finish(result, cx);
+                self.finish_in(result, window, cx);
             }
             Some(Ok(OpenOutcome::NeedsSecrets(prompts))) => {
                 let inputs: Vec<Entity<InputState>> = prompts
                     .iter()
-                    .map(|p| {
-                        let label = p.label.clone();
-                        cx.new(|cx| InputState::new(window, cx).masked(true).placeholder(label))
-                    })
+                    .map(|p| secret_input::masked_input(window, cx, &p.label))
                     .collect();
                 self.prompt = PendingPrompt::Secrets(SecretPromptView::new(&prompts));
                 self.waiting = Some(Waiting::Secrets { prompts, inputs });
@@ -275,8 +275,9 @@ impl ConnectFlow {
             // INTEGRATION POINT (core, feat/p1-d-app-wiring): `OpenOutcome::NeedsVaultUnlock
             // { connection, slot }` lands here; hook-up: a masked master-password dialog calling
             // `CoreServices::unlock_vault`, then `dispatch` again (prompted secrets asked again).
-            Some(Ok(_)) => self.finish(
+            Some(Ok(_)) => self.finish_in(
                 FlowResult::Failed("this NineSQL build cannot handle the core's answer".to_owned()),
+                window,
                 cx,
             ),
         }
@@ -292,9 +293,11 @@ impl ConnectFlow {
             return;
         };
         for (prompt, input) in prompts.iter().zip(&inputs) {
-            let value = input.read(cx).value().to_string();
-            input.update(cx, |s, cx| s.set_value("", window, cx));
-            run.prompted.push((prompt.slot, SecretString::from(value)));
+            // An empty answer is a valid (empty) password.
+            let secret =
+                read_secret(input, cx).unwrap_or_else(|| SecretString::from(String::new()));
+            secret_input::clear(input, window, cx);
+            run.prompted.push((prompt.slot, secret));
         }
         window.close_dialog(cx);
         self.dispatch(window, cx);
@@ -316,9 +319,10 @@ impl ConnectFlow {
             let result = reply.await;
             let _ = this.update_in(cx, |flow, window, cx| match result {
                 Some(Ok(())) => flow.dispatch(window, cx),
-                Some(Err(e)) => flow.finish(FlowResult::Failed(error_text(&e)), cx),
-                None => flow.finish(
+                Some(Err(e)) => flow.finish_in(FlowResult::Failed(error_text(&e)), window, cx),
+                None => flow.finish_in(
                     FlowResult::Failed("the host key could not be recorded".to_owned()),
+                    window,
                     cx,
                 ),
             });
@@ -337,17 +341,36 @@ impl ConnectFlow {
         self.dispatch(window, cx);
     }
 
-    /// Cancels the prompt in progress.
+    /// Cancels the prompt in progress ("Cancel" button): closes its dialog, clears what was
+    /// typed and ends the run.
     pub fn cancel(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.waiting.take().is_some() {
+        if self.waiting.is_some() {
             window.close_dialog(cx);
         }
-        self.finish(FlowResult::Cancelled, cx);
+        self.finish_in(FlowResult::Cancelled, window, cx);
     }
 
-    fn finish(&mut self, result: FlowResult, cx: &mut Context<Self>) {
+    /// The prompt dialog was dismissed (Escape, the close button, a click outside): the run
+    /// ends as cancelled, so the flow never stays stuck waiting on a dialog that is gone.
+    /// Does nothing once the prompt was answered (its dialog is then closed by the flow).
+    pub fn abandon(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.waiting.is_some() {
+            self.finish_in(FlowResult::Cancelled, window, cx);
+        }
+    }
+
+    /// Drops the prompt in progress, emptying its secret inputs first.
+    fn clear_waiting(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(Waiting::Secrets { inputs, .. }) = self.waiting.take() {
+            for input in &inputs {
+                secret_input::clear(input, window, cx);
+            }
+        }
+    }
+
+    fn finish_in(&mut self, result: FlowResult, window: &mut Window, cx: &mut Context<Self>) {
         let purpose = self.run.take().map_or(Purpose::Open, |r| r.purpose);
-        self.waiting = None;
+        self.clear_waiting(window, cx);
         self.prompt = PendingPrompt::None;
         let finished = FlowFinished { purpose, result };
         self.last = Some(finished.clone());
@@ -375,6 +398,12 @@ pub fn error_text(e: &CoreError) -> String {
 fn open_prompt_dialog(flow: Entity<ConnectFlow>, window: &mut Window, cx: &mut App) {
     let first = std::cell::Cell::new(true);
     window.open_dialog(cx, move |dialog, window, cx| {
+        let dialog = {
+            let flow = flow.clone();
+            dialog.on_close(move |_, window, cx| {
+                flow.update(cx, |f, cx| f.abandon(window, cx));
+            })
+        };
         let state = flow.read(cx);
         let prompt = state.prompt.clone();
         let inputs = state.secret_inputs();
@@ -413,7 +442,7 @@ fn open_prompt_dialog(flow: Entity<ConnectFlow>, window: &mut Window, cx: &mut A
                                 .id(("secret-prompt", i))
                                 .gap_1()
                                 .child(div().text_sm().child(label.clone()))
-                                .child(Input::new(input).mask_toggle())
+                                .child(secret_field(input))
                         }),
                 )
                 .child(

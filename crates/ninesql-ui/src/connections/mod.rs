@@ -10,6 +10,7 @@
 //! - [`hub`]: the application's connections, sessions and core services (I6).
 //! - [`connect_flow`]: the per-window connect flow and its prompt dialogs.
 //! - [`dialog`]: the connection dialog view.
+//! - [`secret_input`]: masked secret inputs, read into zeroized buffers and cleared on exit.
 //! - [`visuals`]: type color, type / read-only / security badges (ADR-0007 §4).
 
 pub mod connect_flow;
@@ -18,6 +19,7 @@ pub mod engines;
 pub mod flow;
 pub mod form;
 pub mod hub;
+pub mod secret_input;
 pub mod url;
 pub mod visuals;
 

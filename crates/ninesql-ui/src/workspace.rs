@@ -24,7 +24,9 @@ use crate::actions::{
 };
 use crate::appearance;
 use crate::connections::connect_flow::{ConnectFlow, FlowFinished, FlowResult, Purpose};
-use crate::connections::dialog::{ConnectionDialog, ConnectionSaved, new_form};
+use crate::connections::dialog::{
+    ConnectionDialog, ConnectionDialogCancelled, ConnectionSaved, new_form,
+};
 use crate::connections::form::ConnectionForm;
 use crate::connections::hub::{ConnectionHub, hub_or_install_empty};
 use crate::connections::visuals::{ConnectionBadges, badges};
@@ -272,9 +274,27 @@ impl Workspace {
                     .map(|c| c.name.clone())
                     .unwrap_or_default();
                 window.push_notification(Notification::success(format!("Saved \"{name}\".")), cx);
+                if this.hub.read(cx).is_open(id) {
+                    // The open sessions keep the settings they were opened with (policy,
+                    // read-only, TLS, SSH): say so instead of implying the change is live.
+                    window.push_notification(
+                        Notification::info(format!(
+                            "\"{name}\" is connected: its open sessions keep the previous settings until you reconnect (Disconnect, then Connect)."
+                        ))
+                        .autohide(false),
+                        cx,
+                    );
+                }
             },
         );
         self._subscriptions.push(sub);
+        let cancelled = cx.subscribe(
+            &dialog,
+            |this: &mut Self, _, _: &ConnectionDialogCancelled, _| {
+                this.dialog = None;
+            },
+        );
+        self._subscriptions.push(cancelled);
         self.dialog = Some(dialog.clone());
         let first = std::cell::Cell::new(true);
         let weak = cx.entity().downgrade();
@@ -287,8 +307,12 @@ impl Workspace {
             let weak = weak.clone();
             d.title(title)
                 .w(px(760.))
-                .on_close(move |_, _, cx| {
-                    let _ = weak.update(cx, |ws, _| ws.dialog = None);
+                .on_close(move |_, window, cx| {
+                    // Escape, the close button or a click outside: no typed secret survives.
+                    let dialog = weak.update(cx, |ws, _| ws.dialog.take()).ok().flatten();
+                    if let Some(dialog) = dialog {
+                        dialog.update(cx, |d, cx| d.clear_secret_inputs(window, cx));
+                    }
                 })
                 .child(dialog.clone())
         });
@@ -471,7 +495,9 @@ impl Workspace {
                 );
                 if !warnings.is_empty() {
                     window.push_notification(
-                        Notification::warning(warnings.join("\n")).title("Security warnings"),
+                        Notification::warning(warnings.join("\n"))
+                            .title("Security warnings")
+                            .autohide(false),
                         cx,
                     );
                 }
@@ -489,7 +515,9 @@ impl Workspace {
                 );
                 if !warnings.is_empty() {
                     window.push_notification(
-                        Notification::warning(warnings.join("\n")).title("Security warnings"),
+                        Notification::warning(warnings.join("\n"))
+                            .title("Security warnings")
+                            .autohide(false),
                         cx,
                     );
                 }
@@ -798,10 +826,9 @@ impl Workspace {
         let active = self.active_connection.and_then(|id| {
             let hub = self.hub.read(cx);
             let c = hub.connection(id)?;
-            let session_ro = hub.sessions(id).first().map(|s| s.info().read_only);
             Some((
                 c.name.clone(),
-                ConnectionBadges::of(c, hub.types(), session_ro),
+                ConnectionBadges::of(c, hub.types(), hub.sessions(id)),
                 hub.is_open(id),
             ))
         });
@@ -813,6 +840,14 @@ impl Workspace {
                     name
                 } else {
                     format!("{name} (disconnected)")
+                })
+                .when(b.pending_reconnect, |el| {
+                    el.child(
+                        div()
+                            .id("status-pending-reconnect")
+                            .text_xs()
+                            .child("edited: reconnect to apply"),
+                    )
                 })
                 // ADR-0007 §4: the type name is always visible in the status bar.
                 .child(badges("status", &b, true, cx))
@@ -903,7 +938,7 @@ impl Workspace {
         let id = self.active_connection?;
         let hub = self.hub.read(cx);
         let c = hub.connection(id)?;
-        let b = ConnectionBadges::of(c, hub.types(), None);
+        let b = ConnectionBadges::of(c, hub.types(), hub.sessions(id));
         b.production.then_some(b.color)
     }
 

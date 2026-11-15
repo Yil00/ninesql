@@ -5,7 +5,7 @@
 use gpui_kit::component::{ActiveTheme as _, h_flex};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
-use ninesql_core::{Color, Connection, ConnectionType, ConnectionTypes};
+use ninesql_core::{Color, Connection, ConnectionType, ConnectionTypes, SessionHandle};
 
 use crate::appearance::{MIN_TEXT_CONTRAST, contrast_ratio};
 
@@ -46,25 +46,67 @@ pub struct ConnectionBadges {
     pub production: bool,
     /// Sessions are read-only (enforced engine-side, I3).
     pub read_only: bool,
-    /// Number of weakened security settings (I5).
+    /// Number of weakened security settings (I5): of the open session when there is one
+    /// (TLS and SSH downgrades, host keys recorded without asking, credentials in clear,
+    /// client-side-only read-only), of the saved settings otherwise.
     pub security_warnings: usize,
+    /// The saved settings differ from the open session's (type or read-only edited while
+    /// connected): they apply on reconnect.
+    pub pending_reconnect: bool,
 }
 
 impl ConnectionBadges {
-    /// Badges of a saved connection under `types`. `session_read_only` is the open session's
-    /// actual mode, when there is one: it wins over the configured one.
+    /// Badges of a connection. With open `sessions`, production, read-only and warnings come
+    /// from the sessions themselves (`SessionInfo::policy`, `read_only`, `warnings`): what is
+    /// enforced now, not what was saved since. Without, from the saved connection under `types`.
     #[must_use]
-    pub fn of(c: &Connection, types: &ConnectionTypes, session_read_only: Option<bool>) -> Self {
+    pub fn of(c: &Connection, types: &ConnectionTypes, sessions: &[SessionHandle]) -> Self {
         let ty: ConnectionType = types.resolve(&c.connection_type);
-        let policy = c.policy(types);
-        let color = hsla(ty.color);
+        let saved = c.policy(types);
+        let (production, read_only, security_warnings) = if sessions.is_empty() {
+            (
+                saved.production,
+                saved.read_only,
+                c.security_warnings().len(),
+            )
+        } else {
+            (
+                sessions.iter().any(|s| s.info().policy.production),
+                sessions.iter().all(|s| s.info().read_only),
+                sessions
+                    .iter()
+                    .map(|s| s.info().warnings.len())
+                    .max()
+                    .unwrap_or(0),
+            )
+        };
+        let pending_reconnect = !sessions.is_empty()
+            && (production != saved.production || read_only != saved.read_only);
+        // The color follows what is enforced: a production session keeps a production color
+        // even if the saved type is no longer production, and the other way round.
+        let (type_name, color): (SharedString, Hsla) = if production == saved.production {
+            (ty.name.into(), hsla(ty.color))
+        } else if production {
+            let p = ConnectionType::production();
+            (
+                format!("{} (until reconnect)", p.name).into(),
+                hsla(p.color),
+            )
+        } else {
+            let d = ConnectionType::development();
+            (
+                format!("{} (after reconnect)", ty.name).into(),
+                hsla(d.color),
+            )
+        };
         Self {
-            type_name: ty.name.into(),
+            type_name,
             color,
             on_color: text_on(color),
-            production: policy.production,
-            read_only: session_read_only.unwrap_or(policy.read_only),
-            security_warnings: c.security_warnings().len(),
+            production,
+            read_only,
+            security_warnings,
+            pending_reconnect,
         }
     }
 
