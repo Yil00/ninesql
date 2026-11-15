@@ -16,6 +16,7 @@
 pub mod actions;
 pub mod app;
 pub mod appearance;
+pub mod connections;
 pub mod editor_tab;
 pub mod keymap;
 pub mod layout;

@@ -16,6 +16,7 @@ workspace = true
 ninesql-core.workspace = true
 ninesql-grid.workspace = true
 ninesql-editor.workspace = true
+thiserror.workspace = true
 toml.workspace = true
 toml_edit.workspace = true
 tracing.workspace = true
@@ -29,6 +30,12 @@ gpui-base.workspace = true
 gpui-component.workspace = true
 gpui-component-macros.workspace = true
 gpui-kit-assets.workspace = true
+# The drivers NineSQL ships (L5). Only the `ninesql` binary (src/main.rs) names them, to register
+# them in the core's `DriverRegistry` at startup; the library talks to drivers through
+# `ninesql-core` only (docs/02-architecture.md). Cargo has no binary-only dependencies, hence here.
+ninesql-driver-pgwire = { path = "../drivers/ninesql-driver-pgwire" }
+ninesql-driver-mysqlwire = { path = "../drivers/ninesql-driver-mysqlwire" }
+ninesql-driver-sqlite = { path = "../drivers/ninesql-driver-sqlite" }
 
 [[bin]]
 name = "ninesql"
@@ -38,6 +45,12 @@ path = "src/main.rs"
 # TestAppContext for view-model tests (AGENTS.md): GPUI's own `test-support`, see root Cargo.toml.
 gpui-pre = { workspace = true, features = ["test-support"] }
 tempfile.workspace = true
+# The in-memory mock driver (feature `mock`) and the in-memory secret store for connection flow
+# tests; never in release builds.
+ninesql-core = { workspace = true, features = ["mock"] }
+ninesql-secrets = { workspace = true, features = ["memory-store"] }
+proptest.workspace = true
+serde_json.workspace = true
 # Regression test of the patched X11 IME decoder ([patch.crates-io] in the root Cargo.toml).
 xim-ctext = { version = "=0.3.0", default-features = false }
 

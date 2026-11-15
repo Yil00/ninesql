@@ -47,6 +47,22 @@ actions!(
         ResetFontSize,
         /// List the problems found in settings.toml.
         ShowSettingsProblems,
+        /// Open the dialog to create a connection.
+        NewConnection,
+        /// Edit the connection selected in the navigator.
+        EditConnection,
+        /// Duplicate the connection selected in the navigator.
+        DuplicateConnection,
+        /// Delete the connection selected in the navigator (asks for confirmation).
+        DeleteConnection,
+        /// Open a session on the connection selected in the navigator.
+        ConnectConnection,
+        /// Close the sessions of the connection selected in the navigator.
+        DisconnectConnection,
+        /// Test the connection selected in the navigator.
+        TestConnection,
+        /// List the problems found while loading the connections.
+        ShowConnectionProblems,
     ]
 );
 
@@ -270,6 +286,70 @@ pub const ACTIONS: &[ActionSpec] = &[
         Workspace,
         ["ctrl-k ctrl-e"],
         keywords = ["settings.toml", "errors", "keybindings"]
+    ),
+    spec!(
+        NewConnection,
+        "New connection",
+        "Connection",
+        Workspace,
+        ["ctrl-alt-n"],
+        keywords = ["database", "add", "create", "datasource"]
+    ),
+    spec!(
+        EditConnection,
+        "Edit connection",
+        "Connection",
+        Workspace,
+        ["f4"],
+        keywords = ["properties", "settings", "configure"]
+    ),
+    spec!(
+        DuplicateConnection,
+        "Duplicate connection",
+        "Connection",
+        Workspace,
+        ["ctrl-k ctrl-d"],
+        keywords = ["copy", "clone"]
+    ),
+    spec!(
+        DeleteConnection,
+        "Delete connection",
+        "Connection",
+        Workspace,
+        ["ctrl-k delete"],
+        keywords = ["remove"]
+    ),
+    spec!(
+        ConnectConnection,
+        "Connect",
+        "Connection",
+        Workspace,
+        ["ctrl-k ctrl-o"],
+        keywords = ["open", "session", "login"]
+    ),
+    spec!(
+        DisconnectConnection,
+        "Disconnect",
+        "Connection",
+        Workspace,
+        ["ctrl-k ctrl-x"],
+        keywords = ["close", "session"]
+    ),
+    spec!(
+        TestConnection,
+        "Test connection",
+        "Connection",
+        Workspace,
+        ["ctrl-alt-t"],
+        keywords = ["ping", "check"]
+    ),
+    spec!(
+        ShowConnectionProblems,
+        "Show connection problems",
+        "Connection",
+        Workspace,
+        ["ctrl-k ctrl-l"],
+        keywords = ["load", "errors", "issues", "removed"]
     ),
 ];
 

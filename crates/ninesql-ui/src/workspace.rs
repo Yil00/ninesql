@@ -16,17 +16,26 @@ use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
 use crate::actions::{
-    self, CloseTab, CloseWindow, CommandPalette, FocusNavigator, FocusNextPane, FocusPreviousPane,
-    NewEditorTab, NextTab, PreviousTab, Scope, ShowSettingsProblems, SplitDown, SplitRight,
+    self, CloseTab, CloseWindow, CommandPalette, ConnectConnection, DeleteConnection,
+    DisconnectConnection, DuplicateConnection, EditConnection, FocusNavigator, FocusNextPane,
+    FocusPreviousPane, NewConnection, NewEditorTab, NextTab, PreviousTab, Scope,
+    ShowConnectionProblems, ShowSettingsProblems, SplitDown, SplitRight, TestConnection,
     ToggleNavigator, WORKSPACE_CONTEXT,
 };
 use crate::appearance;
+use crate::connections::connect_flow::{ConnectFlow, FlowFinished, FlowResult, Purpose};
+use crate::connections::dialog::{ConnectionDialog, ConnectionSaved, new_form};
+use crate::connections::form::ConnectionForm;
+use crate::connections::hub::{ConnectionHub, hub_or_install_empty};
+use crate::connections::visuals::{ConnectionBadges, badges};
 use crate::editor_tab::SqlEditorTab;
 use crate::keymap::EffectiveKeymap;
 use crate::layout::{EditorLayout, Node, PaneId, SplitAxis, TabId};
 use crate::navigator::Navigator;
 use crate::services::Services;
 use crate::settings::SettingsState;
+use gpui_kit::component::notification::Notification;
+use ninesql_core::ConnectionId;
 
 /// Width of the navigator dock when the window opens.
 const NAVIGATOR_WIDTH: Pixels = px(260.);
@@ -39,11 +48,22 @@ pub struct Workspace {
     navigator: Entity<Navigator>,
     navigator_visible: bool,
     next_script: usize,
+    hub: Entity<ConnectionHub>,
+    flow: Entity<ConnectFlow>,
+    active_connection: Option<ConnectionId>,
+    dialog: Option<Entity<ConnectionDialog>>,
+    _subscriptions: Vec<Subscription>,
 }
 
 impl Workspace {
     /// A workspace with the navigator and one empty SQL editor.
     pub fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
+        let hub = hub_or_install_empty(cx);
+        let flow = cx.new(|_| ConnectFlow::new(hub.clone()));
+        let subscriptions = vec![
+            cx.observe(&hub, |_, _, cx| cx.notify()),
+            cx.subscribe_in(&flow, window, Self::on_flow_finished),
+        ];
         let mut this = Self {
             focus: cx.focus_handle(),
             layout: EditorLayout::new(),
@@ -51,6 +71,11 @@ impl Workspace {
             navigator: cx.new(Navigator::new),
             navigator_visible: true,
             next_script: 1,
+            hub,
+            flow,
+            active_connection: None,
+            dialog: None,
+            _subscriptions: subscriptions,
         };
         this.new_tab(window, cx);
         this
@@ -175,8 +200,337 @@ impl Workspace {
     /// Shows the navigator dock and focuses it.
     pub fn focus_navigator(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.navigator_visible = true;
-        self.navigator.focus_handle(cx).focus(window, cx);
+        self.navigator.update(cx, |n, cx| n.focus_tree(window, cx));
         cx.notify();
+    }
+
+    /// The application's connections.
+    #[must_use]
+    pub fn hub(&self) -> &Entity<ConnectionHub> {
+        &self.hub
+    }
+
+    /// The connect flow of this window.
+    #[must_use]
+    pub fn flow(&self) -> &Entity<ConnectFlow> {
+        &self.flow
+    }
+
+    /// The connection dialog, while it is open.
+    #[must_use]
+    pub fn connection_dialog(&self) -> Option<&Entity<ConnectionDialog>> {
+        self.dialog.as_ref()
+    }
+
+    /// The connection of the last session opened in this window (status bar, frame color).
+    /// Editor tabs get their own connection in P3.
+    #[must_use]
+    pub fn active_connection(&self) -> Option<ConnectionId> {
+        self.active_connection
+    }
+
+    fn selected_connection(&self, cx: &App) -> Option<ConnectionId> {
+        self.navigator.read(cx).selected_connection(cx)
+    }
+
+    fn notify_no_selection(window: &mut Window, cx: &mut App) {
+        window.push_notification(
+            Notification::info("Select a connection in the navigator first."),
+            cx,
+        );
+    }
+
+    fn selected(&self, cx: &App) -> Option<ninesql_core::Connection> {
+        self.selected_connection(cx)
+            .and_then(|id| self.hub.read(cx).connection(id).cloned())
+    }
+
+    /// Opens the connection dialog on `form`.
+    pub fn open_connection_dialog(
+        &mut self,
+        form: ConnectionForm,
+        title: &'static str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let hub = self.hub.clone();
+        let flow = self.flow.clone();
+        let dialog = cx.new(|cx| ConnectionDialog::new(hub, flow, form, window, cx));
+        let sub = cx.subscribe_in(
+            &dialog,
+            window,
+            |this: &mut Self, _, saved: &ConnectionSaved, window, cx| {
+                let id = saved.0;
+                this.dialog = None;
+                window.close_dialog(cx);
+                this.navigator
+                    .update(cx, |n, cx| n.select_connection(id, cx));
+                let name = this
+                    .hub
+                    .read(cx)
+                    .connection(id)
+                    .map(|c| c.name.clone())
+                    .unwrap_or_default();
+                window.push_notification(Notification::success(format!("Saved \"{name}\".")), cx);
+            },
+        );
+        self._subscriptions.push(sub);
+        self.dialog = Some(dialog.clone());
+        let first = std::cell::Cell::new(true);
+        let weak = cx.entity().downgrade();
+        window.open_dialog(cx, move |d, window, cx| {
+            if first.replace(false)
+                && let Some(name) = dialog.read(cx).input("name").cloned()
+            {
+                name.focus_handle(cx).focus(window, cx);
+            }
+            let weak = weak.clone();
+            d.title(title)
+                .w(px(760.))
+                .on_close(move |_, _, cx| {
+                    let _ = weak.update(cx, |ws, _| ws.dialog = None);
+                })
+                .child(dialog.clone())
+        });
+    }
+
+    /// "New connection".
+    pub fn new_connection(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        match new_form(self.hub.read(cx)) {
+            Some(form) => self.open_connection_dialog(form, "New connection", window, cx),
+            None => window.push_notification(
+                Notification::error("No database driver is available in this build."),
+                cx,
+            ),
+        }
+    }
+
+    /// "Edit connection" on the navigator's selection.
+    pub fn edit_connection(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(c) = self.selected(cx) else {
+            return Self::notify_no_selection(window, cx);
+        };
+        self.open_connection_dialog(
+            ConnectionForm::from_connection(&c),
+            "Edit connection",
+            window,
+            cx,
+        );
+    }
+
+    /// "Duplicate connection": the dialog opens on a copy; saved secrets are not copied.
+    pub fn duplicate_connection(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(c) = self.selected(cx) else {
+            return Self::notify_no_selection(window, cx);
+        };
+        self.open_connection_dialog(
+            ConnectionForm::duplicate_of(&c),
+            "Duplicate connection",
+            window,
+            cx,
+        );
+    }
+
+    /// "Delete connection": asks first, then deletes it and its saved secrets.
+    pub fn delete_connection(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(c) = self.selected(cx) else {
+            return Self::notify_no_selection(window, cx);
+        };
+        let this = cx.entity().downgrade();
+        let id = c.id;
+        let name: SharedString = c.name.clone().into();
+        let secrets = c.secret_refs().len();
+        let open = self.hub.read(cx).is_open(id);
+        window.open_dialog(cx, move |dialog, _window, cx| {
+            let this = this.clone();
+            let delete = Button::new("delete-confirm")
+                .danger()
+                .label("Delete")
+                .on_click(move |_, window, cx| {
+                    window.close_dialog(cx);
+                    let _ = this.update(cx, |ws, cx| ws.delete_connection_now(id, window, cx));
+                });
+            let cancel = Button::new("delete-cancel")
+                .label("Cancel")
+                .on_click(|_, window, cx| window.close_dialog(cx));
+            let muted = cx.theme().muted_foreground;
+            dialog
+                .title("Delete connection")
+                .w(px(480.))
+                .child(
+                    v_flex()
+                        .gap_2()
+                        .text_sm()
+                        .child(format!("Delete \"{name}\"? This cannot be undone."))
+                        .when(secrets > 0, |el| {
+                            el.child(div().text_color(muted).child(format!(
+                                "Its {secrets} saved credential(s) are deleted from the keyring or vault."
+                            )))
+                        })
+                        .when(open, |el| {
+                            el.child(div().text_color(muted).child("Its open sessions are closed."))
+                        }),
+                )
+                .footer(h_flex().gap_2().justify_end().child(cancel).child(delete))
+        });
+    }
+
+    /// Deletes a connection without asking (the confirmed path of "Delete connection").
+    pub fn delete_connection_now(
+        &mut self,
+        id: ConnectionId,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.active_connection == Some(id) {
+            self.active_connection = None;
+        }
+        let task = self.hub.update(cx, |hub, cx| hub.remove(id, cx));
+        cx.spawn_in(window, async move |_, cx| {
+            if let Err(e) = task.await {
+                let _ = cx.update(|window, cx| {
+                    window.push_notification(Notification::error(format!("Not deleted: {e}")), cx);
+                });
+            }
+        })
+        .detach();
+    }
+
+    /// Opens (or tests) the navigator's selection.
+    pub fn connect_selected(
+        &mut self,
+        purpose: Purpose,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(id) = self.selected_connection(cx) else {
+            return Self::notify_no_selection(window, cx);
+        };
+        self.connect(id, purpose, window, cx);
+    }
+
+    /// Opens (or tests) a saved connection through the connect flow.
+    pub fn connect(
+        &mut self,
+        id: ConnectionId,
+        purpose: Purpose,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(c) = self.hub.read(cx).connection(id).cloned() else {
+            return;
+        };
+        if self.flow.read(cx).is_busy() {
+            window.push_notification(
+                Notification::info("A connection is already being opened."),
+                cx,
+            );
+            return;
+        }
+        self.flow.update(cx, |flow, cx| {
+            flow.start(c, purpose, Vec::new(), window, cx)
+        });
+    }
+
+    /// Closes the sessions of the navigator's selection.
+    pub fn disconnect_selected(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(id) = self.selected_connection(cx) else {
+            return Self::notify_no_selection(window, cx);
+        };
+        self.hub.update(cx, |hub, cx| hub.disconnect(id, cx));
+        if self.active_connection == Some(id) {
+            self.active_connection = None;
+        }
+        cx.notify();
+    }
+
+    fn on_flow_finished(
+        &mut self,
+        _: &Entity<ConnectFlow>,
+        event: &FlowFinished,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        // Tests run from the dialog report inside it.
+        let from_dialog = event.purpose == Purpose::Test && self.dialog.is_some();
+        match &event.result {
+            FlowResult::Opened {
+                connection,
+                warnings,
+            } => {
+                self.active_connection = Some(*connection);
+                let name = self
+                    .hub
+                    .read(cx)
+                    .connection(*connection)
+                    .map(|c| c.name.clone())
+                    .unwrap_or_default();
+                window.push_notification(
+                    Notification::success(format!("Connected to \"{name}\".")),
+                    cx,
+                );
+                if !warnings.is_empty() {
+                    window.push_notification(
+                        Notification::warning(warnings.join("\n")).title("Security warnings"),
+                        cx,
+                    );
+                }
+            }
+            FlowResult::TestOk {
+                server_version,
+                warnings,
+            } if !from_dialog => {
+                let version = server_version
+                    .clone()
+                    .unwrap_or_else(|| "the server".to_owned());
+                window.push_notification(
+                    Notification::success(format!("Connected to {version}; session closed.")),
+                    cx,
+                );
+                if !warnings.is_empty() {
+                    window.push_notification(
+                        Notification::warning(warnings.join("\n")).title("Security warnings"),
+                        cx,
+                    );
+                }
+            }
+            FlowResult::Failed(e) if !from_dialog => {
+                window.push_notification(
+                    Notification::error(e.clone()).title("Connection failed"),
+                    cx,
+                );
+            }
+            _ => {}
+        }
+        cx.notify();
+    }
+
+    /// Lists the problems found while loading connections (removed data, unknown keys that
+    /// looked like secrets, a workspace or runtime that could not start).
+    pub fn show_connection_problems(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let problems: Rc<Vec<SharedString>> = Rc::new(
+            self.hub
+                .read(cx)
+                .problems()
+                .iter()
+                .map(|p| SharedString::from(p.clone()))
+                .collect(),
+        );
+        window.open_dialog(cx, move |dialog, _window, _cx| {
+            let body = v_flex()
+                .gap_2()
+                .text_sm()
+                .when(problems.is_empty(), |el| {
+                    el.child("No problems: every saved connection was loaded as it is.")
+                })
+                .children(
+                    problems
+                        .iter()
+                        .enumerate()
+                        .map(|(i, p)| div().id(("connection-problem", i)).child(p.clone())),
+                );
+            dialog.title("Connection problems").w(px(640.)).child(body)
+        });
     }
 
     /// Focuses the active editor, or the workspace when the active pane is empty.
@@ -286,6 +640,22 @@ impl Workspace {
             self.focus_navigator(window, cx);
         } else if any.is::<ShowSettingsProblems>() {
             self.show_settings_problems(window, cx);
+        } else if any.is::<NewConnection>() {
+            self.new_connection(window, cx);
+        } else if any.is::<EditConnection>() {
+            self.edit_connection(window, cx);
+        } else if any.is::<DuplicateConnection>() {
+            self.duplicate_connection(window, cx);
+        } else if any.is::<DeleteConnection>() {
+            self.delete_connection(window, cx);
+        } else if any.is::<ConnectConnection>() {
+            self.connect_selected(Purpose::Open, window, cx);
+        } else if any.is::<TestConnection>() {
+            self.connect_selected(Purpose::Test, window, cx);
+        } else if any.is::<DisconnectConnection>() {
+            self.disconnect_selected(window, cx);
+        } else if any.is::<ShowConnectionProblems>() {
+            self.show_connection_problems(window, cx);
         } else if any.is::<CloseWindow>() {
             window.remove_window();
         } else {
@@ -425,9 +795,38 @@ impl Workspace {
     }
 
     fn render_status_bar(&self, window: &mut Window, cx: &mut Context<Self>) -> StatusBar {
-        let connection = Services::bridge(cx)
-            .active_connection_label()
-            .unwrap_or_else(|| "No connection".into());
+        let active = self.active_connection.and_then(|id| {
+            let hub = self.hub.read(cx);
+            let c = hub.connection(id)?;
+            let session_ro = hub.sessions(id).first().map(|s| s.info().read_only);
+            Some((
+                c.name.clone(),
+                ConnectionBadges::of(c, hub.types(), session_ro),
+                hub.is_open(id),
+            ))
+        });
+        let connection: AnyElement = match active {
+            Some((name, b, open)) => h_flex()
+                .id("status-connection")
+                .gap_2()
+                .child(if open {
+                    name
+                } else {
+                    format!("{name} (disconnected)")
+                })
+                // ADR-0007 §4: the type name is always visible in the status bar.
+                .child(badges("status", &b, true, cx))
+                .into_any_element(),
+            None => div()
+                .id("status-connection")
+                .child(
+                    Services::bridge(cx)
+                        .active_connection_label()
+                        .unwrap_or_else(|| "No connection".into()),
+                )
+                .into_any_element(),
+        };
+        let connection_problems = self.hub.read(cx).problems().len();
         let problems = cx
             .try_global::<SettingsState>()
             .map_or(0, |s| s.diagnostics.len());
@@ -446,7 +845,28 @@ impl Workspace {
                 .map_or(1, |i| i + 1),
             self.layout.pane_count()
         );
-        let mut bar = StatusBar::new().left(div().id("status-connection").child(connection));
+        let mut bar = StatusBar::new().left(connection);
+        if connection_problems > 0 {
+            let this = cx.entity().downgrade();
+            bar = bar.left(
+                Button::new("status-connection-problems")
+                    .ghost()
+                    .xsmall()
+                    .label(if connection_problems == 1 {
+                        "1 connection problem".to_owned()
+                    } else {
+                        format!("{connection_problems} connection problems")
+                    })
+                    .text_color(appearance::ensure_contrast(
+                        cx.theme().warning,
+                        &[*cx.theme().tokens.status_bar],
+                        appearance::MIN_TEXT_CONTRAST,
+                    ))
+                    .on_click(move |_, window, cx| {
+                        let _ = this.update(cx, |ws, cx| ws.show_connection_problems(window, cx));
+                    }),
+            );
+        }
         if problems > 0 {
             let label = if problems == 1 {
                 "1 settings problem".to_owned()
@@ -472,6 +892,32 @@ impl Workspace {
         bar.right(div().id("status-pane").child(position))
             .right(div().id("status-theme").child(mode))
             .right(div().id("status-scale").child(scale))
+    }
+}
+
+impl Workspace {
+    /// The color framing the editor area (ADR-0007 §4): the type color of the active
+    /// connection when production rules apply.
+    #[must_use]
+    pub fn frame_color(&self, cx: &App) -> Option<Hsla> {
+        let id = self.active_connection?;
+        let hub = self.hub.read(cx);
+        let c = hub.connection(id)?;
+        let b = ConnectionBadges::of(c, hub.types(), None);
+        b.production.then_some(b.color)
+    }
+
+    fn frame_editor_area(&self, area: AnyElement, cx: &App) -> AnyElement {
+        match self.frame_color(cx) {
+            Some(color) => div()
+                .id("production-frame")
+                .size_full()
+                .border_2()
+                .border_color(color)
+                .child(area)
+                .into_any_element(),
+            None => area,
+        }
     }
 }
 
@@ -535,6 +981,14 @@ impl Render for Workspace {
             FocusNavigator,
             ShowSettingsProblems,
             CloseWindow,
+            NewConnection,
+            EditConnection,
+            DuplicateConnection,
+            DeleteConnection,
+            ConnectConnection,
+            DisconnectConnection,
+            TestConnection,
+            ShowConnectionProblems,
         );
         let content = root
             .when(client_decorated, |el| {
@@ -557,7 +1011,7 @@ impl Render for Workspace {
                                 .visible(self.navigator_visible)
                                 .child(self.navigator.clone()),
                         )
-                        .child(resizable_panel().child(editor_area)),
+                        .child(resizable_panel().child(self.frame_editor_area(editor_area, cx))),
                 ),
             )
             .child(status_bar);

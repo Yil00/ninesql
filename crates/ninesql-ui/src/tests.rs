@@ -184,7 +184,7 @@ fn navigator_dock_toggles(cx: &mut TestAppContext) {
     assert!(ws.read_with(&vcx, |ws, _| ws.navigator_visible()));
     vcx.simulate_keystrokes("ctrl-b ctrl-k ctrl-n");
     let focused = ws.update_in(&mut vcx, |ws, window, cx| {
-        ws.navigator().focus_handle(cx).is_focused(window)
+        ws.navigator().focus_handle(cx).contains_focused(window, cx)
     });
     assert!(focused, "focus navigator shows and focuses it");
     assert!(ws.read_with(&vcx, |ws, _| ws.navigator_visible()));

@@ -30,7 +30,7 @@ ninesql-ui ──► ninesql-grid, ninesql-editor ──► ninesql-core ──�
                                                   ├──► ninesql-transfer
                                                   └──► ninesql-dbeaver
 ```
-- UI crates never depend on a driver crate directly: `ninesql-core` registers drivers and exposes services.
+- UI crates never use a driver crate directly: `ninesql-core` registers drivers and exposes services. The one exception is the `ninesql` binary (`crates/ninesql-ui/src/main.rs`), which registers the drivers it ships (pgwire, mysqlwire, sqlite) in the `DriverRegistry` at startup; Cargo has no binary-only dependencies, so they are listed in `ninesql-ui`'s manifest, but the library never names them.
 - Drivers depend only on `ninesql-driver-api` (and their client crates). They never read workspace files or secrets; they receive resolved parameters.
 - `ninesql-dbeaver` does not depend on `ninesql-core` (the core depends on it). It outputs a **mirror** of the core connection model, with the decrypted secrets in zeroized buffers; `ninesql-core` converts that model, runs its own validation, persists the connections and moves the secrets to `ninesql-secrets` (P2-C).
 
@@ -78,6 +78,13 @@ The API lives in `ninesql-core` (`runtime`, `registry`, `session`, `connect` mod
 5. The UI enables actions from the capabilities (I8).
 
 For a file endpoint, the core sets `ConnectParams::inside_dbeaver_workspace` (I4) from `ManagerConfig::dbeaver_roots` (`DbeaverRoots`), on the blocking pool: after resolving symbolic links, a file is inside when it lies under the `DBeaverData` directory of a known install location (native, Flatpak, Snap) or under a folder added with `DbeaverRoots::add` (a workspace picked for an import, at runtime through `SessionManager::dbeaver_roots()`), when a component of its path is `DBeaverData`, or when an ancestor below the home directory holds `.metadata/dbeaver-workspace.properties` or a `.dbeaver` directory with a DBeaver project file (`$HOME`, its ancestors and `/` are never taken for one). Every check is read-only and fails closed (an unresolvable path or an unreadable marker counts as inside). The driver receives the canonical path that was checked (`DbeaverRoots::check` → `FileCheck`), and `SessionInfo::inside_dbeaver_workspace` tells the UI the file was opened read-only for that reason. A dangling symbolic link (to a file or folder not created yet) is followed to its target, at most 40 links deep, since a creating open would write there. `DbeaverRoots::from_env`, and with it `ManagerConfig::new` and `CoreConfig::new`, canonicalizes `$HOME`: build the configuration off the UI thread. File drivers then open the file read-only.
+
+## Connections UI (P1-C)
+In `crates/ninesql-ui/src/connections/`; the rustdoc is the reference.
+- **Hub**: one GPUI entity shared by every window, holding the saved connections and types, the secret stores, the `SessionManager` and the open sessions. Workspace writes and secret-store calls run on the driver runtime's blocking pool, connects through `SessionManager::open`; GPUI awaits the answers on its own executor (I6). It takes `CoreEvents` at startup and rebuilds its open sessions from `sessions_of` when `dropped_events` grows.
+- **Dialog**: the view model (`form`) offers only what the driver declares (engines from the registry, TLS modes from `Capabilities::tls`, auth kinds and property keys from `ConnectCapabilities`), flags weakened TLS / SSH settings and `verify-ca` without a CA file, and validates with `DriverRegistry::validate_connection` before saving. Credentials show "Saved in keyring" / "Saved in vault" / "Not saved" / "Asked at every connect", never a value. URLs only fill fields; a URL with a password is refused.
+- **Connect flow** (per window): answers every `OpenOutcome` (secret prompt, host key with fingerprint and `other_key_types`, init SQL with flagged statements) and shows the session's security warnings.
+- **Visuals** (ADR-0007 §4): type color stripe and badges in the navigator, type and read-only badges in the status bar, and a frame in the type color around the editor area while the window's active connection is production.
 
 ## Confirmations (ADR-0007, ADR-0011)
 Everything the user must confirm goes through a single-use token issued by the core, bound to what was shown, expiring after ten minutes:
