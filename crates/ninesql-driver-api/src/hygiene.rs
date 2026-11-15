@@ -9,6 +9,11 @@
 //! The rule is the one `ninesql-core` applies before logging a statement or recording it in
 //! the history, so the core and the drivers skip the same statements. It is lexical and fails
 //! closed: a credential word anywhere (keyword, identifier, string literal, comment) is enough.
+//!
+//! Being lexical, it cannot see a credential statement assembled at run time from pieces that
+//! hold no listed word (`EXECUTE 'ALTER ROLE bob PASS' || 'WORD ' || …`, MySQL `CONCAT` then
+//! `PREPARE`). Such text is logged only at `trace` level, only for a connection type that allows
+//! logging query text, and never for a production connection.
 
 /// Words that mark a statement as handling a credential (lower case). Matched as whole words,
 /// ignoring ASCII case; any character that is not alphanumeric separates words (`_` included,
@@ -30,6 +35,7 @@ pub const CREDENTIAL_WORDS: &[&str] = &[
     "token",
     "apikey",
     "privatekey",
+    "crypt",
 ];
 
 /// Whether `text` holds a URI with credentials, `scheme://user:password@…`: the pattern

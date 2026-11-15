@@ -72,64 +72,17 @@ pub fn may_record(policy: &SafetyPolicy, prefs: &HistoryPreferences) -> bool {
     prefs.enabled && policy.log_query_text && !policy.production
 }
 
-/// Whether `text` holds a URI with credentials, `scheme://user:password@…`: the pattern
-/// `://[^\s/@]*:[^\s@]*@` (`dblink_connect('postgresql://u:pw@h/db')`, `CREATE SUBSCRIPTION …
-/// CONNECTION '…'`, `postgres_fdw` options).
-#[must_use]
-pub fn has_uri_credentials(text: &str) -> bool {
-    let mut rest = text;
-    while let Some(at) = rest.find("://") {
-        let after = &rest[at + 3..];
-        // `[^\s/@]*` then `:`.
-        let user_end = after
-            .find(|c: char| c.is_whitespace() || c == '/' || c == '@' || c == ':')
-            .unwrap_or(after.len());
-        if after[user_end..].starts_with(':') {
-            // `[^\s@]*` then `@`.
-            let pass = &after[user_end + 1..];
-            let pass_end = pass
-                .find(|c: char| c.is_whitespace() || c == '@')
-                .unwrap_or(pass.len());
-            if pass[pass_end..].starts_with('@') {
-                return true;
-            }
-        }
-        rest = after;
-    }
-    false
-}
+/// The credential rule is shared with the drivers' statement logs, so the history and the logs
+/// always skip the same statements: see [`ninesql_driver_api::hygiene`].
+pub use ninesql_driver_api::hygiene::{CREDENTIAL_WORDS, has_uri_credentials};
 
-/// Words that mark a statement as handling a credential (lower case). See
-/// [`has_credential_word`].
-pub const CREDENTIAL_WORDS: &[&str] = &[
-    "password",
-    "passwd",
-    "pwd",
-    "passphrase",
-    "identified",
-    "secret",
-    "secrets",
-    "credential",
-    "credentials",
-    "encrypted",
-    "unencrypted",
-    "encrypt",
-    "decrypt",
-    "token",
-    "apikey",
-    "privatekey",
-];
-
-/// Whether `text` holds a credential word anywhere: in keywords, identifiers, string literals
-/// or comments (fail closed, see the module documentation). Such a statement is never recorded
-/// in the history and its text is never logged.
+/// Whether `text` holds a credential word or a URI with credentials anywhere: in keywords,
+/// identifiers, string literals or comments (fail closed, see the module documentation). Such a
+/// statement is never recorded in the history and its text is never logged. Same rule as
+/// [`ninesql_driver_api::hygiene::text_may_hold_credentials`].
 #[must_use]
 pub fn has_credential_word(text: &str) -> bool {
-    has_uri_credentials(text)
-        || text
-            .split(|c: char| !c.is_alphanumeric())
-            .filter(|w| (3..=16).contains(&w.len()))
-            .any(|w| CREDENTIAL_WORDS.iter().any(|k| w.eq_ignore_ascii_case(k)))
+    ninesql_driver_api::hygiene::text_may_hold_credentials(text)
 }
 
 /// Why the history could not answer.
