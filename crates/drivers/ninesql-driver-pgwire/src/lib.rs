@@ -51,7 +51,7 @@ use ninesql_driver_api::{
     Driver, DriverError, DriverResult, EditingCapabilities, Endpoint, EngineId, ExecOptions,
     ExplainFormat, HostKeyVerification, IsolationLevel, MetadataCapabilities, ObjectKind,
     PasswordExchange, PropertyValue, ReadOnlyMechanism, Session, Statement, TlsMode,
-    TransactionCapabilities, redact_connection_string, redact_secret,
+    TransactionCapabilities, echo_property_key, redact_connection_string, redact_secret,
 };
 use tokio::sync::mpsc;
 
@@ -416,20 +416,21 @@ fn accepted_properties(
         let norm = normalize(key);
         let Some((_, name)) = ACCEPTED_PROPERTIES.iter().find(|(k, _)| *k == norm) else {
             return Err(DriverError::InvalidParams(format!(
-                "property `{key}` is not supported by the PostgreSQL driver; accepted: \
+                "property `{}` is not supported by the PostgreSQL driver; accepted: \
                  search_path, TimeZone, statement_timeout, lock_timeout, work_mem, \
-                 client_min_messages"
+                 client_min_messages",
+                echo_property_key(key)
             )));
         };
         let v = value.expose();
         if v.contains('\0') {
             return Err(DriverError::InvalidParams(format!(
-                "property `{key}` holds a NUL character"
+                "property `{name}` holds a NUL character"
             )));
         }
         if *name == "search_path" && !pg_catalog_first(v) {
             return Err(DriverError::InvalidParams(format!(
-                "property `{key}` lists pg_catalog after another schema; the driver keeps \
+                "property `{name}` lists pg_catalog after another schema; the driver keeps \
                  pg_catalog first (leave it out, or list it first)"
             )));
         }
@@ -588,6 +589,28 @@ mod tests {
             d.connect(p).await,
             Err(DriverError::InvalidParams(_))
         ));
+    }
+
+    /// Review L-a: a key normalization accepts is named by its canonical form; an unknown
+    /// key is escaped. No control character reaches an error message.
+    #[test]
+    fn errors_never_echo_control_characters() {
+        let mut p = BTreeMap::new();
+        p.insert(
+            "search\u{1b}[\n_path".to_owned(),
+            PropertyValue::Plain("app, pg_catalog".into()),
+        );
+        let msg = accepted_properties(&p).unwrap_err().to_string();
+        assert!(msg.contains("`search_path`"), "{msg}");
+        assert!(!msg.chars().any(char::is_control), "{msg:?}");
+        let mut p = BTreeMap::new();
+        p.insert(
+            "fetch\u{1b}[2J\r\nsize".to_owned(),
+            PropertyValue::Plain("1".into()),
+        );
+        let msg = accepted_properties(&p).unwrap_err().to_string();
+        assert!(!msg.chars().any(char::is_control), "{msg:?}");
+        assert!(msg.contains("\\u{1b}"), "{msg}");
     }
 
     #[test]

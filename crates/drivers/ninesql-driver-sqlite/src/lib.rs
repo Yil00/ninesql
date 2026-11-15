@@ -40,7 +40,7 @@ use ninesql_driver_api::{
     Driver, DriverError, DriverResult, EditingCapabilities, Endpoint, EngineId, ExecOptions,
     ExecutionTracker, ExplainFormat, IsolationLevel, MetadataCapabilities, ObjectKind,
     PasswordExchange, PropertyValue, ReadOnlyMechanism, Session, Statement,
-    TransactionCapabilities,
+    TransactionCapabilities, echo_property_key,
 };
 
 pub use dialect::{SqliteDialect, lexer_view};
@@ -227,10 +227,18 @@ fn accepted_properties(
     let mut busy = DEFAULT_BUSY_TIMEOUT;
     let mut pragmas = Vec::new();
     for (key, value) in properties {
+        let norm = normalize(key);
+        // Named by its canonical key (the user's key may hold characters normalization drops).
+        let canonical = match norm.as_str() {
+            "busytimeout" => "busy_timeout",
+            "cachesize" => "cache_size",
+            "foreignkeys" => "foreign_keys",
+            _ => "",
+        };
         let invalid =
-            || DriverError::InvalidParams(format!("property `{key}` has an invalid value"));
+            || DriverError::InvalidParams(format!("property `{canonical}` has an invalid value"));
         let v = value.expose().trim();
-        match normalize(key).as_str() {
+        match norm.as_str() {
             "busytimeout" => {
                 if v.is_empty() || v.len() > 7 || !v.bytes().all(|b| b.is_ascii_digit()) {
                     return Err(invalid());
@@ -263,8 +271,9 @@ fn accepted_properties(
             }
             _ => {
                 return Err(DriverError::InvalidParams(format!(
-                    "property `{key}` is not supported by the sqlite driver; accepted: \
-                     busy_timeout, cache_size, foreign_keys"
+                    "property `{}` is not supported by the sqlite driver; accepted: \
+                     busy_timeout, cache_size, foreign_keys",
+                    echo_property_key(key)
                 )));
             }
         }
@@ -434,6 +443,23 @@ impl Driver for SqliteDriver {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Review L-a: no control character of a key reaches an error message.
+    #[test]
+    fn errors_never_echo_control_characters() {
+        let mut p = BTreeMap::new();
+        p.insert(
+            "busy\u{1b}[\n_timeout".to_owned(),
+            PropertyValue::Plain("x".into()),
+        );
+        let msg = accepted_properties(&p).unwrap_err().to_string();
+        assert!(msg.contains("`busy_timeout`"), "{msg}");
+        assert!(!msg.chars().any(char::is_control), "{msg:?}");
+        let mut p = BTreeMap::new();
+        p.insert("x\u{1b}\ny".to_owned(), PropertyValue::Plain("1".into()));
+        let msg = accepted_properties(&p).unwrap_err().to_string();
+        assert!(!msg.chars().any(char::is_control), "{msg:?}");
+    }
     use ninesql_driver_api::Secret;
 
     #[test]

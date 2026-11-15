@@ -626,8 +626,9 @@ const MAX_ECHOED_KEY_CHARS: usize = 64;
 /// A property key as error messages show it: control and other non-printable characters
 /// escaped (`\u{…}`), cut to [`MAX_ECHOED_KEY_CHARS`] characters with `…`, so a hostile or
 /// misplaced key cannot forge log lines or flood the UI.
+/// Drivers use it whenever an error names a key that is not one of their canonical names.
 #[must_use]
-pub(crate) fn echo_key(key: &str) -> String {
+pub fn echo_property_key(key: &str) -> String {
     let mut out = String::new();
     for (n, c) in key.chars().enumerate() {
         if n == MAX_ECHOED_KEY_CHARS {
@@ -695,7 +696,7 @@ pub fn check_properties(
             return Err(DriverError::InvalidParams(format!(
                 "property `{}` cannot be set as a driver property; use the connection's \
                  TLS, authentication, read-only or endpoint settings",
-                echo_key(key)
+                echo_property_key(key)
             )));
         }
     }
@@ -1202,12 +1203,12 @@ mod tests {
 
     #[test]
     fn echoed_keys_are_escaped_and_cut() {
-        assert_eq!(echo_key("search_path"), "search_path");
-        assert_eq!(echo_key("a\nb"), "a\\u{a}b");
-        assert_eq!(echo_key("a\u{1b}[2J"), "a\\u{1b}[2J");
-        assert_eq!(echo_key("x\u{200b}y"), "x\\u{200b}y");
+        assert_eq!(echo_property_key("search_path"), "search_path");
+        assert_eq!(echo_property_key("a\nb"), "a\\u{a}b");
+        assert_eq!(echo_property_key("a\u{1b}[2J"), "a\\u{1b}[2J");
+        assert_eq!(echo_property_key("x\u{200b}y"), "x\\u{200b}y");
         let long = "k".repeat(200);
-        let shown = echo_key(&long);
+        let shown = echo_property_key(&long);
         assert_eq!(shown.chars().count(), MAX_ECHOED_KEY_CHARS + 1);
         assert!(shown.ends_with('…'));
         let mut props = BTreeMap::new();

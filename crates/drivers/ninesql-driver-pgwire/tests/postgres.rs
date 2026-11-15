@@ -392,7 +392,7 @@ async fn read_only_refuses_writes_engine_side() {
 /// Security review of mysqlwire (H1), checked on pgwire too: `SET TRANSACTION … READ WRITE`
 /// changes only the current transaction and leaves `default_transaction_read_only` on. The
 /// shared classifier refuses its comma form client-side; the driver's re-assert remains as
-/// defence in depth against classifier gaps (tested past the classifier in `src/actor.rs`).
+/// defence in depth against classifier gaps (tested past the classifier in `src/session.rs`).
 /// A write after it must fail, in autocommit, in manual-commit mode and in an explicit
 /// transaction.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

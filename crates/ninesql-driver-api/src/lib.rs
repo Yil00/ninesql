@@ -57,7 +57,7 @@ pub use metadata::{
 pub use params::{
     Auth, AuthKind, ClientCertificate, ConnectParams, Endpoint, EngineId, HostKeyVerification,
     PasswordExchange, PropertyValue, ProxyInfo, ProxyKind, SecurityWarning, SshHop, TlsConfig,
-    TlsMode, TunnelInfo, check_properties, is_reserved_property,
+    TlsMode, TunnelInfo, check_properties, echo_property_key, is_reserved_property,
 };
 pub use result::{
     CancelHandle, DocValue, Document, ENGINE_TYPE_METADATA_KEY, MAX_DOCUMENT_DEPTH, NoServerCancel,

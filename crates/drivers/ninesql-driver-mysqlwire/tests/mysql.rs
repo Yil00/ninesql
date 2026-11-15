@@ -419,7 +419,7 @@ async fn read_only_refuses_writes_engine_side() {
 /// shared classifier refuses the comma form client-side; the driver still re-asserts the
 /// session's read-only characteristic after every statement, as defence in depth against
 /// classifier gaps (a MariaDB stored function here, and the comma form sent past the
-/// classifier in `src/actor.rs`), so the next write still fails engine-side.
+/// classifier in `src/session.rs`), so the next write still fails engine-side.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn one_shot_read_write_transaction_is_reset() {
     const ONE_SHOT: &str = "SET TRANSACTION ISOLATION LEVEL READ COMMITTED, READ WRITE";

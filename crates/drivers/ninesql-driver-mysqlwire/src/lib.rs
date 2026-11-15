@@ -49,7 +49,7 @@ use ninesql_driver_api::{
     Driver, DriverError, DriverResult, EditingCapabilities, Endpoint, EngineId, ExecOptions,
     ExplainFormat, HostKeyVerification, IsolationLevel, MetadataCapabilities, ObjectKind, Param,
     PasswordExchange, PropertyValue, ReadOnlyMechanism, Session, Statement, TlsMode,
-    TransactionCapabilities, redact_connection_string, redact_secret,
+    TransactionCapabilities, echo_property_key, redact_connection_string, redact_secret,
 };
 use tokio::sync::mpsc;
 
@@ -504,8 +504,9 @@ fn accepted_properties(
             .find(|(k, v)| *k == norm && prop_engine_ok(v, engine))
         else {
             return Err(DriverError::InvalidParams(format!(
-                "property `{key}` is not supported by the {engine} driver; accepted: time_zone, \
+                "property `{}` is not supported by the {engine} driver; accepted: time_zone, \
                  lock_wait_timeout, innodb_lock_wait_timeout, group_concat_max_len, {}",
+                echo_property_key(key),
                 if *engine == EngineId::MYSQL {
                     "max_execution_time"
                 } else {
@@ -531,7 +532,7 @@ fn accepted_properties(
             PropKind::Text if !v.contains('\0') => dialect::literal(&Param::Text(v.to_owned()))?,
             _ => {
                 return Err(DriverError::InvalidParams(format!(
-                    "property `{key}` has an invalid value"
+                    "property `{var}` has an invalid value"
                 )));
             }
         };
@@ -786,6 +787,27 @@ mod tests {
             d.connect(p).await,
             Err(DriverError::InvalidParams(_))
         ));
+    }
+
+    /// Review L-a: no control character of a key reaches an error message.
+    #[test]
+    fn errors_never_echo_control_characters() {
+        let mut p = BTreeMap::new();
+        p.insert(
+            "time\u{1b}[\n_zone".to_owned(),
+            PropertyValue::Plain("\0".into()),
+        );
+        let msg = accepted_properties(&EngineId::MYSQL, &p)
+            .unwrap_err()
+            .to_string();
+        assert!(msg.contains("`time_zone`"), "{msg}");
+        assert!(!msg.chars().any(char::is_control), "{msg:?}");
+        let mut p = BTreeMap::new();
+        p.insert("x\u{1b}\ny".to_owned(), PropertyValue::Plain("1".into()));
+        let msg = accepted_properties(&EngineId::MYSQL, &p)
+            .unwrap_err()
+            .to_string();
+        assert!(!msg.chars().any(char::is_control), "{msg:?}");
     }
 
     #[test]
