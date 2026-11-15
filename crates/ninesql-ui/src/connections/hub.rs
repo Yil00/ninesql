@@ -344,6 +344,16 @@ impl ConnectionHub {
     #[must_use]
     pub fn problems(&self) -> Vec<String> {
         let mut out = self.problems.clone();
+        // Saving writes every connection through `save_connections_checked`, which refuses
+        // the whole file when one of them is invalid: name those, with the reason.
+        for c in self.connections.iter() {
+            if let Err(e) = self.check_saved(c) {
+                out.push(format!(
+                    "Connection \"{}\" is refused by its driver ({e}): no connection can be saved until it is fixed or deleted.",
+                    c.name
+                ));
+            }
+        }
         if let Some(core) = &self.core {
             let status = core.lock_watcher_status();
             if !status.is_running {
@@ -411,6 +421,18 @@ impl ConnectionHub {
         self.registry
             .validate_connection(connection)
             .map_err(|e| e.to_string())
+    }
+
+    /// The rule of `Workspace::save_connections_checked` for one saved connection: driver
+    /// validation when enabled, the model rules when disabled (no driver, imported for later).
+    fn check_saved(&self, c: &Connection) -> Result<(), String> {
+        if c.enabled {
+            self.registry
+                .validate_connection(c)
+                .map_err(|e| e.to_string())
+        } else {
+            c.validate().map_err(|e| e.to_string())
+        }
     }
 
     /// Runs blocking work (workspace files, secret stores) off the foreground thread: on the

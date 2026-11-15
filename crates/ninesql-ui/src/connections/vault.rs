@@ -89,6 +89,16 @@ impl VaultPrompt {
         self.busy
     }
 
+    /// Applies a core answer, as when it arrives (tests drive races with it).
+    pub fn apply_result(
+        &mut self,
+        result: Option<Result<(), CoreError>>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.on_result(result, window, cx);
+    }
+
     /// The master-password input, then the confirmation (create only), for tests.
     #[must_use]
     pub fn inputs(&self) -> (Entity<InputState>, Entity<InputState>) {
@@ -146,12 +156,28 @@ impl VaultPrompt {
         cx: &mut Context<Self>,
     ) {
         self.busy = false;
+        if self.finished {
+            // Dismissed while the key was being derived: its dialog is gone (closing now
+            // would close whatever is on top) and its caller already got Cancelled. Only the
+            // vault state is kept up to date.
+            if matches!(result, Some(Ok(()))) {
+                self.hub.update(cx, |h, cx| h.mark_unlocked(cx));
+            }
+            return;
+        }
         match result {
             Some(Ok(())) => {
                 self.finished = true;
                 self.hub.update(cx, |h, cx| h.mark_unlocked(cx));
                 window.close_dialog(cx);
                 cx.emit(VaultPromptEvent::Done);
+            }
+            Some(Err(CoreError::Vault(VaultError::Locked))) if self.mode == VaultMode::Create => {
+                // The vault was created, but a lock (sleep, screen lock, "Lock secrets now")
+                // won the race and left it locked: a second create would answer "already
+                // exists", so the prompt now unlocks it.
+                self.mode = VaultMode::Unlock;
+                self.error = Some("The vault was created, but the secrets were locked meanwhile: type its master password to unlock it.".to_owned());
             }
             Some(Err(e)) => self.error = Some(vault_error_text(&e)),
             None => self.error = Some("The vault did not answer; try again.".to_owned()),
@@ -265,11 +291,13 @@ pub fn open_vault_prompt(
             input.focus_handle(cx).focus(window, cx);
         }
         let on_close = view.clone();
+        // The mode can move from Create to Unlock (lost lock race): read it at each render.
+        let title = match view.read(cx).mode() {
+            VaultMode::Unlock => "Unlock the vault",
+            VaultMode::Create => "Create the vault",
+        };
         dialog
-            .title(match mode {
-                VaultMode::Unlock => "Unlock the vault",
-                VaultMode::Create => "Create the vault",
-            })
+            .title(title)
             .w(px(480.))
             .on_close(move |_, window, cx| {
                 on_close.update(cx, |p, cx| p.dismissed(window, cx));

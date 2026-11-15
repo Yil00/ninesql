@@ -1192,3 +1192,130 @@ fn the_scram_only_toggle_follows_the_driver(cx: &mut TestAppContext) {
     dialog.update(&mut vcx, |d, cx| d.toggle_scram_only(cx));
     assert!(!dialog.read_with(&vcx, |d, _| d.form().scram_only));
 }
+
+// ---------------------------------------------------------------------------------------------
+// Re-review follow-ups (L-A, L-B, L-C).
+
+#[gpui::test]
+fn a_vault_prompt_dismissed_during_the_unlock_does_not_save(cx: &mut TestAppContext) {
+    let tmp = tempfile::tempdir().unwrap_or_else(|e| panic!("{e}"));
+    let (hub, core) = core_hub(cx, tmp.path());
+    create_test_vault(&core);
+    wait_reply(core.lock_now());
+    let c = mock_connection(
+        "Dismissed",
+        ConnectionTypeId::dev(),
+        Auth::Password {
+            username: "app".into(),
+            secret: SecretSource::Prompt,
+        },
+    );
+    let (ws, mut vcx) = open_live(cx);
+    let mut form = super::form::ConnectionForm::from_connection(&c);
+    form.existing = None;
+    form.auth_secret.mode = SecretMode::Save;
+    ws.update_in(&mut vcx, |ws, window, cx| {
+        ws.open_connection_dialog(form, "New connection", window, cx);
+    });
+    let Some(dialog) = ws.read_with(&vcx, |ws, _| ws.connection_dialog().cloned()) else {
+        panic!("dialog");
+    };
+    let secret_input = dialog.read_with(&vcx, |d, _| d.input("secret").cloned());
+    set(secret_input.as_ref(), "db-password", &mut vcx);
+    vcx.update(|window, cx| dialog.update(cx, |d, cx| d.save(window, cx)));
+    wait_until(&mut vcx, |vcx| {
+        dialog.read_with(vcx, |d, _| d.vault_prompt().is_some())
+    });
+    let Some(prompt) = dialog.read_with(&vcx, |d, _| d.vault_prompt().cloned()) else {
+        panic!("vault prompt");
+    };
+    let (master, _) = prompt.read_with(&vcx, |p, _| p.inputs());
+    set(Some(&master), MASTER, &mut vcx);
+    // Submit, then Escape before the key derivation answers.
+    vcx.update(|window, cx| {
+        prompt.update(cx, |p, cx| p.submit(window, cx));
+        window.close_dialog(cx);
+        prompt.update(cx, |p, cx| p.dismissed(window, cx));
+    });
+    // The unlock still completes in the core...
+    wait_until(&mut vcx, |_| {
+        wait_reply(core.vault_status()).ok() == Some(ninesql_core::secrets::VaultStatus::Unlocked)
+    });
+    wait_until(&mut vcx, |vcx| {
+        hub.read_with(vcx, |h, _| h.secrets_locked().is_none())
+    });
+    vcx.run_until_parked();
+    // ...but nothing is saved and the connection dialog is still open.
+    assert_eq!(hub.read_with(&vcx, |h, _| h.connections().len()), 0);
+    assert!(ws.read_with(&vcx, |ws, _| ws.connection_dialog().is_some()));
+    assert!(
+        vcx.update(|window, cx| window.has_active_dialog(cx)),
+        "not closed by the late answer"
+    );
+    let error = dialog.read_with(&vcx, |d, _| d.error().map(str::to_owned));
+    assert!(error.is_some_and(|e| e.contains("Not saved")));
+}
+
+#[gpui::test]
+fn a_create_that_loses_a_lock_race_switches_to_unlock(cx: &mut TestAppContext) {
+    let tmp = tempfile::tempdir().unwrap_or_else(|e| panic!("{e}"));
+    let (hub, _core) = core_hub(cx, tmp.path());
+    let (_ws, mut vcx) = open_live(cx);
+    let prompt = vcx.update(|window, cx| {
+        super::vault::open_vault_prompt(hub.clone(), super::vault::VaultMode::Create, window, cx)
+    });
+    vcx.update(|window, cx| {
+        prompt.update(cx, |p, cx| {
+            p.apply_result(
+                Some(Err(ninesql_core::CoreError::Vault(
+                    ninesql_core::secrets::VaultError::Locked,
+                ))),
+                window,
+                cx,
+            );
+        });
+    });
+    assert_eq!(
+        prompt.read_with(&vcx, |p, _| p.mode()),
+        super::vault::VaultMode::Unlock
+    );
+    let error = prompt.read_with(&vcx, |p, _| p.error().map(str::to_owned));
+    assert!(error.is_some_and(|e| e.contains("unlock")));
+    assert!(
+        vcx.update(|window, cx| window.has_active_dialog(cx)),
+        "stays open"
+    );
+}
+
+#[gpui::test]
+fn invalid_saved_connections_are_listed_as_problems(cx: &mut TestAppContext) {
+    let engine = EngineId::new("postgresql").unwrap_or_else(|e| panic!("{e}"));
+    let mut bad = Connection::new(
+        "Broken",
+        engine,
+        Endpoint::Tcp {
+            host: "db.example.test".into(),
+            port: None,
+            database: None,
+        },
+        Auth::Password {
+            username: "app".into(),
+            secret: SecretSource::Prompt,
+        },
+        ConnectionTypeId::dev(),
+    );
+    bad.properties
+        .insert("not_on_the_allowlist".into(), "x".into());
+    let mut config = HubConfig::empty();
+    config.registry = shipped();
+    config.connections =
+        ninesql_core::Connections::from_vec(vec![bad]).unwrap_or_else(|e| panic!("{e}"));
+    let hub = init(cx, config);
+    let problems = hub.read_with(cx, |h, _| h.problems());
+    assert!(
+        problems
+            .iter()
+            .any(|p| p.contains("\"Broken\"") && p.contains("no connection can be saved")),
+        "{problems:?}"
+    );
+}

@@ -271,7 +271,9 @@ impl ConnectionDialog {
     }
 
     /// Empties every secret input (save, cancel, close).
-    pub fn clear_secret_inputs(&self, window: &mut Window, cx: &mut App) {
+    pub fn clear_secret_inputs(&mut self, window: &mut Window, cx: &mut App) {
+        // A vault prompt opened by a save no longer belongs to a dialog being left.
+        self.vault_prompt = None;
         let all = [&self.secret, &self.client_key_secret]
             .into_iter()
             .chain(self.hops.iter().map(|h| &h.secret));
@@ -624,7 +626,9 @@ impl ConnectionDialog {
         cx.subscribe_in(
             &prompt,
             window,
-            move |this, _, event, window, cx| match event {
+            move |this, emitter, event, window, cx| match event {
+                // Only the prompt this dialog still waits on counts.
+                _ if this.vault_prompt.as_ref() != Some(emitter) => {}
                 VaultPromptEvent::Done => {
                     this.vault_prompt = None;
                     this.vault_ready = true;

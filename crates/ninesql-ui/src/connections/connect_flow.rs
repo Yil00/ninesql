@@ -337,6 +337,9 @@ impl ConnectFlow {
             return;
         };
         let Some(run) = self.run.as_mut() else {
+            for input in &inputs {
+                secret_input::clear(input, window, cx);
+            }
             return;
         };
         for (prompt, input) in prompts.iter().zip(&inputs) {
