@@ -392,6 +392,26 @@ SELECT "lo_import"('/etc/passwd')
 expect: pg=Unknown
 SELECT lo_export(1234, '/tmp/x')
 
+## pg_read_file
+expect: pg=Unknown
+SELECT pg_read_file('/etc/passwd')
+
+## pg_read_binary_file qualified
+expect: pg=Unknown
+SELECT pg_catalog.pg_read_binary_file('postgresql.conf')
+
+## pg_ls_dir as a from-item
+expect: pg=Unknown
+SELECT * FROM pg_ls_dir('.')
+
+## pg_stat_file quoted
+expect: pg=Unknown
+SELECT "pg_stat_file"('postgresql.conf')
+
+## columns named like server file functions are reads
+expect: all=Read
+SELECT pg_read_file, t.pg_ls_dir, pg_stat_file FROM t
+
 ## dblink qualified
 expect: pg=Unknown
 SELECT * FROM public.dblink('dbname=x', 'SELECT 1') AS r(a int)

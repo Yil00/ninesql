@@ -1553,6 +1553,11 @@ const SIDE_EFFECT_FUNCTIONS: &[&str] = &[
     "PG_IMPORT_SYSTEM_COLLATIONS",
     "PG_STAT_STATEMENTS_RESET",
     "PG_NOTIFY",
+    // Server file access, the counterparts of MySQL's `LOAD_FILE` (P5 security review L5).
+    "PG_READ_FILE",
+    "PG_READ_BINARY_FILE",
+    "PG_LS_DIR",
+    "PG_STAT_FILE",
     "LO_IMPORT",
     "LO_EXPORT",
     "LO_UNLINK",
