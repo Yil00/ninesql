@@ -1,5 +1,6 @@
 //! Value viewers of the selected cell (F-DATA-05): text, JSON (pretty, read-only), XML (pretty
-//! text), binary (hex dump) and image preview (PNG, JPEG, GIF).
+//! text), binary (hex dump) and image preview (PNG and JPEG; GIF and animated PNG are shown as
+//! hex, see [`sniff_image`]).
 //!
 //! Everything here reads the value the grid already holds, never more (I6): a value the driver
 //! cut (`ninesql.truncated`) is shown as its kept prefix and flagged
@@ -9,7 +10,10 @@
 //!
 //! Images are decoded by GPUI only after [`sniff_image`] has read the dimensions from the file
 //! header and checked them against [`MAX_IMAGE_SIDE`] / [`MAX_IMAGE_PIXELS`] and the byte size
-//! against [`MAX_IMAGE_BYTES`], so a small value cannot expand into a huge bitmap.
+//! against [`MAX_IMAGE_BYTES`], so a small value cannot expand into a huge bitmap. Only formats
+//! decoded as a single frame are passed to GPUI.
+
+use std::sync::Arc;
 
 use ninesql_core::transfer::value::{CellValue, cell};
 
@@ -60,15 +64,14 @@ impl ViewerKind {
     }
 }
 
-/// An image format the preview decodes.
+/// An image format the preview decodes. GIF and animated PNG are not among them (see
+/// [`sniff_image`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ImageKind {
-    /// PNG.
+    /// PNG (a single image).
     Png,
     /// JPEG.
     Jpeg,
-    /// GIF.
-    Gif,
 }
 
 /// What the header of an image says.
@@ -85,8 +88,13 @@ pub struct ImageInfo {
 /// Why a value is not previewed as an image.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ImageRefusal {
-    /// Not a PNG, JPEG or GIF (or a damaged header).
+    /// Not a PNG or JPEG (or a damaged header).
     NotAnImage,
+    /// A GIF: GPUI decodes every GIF frame with no limit, so GIF is not previewed (the hex
+    /// viewer shows it).
+    GifNotSupported,
+    /// An animated PNG: refused like GIF.
+    AnimatedNotSupported,
     /// Over [`MAX_IMAGE_BYTES`].
     TooLarge,
     /// Over [`MAX_IMAGE_SIDE`] or [`MAX_IMAGE_PIXELS`].
@@ -105,7 +113,9 @@ impl ImageRefusal {
     #[must_use]
     pub fn text(&self) -> String {
         match self {
-            Self::NotAnImage => "Not a PNG, JPEG or GIF image: image preview is not supported for this value.".into(),
+            Self::NotAnImage => "Not a PNG or JPEG image: image preview is not supported for this value.".into(),
+            Self::GifNotSupported => "GIF preview not supported; showing hex.".into(),
+            Self::AnimatedNotSupported => "Animated PNG preview not supported; showing hex.".into(),
             Self::TooLarge => format!(
                 "The image is larger than {} MiB: not previewed.",
                 MAX_IMAGE_BYTES / (1024 * 1024)
@@ -136,8 +146,9 @@ pub struct CellInspection {
     pub text: String,
     /// The text was cut by the viewer's bound.
     pub text_capped: bool,
-    /// Binary value (at most [`MAX_IMAGE_BYTES`], kept only for binary columns).
-    pub bytes: Option<Vec<u8>>,
+    /// Binary value (at most [`MAX_IMAGE_BYTES`], kept only for binary columns), shared so
+    /// that cloning an inspection never copies it.
+    pub bytes: Option<Arc<[u8]>>,
     /// Size of the binary value as held by the grid.
     pub byte_len: usize,
     /// The viewers offered, the default first.
@@ -171,7 +182,7 @@ pub fn inspect_cell(model: &ResultSetModel, row: usize, col: usize) -> Option<Ce
         CellValue::Bytes(b) => {
             out.byte_len = b.len();
             let keep = b.len().min(MAX_IMAGE_BYTES);
-            out.bytes = Some(b[..keep].to_vec());
+            out.bytes = Some(Arc::from(&b[..keep]));
             out.viewers.push(ViewerKind::Hex);
             if sniff_image(b).is_ok() {
                 out.viewers.insert(0, ViewerKind::Image);
@@ -477,32 +488,23 @@ pub fn hex_dump(bytes: &[u8]) -> (String, bool) {
     (out, capped)
 }
 
-/// Reads the format and size of a PNG, JPEG or GIF from its header, and checks the preview
-/// bounds. Nothing is decoded.
+/// Reads the format and size of a PNG or JPEG from its header, and checks the preview bounds.
+/// Nothing is decoded.
+///
+/// GIF is refused ([`ImageRefusal::GifNotSupported`]): GPUI decodes every frame of a GIF with no
+/// limit, so a small file with thousands of frames, or a frame rectangle larger than the logical
+/// screen, would expand without bound (I6). An animated PNG (an `acTL`, `fcTL` or `fdAT` chunk)
+/// is refused for the same reason, and so is a PNG whose chunks do not walk cleanly up to
+/// `IEND`. A JPEG is accepted only when exactly one start-of-frame lies before the first
+/// start-of-scan, so the size checked here is the size the decoder allocates.
 ///
 /// # Errors
 /// [`ImageRefusal`].
 pub fn sniff_image(bytes: &[u8]) -> Result<ImageInfo, ImageRefusal> {
-    let info = if bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
-        if bytes.len() < 24 || &bytes[12..16] != b"IHDR" {
-            return Err(ImageRefusal::NotAnImage);
-        }
-        let be =
-            |i: usize| u32::from_be_bytes([bytes[i], bytes[i + 1], bytes[i + 2], bytes[i + 3]]);
-        ImageInfo {
-            kind: ImageKind::Png,
-            width: be(16),
-            height: be(20),
-        }
-    } else if bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a") {
-        if bytes.len() < 10 {
-            return Err(ImageRefusal::NotAnImage);
-        }
-        ImageInfo {
-            kind: ImageKind::Gif,
-            width: u32::from(u16::from_le_bytes([bytes[6], bytes[7]])),
-            height: u32::from(u16::from_le_bytes([bytes[8], bytes[9]])),
-        }
+    let info = if bytes.starts_with(PNG_SIGNATURE) {
+        png_info(bytes)?
+    } else if is_gif(bytes) {
+        return Err(ImageRefusal::GifNotSupported);
     } else if bytes.starts_with(&[0xFF, 0xD8]) {
         jpeg_size(bytes).ok_or(ImageRefusal::NotAnImage)?
     } else {
@@ -526,9 +528,62 @@ pub fn sniff_image(bytes: &[u8]) -> Result<ImageInfo, ImageRefusal> {
     Ok(info)
 }
 
-/// Walks the JPEG markers up to the first start-of-frame.
+const PNG_SIGNATURE: &[u8] = b"\x89PNG\r\n\x1a\n";
+
+/// Whether `bytes` start with a GIF signature.
+#[must_use]
+pub fn is_gif(bytes: &[u8]) -> bool {
+    bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a")
+}
+
+/// Walks the PNG chunks: `IHDR` first, then every chunk up to `IEND` (or the end of the value),
+/// refusing the animation chunks wherever they are and any chunk that runs past the end. Chunk CRCs are not checked (the decoder
+/// does), only the framing.
+fn png_info(b: &[u8]) -> Result<ImageInfo, ImageRefusal> {
+    let be = |i: usize| -> Option<u32> {
+        b.get(i..i + 4)
+            .map(|s| u32::from_be_bytes([s[0], s[1], s[2], s[3]]))
+    };
+    let mut i = PNG_SIGNATURE.len();
+    let mut info = None;
+    while i < b.len() {
+        let len = be(i).ok_or(ImageRefusal::NotAnImage)? as usize;
+        let kind = b.get(i + 4..i + 8).ok_or(ImageRefusal::NotAnImage)?;
+        let data = i + 8;
+        let end = data
+            .checked_add(len)
+            .and_then(|e| e.checked_add(4))
+            .ok_or(ImageRefusal::NotAnImage)?;
+        match kind {
+            b"IHDR" => {
+                if info.is_some() || len != 13 || i != PNG_SIGNATURE.len() {
+                    return Err(ImageRefusal::NotAnImage);
+                }
+                info = Some(ImageInfo {
+                    kind: ImageKind::Png,
+                    width: be(data).ok_or(ImageRefusal::NotAnImage)?,
+                    height: be(data + 4).ok_or(ImageRefusal::NotAnImage)?,
+                });
+            }
+            _ if info.is_none() => return Err(ImageRefusal::NotAnImage),
+            b"acTL" | b"fcTL" | b"fdAT" => return Err(ImageRefusal::AnimatedNotSupported),
+            b"IEND" => break,
+            _ => {}
+        }
+        if end > b.len() {
+            // A chunk running past the end of the value: the framing is broken, refused.
+            return Err(ImageRefusal::NotAnImage);
+        }
+        i = end;
+    }
+    info.ok_or(ImageRefusal::NotAnImage)
+}
+
+/// Walks the JPEG markers up to the first start-of-scan; exactly one start-of-frame must come
+/// before it.
 fn jpeg_size(b: &[u8]) -> Option<ImageInfo> {
     let mut i = 2;
+    let mut found = None;
     while i + 4 <= b.len() {
         if b[i] != 0xFF {
             return None;
@@ -538,22 +593,29 @@ fn jpeg_size(b: &[u8]) -> Option<ImageInfo> {
             i += 1;
             continue;
         }
-        if matches!(marker, 0xD8 | 0x01 | 0xD0..=0xD7) {
+        if matches!(marker, 0x01 | 0xD0..=0xD7) {
             i += 2;
             continue;
+        }
+        if matches!(marker, 0xD8 | 0xD9) {
+            // A second SOI or an EOI before any scan: not a picture this walk trusts.
+            return None;
         }
         let len = usize::from(u16::from_be_bytes([b[i + 2], b[i + 3]]));
         if len < 2 {
             return None;
         }
+        if marker == 0xDA {
+            return found;
+        }
         let sof = matches!(marker, 0xC0..=0xCF) && !matches!(marker, 0xC4 | 0xC8 | 0xCC);
         if sof {
-            if i + 9 > b.len() {
+            if found.is_some() || i + 9 > b.len() {
                 return None;
             }
             let height = u32::from(u16::from_be_bytes([b[i + 5], b[i + 6]]));
             let width = u32::from(u16::from_be_bytes([b[i + 7], b[i + 8]]));
-            return Some(ImageInfo {
+            found = Some(ImageInfo {
                 kind: ImageKind::Jpeg,
                 width,
                 height,
@@ -614,6 +676,11 @@ pub fn render(inspection: &CellInspection, kind: ViewerKind) -> ViewerOutput {
                 .as_deref()
                 .unwrap_or(inspection.text.as_bytes());
             let (t, capped) = hex_dump(bytes);
+            if let Err(r @ (ImageRefusal::GifNotSupported | ImageRefusal::AnimatedNotSupported)) =
+                sniff_image(bytes)
+            {
+                notes.push(r.text());
+            }
             if capped {
                 notes.push(format!(
                     "Showing the first {} KiB of {} bytes.",
@@ -659,19 +726,55 @@ pub fn image_for_preview(inspection: &CellInspection) -> Result<ImageInfo, Image
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
-
     use ninesql_core::driver_api::arrow_array::{BinaryArray, RecordBatch, StringArray};
     use ninesql_core::driver_api::arrow_schema::{DataType, Field, Schema};
     use ninesql_core::driver_api::{ENGINE_TYPE_METADATA_KEY, TRUNCATED_VALUES_METADATA_KEY};
 
     use super::*;
 
+    fn chunk(v: &mut Vec<u8>, kind: &[u8; 4], data: &[u8]) {
+        v.extend_from_slice(&u32::try_from(data.len()).unwrap().to_be_bytes());
+        v.extend_from_slice(kind);
+        v.extend_from_slice(data);
+        v.extend_from_slice(&[0, 0, 0, 0]); // CRC: not checked by the sniffer.
+    }
+
+    fn ihdr(width: u32, height: u32) -> Vec<u8> {
+        let mut d = width.to_be_bytes().to_vec();
+        d.extend_from_slice(&height.to_be_bytes());
+        d.extend_from_slice(&[8, 6, 0, 0, 0]);
+        d
+    }
+
+    /// A PNG framing with `extra` chunks between `IHDR` and `IDAT`.
+    fn png_with(width: u32, height: u32, extra: &[(&[u8; 4], &[u8])]) -> Vec<u8> {
+        let mut v = PNG_SIGNATURE.to_vec();
+        chunk(&mut v, b"IHDR", &ihdr(width, height));
+        for (k, d) in extra {
+            chunk(&mut v, k, d);
+        }
+        chunk(&mut v, b"IDAT", &[0; 8]);
+        chunk(&mut v, b"IEND", &[]);
+        v
+    }
+
     fn png(width: u32, height: u32) -> Vec<u8> {
-        let mut v = b"\x89PNG\r\n\x1a\n\x00\x00\x00\x0dIHDR".to_vec();
-        v.extend_from_slice(&width.to_be_bytes());
-        v.extend_from_slice(&height.to_be_bytes());
-        v.extend_from_slice(&[8, 6, 0, 0, 0]);
+        png_with(width, height, &[])
+    }
+
+    /// SOI, an APP0 segment, `sofs` start-of-frame segments, then SOS.
+    fn jpeg(sofs: &[(u8, u16, u16)], sos: bool) -> Vec<u8> {
+        let mut v = vec![0xFF, 0xD8, 0xFF, 0xE0, 0x00, 0x04, 0x00, 0x00];
+        for &(marker, h, w) in sofs {
+            v.extend_from_slice(&[0xFF, marker, 0x00, 0x0B, 0x08]);
+            v.extend_from_slice(&h.to_be_bytes());
+            v.extend_from_slice(&w.to_be_bytes());
+            v.extend_from_slice(&[0x01, 0x01, 0x11, 0x00]);
+        }
+        if sos {
+            v.extend_from_slice(&[0xFF, 0xDA, 0x00, 0x08, 0x01, 0x01, 0x00, 0x00, 0x3F, 0x00]);
+            v.extend_from_slice(&[0x12, 0x34, 0xFF, 0xD9]);
+        }
         v
     }
 
@@ -748,15 +851,8 @@ mod tests {
                 height: 5000
             })
         );
-        let gif = b"GIF89a\x02\x00\x03\x00rest";
-        assert_eq!(sniff_image(gif).unwrap().width, 2);
-        // JPEG: SOI, an APP0 segment, then SOF0 with height 7, width 9.
-        let jpeg = [
-            0xFF, 0xD8, 0xFF, 0xE0, 0x00, 0x04, 0x00, 0x00, 0xFF, 0xC0, 0x00, 0x0B, 0x08, 0x00,
-            0x07, 0x00, 0x09, 0x01, 0x01, 0x11, 0x00,
-        ];
         assert_eq!(
-            sniff_image(&jpeg),
+            sniff_image(&jpeg(&[(0xC0, 7, 9)], true)),
             Ok(ImageInfo {
                 kind: ImageKind::Jpeg,
                 width: 9,
@@ -769,6 +865,128 @@ mod tests {
             Err(ImageRefusal::NotAnImage)
         );
         assert_eq!(sniff_image(&png(0, 4)), Err(ImageRefusal::NotAnImage));
+    }
+
+    #[test]
+    fn gif_is_never_decoded() {
+        // A tiny logical screen whose single frame descriptor claims 65535 × 65535: GPUI would
+        // decode it with no limit, so every GIF is refused and shown as hex.
+        let mut bomb = b"GIF89a\x02\x00\x02\x00\x00\x00\x00".to_vec();
+        bomb.extend_from_slice(&[0x2C, 0, 0, 0, 0, 0xFF, 0xFF, 0xFF, 0xFF, 0x00]);
+        bomb.extend_from_slice(&[0x02, 0x02, 0x44, 0x01, 0x00, 0x3B]);
+        assert_eq!(sniff_image(&bomb), Err(ImageRefusal::GifNotSupported));
+        // Thousands of 1 × 1 frames: refused as well.
+        let mut many = b"GIF87a\x01\x00\x01\x00\x00\x00\x00".to_vec();
+        for _ in 0..10_000 {
+            many.extend_from_slice(&[0x2C, 0, 0, 0, 0, 1, 0, 1, 0, 0, 0x02, 0x02, 0x44, 0x01, 0]);
+        }
+        many.push(0x3B);
+        assert_eq!(sniff_image(&many), Err(ImageRefusal::GifNotSupported));
+        assert_eq!(
+            ImageRefusal::GifNotSupported.text(),
+            "GIF preview not supported; showing hex."
+        );
+        // The hex viewer says why.
+        let m = model(
+            vec![Field::new("b", DataType::Binary, true)],
+            vec![Arc::new(BinaryArray::from(vec![Some(bomb.as_slice())]))],
+        );
+        let i = inspect_cell(&m, 0, 0).unwrap();
+        assert_eq!(i.viewers, vec![ViewerKind::Hex]);
+        assert_eq!(image_for_preview(&i), Err(ImageRefusal::GifNotSupported));
+        let out = render(&i, ViewerKind::Hex);
+        assert!(
+            out.notes
+                .iter()
+                .any(|n| n.contains("GIF preview not supported")),
+            "{:?}",
+            out.notes
+        );
+    }
+
+    #[test]
+    fn animated_and_malformed_png_are_refused() {
+        let actl: &[u8] = &[0, 0, 0, 200, 0, 0, 0, 0];
+        assert_eq!(
+            sniff_image(&png_with(2, 2, &[(b"acTL", actl)])),
+            Err(ImageRefusal::AnimatedNotSupported)
+        );
+        // An animation chunk anywhere, even after the image data.
+        let mut late = png(2, 2);
+        late.truncate(late.len() - 12); // drop IEND
+        chunk(&mut late, b"fcTL", &[0; 26]);
+        chunk(&mut late, b"IEND", &[]);
+        assert_eq!(sniff_image(&late), Err(ImageRefusal::AnimatedNotSupported));
+        let mut fdat = png(2, 2);
+        fdat.truncate(fdat.len() - 12);
+        chunk(&mut fdat, b"fdAT", &[0; 8]);
+        assert_eq!(sniff_image(&fdat), Err(ImageRefusal::AnimatedNotSupported));
+        // A chunk running past the end of the value.
+        let mut overrun = png(2, 2);
+        overrun.truncate(overrun.len() - 12);
+        overrun.extend_from_slice(&[0x7F, 0xFF, 0xFF, 0xFF]);
+        overrun.extend_from_slice(b"tEXt");
+        assert_eq!(sniff_image(&overrun), Err(ImageRefusal::NotAnImage));
+        // IHDR not first, IHDR twice, IHDR of the wrong length, a bare signature.
+        let mut v = PNG_SIGNATURE.to_vec();
+        chunk(&mut v, b"tEXt", b"k\0v");
+        chunk(&mut v, b"IHDR", &ihdr(2, 2));
+        assert_eq!(sniff_image(&v), Err(ImageRefusal::NotAnImage));
+        assert_eq!(
+            sniff_image(&png_with(2, 2, &[(b"IHDR", &ihdr(9000, 9000))])),
+            Err(ImageRefusal::NotAnImage)
+        );
+        let mut short = PNG_SIGNATURE.to_vec();
+        chunk(&mut short, b"IHDR", &[0, 0, 0, 2, 0, 0, 0, 2]);
+        assert_eq!(sniff_image(&short), Err(ImageRefusal::NotAnImage));
+        assert_eq!(sniff_image(PNG_SIGNATURE), Err(ImageRefusal::NotAnImage));
+        // Other formats GPUI could decode are never claimed (WebP, BMP, TIFF, ICO).
+        assert_eq!(
+            sniff_image(b"RIFF\x10\x00\x00\x00WEBPVP8X"),
+            Err(ImageRefusal::NotAnImage)
+        );
+        assert_eq!(
+            sniff_image(b"II*\x00\x08\x00"),
+            Err(ImageRefusal::NotAnImage)
+        );
+        assert_eq!(
+            sniff_image(b"\x00\x00\x01\x00"),
+            Err(ImageRefusal::NotAnImage)
+        );
+    }
+
+    #[test]
+    fn jpeg_size_comes_from_the_only_frame_before_the_scan() {
+        // A small first frame then a huge second one: refused, whichever the decoder reads.
+        assert_eq!(
+            sniff_image(&jpeg(&[(0xC0, 7, 9), (0xC2, 65_535, 65_535)], true)),
+            Err(ImageRefusal::NotAnImage)
+        );
+        // No start-of-scan: not a complete header.
+        assert_eq!(
+            sniff_image(&jpeg(&[(0xC0, 7, 9)], false)),
+            Err(ImageRefusal::NotAnImage)
+        );
+        // No frame before the scan.
+        assert_eq!(sniff_image(&jpeg(&[], true)), Err(ImageRefusal::NotAnImage));
+        // Height 0 (defined later by DNL) is refused.
+        assert_eq!(
+            sniff_image(&jpeg(&[(0xC0, 0, 9)], true)),
+            Err(ImageRefusal::NotAnImage)
+        );
+        // Over the bounds.
+        assert_eq!(
+            sniff_image(&jpeg(&[(0xC1, 65_535, 65_535)], true)),
+            Err(ImageRefusal::TooManyPixels {
+                width: 65_535,
+                height: 65_535
+            })
+        );
+        // EOI or a second SOI before the scan.
+        let mut eoi = jpeg(&[], false);
+        eoi.extend_from_slice(&[0xFF, 0xD9]);
+        eoi.extend_from_slice(&jpeg(&[(0xC0, 7, 9)], true)[2..]);
+        assert_eq!(sniff_image(&eoi), Err(ImageRefusal::NotAnImage));
     }
 
     fn model(
