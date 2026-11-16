@@ -1,5 +1,6 @@
-//! DBeaver interoperability: read-only workspace import (ADR-0006, invariants I1 and I4).
-//! ROADMAP: P2-A (this parser), P5-D (export). **Security review required for every change.**
+//! DBeaver interoperability: read-only workspace import and export to a new file (ADR-0006,
+//! invariants I1 and I4). ROADMAP: P2-A (the parser), P5-D (the export, [`export`]).
+//! **Security review required for every change.**
 //!
 //! # Pipeline
 //! 1. [`detect`]: find DBeaver workspaces (native, Flatpak, Snap, or a folder the user picks) and
@@ -20,9 +21,15 @@
 //! ([`SourceLimits`]), reading each folder once, and stops when its [`CancelFlag`] is
 //! set ([`source`], P2-D review M1). Real imports use [`import_source`].
 //!
+//! [`export_connections`] generates a new DBeaver `data-sources.json` for NineSQL connections,
+//! without any secret, and [`write_export`] writes it to a new file or project folder the user
+//! chose ([`export`], P5-D).
+//!
 //! # Rules this crate enforces
 //! - **I4**: every DBeaver file is opened read-only through one function (`fsread`), never
-//!   created, written, renamed, deleted or locked. `.bak` and other dot-files are ignored.
+//!   created, written, renamed, deleted or locked. `.bak` and other dot-files are ignored. The
+//!   export (`export::write`) only creates new paths, outside any DBeaver workspace, and never
+//!   overwrites a file.
 //! - **I1**: decrypted secrets only exist as [`ninesql_secrets::SecretString`] (zeroized on drop,
 //!   redacted in `Debug`) inside [`mapping::ImportedSecret`]. The caller (P2-C) hands them to
 //!   `ninesql-secrets`; this crate stores nothing. Issues, errors and logs name keys and DBeaver
@@ -40,6 +47,7 @@ mod coverage;
 pub mod credentials;
 pub mod detect;
 mod error;
+pub mod export;
 mod fsread;
 mod jdbc;
 pub mod mapping;
@@ -55,6 +63,10 @@ pub use detect::{
     open_folder_with,
 };
 pub use error::DbeaverError;
+pub use export::{
+    Export, ExportConnection, ExportConnectionType, ExportError, ExportOptions, ExportReport,
+    ExportTarget, ExportWriteError, WrittenExport, export_connections, write_export,
+};
 pub use mapping::{
     ConnectionImport, DroppedProperty, ImportedConnection, ImportedSecret, Outcome, ProjectImport,
     PropertyDropReason,

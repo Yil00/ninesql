@@ -8,7 +8,9 @@
 //!    after, including the `.bak` files the importer must ignore (this also covers runs as root,
 //!    which bypasses permission bits);
 //! 3. the sources of the crate contain no write, create, rename, delete or lock call, and only
-//!    `src/fsread.rs` touches `std::fs`.
+//!    `src/fsread.rs` touches `std::fs`; the one exception is the export writer
+//!    (`src/export/write.rs`, P5-D), which only creates new paths outside DBeaver directories
+//!    (`tests/export_roundtrip.rs`).
 
 mod common;
 
@@ -168,19 +170,41 @@ fn sources_have_no_write_path() {
         "tempfile",
         "persist(",
     ];
-    for entry in fs::read_dir(&src)
-        .unwrap_or_else(|e| panic!("{e}"))
-        .flatten()
-    {
-        let path = entry.path();
-        let name = entry.file_name().to_string_lossy().into_owned();
-        let text = fs::read_to_string(&path).unwrap_or_default();
+    // Every `.rs` file, subdirectories included (`src/export/`).
+    let mut files = Vec::new();
+    let mut dirs = vec![src.clone()];
+    while let Some(dir) = dirs.pop() {
+        for entry in fs::read_dir(&dir)
+            .unwrap_or_else(|e| panic!("{e}"))
+            .flatten()
+        {
+            let path = entry.path();
+            if path.is_dir() {
+                dirs.push(path);
+            } else if path.extension().is_some_and(|e| e == "rs") {
+                files.push(path);
+            }
+        }
+    }
+    assert!(files.iter().any(|f| f.ends_with("export/mod.rs")));
+    for path in files {
+        let name = path
+            .strip_prefix(&src)
+            .unwrap_or(&path)
+            .to_string_lossy()
+            .into_owned();
+        let text = fs::read_to_string(&path).unwrap_or_else(|e| panic!("{name}: {e}"));
         // Doc comments may mention the forbidden calls; only code lines are checked.
         let code: String = text
             .lines()
             .filter(|l| !l.trim_start().starts_with("//"))
             .collect::<Vec<_>>()
             .join("\n");
+        // The export writer creates new files (O_EXCL), links and removes its own temporary
+        // file: the only writing code of the crate.
+        if name == "export/write.rs" {
+            continue;
+        }
         for f in forbidden {
             assert!(!code.contains(f), "{name} contains `{f}`");
         }
