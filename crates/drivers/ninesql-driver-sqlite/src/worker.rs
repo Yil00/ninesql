@@ -1421,6 +1421,10 @@ impl Worker {
                     let mut t = TableInfo::default();
                     if row.get(1) == Some(&Val::Int(1)) {
                         t.flavour = Some("virtual".to_owned());
+                    } else {
+                        // Ordinary SQLite tables are always transactional; a virtual table's
+                        // module decides (unknown).
+                        t.transactional = Some(true);
                     }
                     items.push(ObjectInfo {
                         path: parent.child(kind, name),
@@ -1479,7 +1483,7 @@ impl Worker {
                 let table = segment(1, &[ObjectKind::Table, ObjectKind::View])?;
                 if kind == ObjectKind::Index {
                     let rows = self.query_internal(
-                        "SELECT name, \"unique\", origin FROM pragma_index_list(?1, ?2) \
+                        "SELECT name, \"unique\", origin, partial FROM pragma_index_list(?1, ?2) \
                          WHERE (?3 IS NULL OR name LIKE ?3 ESCAPE '!') AND (?4 IS NULL OR name > ?4) \
                          ORDER BY name LIMIT ?5",
                         &[&table, &schema_name, &filter, &cursor, &fetch],
@@ -1492,6 +1496,13 @@ impl Worker {
                         let mut info = IndexInfo::default();
                         info.unique = row.get(1) == Some(&Val::Int(1));
                         info.primary = text(row.get(2)) == "pk";
+                        // SQLite indexes are always valid and checked at once; `NULL`s are
+                        // distinct. A partial index is flagged; its predicate text is not read
+                        // (`predicate` stays `None`).
+                        info.valid = true;
+                        info.deferrable = false;
+                        info.nulls_distinct = true;
+                        info.partial = row.get(3) == Some(&Val::Int(1));
                         // Key parts; SQLite does not report the text of an expression part.
                         let parts = self.query_internal(
                             "SELECT name, cid FROM pragma_index_xinfo(?1, ?2) \
@@ -1505,6 +1516,14 @@ impl Worker {
                             .map(|p| match p.first() {
                                 Some(Val::Null) | None => "(expression)".to_owned(),
                                 v => text(v),
+                            })
+                            .collect();
+                        // `cid` -2 is an expression part (and its name is NULL).
+                        info.expressions = parts
+                            .iter()
+                            .map(|p| {
+                                matches!(p.first(), Some(Val::Null) | None)
+                                    || p.get(1) == Some(&Val::Int(-2))
                             })
                             .collect();
                         next = Some(name.clone());

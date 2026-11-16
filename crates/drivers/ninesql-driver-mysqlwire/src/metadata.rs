@@ -92,6 +92,21 @@ fn not_found() -> DriverError {
     DriverError::InvalidParams("object not found".into())
 }
 
+/// Whether a table's storage engine (`information_schema.TABLES.ENGINE`) is transactional:
+/// `Some(false)` for engines where a rollback undoes nothing (P5-B review M2), `None` for a view
+/// or an engine this driver does not know.
+pub(crate) fn engine_transactional(engine: Option<&str>) -> Option<bool> {
+    let e = engine?.trim().to_ascii_uppercase();
+    match e.as_str() {
+        "INNODB" | "NDB" | "NDBCLUSTER" | "ROCKSDB" | "TOKUDB" | "XTRADB" => Some(true),
+        "MYISAM" | "MEMORY" | "HEAP" | "ARCHIVE" | "CSV" | "ARIA" | "BLACKHOLE" | "MRG_MYISAM"
+        | "MERGE" | "FEDERATED" | "FEDERATEDX" | "CONNECT" | "SEQUENCE" | "S3" | "SPIDER" => {
+            Some(false)
+        }
+        _ => None,
+    }
+}
+
 fn cell(row: &[Option<String>], i: usize) -> Option<String> {
     row.get(i).cloned().flatten()
 }
@@ -285,7 +300,7 @@ impl Metadata for MyMetadata {
                      (SELECT CONCAT(p.PARTITION_METHOD, ' (', COALESCE(p.PARTITION_EXPRESSION, ''), ')') \
                       FROM information_schema.PARTITIONS p \
                       WHERE p.TABLE_SCHEMA = t.TABLE_SCHEMA AND p.TABLE_NAME = t.TABLE_NAME \
-                      AND p.PARTITION_ORDINAL_POSITION = 1 LIMIT 1) END \
+                      AND p.PARTITION_ORDINAL_POSITION = 1 LIMIT 1) END, t.ENGINE \
                      FROM information_schema.TABLES t \
                      WHERE {} AND t.TABLE_TYPE IN ({types}){}{} \
                      ORDER BY CAST(t.TABLE_NAME AS BINARY) LIMIT {fetch}",
@@ -445,6 +460,7 @@ impl Metadata for MyMetadata {
                         _ if t.partition_key.is_some() => Some("partitioned".to_owned()),
                         _ => None,
                     };
+                    t.transactional = engine_transactional(cell(row, 6).as_deref());
                     ObjectDetails::Table(t)
                 }
                 ObjectKind::Sequence => ObjectDetails::Sequence(SequenceInfo::default()),
@@ -508,9 +524,21 @@ impl Metadata for MyMetadata {
                             }
                         })
                         .collect();
+                    i.expressions = keys
+                        .iter()
+                        .filter(|(k, _, _)| *k == name)
+                        .map(|(_, c, _)| c.is_empty())
+                        .collect();
                     i.unique = cell(row, 3).as_deref() == Some("0");
                     i.primary = name == "PRIMARY";
                     i.method = cell(row, 4);
+                    // MySQL-family indexes are always usable and checked at once; unique
+                    // indexes treat `NULL`s as distinct.
+                    i.valid = true;
+                    i.deferrable = false;
+                    i.nulls_distinct = true;
+                    // No partial indexes in the MySQL family.
+                    i.partial = false;
                     ObjectDetails::Index(i)
                 }
                 ObjectKind::Trigger => {

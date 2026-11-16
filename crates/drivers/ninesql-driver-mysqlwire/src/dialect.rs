@@ -18,8 +18,9 @@
 //! with `\`) are refused.
 //!
 //! Parameters ([`bind_params`]) are inlined client-side as literals that cannot leave their
-//! token whatever the session's modes: hexadecimal literals (`X'…'`, converted with `CONVERT(…
-//! USING utf8mb4)` for text), digits, `DATE` / `TIMESTAMP` literals. Placeholders are found with
+//! token whatever the session's modes: hexadecimal literals (`X'…'`, as `CONCAT(_utf8mb4 X'…')`
+//! for text, so the column's collation applies), digits, `DATE` / `TIMESTAMP`
+//! literals. Placeholders are found with
 //! the same scanner, so a `?` inside a string, an identifier or a comment is never replaced.
 
 use std::borrow::Cow;
@@ -27,6 +28,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use ninesql_driver_api::dialect::{classify_with_rules, split_with_rules};
+use ninesql_driver_api::dml::{ColumnType, DmlError};
 use ninesql_driver_api::{
     CodeTokenKind, Dialect, DriverError, DriverResult, ExplainFormat, LexicalRules, Param,
     RowChange, RowEdit, ScriptItem, ScriptItemKind, ScriptRefusal, ScriptState, Statement,
@@ -334,6 +336,25 @@ impl Dialect for MyDialect {
             ExplainFormat::Analyze if self.explain_analyze => format!("EXPLAIN ANALYZE {q}"),
             _ => return None,
         })
+    }
+
+    fn dml_literal(&self, value: &Param, ty: &ColumnType) -> Result<String, &'static str> {
+        let _ = ty;
+        // Mode-independent (security review H1): the text may be replayed in another session.
+        crate::dml::literal(value)
+    }
+
+    fn dml_check_identifier(&self, name: &str) -> Result<(), DmlError> {
+        crate::dml::check_identifier(name)
+    }
+
+    fn dml_comparable(&self, ty: &ColumnType) -> bool {
+        crate::dml::comparable(ty)
+    }
+
+    fn dml_insert_default_values(&self, table: &str) -> String {
+        // MySQL has no `DEFAULT VALUES`.
+        format!("INSERT INTO {table} () VALUES ()")
     }
 
     fn render_edit(&self, edit: &RowEdit) -> DriverResult<Statement> {
@@ -1034,11 +1055,19 @@ pub(crate) fn literal(value: &Param) -> DriverResult<String> {
                 "a decimal parameter must be plain digits with an optional sign and point".into(),
             ));
         }
+        // `CONCAT(_utf8mb4 X'…')`: the introducer makes a coercible string (coercibility 4), so
+        // the column's collation applies in comparisons, where `CONVERT(… USING utf8mb4)` is
+        // implicit (coercibility 2) with the charset's default collation: it matched two rows of
+        // a `latin1_swedish_ci` key and failed with error 1267 against `utf8mb4_0900_as_cs`
+        // (P5-B re-review M-a). `CONCAT` turns the introduced hexadecimal literal into a string
+        // expression: alone, MySQL stores it into a JSON column as binary (error 3144) and TiDB
+        // reads it as a bit / hex literal for a `TIME` column. Still hexadecimal: no text of the
+        // value reaches the statement (ADR-0020 §2).
         Param::Text(s) | Param::Json(s) => {
             if s.is_empty() {
-                "CONVERT('' USING utf8mb4)".to_owned()
+                "_utf8mb4''".to_owned()
             } else {
-                format!("CONVERT(X'{}' USING utf8mb4)", hex(s.as_bytes()))
+                format!("CONCAT(_utf8mb4 X'{}')", hex(s.as_bytes()))
             }
         }
         Param::Bytes(b) => format!("X'{}'", hex(b)),
@@ -1212,7 +1241,7 @@ mod tests {
         let out = bind_params("SELECT ?, 1-?, ?, '?', `?`, ? -- ?", &p, DEFAULT).unwrap();
         assert_eq!(
             out,
-            "SELECT  CONVERT(X'7827204F5220313D313B202D2D205C' USING utf8mb4) , 1- (-5) ,  \
+            "SELECT  CONCAT(_utf8mb4 X'7827204F5220313D313B202D2D205C') , 1- (-5) ,  \
              X'DEAD' , '?', `?`,  NULL  -- ?"
         );
         assert!(bind_params("SELECT ?", &[], DEFAULT).is_ok());

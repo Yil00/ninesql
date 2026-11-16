@@ -27,6 +27,7 @@
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
 
 mod dialect;
+mod dml;
 mod session;
 mod types;
 mod worker;

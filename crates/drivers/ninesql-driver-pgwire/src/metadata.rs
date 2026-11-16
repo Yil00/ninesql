@@ -196,6 +196,12 @@ const FOREIGN_KEYS_SQL: &str = concat!(
 );
 
 /// Indexes of relation `$4`: key parts are column names, or expression text (hex-encoded).
+///
+/// `unique` is `indisunique`; whether the index is valid and ready (`indisvalid`, `indisready`:
+/// not after a failed `CREATE INDEX CONCURRENTLY`) and whether its uniqueness is deferred
+/// (`indimmediate = false`) are columns 7 and 8 (P5-B review M1: key selection refuses both);
+/// column 10 holds one `t` / `f` per key part (`t` for an expression, `indkey = 0`). `indnullsnotdistinct` (PostgreSQL 15+) is
+/// read through `to_jsonb` so the statement also runs on servers without the column.
 const INDEXES_SQL: &str = concat!(
     "SELECT ic.relname::pg_catalog.text, ",
     "pg_catalog.obj_description(ic.oid, 'pg_class'::pg_catalog.name), ",
@@ -207,8 +213,18 @@ const INDEXES_SQL: &str = concat!(
     "ELSE pg_catalog.pg_get_indexdef(i.indexrelid, k.ord, true) END, ",
     "'UTF8'::pg_catalog.name), 'hex'::pg_catalog.text), ','::pg_catalog.text ORDER BY k.ord) ",
     "FROM pg_catalog.generate_series(1, i.indnkeyatts::pg_catalog.int4) AS k(ord)), ",
-    "i.indisunique::pg_catalog.text, i.indisprimary::pg_catalog.text, am.amname::pg_catalog.text, ",
-    "pg_catalog.pg_get_expr(i.indpred, i.indrelid, true) ",
+    "i.indisunique::pg_catalog.text, ",
+    "i.indisprimary::pg_catalog.text, am.amname::pg_catalog.text, ",
+    "pg_catalog.pg_get_expr(i.indpred, i.indrelid, true), ",
+    "(i.indisvalid AND i.indisready)::pg_catalog.text, ",
+    "(NOT i.indimmediate)::pg_catalog.text, ",
+    "COALESCE(pg_catalog.jsonb_extract_path_text(pg_catalog.to_jsonb(i), ",
+    "'indnullsnotdistinct'::pg_catalog.text), ",
+    "'false'::pg_catalog.text), ",
+    "(SELECT pg_catalog.string_agg(CASE WHEN i.indkey[k.ord OPERATOR(pg_catalog.-) 1] ",
+    "OPERATOR(pg_catalog.<>) 0::pg_catalog.int2 THEN 'f'::pg_catalog.text ELSE 't'::pg_catalog.text END, ",
+    "''::pg_catalog.text ORDER BY k.ord) ",
+    "FROM pg_catalog.generate_series(1, i.indnkeyatts::pg_catalog.int4) AS k(ord)) ",
     "FROM pg_catalog.pg_index i ",
     "JOIN pg_catalog.pg_class ic ON ic.oid OPERATOR(pg_catalog.=) i.indexrelid ",
     "JOIN pg_catalog.pg_am am ON am.oid OPERATOR(pg_catalog.=) ic.relam ",
@@ -948,6 +964,7 @@ impl Metadata for PgMetadata {
                         _ => None,
                     };
                     t.partition_key = cell(row, 4);
+                    t.transactional = Some(true);
                     ObjectDetails::Table(t)
                 }
                 ObjectKind::Column => {
@@ -990,6 +1007,15 @@ impl Metadata for PgMetadata {
                     i.primary = truthy(row, 4);
                     i.method = cell(row, 5);
                     i.predicate = cell(row, 6);
+                    i.partial = i.predicate.is_some();
+                    i.valid = truthy(row, 7);
+                    i.deferrable = truthy(row, 8);
+                    i.nulls_distinct = !truthy(row, 9);
+                    i.expressions = cell(row, 10)
+                        .unwrap_or_default()
+                        .chars()
+                        .map(|c| c != 'f')
+                        .collect();
                     ObjectDetails::Index(i)
                 }
                 ObjectKind::Trigger => {

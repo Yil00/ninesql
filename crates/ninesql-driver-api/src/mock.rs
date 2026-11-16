@@ -1063,6 +1063,7 @@ impl MockMetadata {
                         estimated_rows: Some(1000),
                         flavour: None,
                         partition_key: None,
+                        transactional: Some(true),
                     }),
                 })
                 .collect(),
