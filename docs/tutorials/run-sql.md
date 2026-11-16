@@ -25,7 +25,7 @@ The editor follows the dialect of its connection: how statements are split, whic
 | "Add next occurrence to selection" (multi-cursor) | `Ctrl+D` |
 | Add a cursor above / below | `Ctrl+Alt+Up` / `Ctrl+Alt+Down` |
 
-- **Completion** offers the dialect's keywords and the aliases and CTE names of the statement. Schemas, tables, views and columns are **not offered yet**: they need the metadata cache of phase 4. Joins on foreign keys are not completed.
+- **Completion** offers the dialect's keywords, the aliases and CTE names of the statement, and the schemas, tables, views, routines and columns already loaded for the connection (expanded in the navigator, found with "Find object", or the default schema loaded when the editor binds to the connection; [Browse a database](browse-database.md#8-object-completion-in-the-sql-editor)). Joins on foreign keys are not completed.
 - **Folding** works with the mouse in the gutter; there is no key binding to fold or unfold yet.
 - **Pasted and loaded text is cleaned**: control characters are removed and line ends become `\n`. Invisible bidirectional control characters are kept but flagged: each one gets a warning, a banner says "N bidirectional control character(s) in this script (first: …). Alt+F8 selects them.", and "Select bidirectional control characters" (`Alt+F8`) selects them so you can review or delete them.
 
@@ -159,11 +159,11 @@ close_with_open_transaction = true   # always asked for production connections
 ```
 - The connection id of `[execution.connection_timeouts]` is the `id` of the connection in `connections.json`.
 - Statement confirmations are not a preference: they come from the connection type ([Create your first connection](first-connection.md#5-connection-type-and-read-only)).
-- Editor and grid key bindings are overridden under `[keybindings]` with their full names, for example `"ninesql_editor::ExecuteStatement" = "f5"` or `"ninesql_grid::FetchAllRows" = ["alt-end", "ctrl-shift-end"]`.
+- Editor and grid key bindings are overridden under `[keybindings]` with their full names, for example `"ninesql_editor::ExecuteStatement" = "f9"` or `"ninesql_grid::FetchAllRows" = ["alt-end", "ctrl-shift-end"]`.
 
 ## Not built yet
 - Saving and opening script files, and reopening tabs after a restart. Unsaved tabs will not be restored even then: their text could hold a password.
-- Completion of tables and columns, and of joins on foreign keys (phase 4).
+- Completion of joins on foreign keys.
 - A keyboard fold action, a history view, a preferences page, an auto-commit toggle, a reconnect when a session is lost.
 - Measurements on a real GPU: the time to first rows was measured only at the core level, and scrolling has not been measured ([ROADMAP](../ROADMAP.md#phase-3--sql-editor-and-results-grid)).
 

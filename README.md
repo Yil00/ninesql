@@ -37,7 +37,7 @@
   </p>
 </div>
 
-> ⚠️ **Pre-alpha.** Nothing is released yet. A development build can create, test and open connections to PostgreSQL, MySQL, MariaDB and SQLite (directly, over TLS and over SSH) from the connection dialog, and import connections from a DBeaver workspace from the UI (preview, saved passwords moved to the vault, re-import; [tutorial](docs/tutorials/import-from-dbeaver.md)), and run SQL in an editor with a results grid (statements, selections and scripts, parameters, production confirmations, cancel, commit and roll back; [tutorial](docs/tutorials/run-sql.md)). There is no schema browser, data editing or export yet, and the interface, editor and grid included, awaits its visual check and its performance measurements on real desktops, planned with the final MVP tests (P6-F). Saved passwords go to the encrypted vault: the keyring backend is off by default until it is validated on GNOME and KDE. See the [roadmap](docs/ROADMAP.md) for the MVP plan.
+> ⚠️ **Pre-alpha.** Nothing is released yet. A development build can create, test and open connections to PostgreSQL, MySQL, MariaDB and SQLite (directly, over TLS and over SSH), and to TimescaleDB, YugabyteDB, QuestDB and TiDB with per-engine limits, from the connection dialog, and import connections from a DBeaver workspace from the UI (preview, saved passwords moved to the vault, re-import; [tutorial](docs/tutorials/import-from-dbeaver.md)), and run SQL in an editor with a results grid (statements, selections and scripts, parameters, production confirmations, cancel, commit and roll back; [tutorial](docs/tutorials/run-sql.md)). It can also browse schemas and objects in the navigator, with an object editor, DDL, SQL templates and object completion ([tutorial](docs/tutorials/browse-database.md)). There is no data editing or export yet, and the interface, navigator, editor and grid included, awaits its visual check and its performance measurements on real desktops, planned with the final MVP tests (P6-F). Saved passwords go to the encrypted vault: the keyring backend is off by default until it is validated on GNOME and KDE. See the [roadmap](docs/ROADMAP.md) for the MVP plan.
 
 ## Why NineSQL
 DBeaver is the de facto universal database client, but it runs on the JVM and Eclipse RCP: high memory use, slow cold start, and uneven HiDPI / Wayland behavior on Linux.
@@ -54,14 +54,14 @@ The 20 most used **open-source, self-hostable** engines. Cloud-only services (Sn
 
 | Engine | Family | Planned in | Status |
 |:--|:--|:--|:--|
-| **PostgreSQL** | SQL · pg-wire | MVP (v0.1) | 🚧 Driver landed (P1-B); connect from the connection dialog (P1-C) or import from DBeaver (P2); run SQL in the editor and read results in the grid (P3); no schema browser yet (P4) |
-| **MySQL** | SQL · mysql-wire | MVP (v0.1) | 🚧 Driver landed (P1-B); connect from the connection dialog (P1-C) or import from DBeaver (P2); run SQL in the editor and read results in the grid (P3); no schema browser yet (P4) |
-| **MariaDB** | SQL · mysql-wire | MVP (v0.1) | 🚧 Driver landed (P1-B); connect from the connection dialog (P1-C) or import from DBeaver (P2); run SQL in the editor and read results in the grid (P3); no schema browser yet (P4) |
-| **SQLite** | SQL · embedded | MVP (v0.1) | 🚧 Driver landed (P1-B); connect from the connection dialog (P1-C) or import from DBeaver (P2); run SQL in the editor and read results in the grid (P3); no schema browser yet (P4) |
-| **TimescaleDB** | SQL · pg-wire | MVP (v0.1) | 🗓 Planned |
-| **YugabyteDB** (YSQL) | SQL · pg-wire | MVP (v0.1) | 🗓 Planned |
-| **QuestDB** | SQL · pg-wire | MVP (v0.1) | 🗓 Planned |
-| **TiDB** | SQL · mysql-wire | MVP (v0.1) | 🗓 Planned |
+| **PostgreSQL** | SQL · pg-wire | MVP (v0.1) | 🚧 Driver landed (P1-B); connect from the connection dialog (P1-C) or import from DBeaver (P2); run SQL in the editor and read results in the grid (P3); browse objects and DDL in the navigator (P4, pending its phase-end review) |
+| **MySQL** | SQL · mysql-wire | MVP (v0.1) | 🚧 Driver landed (P1-B); connect from the connection dialog (P1-C) or import from DBeaver (P2); run SQL in the editor and read results in the grid (P3); browse objects and DDL in the navigator (P4, pending its phase-end review) |
+| **MariaDB** | SQL · mysql-wire | MVP (v0.1) | 🚧 Driver landed (P1-B); connect from the connection dialog (P1-C) or import from DBeaver (P2); run SQL in the editor and read results in the grid (P3); browse objects and DDL in the navigator (P4, pending its phase-end review) |
+| **SQLite** | SQL · embedded | MVP (v0.1) | 🚧 Driver landed (P1-B); connect from the connection dialog (P1-C) or import from DBeaver (P2); run SQL in the editor and read results in the grid (P3); browse objects and DDL in the navigator (P4, pending its phase-end review) |
+| **TimescaleDB** | SQL · pg-wire | MVP (v0.1) | 🚧 Served by the pgwire driver (P4-C): connect (the `timescaledb` extension is required), run SQL, browse hypertables and continuous aggregates (chunks hidden); read-only as PostgreSQL |
+| **YugabyteDB** (YSQL) | SQL · pg-wire | MVP (v0.1) | 🚧 Served by the pgwire driver (P4-C): connect, run SQL, browse as PostgreSQL; read-only as PostgreSQL |
+| **QuestDB** | SQL · pg-wire | MVP (v0.1) | 🚧 Served by the pgwire driver (P4-C): run SQL and browse tables, views and partitions; no TLS, so the password needs a strict SSH tunnel; no transactions; read-only only through QuestDB's read-only user or a read-only server (open-source QuestDB tested) |
+| **TiDB** | SQL · mysql-wire | MVP (v0.1) | 🚧 Served by the mysqlwire driver (P4-C): connect, run SQL, browse; no TLS yet (plaintext); read-only only on a read-only TiDB instance |
 | **DuckDB** | SQL · embedded | v0.2 | 🗓 Planned |
 | **ClickHouse** | SQL · HTTP | v0.2 | 🗓 Planned |
 | **Trino** | SQL · HTTP | v0.2 | 🗓 Planned |

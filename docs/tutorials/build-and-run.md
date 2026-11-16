@@ -2,7 +2,7 @@
 
 NineSQL has no release yet: you build it from the repository. This page covers Linux (Debian, Ubuntu), the platforms NineSQL targets, and macOS, which is kept compiling so contributors on a Mac can iterate on the interface ([docs/10](../10-supported-platforms.md)).
 
-What you get today: the main window (navigator, editor tabs and splits, status bar, several windows), the command palette, themes, the connection dialog, and sessions to PostgreSQL, MySQL, MariaDB and SQLite. Not built yet: running SQL and seeing results (phase 3), the DBeaver import screen (phase 2), packages (phase 6).
+What you get today: the main window (navigator, editor tabs and splits, status bar, several windows), the command palette, themes, the connection dialog, sessions to PostgreSQL, MySQL, MariaDB, SQLite, TimescaleDB, YugabyteDB, QuestDB and TiDB, the DBeaver import, the SQL editor with its results grid, and the navigator's object tree and object editor. Not built yet: data editing and export (phase 5), packages (phase 6).
 
 ## 1. Install the toolchain
 
@@ -48,6 +48,8 @@ Only one NineSQL process can use the workspace at a time: a second one is refuse
 | Import from DBeaver | `Ctrl+K` then `Ctrl+I` |
 | Show or hide the database navigator | `Ctrl+B` |
 | Move focus to the navigator | `Ctrl+K` then `Ctrl+N` |
+| Find an object ([browse a database](browse-database.md)) | `Ctrl+Shift+O` |
+| Refresh the selected navigator node | `F5` |
 | New SQL editor ([run SQL](run-sql.md)) | `Ctrl+T` |
 | Choose the editor's connection | `Ctrl+K` then `Ctrl+P` |
 | Close the editor tab | `Ctrl+W` |
@@ -57,7 +59,7 @@ Only one NineSQL process can use the workspace at a time: a second one is refuse
 | Show settings problems | `Ctrl+K` then `Ctrl+E` |
 | New window / close window / quit | `Ctrl+Shift+N` / `Ctrl+Shift+W` / `Ctrl+Q` |
 
-The connection actions are in [Create your first connection](first-connection.md), the editor and results grid actions in [Run SQL and read results](run-sql.md), the secret actions in [Secrets](secrets.md).
+The connection actions are in [Create your first connection](first-connection.md), the editor and results grid actions in [Run SQL and read results](run-sql.md), the navigator and object actions in [Browse a database](browse-database.md), the secret actions in [Secrets](secrets.md).
 
 On macOS the default bindings use **Ctrl** too, not Cmd: the defaults are the Linux ones on every platform.
 
@@ -79,7 +81,7 @@ ToggleNavigator = []                            # unbinds
 [import]
 first_run_prompt = false        # do not offer the DBeaver import at startup
 ```
-Editor and grid actions are named in full under `[keybindings]` (`"ninesql_editor::ExecuteStatement" = "f5"`, `"ninesql_grid::FetchAllRows" = "alt-end"`); short names work for the shell's own actions only. The `[execution]`, `[history]` and `[confirmations]` sections (timeouts, fetch size, memory budget, history retention, close confirmation) are described in [Run SQL and read results](run-sql.md#10-preferences-in-settingstoml).
+Editor and grid actions are named in full under `[keybindings]` (`"ninesql_editor::ExecuteStatement" = "f9"`, `"ninesql_grid::FetchAllRows" = "alt-end"`); short names work for the shell's own actions only. The `[execution]`, `[history]` and `[confirmations]` sections (timeouts, fetch size, memory budget, history retention, close confirmation) are described in [Run SQL and read results](run-sql.md#10-preferences-in-settingstoml).
 An invalid value or binding never stops NineSQL: the default is used and the problem is listed by "Show settings problems" (`Ctrl+K` then `Ctrl+E`).
 
 ## Where NineSQL keeps its files

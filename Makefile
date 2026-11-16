@@ -29,7 +29,12 @@ TIMEOUT     ?= 900
 DEV_TIMEOUT ?= 900
 # Engines whose integration tests must not be skipped (same list as the driver-integration
 # CI job).
-REQUIRE_ENGINES ?= postgresql,mysql,mariadb,ssh
+REQUIRE_ENGINES ?= postgresql,mysql,mariadb,ssh,timescaledb,yugabytedb,questdb,tidb
+# Wire-compatible engines of the sql profile that test-engines starts besides the core profile
+# (same list as WIRE_ENGINES in the driver-integration CI job; about 2.3 GB of memory together).
+WIRE_ENGINES ?= timescaledb,yugabytedb,questdb,tidb
+# The same list separated by spaces, for `docker compose pull` (no GNU functions, see above).
+WIRE_SERVICES ?= timescaledb yugabytedb questdb tidb
 # Crates whose integration tests run against the dev containers (driver-integration CI job).
 ENGINE_TEST_CRATES ?= -p ninesql-driver-pgwire -p ninesql-driver-mysqlwire \
                       -p ninesql-driver-sqlite -p ninesql-core -p ninesql-ssh
@@ -70,6 +75,7 @@ help: ## List the targets (default)
 	@echo "  CARGO=$(CARGO)  PYTHON=$(PYTHON)  COMPOSE=$(COMPOSE)"
 	@echo "  PROFILE=$(PROFILE)  TIMEOUT=$(TIMEOUT)  DEV_TIMEOUT=$(DEV_TIMEOUT)"
 	@echo "  REQUIRE_ENGINES=$(REQUIRE_ENGINES)"
+	@echo "  WIRE_ENGINES=$(WIRE_ENGINES)"
 
 # ---------------------------------------------------------------------------------------------
 ##@ Build and run
@@ -143,10 +149,12 @@ dev-ps: ## Show the state of the dev containers
 ##@ Integration tests (driver-integration CI job)
 # ---------------------------------------------------------------------------------------------
 
-test-engines: ## Start core, run driver/core/ssh tests with required engines, stop the engines
+test-engines: ## Start core and the wire engines, run driver/core/ssh tests, stop the engines
 	@status=0; \
 	$(WITH_TIMEOUT) $(COMPOSE) $(COMPOSE_FILE_ARGS) --profile core pull --quiet \
+	&& $(WITH_TIMEOUT) $(COMPOSE) $(COMPOSE_FILE_ARGS) --profile sql pull --quiet $(WIRE_SERVICES) \
 	&& $(PYTHON) dev/ready.py up core --timeout $(DEV_TIMEOUT) \
+	&& $(PYTHON) dev/ready.py up sql --engines $(WIRE_ENGINES) --timeout $(DEV_TIMEOUT) \
 	&& $(ENGINE_TESTS) \
 	|| status=$$?; \
 	$(PYTHON) dev/ready.py down; \

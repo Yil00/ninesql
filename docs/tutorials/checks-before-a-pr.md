@@ -23,18 +23,18 @@ Each target also runs alone (`make clippy`, `make md-links`…). To fix formatti
 
 Requirements: the [build requirements](build-and-run.md#1-install-the-toolchain) (clippy and the tests build GPUI), [`cargo-deny`](https://github.com/EmbarkStudios/cargo-deny) (`cargo install cargo-deny --locked`; CI uses 0.20.2), Python 3.11 or newer for `verify-patches`. The long cargo commands stop after `TIMEOUT` seconds (900 by default; `make check TIMEOUT=1800` on a slow machine).
 
-In `make test`, the integration tests of PostgreSQL, MySQL, MariaDB and SSH **skip themselves** when their engine is not reachable. That is why the next step exists.
+In `make test`, the integration tests of PostgreSQL, MySQL, MariaDB, TimescaleDB, YugabyteDB, QuestDB, TiDB and SSH **skip themselves** when their engine is not reachable. That is why the next step exists.
 
 ## 2. The driver integration tests
 ```bash
 make test-engines
 ```
 This does what the `driver-integration` CI job does:
-1. pulls the images of the `core` profile and starts PostgreSQL, MySQL and MariaDB (`dev/ready.py up core`);
-2. runs `cargo test --locked` for `ninesql-driver-pgwire`, `ninesql-driver-mysqlwire`, `ninesql-driver-sqlite`, `ninesql-core` and `ninesql-ssh` with `NINESQL_REQUIRE_ENGINES=postgresql,mysql,mariadb,ssh`, so an unreachable engine **fails** the run instead of skipping. The SSH tests start their own OpenSSH containers with `docker run`;
+1. pulls the images of the `core` profile and of the four wire-compatible engines, then starts PostgreSQL, MySQL and MariaDB (`dev/ready.py up core`) and TimescaleDB, YugabyteDB, QuestDB and TiDB (`dev/ready.py up sql --engines timescaledb,yugabytedb,questdb,tidb`; about 2.3 GB of memory together);
+2. runs `cargo test --locked` for `ninesql-driver-pgwire`, `ninesql-driver-mysqlwire`, `ninesql-driver-sqlite`, `ninesql-core` and `ninesql-ssh` with `NINESQL_REQUIRE_ENGINES=postgresql,mysql,mariadb,ssh,timescaledb,yugabytedb,questdb,tidb`, so an unreachable engine **fails** the run instead of skipping. The SSH tests start their own OpenSSH containers with `docker run`;
 3. stops the engines and deletes their volumes (`dev/ready.py down`), whether the tests passed or not.
 
-It needs Docker ([Start the dev databases](dev-databases.md#1-requirements)) and none of the GPUI system packages. If you already started the engines with `make dev-up`, run only the tests with `make test-engines-run` and stop the engines yourself with `make dev-down`. Note that `make test-engines` stops them at the end too.
+It needs Docker ([Start the dev databases](dev-databases.md#1-requirements)) and none of the GPUI system packages. If you already started the engines, run only the tests with `make test-engines-run` and stop the engines yourself with `make dev-down`. With only the `core` profile up (`make dev-up`), narrow the required list: `make test-engines-run REQUIRE_ENGINES=postgresql,mysql,mariadb,ssh` (the tests of the other engines then skip). Note that `make test-engines` stops them at the end too.
 
 ## 3. Optional checks
 - `make verify-gpui-snapshot`: compares the GPUI crates in Cargo's cache with their upstream sources ([ADR-0013](../adr/0013-gpui-source-and-supply-chain.md)). It needs network access to GitHub and crates.io. Its output is required in a PR that bumps GPUI.

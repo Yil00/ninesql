@@ -1,8 +1,8 @@
 # Create your first connection
 
-This tutorial creates, tests and opens a connection to PostgreSQL, MySQL, MariaDB or SQLite from the connection dialog (P1-C). It uses the [dev databases](dev-databases.md); replace the values with your own server's.
+This tutorial creates, tests and opens a connection to PostgreSQL, MySQL, MariaDB or SQLite from the connection dialog (P1-C), then covers TimescaleDB, YugabyteDB, QuestDB and TiDB (P4-C), which have their own conditions ([section 8](#8-timescaledb-yugabytedb-questdb-and-tidb)). It uses the [dev databases](dev-databases.md); replace the values with your own server's.
 
-What you can do once connected: see the session in the navigator and the status bar, with its type and read-only badges and any security warning. Running SQL and browsing tables come with the SQL editor and results grid (phase 3) and the navigator tree (phase 4); they are not built yet.
+What you can do once connected: see the session in the navigator and the status bar, with its type and read-only badges and any security warning, [browse its objects](browse-database.md) and [run SQL](run-sql.md).
 
 ## Before you start
 - NineSQL builds and runs ([Build and run](build-and-run.md)).
@@ -89,7 +89,30 @@ Select the connection in the navigator (`Ctrl+K` then `Ctrl+N` moves the focus t
 - On success: "Connected to "nine-pg"." If the session has weakened settings, a "Security warnings" notification lists them; it stays until you close it.
 - The status bar always shows the connection type, and a read-only badge when the session is read-only. For a **production** connection, a frame in the type color surrounds the editor area of the window while that connection is the window's active one. The navigator shows each connection's type color stripe and badges. These come from the open session, so an edit you save applies at the next connect, and the dialog says so ("This connection is open: its sessions keep their current settings until you reconnect.").
 
-To run statements on the connection, open an SQL editor (`Ctrl+T`): see [Run SQL and read results](run-sql.md). On a production connection, destructive statements open the "Run on production?" confirmation first.
+To browse the connection's schemas and tables, expand it in the navigator: see [Browse a database](browse-database.md). To run statements on the connection, open an SQL editor (`Ctrl+T`): see [Run SQL and read results](run-sql.md). On a production connection, destructive statements open the "Run on production?" confirmation first.
+
+## 8. TimescaleDB, YugabyteDB, QuestDB and TiDB
+These engines speak the PostgreSQL protocol (TimescaleDB, YugabyteDB, QuestDB) or the MySQL protocol (TiDB) and have their own entries in "Engine". Their dev services ([Start the dev databases](dev-databases.md#4-connection-details)) need `make dev-up PROFILE=sql`; none of them has TLS in the dev environment.
+
+| Engine (dev) | Endpoint | User / password | TLS modes offered | Read-only |
+|---|---|---|---|---|
+| **TimescaleDB** | `127.0.0.1`, `15433`, database `nine` | `nine` / `nine_dev_only` | the four PostgreSQL modes | as PostgreSQL |
+| **YugabyteDB** | `127.0.0.1`, `15434`, database `nine` | `nine` / `nine_dev_only` | the four PostgreSQL modes | as PostgreSQL |
+| **QuestDB** | `127.0.0.1`, `18812`, database `qdb` | `nine` / `nine_dev_only`; read-only user `nine_ro` / `nine_dev_only` | "Disabled" only | only as QuestDB's read-only user, or on a read-only server |
+| **TiDB** | `127.0.0.1`, `14000`, database `nine` | `nine` / `nine_dev_only` | "Disabled" only | only on a read-only TiDB instance |
+
+**The server must be the engine you chose.** At connect, NineSQL checks what the server reports; a mismatch fails with "this server reports version …, which is …, not …; choose the matching engine". TimescaleDB also needs the `timescaledb` extension in the connection's database. A PostgreSQL connection to a database that has the extension is accepted: it is browsed as plain PostgreSQL (hypertable chunks appear as tables of `_timescaledb_internal`), and TimescaleDB functions that drop or convert data (`drop_chunks`, `compress_chunk`…) are confirmed on production and refused in read-only sessions on every PostgreSQL-protocol connection.
+
+**QuestDB.**
+- QuestDB only accepts a password sent in clear, so NineSQL sends it only over verified TLS ("Verify CA" or "Verify CA and host name", which open-source QuestDB does not offer) or an SSH tunnel whose hops all use the "Strict (confirm unknown keys)" policy. A direct connection, the dev one included, fails before the password is sent ("the server asks for a cleartext password over a connection that is not protected …"). To try the dev QuestDB from the application, reach it through your own SSH server ([section 4](#4-ssh-tunnel-optional)).
+- "SCRAM only" and driver properties are not offered. QuestDB has no transactions: manual commit is refused, and `BEGIN`, `COMMIT`, `ROLLBACK` and `SAVEPOINT` statements are refused as unsupported.
+- **Read-only**: QuestDB has no session read-only mode. A read-only connection is accepted only when the server makes the account read-only: log in as QuestDB's read-only user (`pg.readonly.user`, `nine_ro` in the dev environment) or connect to a read-only server (`pg.security.readonly`). NineSQL checks the server's settings and tries a write that changes nothing, which must be denied. Otherwise the connect fails: "QuestDB has no session read-only mode and this account can write, so the read-only session was refused; …". This check is verified on open-source QuestDB only.
+
+**TiDB.**
+- No TLS is offered yet (until NineSQL's tests can verify a TiDB certificate): **every TiDB connection is in clear**. The password itself is never sent in clear (the `mysql_native_password` exchange sends a scramble), but queries and results are. For a remote TiDB, use an SSH tunnel.
+- **Read-only**: TiDB has no session read-only mode. A read-only connection is accepted only when the whole TiDB instance refuses writes (`tidb_super_read_only` or `tidb_restricted_read_only` on); NineSQL reads that back after every statement and closes the session if it is lifted. Otherwise the connect fails: "TiDB has no session read-only mode … use an account with SELECT privileges only, on a connection that is not read-only". The dev TiDB is writable, so a read-only connection to it is refused.
+
+Per-engine details: [docs/08](../08-engine-capabilities.md#wire-compatible-engines-p4-c).
 
 ## Manage connections
 | Action | Keys |
@@ -106,4 +129,5 @@ To run statements on the connection, open an SQL editor (`Ctrl+T`): see [Run SQL
 ## Next
 - [Run SQL and read results](run-sql.md).
 - [Secrets: keyring, vault and locking](secrets.md).
+- [Browse a database](browse-database.md).
 - Per-engine details (TLS, read-only mechanism, properties): [docs/08](../08-engine-capabilities.md).

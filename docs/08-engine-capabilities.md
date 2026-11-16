@@ -264,6 +264,8 @@ TimescaleDB, YugabyteDB and QuestDB (pgwire) and TiDB (mysqlwire) are separate e
 
 **YugabyteDB** (tested on 2026.1.3, YSQL 15.12). The PostgreSQL capabilities, read-only mechanism (`default_transaction_read_only` and the `ParameterStatus` check are the same), cancel request, metadata and DDL: the YSQL catalog has every `pg_get_*def` function and catalog the P4-A queries use, and the "nine" dataset browses fully (tablets are not shown; YugabyteDB's sharding appears in index DDL as `lsm (… HASH)`). Isolation levels: repeatable read and serializable; read committed only when `BEGIN ISOLATION LEVEL READ COMMITTED` really runs read committed (`yb_effective_transaction_isolation_level`, read at connect), since a YugabyteDB server without its read-committed mode runs it as snapshot isolation. `set_isolation_level` refuses an undeclared level on every pgwire engine.
 
+**TLS on TimescaleDB and YugabyteDB.** Both declare the PostgreSQL TLS modes, CA file and client certificates (the same code path as PostgreSQL), but their `dev/` services have no TLS, so TLS is **not integration-tested** on these two engines.
+
 **QuestDB** (tested on 10.2.0). QuestDB speaks a limited PostgreSQL protocol:
 - *connect*: cleartext password only, so the existing rule applies: the password is sent only over a protected transport (verified TLS, which open-source QuestDB does not offer, or an SSH tunnel whose hops all verify host keys and whose local end is loopback); plain TCP fails with `Auth` before the password is sent. `ScramOnly` is not offered, no driver property is accepted, `tls` is `disable` only, no client certificate;
 - *read-only*: [table above](#read-only-mechanism-adr-0007-i3);

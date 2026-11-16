@@ -23,7 +23,12 @@ make dev-up PROFILE=nosql # MongoDB, Redis, Valkey
 make dev-up PROFILE=heavy # Elasticsearch, OpenSearch, Cassandra, Neo4j
 make dev-up-all           # everything
 ```
-NineSQL can only connect to PostgreSQL, MySQL, MariaDB and SQLite today; the other engines are there for the drivers still to come ([ROADMAP](../ROADMAP.md)).
+NineSQL can connect to PostgreSQL, MySQL, MariaDB, SQLite, TimescaleDB, YugabyteDB, QuestDB and TiDB today; the other engines are there for the drivers still to come ([ROADMAP](../ROADMAP.md)).
+
+To start only some engines of a profile, list them with `--engines` (with `up` and `wait`; their seed containers come along, and an id outside the profile is an error). The driver integration tests use it for the four wire-compatible engines, which need about 2.3 GB of memory together:
+```bash
+python3 dev/ready.py up sql --engines timescaledb,yugabytedb,questdb,tidb --timeout 900
+```
 
 Slow machines or slow pulls: `make dev-up DEV_TIMEOUT=1800`.
 
@@ -40,8 +45,12 @@ make dev-check            # engines.json against compose.yaml; starts nothing
 | MySQL | `127.0.0.1` | 13306 | `nine` | `nine_dev_only` | `nine` |
 | MariaDB | `127.0.0.1` | 13307 | `nine` | `nine_dev_only` | `nine` |
 | SQLite | — | — | — | — | a file you create, see below |
+| TimescaleDB | `127.0.0.1` | 15433 | `nine` | `nine_dev_only` | `nine` |
+| YugabyteDB | `127.0.0.1` | 15434 | `nine` | `nine_dev_only` | `nine` |
+| QuestDB | `127.0.0.1` | 18812 | `nine`; read-only user `nine_ro` | `nine_dev_only` | `qdb` |
+| TiDB | `127.0.0.1` | 14000 | `nine` | `nine_dev_only` | `nine` |
 
-The ports are remapped so they do not clash with servers installed on your machine. The other engines are listed in [dev/README.md](../../dev/README.md#engines-ports-and-dev-credentials).
+The ports are remapped so they do not clash with servers installed on your machine. TimescaleDB, YugabyteDB, QuestDB and TiDB are in the `sql` profile and have no TLS. NineSQL refuses a direct connection to QuestDB (it only accepts a password sent in clear) and a read-only connection to the dev TiDB (the instance is writable); see [Create your first connection](first-connection.md#8-timescaledb-yugabytedb-questdb-and-tidb). The other engines are listed in [dev/README.md](../../dev/README.md#engines-ports-and-dev-credentials).
 
 ### TLS on the dev engines
 PostgreSQL, MySQL and MariaDB also accept TLS. At their first start, each container generates a throwaway certificate authority (CA) and a server certificate for `localhost` and `127.0.0.1`; no key is committed or leaves the container. Your system does not trust that CA, so to try NineSQL's verified TLS modes, copy the public CA certificate to a file:
@@ -78,4 +87,5 @@ This stops every dev container **and deletes their data volumes** (`docker compo
 
 ## Next
 - [Create your first connection](first-connection.md) to one of these engines.
-- [Run the checks before a PR](checks-before-a-pr.md): `make test-engines` runs the driver integration tests against the `core` profile.
+- [Browse a database](browse-database.md) in the navigator, on the "nine" dataset.
+- [Run the checks before a PR](checks-before-a-pr.md): `make test-engines` runs the driver integration tests against the `core` profile and the four wire-compatible engines.

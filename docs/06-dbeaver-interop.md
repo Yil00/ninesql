@@ -152,7 +152,7 @@ Every dropped property is also listed in `ImportedConnection::dropped_properties
 
 Which JDBC driver's semantics apply depends on the DBeaver driver: `mariaDB` uses MariaDB Connector/J, `mysql8`, `mysql5` and `tidb` use MySQL Connector/J, the PostgreSQL-plugin drivers use pgjdbc, `sqlite_jdbc` uses xerial sqlite-jdbc. JDBC property names are matched ignoring ASCII case.
 
-**pgjdbc → pgwire** (PostgreSQL, TimescaleDB, YugabyteDB, QuestDB; pgwire accepts `search_path`, `TimeZone`, `statement_timeout`, `lock_timeout`, `work_mem`, `client_min_messages`):
+**pgjdbc → pgwire** (PostgreSQL, TimescaleDB, YugabyteDB; pgwire accepts `search_path`, `TimeZone`, `statement_timeout`, `lock_timeout`, `work_mem`, `client_min_messages`). **QuestDB** accepts no driver property (pgwire declares an empty allowlist for it; QuestDB ignores PostgreSQL session settings): every pgjdbc property of a QuestDB connection is dropped with a report entry (P4-C). pgjdbc's semantics still apply to read them: URL precedence, `options` read entry by entry for its read-only and secret-like entries (read-only intent is never lost), TLS properties still feeding the TLS settings:
 
 | JDBC property | NineSQL | Notes |
 |---|---|---|
