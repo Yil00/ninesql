@@ -1,6 +1,6 @@
 # ADR-0026: Phase 4 metadata, navigator and wire-engine decisions
 
-- **Status**: Proposed. It adds to [ADR-0008](0008-workspace-and-config-storage.md) §1 (a new machine-owned file in the project directory, §1.1 below) without editing it, applies [ADR-0007](0007-production-safety-model.md) §2 (read-only is engine-side) to engines that have no session read-only mode (§3.1, §3.2) and builds on [ADR-0003](0003-supported-engines-v1.md) (one crate per family, engine ids per engine) and [ADR-0004](0004-driver-api-runtime-and-results.md) (I6: metadata calls run on the driver runtime). It does not rewrite their decisions.
+- **Status**: Accepted (maintainer, 2026-11-16). It adds to [ADR-0008](0008-workspace-and-config-storage.md) §1 (a new machine-owned file in the project directory, §1.1 below) without editing it, applies [ADR-0007](0007-production-safety-model.md) §2 (read-only is engine-side) to engines that have no session read-only mode (§3.1, §3.2) and builds on [ADR-0003](0003-supported-engines-v1.md) (one crate per family, engine ids per engine) and [ADR-0004](0004-driver-api-runtime-and-results.md) (I6: metadata calls run on the driver runtime). It does not rewrite their decisions.
 - **Date**: 2026-11-16
 
 ## Context
