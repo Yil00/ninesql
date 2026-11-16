@@ -207,13 +207,19 @@ impl TemplateInput {
     }
 }
 
-/// Whether every name of `path` and of `columns` reaches the editor unchanged (no control
-/// character, carriage return or line / paragraph separator, which the editor strips or
-/// rewrites). A template is refused otherwise (M2).
+/// Whether every name of `path` and of `input` (its columns and the columns of a known
+/// primary key, which may not be among the listed columns) reaches the editor unchanged (no
+/// control character, carriage return or line / paragraph separator, which the editor strips
+/// or rewrites). A template is refused otherwise (M2).
 #[must_use]
-pub fn names_survive_editor(path: &ObjectPath, columns: &[TemplateColumn]) -> bool {
+pub fn names_survive_editor(path: &ObjectPath, input: &TemplateInput) -> bool {
+    let keys: &[String] = match &input.key {
+        KeySource::Known(k) => k,
+        _ => &[],
+    };
     path.0.iter().all(|s| !needs_sanitizing(&s.name))
-        && columns.iter().all(|c| !needs_sanitizing(&c.name))
+        && input.columns.iter().all(|c| !needs_sanitizing(&c.name))
+        && keys.iter().all(|k| !needs_sanitizing(k))
 }
 
 /// The qualified name of an object: its nearest schema (else its catalog) and its name, each
@@ -526,7 +532,7 @@ mod tests {
     #[test]
     fn names_that_the_editor_would_change_are_detected() {
         let ok = ObjectPath::root().child(ObjectKind::Table, "orders");
-        assert!(names_survive_editor(&ok, &cols()));
+        assert!(names_survive_editor(&ok, &complete(cols())));
         for bad in [
             "orders\u{1}",
             "orders\r",
@@ -535,13 +541,20 @@ mod tests {
             "x\u{7f}",
         ] {
             let p = ObjectPath::root().child(ObjectKind::Table, bad);
-            assert!(!names_survive_editor(&p, &[]), "{bad:?}");
+            assert!(!names_survive_editor(&p, &TemplateInput::none()), "{bad:?}");
             let c = vec![TemplateColumn {
                 name: bad.to_owned(),
                 primary_key: false,
                 auto_generated: false,
             }];
-            assert!(!names_survive_editor(&ok, &c), "{bad:?}");
+            assert!(!names_survive_editor(&ok, &complete(c)), "{bad:?}");
+            // A key column that is not among the (filtered) listed columns is checked too.
+            let filtered = TemplateInput {
+                columns: cols(),
+                columns_complete: false,
+                key: KeySource::Known(vec!["tenant".into(), bad.to_owned()]),
+            };
+            assert!(!names_survive_editor(&ok, &filtered), "key {bad:?}");
         }
     }
 

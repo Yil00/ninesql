@@ -115,18 +115,46 @@ pub const INVISIBLE_MARKER: char = '\u{FFFD}';
 /// would hide or reorder text (P4-B review L1).
 #[must_use]
 pub fn is_invisible(c: char) -> bool {
+    // Controls, then Unicode `Default_Ignorable_Code_Point` (and U+2800, which renders blank).
     c.is_control()
         || matches!(
             c,
             '\u{00AD}'
+                | '\u{034F}'
                 | '\u{061C}'
-                | '\u{180E}'
+                | '\u{115F}'
+                | '\u{1160}'
+                | '\u{17B4}'
+                | '\u{17B5}'
+                | '\u{180B}'..='\u{180F}'
                 | '\u{200B}'..='\u{200F}'
                 | '\u{2028}'..='\u{202E}'
                 | '\u{2060}'..='\u{206F}'
+                | '\u{2800}'
+                | '\u{3164}'
+                | '\u{FE00}'..='\u{FE0F}'
                 | '\u{FEFF}'
-                | '\u{FFF9}'..='\u{FFFB}'
+                | '\u{FFA0}'
+                | '\u{FFF0}'..='\u{FFFB}'
+                | '\u{1BCA0}'..='\u{1BCA3}'
+                | '\u{1D173}'..='\u{1D17A}'
+                | '\u{E0000}'..='\u{E0FFF}'
         )
+}
+
+/// The visible marker of space-like characters other than the ASCII space in labels.
+pub const SPACE_MARKER: char = '\u{2423}';
+/// The visible marker of a leading or trailing ASCII space in labels.
+pub const EDGE_SPACE_MARKER: char = '\u{2420}';
+
+/// Whether `c` is a space other than the ASCII space (no-break, en / em spaces, ideographic
+/// space…), shown as [`SPACE_MARKER`] so two names that look alike can be told apart.
+#[must_use]
+pub fn is_odd_space(c: char) -> bool {
+    matches!(
+        c,
+        '\u{00A0}' | '\u{1680}' | '\u{2000}'..='\u{200A}' | '\u{202F}' | '\u{205F}' | '\u{3000}'
+    )
 }
 
 /// A name as a one-line label: invisible characters ([`is_invisible`]) replaced by
@@ -144,10 +172,22 @@ pub fn display_message(message: &str) -> String {
 }
 
 fn display_capped(text: &str, max: usize) -> String {
+    let leading = text.len() - text.trim_start_matches(' ').len();
+    let trailing_from = text.trim_end_matches(' ').len().max(leading);
     let mut out: String = text
-        .chars()
+        .char_indices()
         .take(max)
-        .map(|c| if is_invisible(c) { INVISIBLE_MARKER } else { c })
+        .map(|(i, c)| {
+            if c == ' ' && (i < leading || i >= trailing_from) {
+                EDGE_SPACE_MARKER
+            } else if is_invisible(c) {
+                INVISIBLE_MARKER
+            } else if is_odd_space(c) {
+                SPACE_MARKER
+            } else {
+                c
+            }
+        })
         .collect();
     if text.chars().nth(max).is_some() {
         out.push('…');
@@ -174,6 +214,46 @@ mod label_tests {
             );
         }
         assert_eq!(display_name("é漢"), "é漢");
+        // The rest of Default_Ignorable_Code_Point, and U+2800.
+        for c in [
+            '\u{E0001}',
+            '\u{E0041}',
+            '\u{E007F}',
+            '\u{FE00}',
+            '\u{FE0F}',
+            '\u{E0100}',
+            '\u{E01EF}',
+            '\u{034F}',
+            '\u{115F}',
+            '\u{1160}',
+            '\u{3164}',
+            '\u{FFA0}',
+            '\u{17B4}',
+            '\u{17B5}',
+            '\u{2800}',
+        ] {
+            assert_eq!(
+                display_name(&format!("a{c}b")),
+                format!("a{INVISIBLE_MARKER}b"),
+                "{:04X}",
+                u32::from(c)
+            );
+        }
+        // Space-like characters, and leading or trailing ASCII spaces, are shown.
+        for c in ['\u{00A0}', '\u{2000}', '\u{2005}', '\u{200A}', '\u{3000}'] {
+            assert_eq!(
+                display_name(&format!("a{c}b")),
+                format!("a{SPACE_MARKER}b"),
+                "{:04X}",
+                u32::from(c)
+            );
+        }
+        assert_eq!(
+            display_name("  order items "),
+            "\u{2420}\u{2420}order items\u{2420}"
+        );
+        assert_eq!(display_name("   "), "\u{2420}\u{2420}\u{2420}");
+        assert_eq!(display_name("a b"), "a b");
         let long = display_name(&"x".repeat(500));
         assert_eq!(long.chars().count(), MAX_LABEL + 1);
         assert!(long.ends_with('…'));
