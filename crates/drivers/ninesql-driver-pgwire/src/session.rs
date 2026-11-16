@@ -14,7 +14,7 @@ use ninesql_driver_api::{
 use tokio::sync::{mpsc, oneshot};
 
 use crate::actor::{Chunk, Command, Demand, ExecRequest, Rows, Shared, params_supported};
-use crate::cancel::{CancelTarget, ExecCancel, PgCancel};
+use crate::cancel::{CancelTarget, ExecCancel, MetaGate, PgCancel};
 use crate::dialect::PgDialect;
 use crate::metadata::PgMetadata;
 
@@ -53,12 +53,16 @@ impl Link {
             return Err(self.shared.closed_error());
         }
         let guard = self.tracker.begin()?;
-        let mut on_drop = cancel_on_drop.map(|target| CancelOnDrop {
-            tracker: self.tracker.clone(),
-            id: guard.id(),
-            target: Arc::clone(target),
-            armed: true,
-        });
+        let gate = cancel_on_drop.map(|_| Arc::new(MetaGate::default()));
+        let mut on_drop = cancel_on_drop
+            .zip(gate.as_ref())
+            .map(|(target, gate)| CancelOnDrop {
+                tracker: self.tracker.clone(),
+                id: guard.id(),
+                target: Arc::clone(target),
+                gate: Arc::clone(gate),
+                armed: true,
+            });
         let (reply, rx) = oneshot::channel();
         self.tx
             .send(Command::Internal {
@@ -66,6 +70,7 @@ impl Link {
                 params,
                 max_rows,
                 value_limit,
+                gate,
                 verify: true,
                 guard,
                 reply,
@@ -87,12 +92,14 @@ struct CancelOnDrop {
     tracker: ExecutionTracker,
     id: ninesql_driver_api::ExecutionId,
     target: Arc<CancelTarget>,
+    gate: Arc<MetaGate>,
     armed: bool,
 }
 
 impl Drop for CancelOnDrop {
     fn drop(&mut self) {
-        if !self.armed {
+        // Only while the navigator statement itself runs (never its savepoint handling).
+        if !self.armed || !self.gate.abandon() {
             return;
         }
         let Ok(rt) = tokio::runtime::Handle::try_current() else {

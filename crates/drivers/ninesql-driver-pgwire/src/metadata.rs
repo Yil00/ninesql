@@ -416,13 +416,13 @@ const SEQUENCE_DDL_SQL: &str = concat!(
 
 /// DDL of an enum, domain, composite or range type (`NULL` for a base type).
 const TYPE_DDL_SQL: &str = concat!(
-    "SELECT CASE t.typtype ",
-    "WHEN 'e'::pg_catalog.\"char\" THEN pg_catalog.format('CREATE TYPE %I.%I AS ENUM (%s);'",
+    "SELECT CASE ",
+    "WHEN t.typtype OPERATOR(pg_catalog.=) 'e'::pg_catalog.\"char\" THEN pg_catalog.format('CREATE TYPE %I.%I AS ENUM (%s);'",
     "::pg_catalog.text, n.nspname, t.typname, (SELECT pg_catalog.string_agg(",
     "pg_catalog.quote_literal(e.enumlabel::pg_catalog.text), ', '::pg_catalog.text ",
     "ORDER BY e.enumsortorder) FROM pg_catalog.pg_enum e ",
     "WHERE e.enumtypid OPERATOR(pg_catalog.=) t.oid)) ",
-    "WHEN 'd'::pg_catalog.\"char\" THEN pg_catalog.format('CREATE DOMAIN %I.%I AS %s%s%s%s;'",
+    "WHEN t.typtype OPERATOR(pg_catalog.=) 'd'::pg_catalog.\"char\" THEN pg_catalog.format('CREATE DOMAIN %I.%I AS %s%s%s%s;'",
     "::pg_catalog.text, n.nspname, t.typname, pg_catalog.format_type(t.typbasetype, t.typtypmod), ",
     "CASE WHEN t.typdefault IS NOT NULL THEN pg_catalog.format(' DEFAULT %s'::pg_catalog.text, ",
     "t.typdefault) END, ",
@@ -432,13 +432,13 @@ const TYPE_DDL_SQL: &str = concat!(
     "ORDER BY co.conname::pg_catalog.text COLLATE pg_catalog.\"C\") ",
     "FROM pg_catalog.pg_constraint co WHERE co.contypid OPERATOR(pg_catalog.=) t.oid ",
     "AND co.contype OPERATOR(pg_catalog.=) 'c'::pg_catalog.\"char\")) ",
-    "WHEN 'c'::pg_catalog.\"char\" THEN pg_catalog.format('CREATE TYPE %I.%I AS (%s);'",
+    "WHEN t.typtype OPERATOR(pg_catalog.=) 'c'::pg_catalog.\"char\" THEN pg_catalog.format('CREATE TYPE %I.%I AS (%s);'",
     "::pg_catalog.text, n.nspname, t.typname, (SELECT pg_catalog.string_agg(",
     "pg_catalog.format('%I %s'::pg_catalog.text, a.attname, ",
     "pg_catalog.format_type(a.atttypid, a.atttypmod)), ', '::pg_catalog.text ORDER BY a.attnum) ",
     "FROM pg_catalog.pg_attribute a WHERE a.attrelid OPERATOR(pg_catalog.=) t.typrelid ",
     "AND a.attnum OPERATOR(pg_catalog.>) 0::pg_catalog.int2 AND NOT a.attisdropped)) ",
-    "WHEN 'r'::pg_catalog.\"char\" THEN (SELECT pg_catalog.format(",
+    "WHEN t.typtype OPERATOR(pg_catalog.=) 'r'::pg_catalog.\"char\" THEN (SELECT pg_catalog.format(",
     "'CREATE TYPE %I.%I AS RANGE (SUBTYPE = %s);'::pg_catalog.text, n.nspname, t.typname, ",
     "pg_catalog.format_type(r.rngsubtype, NULL)) FROM pg_catalog.pg_range r ",
     "WHERE r.rngtypid OPERATOR(pg_catalog.=) t.oid) END ",
@@ -583,6 +583,25 @@ impl PgMetadata {
             .await
     }
 
+    /// Rows of one part of a rebuilt DDL (columns, constraints, indexes of relation `oid`):
+    /// values up to [`MAX_DDL_BYTES`], never cut, and an error rather than a DDL missing
+    /// parts when the statement returns its `LIMIT` (`cap` rows; security review M2).
+    async fn ddl_part(&self, sql: &str, oid: &str, cap: i32) -> DriverResult<Rows> {
+        let rows = self
+            .query(sql, vec![Some(oid.to_owned())], cap, Some(MAX_DDL_BYTES))
+            .await?;
+        if rows.len() >= usize::try_from(cap).unwrap_or(usize::MAX) {
+            return Err(DriverError::Query {
+                code: None,
+                message: "the table has too many columns, constraints or indexes to rebuild \
+                          its DDL"
+                    .into(),
+                position: None,
+            });
+        }
+        Ok(rows)
+    }
+
     /// One text value of a single-row DDL query (`object not found` without a row).
     async fn ddl_value(&self, sql: &str, params: Vec<Option<String>>) -> DriverResult<String> {
         let rows = self.query(sql, params, 2, Some(MAX_DDL_BYTES)).await?;
@@ -674,20 +693,11 @@ impl PgMetadata {
             }
             "r" | "p" => {
                 let partition = truthy(head, 3);
-                let constraints = self
-                    .query(
-                        REL_CONSTRAINTS_DDL_SQL,
-                        vec![Some(oid.clone())],
-                        10_001,
-                        None,
-                    )
-                    .await?;
+                let constraints = self.ddl_part(REL_CONSTRAINTS_DDL_SQL, &oid, 10_001).await?;
                 let mut lines = Vec::new();
                 let mut comments = Vec::new();
                 if !partition {
-                    let cols = self
-                        .query(REL_COLUMNS_DDL_SQL, vec![Some(oid.clone())], 1601, None)
-                        .await?;
+                    let cols = self.ddl_part(REL_COLUMNS_DDL_SQL, &oid, 1601).await?;
                     for c in &cols {
                         let col = cell(c, 0).unwrap_or_default();
                         let mut line = format!("{col} {}", cell(c, 1).unwrap_or_default());
@@ -745,9 +755,7 @@ impl PgMetadata {
                 if let Some(comment) = cell(head, 7) {
                     comments.insert(0, format!("COMMENT ON TABLE {name} IS {comment};"));
                 }
-                let indexes = self
-                    .query(REL_INDEXES_DDL_SQL, vec![Some(oid)], 10_001, None)
-                    .await?;
+                let indexes = self.ddl_part(REL_INDEXES_DDL_SQL, &oid, 10_001).await?;
                 for i in indexes.iter().filter_map(|r| cell(r, 0)) {
                     out.push_str(&format!("\n{i};"));
                 }
@@ -766,9 +774,7 @@ impl PgMetadata {
             }
         }
         if relkind == "m" {
-            let indexes = self
-                .query(REL_INDEXES_DDL_SQL, vec![Some(oid)], 10_001, None)
-                .await?;
+            let indexes = self.ddl_part(REL_INDEXES_DDL_SQL, &oid, 10_001).await?;
             for i in indexes.iter().filter_map(|r| cell(r, 0)) {
                 out.push_str(&format!("\n{i};"));
             }
@@ -1172,6 +1178,20 @@ mod tests {
             for op in ["=", "<", ">", "||", "~", "+", "-"] {
                 assert!(!stripped.contains(op), "bare `{op}` in {sql}");
             }
+            // A simple `CASE <expr> WHEN` compares with an unqualified `=` (security review
+            // L1): only the searched form is allowed.
+            let words: Vec<&str> = code.split_whitespace().collect();
+            for w in words.windows(2) {
+                if w[0] == "CASE" {
+                    assert_eq!(w[1], "WHEN", "simple CASE in {sql}");
+                }
+            }
+            assert!(
+                !code
+                    .replace("pg_catalog.\"char\"", " ")
+                    .contains("\"char\""),
+                "unqualified \"char\" in {sql}"
+            );
         }
     }
 }

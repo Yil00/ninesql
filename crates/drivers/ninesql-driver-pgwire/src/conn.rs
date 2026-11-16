@@ -111,16 +111,27 @@ pub(crate) struct TextRows {
     pub(crate) value_limit: Option<usize>,
     /// A value longer than `value_limit` was cut.
     pub(crate) cut: bool,
+    /// The rows passed [`MAX_INTERNAL_BYTES`]: the rest of the result is read and dropped, and
+    /// the statement fails without closing the session (security review L3).
+    pub(crate) overflow: bool,
 }
 
 impl TextRows {
     fn push(&mut self, row: Vec<Option<String>>) -> DriverResult<()> {
+        if self.overflow {
+            return Ok(());
+        }
         self.bytes += row
             .iter()
             .map(|v| v.as_ref().map_or(1, |s| s.len() + 24))
             .sum::<usize>();
+        if self.bytes > MAX_INTERNAL_BYTES {
+            self.overflow = true;
+            self.rows = Vec::new();
+            return Ok(());
+        }
         self.rows.push(row);
-        if self.rows.len() > MAX_INTERNAL_ROWS || self.bytes > MAX_INTERNAL_BYTES {
+        if self.rows.len() > MAX_INTERNAL_ROWS {
             return Err(DriverError::Protocol(
                 "the server returned more rows than the driver asked for".into(),
             ));

@@ -758,3 +758,196 @@ async fn large_listings_page_and_calls_cancel() {
     s.close().await.unwrap();
     admin.close().await.unwrap();
 }
+
+async fn scalar(s: &mut dyn Session, sql: &str) -> String {
+    exec(s, sql).await.unwrap()[0][0].clone()
+}
+
+/// Security review M1: in an open transaction, neither an abandoned (cancelled) navigator
+/// call nor one that fails server-side aborts the user's transaction.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn navigator_calls_keep_an_open_transaction_usable() {
+    let Some(dev) = dev() else { return };
+    let _serial = SERIAL.lock().await;
+    let mut admin = connect(&dev, false).await;
+    script(
+        admin.as_mut(),
+        "DROP TABLE IF EXISTS public.ninesql_meta_tx; CREATE TABLE public.ninesql_meta_tx (a int);",
+    )
+    .await;
+    let mut s = connect(&dev, false).await;
+    let m = s.metadata();
+    let orders = ObjectPath::root()
+        .child(ObjectKind::Schema, "public")
+        .child(ObjectKind::Table, "orders");
+    exec(s.as_mut(), "BEGIN").await.unwrap();
+    exec(s.as_mut(), "INSERT INTO public.ninesql_meta_tx VALUES (1)")
+        .await
+        .unwrap();
+    // A metadata call inside the transaction works and leaves it open.
+    m.list(&orders, ObjectKind::Column, PageRequest::first())
+        .await
+        .unwrap();
+    assert!(s.in_transaction());
+
+    // Abandoned while blocked: cancelled server-side.
+    exec(admin.as_mut(), "BEGIN").await.unwrap();
+    exec(
+        admin.as_mut(),
+        "LOCK TABLE pg_catalog.pg_inherits IN ACCESS EXCLUSIVE MODE",
+    )
+    .await
+    .unwrap();
+    let dropped = tokio::time::timeout(
+        Duration::from_millis(500),
+        m.list(&orders, ObjectKind::Partition, PageRequest::first()),
+    )
+    .await;
+    assert!(dropped.is_err(), "the partition query was not blocked");
+    let mut free = false;
+    for _ in 0..50 {
+        match m
+            .list(
+                &ObjectPath::root(),
+                ObjectKind::Schema,
+                PageRequest::first(),
+            )
+            .await
+        {
+            Ok(_) => {
+                free = true;
+                break;
+            }
+            Err(DriverError::Busy) => tokio::time::sleep(Duration::from_millis(100)).await,
+            Err(e) => panic!("{e}"),
+        }
+    }
+    assert!(free, "the abandoned call kept the session busy");
+    // A navigator statement that fails server-side (lock timeout).
+    exec(s.as_mut(), "SET LOCAL lock_timeout = '200ms'")
+        .await
+        .unwrap();
+    assert!(
+        m.list(&orders, ObjectKind::Partition, PageRequest::first())
+            .await
+            .is_err()
+    );
+    exec(admin.as_mut(), "ROLLBACK").await.unwrap();
+
+    // The transaction is still usable and commits the writes.
+    assert!(s.in_transaction());
+    exec(s.as_mut(), "INSERT INTO public.ninesql_meta_tx VALUES (2)")
+        .await
+        .unwrap();
+    exec(s.as_mut(), "COMMIT").await.unwrap();
+    assert_eq!(
+        scalar(
+            admin.as_mut(),
+            "SELECT count(*)::text FROM public.ninesql_meta_tx"
+        )
+        .await,
+        "2"
+    );
+    exec(admin.as_mut(), "DROP TABLE public.ninesql_meta_tx")
+        .await
+        .unwrap();
+    s.close().await.unwrap();
+    admin.close().await.unwrap();
+}
+
+/// Security review M2: a rebuilt `CREATE TABLE` keeps a constraint longer than 64 KiB whole.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn large_check_constraint_is_kept_whole() {
+    let Some(dev) = dev() else { return };
+    let _serial = SERIAL.lock().await;
+    let mut admin = connect(&dev, false).await;
+    let values: Vec<String> = (0..3000)
+        .map(|i| format!("'value_number_{i:05}'"))
+        .collect();
+    let check = format!("CHECK (note IN ({}))", values.join(", "));
+    script(
+        admin.as_mut(),
+        &format!(
+            "DROP SCHEMA IF EXISTS ninesql_meta_m2 CASCADE;\n\
+             CREATE SCHEMA ninesql_meta_m2;\n\
+             CREATE TABLE ninesql_meta_m2.t (note text, CONSTRAINT big {check});"
+        ),
+    )
+    .await;
+    let s = connect(&dev, true).await;
+    let m = s.metadata();
+    let t = ObjectPath::root()
+        .child(ObjectKind::Schema, "ninesql_meta_m2")
+        .child(ObjectKind::Table, "t");
+    let ddl = m.ddl(&t).await.unwrap();
+    assert!(ddl.len() > 64 * 1024, "{}", ddl.len());
+    assert!(ddl.contains("value_number_02999"));
+    assert!(ddl.ends_with(");"), "{}", &ddl[ddl.len() - 40..]);
+    let con = m
+        .ddl(&t.child(ObjectKind::Constraint, "big"))
+        .await
+        .unwrap();
+    assert!(con.contains("value_number_02999"));
+    // The DDL re-creates the table.
+    exec(admin.as_mut(), "DROP TABLE ninesql_meta_m2.t")
+        .await
+        .unwrap();
+    script(admin.as_mut(), &ddl).await;
+    assert_eq!(m.ddl(&t).await.unwrap(), ddl);
+    exec(admin.as_mut(), "DROP SCHEMA ninesql_meta_m2 CASCADE")
+        .await
+        .unwrap();
+    s.close().await.unwrap();
+    admin.close().await.unwrap();
+}
+
+/// Security review L3: a listing past the internal 32 MiB cap fails without closing the
+/// session or aborting its transaction; a smaller page works.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn oversized_listing_fails_without_closing_the_session() {
+    let Some(dev) = dev() else { return };
+    let _serial = SERIAL.lock().await;
+    let mut admin = connect(&dev, false).await;
+    script(
+        admin.as_mut(),
+        "DROP SCHEMA IF EXISTS ninesql_meta_l3 CASCADE;\n\
+         CREATE SCHEMA ninesql_meta_l3;\n\
+         DO $$ BEGIN FOR i IN 1..600 LOOP \
+         EXECUTE pg_catalog.format('CREATE TABLE ninesql_meta_l3.%I (id int)', 't' || i); \
+         EXECUTE pg_catalog.format('COMMENT ON TABLE ninesql_meta_l3.%I IS %L', 't' || i, \
+           pg_catalog.repeat('c', 60000)); \
+         END LOOP; END $$;",
+    )
+    .await;
+    let mut s = connect(&dev, false).await;
+    exec(s.as_mut(), "BEGIN").await.unwrap();
+    let m = s.metadata();
+    let sch = ObjectPath::root().child(ObjectKind::Schema, "ninesql_meta_l3");
+    match m
+        .list(
+            &sch,
+            ObjectKind::Table,
+            PageRequest::first().with_limit(600),
+        )
+        .await
+    {
+        Err(DriverError::Query { message, .. }) => assert!(message.contains("32 MiB")),
+        other => panic!("{:?}", other.map(|p| p.items.len())),
+    }
+    assert!(s.in_transaction());
+    let small = m
+        .list(
+            &sch,
+            ObjectKind::Table,
+            PageRequest::first().with_limit(100),
+        )
+        .await
+        .unwrap();
+    assert_eq!(small.items.len(), 100);
+    exec(s.as_mut(), "COMMIT").await.unwrap();
+    exec(admin.as_mut(), "DROP SCHEMA ninesql_meta_l3 CASCADE")
+        .await
+        .unwrap();
+    s.close().await.unwrap();
+    admin.close().await.unwrap();
+}

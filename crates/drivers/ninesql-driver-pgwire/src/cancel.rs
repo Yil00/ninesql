@@ -102,3 +102,32 @@ impl CancelHandle for PgCancel {
         true
     }
 }
+
+/// Cancel gate of one navigator statement (security review M1). A server-side cancel is sent
+/// only while the statement itself runs, never while the driver sets up or releases the
+/// savepoint that protects the user's open transaction; a call abandoned before its statement
+/// started does not run it.
+#[derive(Debug, Default)]
+pub(crate) struct MetaGate {
+    running: AtomicBool,
+    abandoned: AtomicBool,
+}
+
+impl MetaGate {
+    /// The caller dropped the call: `true` when the statement runs now and may be cancelled.
+    pub(crate) fn abandon(&self) -> bool {
+        self.abandoned.store(true, Ordering::SeqCst);
+        self.running.load(Ordering::SeqCst)
+    }
+
+    /// The statement is about to run: `false` when the caller already dropped the call.
+    pub(crate) fn start(&self) -> bool {
+        self.running.store(true, Ordering::SeqCst);
+        !self.abandoned.load(Ordering::SeqCst)
+    }
+
+    /// The statement ended.
+    pub(crate) fn stop(&self) {
+        self.running.store(false, Ordering::SeqCst);
+    }
+}
