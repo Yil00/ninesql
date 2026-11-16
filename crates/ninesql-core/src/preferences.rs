@@ -50,7 +50,7 @@
 //!   `net_write_timeout`) end a session whose result is left waiting, which on mysqlwire in
 //!   manual commit also rolls back the user's open transaction (phase 3 review M1). The 20 s
 //!   margin covers the release reaching the server. A value set directly in memory is still
-//!   capped at [`PAUSED_RESULT_IDLE_SECS_RANGE`]'s maximum when a run uses it
+//!   clamped to [`PAUSED_RESULT_IDLE_SECS_RANGE`] when a run uses it
 //!   ([`crate::paused_result_idle_limit`]).
 //! - No secret is ever stored here (I1); connection ids are not secrets.
 
@@ -145,7 +145,7 @@ pub struct ExecutionPreferences {
     pub connection_timeouts: BTreeMap<ConnectionId, Duration>,
     /// A paused paged result ([`crate::RunRequest::with_paging`]) with no fetch for longer
     /// than this is closed by its run ([`crate::RunEvent::ResultClosedIdle`]). Saved and
-    /// loaded within [`PAUSED_RESULT_IDLE_SECS_RANGE`]; capped at its maximum when used.
+    /// loaded within [`PAUSED_RESULT_IDLE_SECS_RANGE`]; clamped to it when used.
     pub paused_result_idle: Duration,
 }
 
