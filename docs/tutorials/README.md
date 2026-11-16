@@ -2,7 +2,7 @@
 
 Step-by-step guides for people who build, try or contribute to NineSQL. They describe what the code on the `dev` branch does today, and they are updated when a user-visible behaviour or a command changes ([AGENTS.md](../../AGENTS.md#definition-of-done)).
 
-NineSQL is **pre-alpha**: nothing is released, and you run it from source. What exists today is the application shell, the connection dialog, the PostgreSQL, MySQL, MariaDB, SQLite, TimescaleDB, YugabyteDB, QuestDB and TiDB drivers, the DBeaver import (phase 2), the SQL editor with its results grid (phase 3) and the navigator with its object tree, object editor and object completion (phase 4, pending its phase-end review). Not built yet: data editing and export (phase 5), script files and session restore ([ROADMAP](../ROADMAP.md)). The screens were written without a display; their visual pass is deferred to the end of the MVP (P6-F).
+NineSQL is **pre-alpha**: nothing is released, and you run it from source. What exists today is the application shell, the connection dialog, the PostgreSQL, MySQL, MariaDB, SQLite, TimescaleDB, YugabyteDB, QuestDB and TiDB drivers, the DBeaver import (phase 2), the SQL editor with its results grid (phase 3) and the navigator with its object tree, object editor and object completion (phase 4, closed 2026-11-16). Not built yet: data editing and export (phase 5), script files and session restore ([ROADMAP](../ROADMAP.md)). The screens were written without a display; their visual pass is deferred to the end of the MVP (P6-F).
 
 | Tutorial | For | You will |
 |---|---|---|

@@ -54,14 +54,14 @@ The 20 most used **open-source, self-hostable** engines. Cloud-only services (Sn
 
 | Engine | Family | Planned in | Status |
 |:--|:--|:--|:--|
-| **PostgreSQL** | SQL · pg-wire | MVP (v0.1) | 🚧 Driver landed (P1-B); connect from the connection dialog (P1-C) or import from DBeaver (P2); run SQL in the editor and read results in the grid (P3); browse objects and DDL in the navigator (P4, pending its phase-end review) |
-| **MySQL** | SQL · mysql-wire | MVP (v0.1) | 🚧 Driver landed (P1-B); connect from the connection dialog (P1-C) or import from DBeaver (P2); run SQL in the editor and read results in the grid (P3); browse objects and DDL in the navigator (P4, pending its phase-end review) |
-| **MariaDB** | SQL · mysql-wire | MVP (v0.1) | 🚧 Driver landed (P1-B); connect from the connection dialog (P1-C) or import from DBeaver (P2); run SQL in the editor and read results in the grid (P3); browse objects and DDL in the navigator (P4, pending its phase-end review) |
-| **SQLite** | SQL · embedded | MVP (v0.1) | 🚧 Driver landed (P1-B); connect from the connection dialog (P1-C) or import from DBeaver (P2); run SQL in the editor and read results in the grid (P3); browse objects and DDL in the navigator (P4, pending its phase-end review) |
+| **PostgreSQL** | SQL · pg-wire | MVP (v0.1) | 🚧 Driver landed (P1-B); connect from the connection dialog (P1-C) or import from DBeaver (P2); run SQL in the editor and read results in the grid (P3); browse objects and DDL in the navigator (P4) |
+| **MySQL** | SQL · mysql-wire | MVP (v0.1) | 🚧 Driver landed (P1-B); connect from the connection dialog (P1-C) or import from DBeaver (P2); run SQL in the editor and read results in the grid (P3); browse objects and DDL in the navigator (P4) |
+| **MariaDB** | SQL · mysql-wire | MVP (v0.1) | 🚧 Driver landed (P1-B); connect from the connection dialog (P1-C) or import from DBeaver (P2); run SQL in the editor and read results in the grid (P3); browse objects and DDL in the navigator (P4) |
+| **SQLite** | SQL · embedded | MVP (v0.1) | 🚧 Driver landed (P1-B); connect from the connection dialog (P1-C) or import from DBeaver (P2); run SQL in the editor and read results in the grid (P3); browse objects and DDL in the navigator (P4) |
 | **TimescaleDB** | SQL · pg-wire | MVP (v0.1) | 🚧 Served by the pgwire driver (P4-C): connect (the `timescaledb` extension is required), run SQL, browse hypertables and continuous aggregates (chunks hidden); read-only as PostgreSQL |
 | **YugabyteDB** (YSQL) | SQL · pg-wire | MVP (v0.1) | 🚧 Served by the pgwire driver (P4-C): connect, run SQL, browse as PostgreSQL; read-only as PostgreSQL |
-| **QuestDB** | SQL · pg-wire | MVP (v0.1) | 🚧 Served by the pgwire driver (P4-C): run SQL and browse tables, views and partitions; no TLS, so the password needs a strict SSH tunnel; no transactions; read-only only through QuestDB's read-only user or a read-only server (open-source QuestDB tested) |
-| **TiDB** | SQL · mysql-wire | MVP (v0.1) | 🚧 Served by the mysqlwire driver (P4-C): connect, run SQL, browse; no TLS yet (plaintext); read-only only on a read-only TiDB instance |
+| **QuestDB** | SQL · pg-wire | MVP (v0.1) | 🚧 Served by the pgwire driver (P4-C): run SQL and browse tables, views and partitions; no TLS, so the password needs a strict SSH tunnel, ideally to the QuestDB host itself; no transactions; read-only only through QuestDB's read-only user or a read-only server (open-source QuestDB tested) |
+| **TiDB** | SQL · mysql-wire | MVP (v0.1) | 🚧 Served by the mysqlwire driver (P4-C): connect, run SQL, browse; no TLS yet (plaintext); read-only only on a read-only TiDB instance, for an account without `RESTRICTED_REPLICA_WRITER_ADMIN`, `SUPER` or `ALL PRIVILEGES ON *.*` (so not `root`) |
 | **DuckDB** | SQL · embedded | v0.2 | 🗓 Planned |
 | **ClickHouse** | SQL · HTTP | v0.2 | 🗓 Planned |
 | **Trino** | SQL · HTTP | v0.2 | 🗓 Planned |
