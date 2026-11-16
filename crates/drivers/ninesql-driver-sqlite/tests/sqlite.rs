@@ -1421,3 +1421,326 @@ async fn scripts_split_as_sqlite_parses_them() {
     assert_eq!(first_i64(&last.unwrap()), Some(4));
     s.close().await.unwrap();
 }
+
+/// P4-A: foreign keys (with their target), indexes and triggers are listed on a read-only
+/// session; the stored DDL re-creates the schema; large listings page (F-NAV-02, F-NAV-07).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn metadata_lists_keys_indexes_triggers_and_ddl_round_trips() {
+    use ninesql_driver_api::{ObjectDetails, ReferentialAction};
+    let dir = tempfile::tempdir().unwrap();
+    let src = dir.path().join("meta.db");
+    let schema = [
+        "CREATE TABLE parent (id INTEGER PRIMARY KEY, code TEXT NOT NULL UNIQUE)",
+        "CREATE TABLE \"Weird \"\"Name\"\" é\" (\"select\" INTEGER, parent_id INTEGER, note TEXT, \
+         a INTEGER, b INTEGER, PRIMARY KEY (\"select\"), \
+         FOREIGN KEY (parent_id) REFERENCES parent ON DELETE CASCADE, \
+         FOREIGN KEY (a, b) REFERENCES pair (x, y) ON UPDATE SET NULL)",
+        "CREATE TABLE pair (x INTEGER, y INTEGER, PRIMARY KEY (x, y))",
+        "CREATE INDEX weird_note ON \"Weird \"\"Name\"\" é\" (note, lower(note)) WHERE note IS NOT NULL",
+        "CREATE VIEW parent_codes AS SELECT id, code FROM parent",
+        "CREATE TRIGGER \"before ins\" BEFORE INSERT ON parent BEGIN SELECT 1; END",
+        "CREATE TRIGGER view_ins INSTEAD OF INSERT ON parent_codes BEGIN SELECT 1; END",
+    ];
+    {
+        let c = rusqlite::Connection::open(&src).unwrap();
+        for sql in schema {
+            c.execute_batch(sql).unwrap();
+        }
+        for i in 1..=1205 {
+            c.execute_batch(&format!("CREATE TABLE big_{i:04} (id INTEGER)"))
+                .unwrap();
+        }
+    }
+    let s = connect(ro_params(&src)).await;
+    assert!(s.is_read_only());
+    let caps = s.capabilities().metadata.clone();
+    let m = s.metadata();
+    for parent in [
+        None,
+        Some(ObjectKind::Schema),
+        Some(ObjectKind::Table),
+        Some(ObjectKind::View),
+    ] {
+        for k in m.child_kinds(parent) {
+            assert!(caps.kinds.contains(&k), "{k:?} listed but not declared");
+        }
+    }
+    let main = ObjectPath::root().child(ObjectKind::Schema, "main");
+    let weird = main.child(ObjectKind::Table, "Weird \"Name\" é");
+    let fks = m
+        .list(&weird, ObjectKind::ForeignKey, PageRequest::first())
+        .await
+        .unwrap();
+    assert_eq!(fks.items.len(), 2);
+    let details: Vec<_> = fks
+        .items
+        .iter()
+        .map(|f| match &f.details {
+            ObjectDetails::ForeignKey(f) => f.clone(),
+            other => panic!("{other:?}"),
+        })
+        .collect();
+    let to_parent = details
+        .iter()
+        .find(|f| f.referenced_table.leaf().unwrap().name == "parent")
+        .unwrap();
+    assert_eq!(to_parent.columns, vec!["parent_id"]);
+    // `REFERENCES parent` without columns: the primary key.
+    assert_eq!(to_parent.referenced_columns, vec!["id"]);
+    assert_eq!(to_parent.on_delete, Some(ReferentialAction::Cascade));
+    let to_pair = details
+        .iter()
+        .find(|f| f.referenced_table.leaf().unwrap().name == "pair")
+        .unwrap();
+    assert_eq!(to_pair.columns, vec!["a", "b"]);
+    assert_eq!(to_pair.referenced_columns, vec!["x", "y"]);
+    assert_eq!(to_pair.on_update, Some(ReferentialAction::SetNull));
+    // Paged one by one, and filtered by the referenced table.
+    let p1 = m
+        .list(
+            &weird,
+            ObjectKind::ForeignKey,
+            PageRequest::first().with_limit(1),
+        )
+        .await
+        .unwrap();
+    let p2 = m
+        .list(
+            &weird,
+            ObjectKind::ForeignKey,
+            PageRequest::first()
+                .with_limit(1)
+                .with_cursor(p1.next_cursor.clone()),
+        )
+        .await
+        .unwrap();
+    assert_eq!(p1.items.len() + p2.items.len(), 2);
+    assert!(p2.next_cursor.is_none() && p1.items[0] != p2.items[0]);
+    let f = m
+        .list(
+            &weird,
+            ObjectKind::ForeignKey,
+            PageRequest::first().with_filter(Some("PAIR".into())),
+        )
+        .await
+        .unwrap();
+    assert_eq!(f.items.len(), 1);
+
+    let idx = m
+        .list(&weird, ObjectKind::Index, PageRequest::first())
+        .await
+        .unwrap();
+    let note = idx.items.iter().find(|i| i.name() == "weird_note").unwrap();
+    match &note.details {
+        ObjectDetails::Index(i) => {
+            assert!(!i.unique && !i.primary);
+            assert_eq!(i.columns, vec!["note", "(expression)"]);
+        }
+        other => panic!("{other:?}"),
+    }
+    let pidx = m
+        .list(
+            &main.child(ObjectKind::Table, "parent"),
+            ObjectKind::Index,
+            PageRequest::first(),
+        )
+        .await
+        .unwrap();
+    match &pidx.items[0].details {
+        ObjectDetails::Index(i) => {
+            assert!(i.unique);
+            assert_eq!(i.columns, vec!["code"]);
+        }
+        other => panic!("{other:?}"),
+    }
+    let auto = pidx.items[0].path.clone();
+    assert!(matches!(m.ddl(&auto).await, Err(DriverError::Query { .. })));
+    let trg = m
+        .list(
+            &main.child(ObjectKind::Table, "parent"),
+            ObjectKind::Trigger,
+            PageRequest::first(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(trg.items[0].name(), "before ins");
+    match &trg.items[0].details {
+        ObjectDetails::Trigger(t) => {
+            assert_eq!(t.timing.as_deref(), Some("BEFORE"));
+            assert_eq!(t.events, vec!["INSERT"]);
+        }
+        other => panic!("{other:?}"),
+    }
+    let view = main.child(ObjectKind::View, "parent_codes");
+    let vtrg = m
+        .list(&view, ObjectKind::Trigger, PageRequest::first())
+        .await
+        .unwrap();
+    match &vtrg.items[0].details {
+        ObjectDetails::Trigger(t) => assert_eq!(t.timing.as_deref(), Some("INSTEAD OF")),
+        other => panic!("{other:?}"),
+    }
+    assert!(matches!(
+        m.list(&view, ObjectKind::Index, PageRequest::first()).await,
+        Err(DriverError::Unsupported(_))
+    ));
+
+    // DDL round trip: the stored text re-creates every object in a new file.
+    let objects = [
+        main.child(ObjectKind::Table, "parent"),
+        main.child(ObjectKind::Table, "pair"),
+        weird.clone(),
+        weird.child(ObjectKind::Index, "weird_note"),
+        view.clone(),
+        main.child(ObjectKind::Table, "parent")
+            .child(ObjectKind::Trigger, "before ins"),
+        view.child(ObjectKind::Trigger, "view_ins"),
+    ];
+    let mut ddls = Vec::new();
+    for o in &objects {
+        ddls.push(m.ddl(o).await.unwrap_or_else(|e| panic!("{o:?}: {e}")));
+    }
+    // A trigger path under another table does not resolve.
+    assert!(
+        m.ddl(&weird.child(ObjectKind::Trigger, "before ins"))
+            .await
+            .is_err()
+    );
+    let copy = dir.path().join("copy.db");
+    {
+        let c = rusqlite::Connection::open(&copy).unwrap();
+        for d in &ddls {
+            c.execute_batch(d).unwrap();
+        }
+    }
+    let s2 = connect(ro_params(&copy)).await;
+    let m2 = s2.metadata();
+    for (o, before) in objects.iter().zip(&ddls) {
+        assert_eq!(&m2.ddl(o).await.unwrap(), before, "{o:?}");
+    }
+
+    // Large listing: 1 205 + 3 tables in pages of 500.
+    let mut seen = 0;
+    let mut cursor = None;
+    let mut pages = 0;
+    loop {
+        let p = m
+            .list(
+                &main,
+                ObjectKind::Table,
+                PageRequest::first().with_limit(500).with_cursor(cursor),
+            )
+            .await
+            .unwrap();
+        assert!(p.items.len() <= 500);
+        seen += p.items.len();
+        pages += 1;
+        match p.next_cursor {
+            Some(c) => cursor = Some(c),
+            None => break,
+        }
+    }
+    assert_eq!((seen, pages), (1208, 3));
+
+    // The "nine" dataset: foreign keys of `orders` and its index.
+    let nine = connect(ro_params(nine_db())).await;
+    let nm = nine.metadata();
+    let orders = main.child(ObjectKind::Table, "orders");
+    let ofks = nm
+        .list(&orders, ObjectKind::ForeignKey, PageRequest::first())
+        .await
+        .unwrap();
+    let mut targets: Vec<_> = ofks
+        .items
+        .iter()
+        .map(|f| match &f.details {
+            ObjectDetails::ForeignKey(f) => (
+                f.columns.clone(),
+                f.referenced_table.leaf().unwrap().name.clone(),
+                f.referenced_columns.clone(),
+            ),
+            other => panic!("{other:?}"),
+        })
+        .collect();
+    targets.sort();
+    assert_eq!(
+        targets,
+        vec![
+            (
+                vec!["customer_id".to_owned()],
+                "customers".to_owned(),
+                vec!["id".to_owned()]
+            ),
+            (
+                vec!["product_id".to_owned()],
+                "products".to_owned(),
+                vec!["id".to_owned()]
+            ),
+        ]
+    );
+    let oidx = nm
+        .list(&orders, ObjectKind::Index, PageRequest::first())
+        .await
+        .unwrap();
+    assert!(oidx.items.iter().any(|i| i.name() == "orders_customer_idx"));
+    let ddl = nm
+        .ddl(&orders.child(ObjectKind::Index, "orders_customer_idx"))
+        .await
+        .unwrap();
+    assert_eq!(
+        ddl,
+        "CREATE INDEX orders_customer_idx ON orders (customer_id)"
+    );
+    assert!(s.is_read_only());
+}
+
+/// Security review L4: foreign keys past the internal row cap continue on the next page.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn foreign_keys_past_the_row_cap_page() {
+    let dir = tempfile::tempdir().unwrap();
+    let src = dir.path().join("fks.db");
+    {
+        let c = rusqlite::Connection::open(&src).unwrap();
+        // Two-column keys: 10 050 rows, so the cap cuts a key in half.
+        let fks = ", FOREIGN KEY (a, b) REFERENCES parent (x, y)".repeat(5025);
+        c.execute_batch(&format!(
+            "CREATE TABLE parent (x INTEGER, y INTEGER, PRIMARY KEY (x, y)); \
+             CREATE TABLE child (a INTEGER, b INTEGER{fks})"
+        ))
+        .unwrap();
+    }
+    let s = connect(ro_params(&src)).await;
+    let m = s.metadata();
+    let child = ObjectPath::root()
+        .child(ObjectKind::Schema, "main")
+        .child(ObjectKind::Table, "child");
+    let mut seen = std::collections::BTreeSet::new();
+    let mut cursor = None;
+    let mut pages = 0;
+    loop {
+        let p = m
+            .list(
+                &child,
+                ObjectKind::ForeignKey,
+                PageRequest::first().with_limit(10_000).with_cursor(cursor),
+            )
+            .await
+            .unwrap();
+        pages += 1;
+        for i in &p.items {
+            assert!(seen.insert(i.name().to_owned()), "{} twice", i.name());
+            match &i.details {
+                ninesql_driver_api::ObjectDetails::ForeignKey(f) => {
+                    assert_eq!(f.columns, vec!["a", "b"], "{} is partial", i.name());
+                }
+                other => panic!("{other:?}"),
+            }
+        }
+        match p.next_cursor {
+            Some(c) => cursor = Some(c),
+            None => break,
+        }
+    }
+    assert_eq!(seen.len(), 5025);
+    assert!(pages >= 2);
+}

@@ -35,6 +35,7 @@ mod auth;
 mod cancel;
 mod conn;
 mod dialect;
+mod metadata;
 mod proto;
 mod session;
 mod tls;
@@ -55,7 +56,8 @@ use tokio::sync::mpsc;
 
 pub use actor::PAUSED_RESULT_TIMEOUT;
 pub use dialect::MyDialect;
-pub use session::{MyMetadata, MySession};
+pub use metadata::MyMetadata;
+pub use session::MySession;
 
 use crate::actor::{Actor, Shared};
 use crate::cancel::Control;
@@ -420,8 +422,27 @@ fn capabilities_for(engine: &EngineId, server_version: Option<&str>) -> Capabili
         ObjectKind::Table,
         ObjectKind::View,
         ObjectKind::Column,
+        ObjectKind::Constraint,
+        ObjectKind::ForeignKey,
+        ObjectKind::Index,
+        ObjectKind::Trigger,
+        ObjectKind::Partition,
         ObjectKind::Routine,
+        ObjectKind::Event,
     ]);
+    // `SHOW CREATE …` (P4-A, F-NAV-07); keys, indexes and partitions are part of the table's.
+    metadata.ddl = BTreeSet::from([
+        ObjectKind::Schema,
+        ObjectKind::Table,
+        ObjectKind::View,
+        ObjectKind::Trigger,
+        ObjectKind::Routine,
+        ObjectKind::Event,
+    ]);
+    if *engine == EngineId::MARIADB {
+        metadata.kinds.insert(ObjectKind::Sequence);
+        metadata.ddl.insert(ObjectKind::Sequence);
+    }
     c.metadata = metadata;
     let mut editing = EditingCapabilities::default();
     editing.insert = true;

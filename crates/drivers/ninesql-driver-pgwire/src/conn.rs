@@ -107,16 +107,31 @@ pub(crate) enum RowSink<'a> {
 pub(crate) struct TextRows {
     pub(crate) rows: Vec<Vec<Option<String>>>,
     bytes: usize,
+    /// Largest value kept; `None` keeps [`MAX_INTERNAL_VALUE`] and cuts silently.
+    pub(crate) value_limit: Option<usize>,
+    /// A value longer than `value_limit` was cut.
+    pub(crate) cut: bool,
+    /// The rows passed [`MAX_INTERNAL_BYTES`]: the rest of the result is read and dropped, and
+    /// the statement fails without closing the session (security review L3).
+    pub(crate) overflow: bool,
 }
 
 impl TextRows {
     fn push(&mut self, row: Vec<Option<String>>) -> DriverResult<()> {
+        if self.overflow {
+            return Ok(());
+        }
         self.bytes += row
             .iter()
             .map(|v| v.as_ref().map_or(1, |s| s.len() + 24))
             .sum::<usize>();
+        if self.bytes > MAX_INTERNAL_BYTES {
+            self.overflow = true;
+            self.rows = Vec::new();
+            return Ok(());
+        }
         self.rows.push(row);
-        if self.rows.len() > MAX_INTERNAL_ROWS || self.bytes > MAX_INTERNAL_BYTES {
+        if self.rows.len() > MAX_INTERNAL_ROWS {
             return Err(DriverError::Protocol(
                 "the server returned more rows than the driver asked for".into(),
             ));
@@ -521,7 +536,9 @@ impl Conn {
                 match &mut sink {
                     RowSink::Arrow(b) => self.read_arrow_row(body_len, b).await?,
                     RowSink::Text(rows) => {
-                        let row = self.read_text_row(body_len).await?;
+                        let keep = rows.value_limit.unwrap_or(MAX_INTERNAL_VALUE);
+                        let (row, cut) = self.read_text_row(body_len, keep).await?;
+                        rows.cut |= cut;
                         rows.push(row)?;
                     }
                     RowSink::Discard => self.skip(body_len).await?,
@@ -644,7 +661,12 @@ impl Conn {
         Ok(())
     }
 
-    async fn read_text_row(&mut self, body_len: usize) -> DriverResult<Vec<Option<String>>> {
+    async fn read_text_row(
+        &mut self,
+        body_len: usize,
+        keep: usize,
+    ) -> DriverResult<(Vec<Option<String>>, bool)> {
+        let mut cut = false;
         let ncols = self.io.read_i16().await.map_err(io_err)?;
         let ncols = usize::try_from(ncols)
             .map_err(|_| DriverError::Protocol("negative column count".into()))?;
@@ -664,7 +686,8 @@ impl Conn {
                     "data row longer than its message".into(),
                 ));
             }
-            let v = self.read_value(n, MAX_INTERNAL_VALUE).await?;
+            cut |= n > keep;
+            let v = self.read_value(n, keep).await?;
             let s = match String::from_utf8(v) {
                 Ok(s) => s,
                 Err(e) => {
@@ -681,7 +704,7 @@ impl Conn {
                 "data row shorter than its message".into(),
             ));
         }
-        Ok(out)
+        Ok((out, cut))
     }
 }
 

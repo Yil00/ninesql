@@ -32,9 +32,9 @@ use std::time::{Duration, Instant};
 
 use ninesql_driver_api::{
     BatchLimiter, ColumnInfo, Dialect, DriverError, DriverResult, ExecutionGuard, FetchBudget,
-    Notice, NoticeSeverity, ObjectDetails, ObjectInfo, ObjectKind, ObjectPath, Page, PageRequest,
-    Param, ResultItem, ResultSetHeader, RowBudget, StatementClass, TableInfo, escape_like,
-    truncate_str,
+    ForeignKeyInfo, IndexInfo, Notice, NoticeSeverity, ObjectDetails, ObjectInfo, ObjectKind,
+    ObjectPath, Page, PageRequest, Param, ReferentialAction, ResultItem, ResultSetHeader,
+    RowBudget, StatementClass, TableInfo, TriggerInfo, escape_like, truncate_str,
 };
 use rusqlite::config::DbConfig;
 use rusqlite::hooks::{AuthAction, AuthContext, Authorization};
@@ -1471,6 +1471,174 @@ impl Worker {
                     });
                 }
             }
+            (
+                Some(ObjectKind::Table | ObjectKind::View),
+                ObjectKind::Index | ObjectKind::Trigger,
+            ) if kind == ObjectKind::Trigger || parent.kind() == Some(ObjectKind::Table) => {
+                let schema_name = segment(0, &[ObjectKind::Schema])?;
+                let table = segment(1, &[ObjectKind::Table, ObjectKind::View])?;
+                if kind == ObjectKind::Index {
+                    let rows = self.query_internal(
+                        "SELECT name, \"unique\", origin FROM pragma_index_list(?1, ?2) \
+                         WHERE (?3 IS NULL OR name LIKE ?3 ESCAPE '!') AND (?4 IS NULL OR name > ?4) \
+                         ORDER BY name LIMIT ?5",
+                        &[&table, &schema_name, &filter, &cursor, &fetch],
+                        limit + 1,
+                        NAME_BYTES,
+                    )?;
+                    more = rows.len() > limit;
+                    for row in rows.iter().take(limit) {
+                        let name = text(row.first());
+                        let mut info = IndexInfo::default();
+                        info.unique = row.get(1) == Some(&Val::Int(1));
+                        info.primary = text(row.get(2)) == "pk";
+                        // Key parts; SQLite does not report the text of an expression part.
+                        let parts = self.query_internal(
+                            "SELECT name, cid FROM pragma_index_xinfo(?1, ?2) \
+                             WHERE key = 1 ORDER BY seqno LIMIT 2001",
+                            &[&name, &schema_name],
+                            2001,
+                            NAME_BYTES,
+                        )?;
+                        info.columns = parts
+                            .iter()
+                            .map(|p| match p.first() {
+                                Some(Val::Null) | None => "(expression)".to_owned(),
+                                v => text(v),
+                            })
+                            .collect();
+                        next = Some(name.clone());
+                        items.push(ObjectInfo {
+                            path: parent.child(kind, name),
+                            comment: None,
+                            details: ObjectDetails::Index(info),
+                        });
+                    }
+                } else {
+                    let schema = self.schema_ident(&schema_name)?;
+                    let sql = format!(
+                        "SELECT name, substr(sql, 1, 2048) FROM {schema}.sqlite_schema \
+                         WHERE type = 'trigger' AND tbl_name = ?1 \
+                         AND (?2 IS NULL OR name LIKE ?2 ESCAPE '!') AND (?3 IS NULL OR name > ?3) \
+                         ORDER BY name LIMIT ?4"
+                    );
+                    let rows = self.query_internal(
+                        &sql,
+                        &[&table, &filter, &cursor, &fetch],
+                        limit + 1,
+                        // The trigger's header is at the start of its text.
+                        NAME_BYTES,
+                    )?;
+                    more = rows.len() > limit;
+                    for row in rows.iter().take(limit) {
+                        let name = text(row.first());
+                        next = Some(name.clone());
+                        items.push(ObjectInfo {
+                            path: parent.child(kind, name),
+                            comment: None,
+                            details: ObjectDetails::Trigger(trigger_info(&text(row.get(1)))),
+                        });
+                    }
+                }
+            }
+            (Some(ObjectKind::Table), ObjectKind::ForeignKey) => {
+                let schema_name = segment(0, &[ObjectKind::Schema])?;
+                let table = segment(1, &[ObjectKind::Table])?;
+                // Foreign keys have no name in SQLite: `fk_<id>`, keyed by the engine's id.
+                let after: Option<i64> = match &cursor {
+                    Some(c) => Some(
+                        c.strip_prefix("fk_")
+                            .and_then(|n| n.parse().ok())
+                            .ok_or_else(|| {
+                                DriverError::InvalidParams("invalid page cursor".into())
+                            })?,
+                    ),
+                    None => None,
+                };
+                let rows = self.query_internal(
+                    "SELECT id, \"table\", \"from\", \"to\", on_update, on_delete \
+                     FROM pragma_foreign_key_list(?1, ?2) WHERE (?3 IS NULL OR id > ?3) \
+                     ORDER BY id, seq LIMIT 10001",
+                    &[&table, &schema_name, &after],
+                    10_001,
+                    NAME_BYTES,
+                )?;
+                let pattern = page.filter.as_deref().map(str::to_lowercase);
+                let mut keys: Vec<(String, ForeignKeyInfo, bool)> = Vec::new();
+                for row in &rows {
+                    let id = match row.first() {
+                        Some(Val::Int(i)) => *i,
+                        _ => 0,
+                    };
+                    let name = format!("fk_{id}");
+                    if keys.last().is_none_or(|(n, _, _)| *n != name) {
+                        let target = ObjectPath::root()
+                            .child(ObjectKind::Schema, schema_name.clone())
+                            .child(ObjectKind::Table, text(row.get(1)));
+                        let mut f = ForeignKeyInfo::new(target);
+                        f.on_update = ReferentialAction::parse(&text(row.get(4)));
+                        f.on_delete = ReferentialAction::parse(&text(row.get(5)));
+                        keys.push((name, f, false));
+                    }
+                    if let Some((_, f, implicit)) = keys.last_mut() {
+                        f.columns.push(text(row.get(2)));
+                        match row.get(3) {
+                            Some(Val::Null) | None => *implicit = true,
+                            v => f.referenced_columns.push(text(v)),
+                        }
+                    }
+                }
+                // At the row cap the last key may be partial: drop it and continue from the
+                // last complete one on the next page (security review L4).
+                let capped = rows.len() >= 10_001;
+                if capped {
+                    keys.pop();
+                }
+                let last_complete = keys.last().map(|(n, _, _)| n.clone());
+                // The filter matches the name or the referenced table, as a literal substring.
+                keys.retain(|(n, f, _)| {
+                    pattern.as_ref().is_none_or(|p| {
+                        n.to_lowercase().contains(p)
+                            || f.referenced_table
+                                .leaf()
+                                .is_some_and(|t| t.name.to_lowercase().contains(p))
+                    })
+                });
+                more = keys.len() > limit || (capped && last_complete.is_some());
+                // Every key left fits the page: continue after the last one read.
+                let tail = if keys.len() <= limit && capped {
+                    last_complete
+                } else {
+                    None
+                };
+                for (name, mut f, implicit) in keys.into_iter().take(limit) {
+                    if implicit {
+                        // `REFERENCES t` without columns: the referenced table's primary key.
+                        let target = f
+                            .referenced_table
+                            .leaf()
+                            .map(|t| t.name.clone())
+                            .unwrap_or_default();
+                        let pk = self.query_internal(
+                            "SELECT name FROM pragma_table_info(?1, ?2) WHERE pk > 0 \
+                             ORDER BY pk LIMIT 2001",
+                            &[&target, &schema_name],
+                            2001,
+                            NAME_BYTES,
+                        )?;
+                        f.referenced_columns = pk.iter().map(|r| text(r.first())).collect();
+                    }
+                    next = Some(name.clone());
+                    items.push(ObjectInfo {
+                        path: parent.child(kind, name),
+                        comment: None,
+                        details: ObjectDetails::ForeignKey(f),
+                    });
+                }
+                if tail.is_some() {
+                    next = tail;
+                }
+            }
             _ => {
                 return Err(DriverError::Unsupported(
                     ninesql_driver_api::Feature::Metadata(kind),
@@ -1487,25 +1655,50 @@ impl Worker {
         let leaf = path
             .leaf()
             .ok_or_else(|| DriverError::InvalidParams("empty object path".into()))?;
-        let ty = match leaf.kind {
-            ObjectKind::Table => "table",
-            ObjectKind::View => "view",
+        let (ty, depth) = match leaf.kind {
+            ObjectKind::Table => ("table", 2),
+            ObjectKind::View => ("view", 2),
+            ObjectKind::Index => ("index", 3),
+            ObjectKind::Trigger => ("trigger", 3),
             _ => return Err(DriverError::Unsupported(ninesql_driver_api::Feature::Ddl)),
         };
         let schema = path
             .0
             .first()
-            .filter(|s| s.kind == ObjectKind::Schema && path.0.len() == 2)
+            .filter(|s| s.kind == ObjectKind::Schema && path.0.len() == depth)
             .ok_or_else(|| DriverError::InvalidParams("unexpected object path".into()))?;
+        // An index or trigger belongs to the table (or view) of its path.
+        let owner = if depth == 3 {
+            match path.0.get(1) {
+                Some(t)
+                    if t.kind == ObjectKind::Table
+                        || (t.kind == ObjectKind::View && leaf.kind == ObjectKind::Trigger) =>
+                {
+                    Some(t.name.clone())
+                }
+                _ => return Err(DriverError::InvalidParams("unexpected object path".into())),
+            }
+        } else {
+            None
+        };
         let schema = self.schema_ident(&schema.name)?;
         let sql = format!(
             "SELECT sql, length(CAST(sql AS BLOB)) FROM {schema}.sqlite_schema \
-             WHERE type = ?1 AND name = ?2"
+             WHERE type = ?1 AND name = ?2 AND (?3 IS NULL OR tbl_name = ?3)"
         );
-        let rows = self.query_internal(&sql, &[&ty, &leaf.name], 1, MAX_DDL_BYTES)?;
+        let rows = self.query_internal(&sql, &[&ty, &leaf.name, &owner], 1, MAX_DDL_BYTES)?;
         let row = rows
             .first()
             .ok_or_else(|| DriverError::InvalidParams("object not found".into()))?;
+        if row.first() == Some(&Val::Null) {
+            return Err(DriverError::Query {
+                code: None,
+                message: "this index was created by a constraint: its DDL is part of the \
+                          table's"
+                    .into(),
+                position: None,
+            });
+        }
         if matches!(row.get(1), Some(Val::Int(n)) if *n > i64::try_from(MAX_DDL_BYTES).unwrap_or(i64::MAX))
         {
             return Err(DriverError::Query {
@@ -1516,6 +1709,94 @@ impl Worker {
         }
         Ok(text(row.first()))
     }
+}
+
+/// Timing and event of a trigger, read from its stored `CREATE TRIGGER` text (SQLite has no
+/// catalog columns for them). Quoted names and comments are skipped as whole tokens.
+fn trigger_info(sql: &str) -> TriggerInfo {
+    let mut words: Vec<String> = Vec::new();
+    let mut it = sql.chars().peekable();
+    while let Some(c) = it.next() {
+        match c {
+            c if c.is_whitespace() => {}
+            '-' if it.peek() == Some(&'-') => {
+                for n in it.by_ref() {
+                    if n == '\n' {
+                        break;
+                    }
+                }
+            }
+            '/' if it.peek() == Some(&'*') => {
+                it.next();
+                let mut prev = ' ';
+                for n in it.by_ref() {
+                    if prev == '*' && n == '/' {
+                        break;
+                    }
+                    prev = n;
+                }
+            }
+            '\'' | '"' | '`' | '[' => {
+                let close = if c == '[' { ']' } else { c };
+                while let Some(n) = it.next() {
+                    if n == close {
+                        // A doubled quote stays inside the token.
+                        if close != ']' && it.peek() == Some(&close) {
+                            it.next();
+                            continue;
+                        }
+                        break;
+                    }
+                }
+                words.push("\u{0}".to_owned());
+            }
+            c if c.is_alphanumeric() || c == '_' || c == '$' || !c.is_ascii() => {
+                let mut w = String::from(c);
+                while let Some(&n) = it.peek() {
+                    if n.is_alphanumeric() || n == '_' || n == '$' || !n.is_ascii() {
+                        w.push(n);
+                        it.next();
+                    } else {
+                        break;
+                    }
+                }
+                words.push(w.to_ascii_uppercase());
+            }
+            c => words.push(c.to_string()),
+        }
+        if words.len() > 64 {
+            break;
+        }
+    }
+    let mut t = TriggerInfo::default();
+    t.for_each_row = true;
+    t.enabled = true;
+    let Some(mut i) = words.iter().position(|w| w == "TRIGGER") else {
+        return t;
+    };
+    i += 1;
+    if words.get(i).map(String::as_str) == Some("IF") {
+        i += 3;
+    }
+    // The trigger's name, possibly schema-qualified.
+    i += 1;
+    if words.get(i).map(String::as_str) == Some(".") {
+        i += 2;
+    }
+    let mut timing = "BEFORE";
+    while let Some(w) = words.get(i) {
+        match w.as_str() {
+            "BEFORE" => timing = "BEFORE",
+            "AFTER" => timing = "AFTER",
+            "INSTEAD" => timing = "INSTEAD OF",
+            "DELETE" | "INSERT" | "UPDATE" => t.events.push(w.clone()),
+            "OF" => {}
+            _ => break,
+        }
+        i += 1;
+    }
+    t.timing = Some(timing.to_owned());
+    t
 }
 
 fn millis_since(epoch: Instant) -> u64 {
@@ -1535,6 +1816,27 @@ fn text(v: Option<&Val>) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn trigger_text_gives_timing_and_events() {
+        let t = trigger_info("CREATE TRIGGER t AFTER UPDATE OF a ON x BEGIN SELECT 1; END");
+        assert_eq!(t.timing.as_deref(), Some("AFTER"));
+        assert_eq!(t.events, vec!["UPDATE"]);
+        assert!(t.for_each_row && t.enabled);
+        let t = trigger_info(
+            "CREATE TEMP TRIGGER IF NOT EXISTS main.\"before \"\"x\"\"\" -- c\n INSTEAD OF INSERT ON v BEGIN SELECT 1; END",
+        );
+        assert_eq!(t.timing.as_deref(), Some("INSTEAD OF"));
+        assert_eq!(t.events, vec!["INSERT"]);
+        // A trigger named like a keyword; the default timing is BEFORE.
+        let t = trigger_info("create trigger after delete on x begin select 1; end");
+        assert_eq!(t.timing.as_deref(), Some("BEFORE"));
+        assert_eq!(t.events, vec!["DELETE"]);
+        let t = trigger_info("CREATE TRIGGER [a b] /* x */ AFTER INSERT ON x BEGIN SELECT 1; END");
+        assert_eq!(t.timing.as_deref(), Some("AFTER"));
+        assert_eq!(t.events, vec!["INSERT"]);
+        assert_eq!(trigger_info("").events, Vec::<String>::new());
+    }
 
     #[test]
     fn authorizer_allows_only_reads_in_read_only_sessions() {

@@ -1062,6 +1062,7 @@ impl MockMetadata {
                     details: ObjectDetails::Table(TableInfo {
                         estimated_rows: Some(1000),
                         flavour: None,
+                        partition_key: None,
                     }),
                 })
                 .collect(),

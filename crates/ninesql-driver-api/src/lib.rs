@@ -56,8 +56,9 @@ pub use error::{DriverError, DriverResult, redact_connection_string, redact_secr
 pub use execution::{ExecutionGuard, ExecutionId, ExecutionTracker};
 pub use hygiene::{may_log_statement_text, text_may_hold_credentials};
 pub use metadata::{
-    ColumnInfo, Metadata, ObjectDetails, ObjectInfo, ObjectPath, Page, PageRequest, PathSegment,
-    TableInfo, escape_like,
+    ColumnInfo, ConstraintInfo, ConstraintKind, ForeignKeyInfo, IndexInfo, Metadata, ObjectDetails,
+    ObjectInfo, ObjectPath, Page, PageRequest, PartitionInfo, PathSegment, ReferentialAction,
+    RoutineInfo, RoutineKind, SequenceInfo, TableInfo, TriggerInfo, TypeInfo, escape_like,
 };
 pub use params::{
     Auth, AuthKind, ClientCertificate, ConnectParams, Endpoint, EngineId, HostKeyVerification,

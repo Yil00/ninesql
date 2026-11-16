@@ -170,16 +170,31 @@ pub(crate) enum RowSink<'a> {
 pub(crate) struct TextRows {
     pub(crate) rows: Vec<Vec<Option<String>>>,
     bytes: usize,
+    /// Largest value kept; `None` keeps [`MAX_INTERNAL_VALUE`] and cuts silently.
+    pub(crate) value_limit: Option<u64>,
+    /// A value longer than `value_limit` was cut.
+    pub(crate) cut: bool,
+    /// The rows passed [`MAX_INTERNAL_BYTES`]: the rest of the result is read and dropped, and
+    /// the statement fails without closing the session (security review L3).
+    pub(crate) overflow: bool,
 }
 
 impl TextRows {
     fn push(&mut self, row: Vec<Option<String>>) -> DriverResult<()> {
+        if self.overflow {
+            return Ok(());
+        }
         self.bytes += row
             .iter()
             .map(|v| v.as_ref().map_or(1, |s| s.len() + 24))
             .sum::<usize>();
+        if self.bytes > MAX_INTERNAL_BYTES {
+            self.overflow = true;
+            self.rows = Vec::new();
+            return Ok(());
+        }
         self.rows.push(row);
-        if self.rows.len() > MAX_INTERNAL_ROWS || self.bytes > MAX_INTERNAL_BYTES {
+        if self.rows.len() > MAX_INTERNAL_ROWS {
             return Err(DriverError::Protocol(
                 "the server returned more rows than the driver asked for".into(),
             ));
@@ -559,7 +574,10 @@ impl Conn {
         match sink {
             RowSink::Arrow(b) => self.read_arrow_row(first, b).await?,
             RowSink::Text(rows) => {
-                let row = self.read_text_row(first, ncols).await?;
+                let keep = rows.value_limit.unwrap_or(MAX_INTERNAL_VALUE);
+                let (row, cut, overflow) = self.read_text_row(first, ncols, keep).await?;
+                rows.cut |= cut;
+                rows.overflow |= overflow;
                 rows.push(row)?;
             }
             RowSink::Discard => self.p.skip_rest().await?,
@@ -615,7 +633,10 @@ impl Conn {
         &mut self,
         first: u8,
         ncols: usize,
-    ) -> DriverResult<Vec<Option<String>>> {
+        max_value: u64,
+    ) -> DriverResult<(Vec<Option<String>>, bool, bool)> {
+        let mut cut = false;
+        let mut overflow = false;
         let mut out = Vec::with_capacity(ncols);
         let mut first = Some(first);
         let mut bytes = 0u64;
@@ -623,12 +644,14 @@ impl Conn {
             match self.value_len(first.take()).await? {
                 None => out.push(None),
                 Some(len) => {
-                    let keep = len.min(MAX_INTERNAL_VALUE);
+                    // Past the byte cap the rest of the row is skipped, and the statement
+                    // fails without closing the session (security review L3).
+                    let room = (MAX_INTERNAL_BYTES as u64).saturating_sub(bytes);
+                    let keep = len.min(max_value).min(room);
+                    cut |= keep < len;
                     bytes = bytes.saturating_add(keep + 24);
                     if bytes > MAX_INTERNAL_BYTES as u64 {
-                        return Err(DriverError::Protocol(
-                            "the server returned more data than the driver asked for".into(),
-                        ));
+                        overflow = true;
                     }
                     let mut v = vec![0u8; usize::try_from(keep).unwrap_or(0)];
                     self.p.read_exact(&mut v).await?;
@@ -637,14 +660,26 @@ impl Conn {
                 }
             }
         }
-        Ok(out)
+        Ok((out, cut, overflow))
     }
 
     /// Runs a driver statement (text protocol) and returns its rows as text, bounded. Further
     /// result sets (procedures) are read and dropped.
     pub(crate) async fn query(&mut self, sql: &str) -> DriverResult<Result<TextRows, MyError>> {
+        self.query_limited(sql, None).await
+    }
+
+    /// [`query`](Self::query) keeping values up to `value_limit` bytes (see `TextRows`).
+    pub(crate) async fn query_limited(
+        &mut self,
+        sql: &str,
+        value_limit: Option<u64>,
+    ) -> DriverResult<Result<TextRows, MyError>> {
         self.command(COM_QUERY, sql.as_bytes()).await?;
-        let mut out = TextRows::default();
+        let mut out = TextRows {
+            value_limit,
+            ..TextRows::default()
+        };
         let mut error = None;
         loop {
             let status = match self.read_head().await? {

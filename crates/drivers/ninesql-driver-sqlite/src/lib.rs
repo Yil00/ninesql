@@ -170,8 +170,17 @@ fn capabilities_for(server_version: Option<&str>) -> Capabilities {
         ObjectKind::Table,
         ObjectKind::View,
         ObjectKind::Column,
+        ObjectKind::ForeignKey,
+        ObjectKind::Index,
+        ObjectKind::Trigger,
     ]);
-    metadata.ddl = BTreeSet::from([ObjectKind::Table, ObjectKind::View]);
+    // The stored `CREATE` text (P4-A, F-NAV-07).
+    metadata.ddl = BTreeSet::from([
+        ObjectKind::Table,
+        ObjectKind::View,
+        ObjectKind::Index,
+        ObjectKind::Trigger,
+    ]);
     c.metadata = metadata;
     let mut editing = EditingCapabilities::default();
     editing.insert = true;

@@ -178,6 +178,22 @@ pub enum ObjectDetails {
     Column(ColumnInfo),
     /// A table-like object.
     Table(TableInfo),
+    /// A primary-key, unique, check or exclusion constraint.
+    Constraint(ConstraintInfo),
+    /// A foreign key.
+    ForeignKey(ForeignKeyInfo),
+    /// An index.
+    Index(IndexInfo),
+    /// A trigger.
+    Trigger(TriggerInfo),
+    /// A function or procedure.
+    Routine(RoutineInfo),
+    /// A sequence.
+    Sequence(SequenceInfo),
+    /// A user-defined type or domain.
+    Type(TypeInfo),
+    /// A partition of a table.
+    Partition(PartitionInfo),
 }
 
 /// Column details. Build with [`ColumnInfo::new`].
@@ -221,12 +237,282 @@ pub struct TableInfo {
     pub estimated_rows: Option<u64>,
     /// Engine-specific flavour (`hypertable`, `partitioned`, `temporary`, `system`…).
     pub flavour: Option<String>,
+    /// Partition key of a partitioned table, as the engine spells it (`RANGE (ordered_at)`).
+    pub partition_key: Option<String>,
+}
+
+/// Kind of a [`ConstraintInfo`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum ConstraintKind {
+    /// Primary key.
+    PrimaryKey,
+    /// Unique constraint.
+    Unique,
+    /// Check constraint.
+    Check,
+    /// Exclusion constraint (PostgreSQL).
+    Exclusion,
+}
+
+/// Details of an [`ObjectKind::Constraint`] (foreign keys are [`ForeignKeyInfo`]). Build with
+/// [`ConstraintInfo::new`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct ConstraintInfo {
+    /// Kind of constraint.
+    pub kind: ConstraintKind,
+    /// Constrained columns, unquoted, in key order (empty for a check constraint the engine
+    /// does not attach to columns).
+    pub columns: Vec<String>,
+    /// Definition as the engine spells it (the check expression, `PRIMARY KEY (id)`…), when
+    /// the engine provides it.
+    pub definition: Option<String>,
+}
+
+impl ConstraintInfo {
+    /// A constraint of `kind` with no columns and no definition.
+    #[must_use]
+    pub fn new(kind: ConstraintKind) -> Self {
+        Self {
+            kind,
+            columns: Vec::new(),
+            definition: None,
+        }
+    }
+}
+
+/// Action of a foreign key on update or delete of the referenced row.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum ReferentialAction {
+    /// `NO ACTION`.
+    NoAction,
+    /// `RESTRICT`.
+    Restrict,
+    /// `CASCADE`.
+    Cascade,
+    /// `SET NULL`.
+    SetNull,
+    /// `SET DEFAULT`.
+    SetDefault,
+}
+
+impl ReferentialAction {
+    /// Parses the SQL spelling (`NO ACTION`, `restrict`, `SET NULL`…), case-insensitively.
+    #[must_use]
+    pub fn parse(s: &str) -> Option<Self> {
+        let s = s.trim();
+        let eq = |w: &str| s.eq_ignore_ascii_case(w);
+        if eq("NO ACTION") {
+            Some(Self::NoAction)
+        } else if eq("RESTRICT") {
+            Some(Self::Restrict)
+        } else if eq("CASCADE") {
+            Some(Self::Cascade)
+        } else if eq("SET NULL") {
+            Some(Self::SetNull)
+        } else if eq("SET DEFAULT") {
+            Some(Self::SetDefault)
+        } else {
+            None
+        }
+    }
+
+    /// The SQL spelling (`NO ACTION`, `SET NULL`…).
+    #[must_use]
+    pub fn as_sql(self) -> &'static str {
+        match self {
+            Self::NoAction => "NO ACTION",
+            Self::Restrict => "RESTRICT",
+            Self::Cascade => "CASCADE",
+            Self::SetNull => "SET NULL",
+            Self::SetDefault => "SET DEFAULT",
+        }
+    }
+}
+
+/// Details of an [`ObjectKind::ForeignKey`]. Build with [`ForeignKeyInfo::new`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct ForeignKeyInfo {
+    /// Referencing columns of the table the key belongs to, unquoted, in key order.
+    pub columns: Vec<String>,
+    /// Path of the referenced table, in the same shape as the paths [`Metadata::list`]
+    /// returns for tables of this driver (e.g. `[Schema public, Table customers]`).
+    pub referenced_table: ObjectPath,
+    /// Referenced columns, unquoted, in the order matching [`columns`](Self::columns).
+    pub referenced_columns: Vec<String>,
+    /// Action on update of the referenced row, when the engine reports it.
+    pub on_update: Option<ReferentialAction>,
+    /// Action on delete of the referenced row, when the engine reports it.
+    pub on_delete: Option<ReferentialAction>,
+}
+
+impl ForeignKeyInfo {
+    /// A foreign key to `referenced_table` with no columns and no actions.
+    #[must_use]
+    pub fn new(referenced_table: ObjectPath) -> Self {
+        Self {
+            columns: Vec::new(),
+            referenced_table,
+            referenced_columns: Vec::new(),
+            on_update: None,
+            on_delete: None,
+        }
+    }
+}
+
+/// Details of an [`ObjectKind::Index`]. Build with `IndexInfo::default()` and set fields.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct IndexInfo {
+    /// Key parts in order: a column name (unquoted), or the expression text for an expression
+    /// key where the engine reports it (`lower(email)`).
+    pub columns: Vec<String>,
+    /// Unique index.
+    pub unique: bool,
+    /// Backs the primary key.
+    pub primary: bool,
+    /// Access method as the engine spells it (`btree`, `hash`, `gin`, `BTREE`, `FULLTEXT`…).
+    pub method: Option<String>,
+    /// Predicate of a partial index (`WHERE` text without the keyword).
+    pub predicate: Option<String>,
+}
+
+/// Details of an [`ObjectKind::Trigger`]. Build with `TriggerInfo::default()` and set fields.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct TriggerInfo {
+    /// `BEFORE`, `AFTER` or `INSTEAD OF`, when known.
+    pub timing: Option<String>,
+    /// Events in upper case: `INSERT`, `UPDATE`, `DELETE`, `TRUNCATE`.
+    pub events: Vec<String>,
+    /// `FOR EACH ROW` (otherwise per statement).
+    pub for_each_row: bool,
+    /// Enabled (engines without a disabled state report `true`).
+    pub enabled: bool,
+}
+
+/// Kind of a [`RoutineInfo`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum RoutineKind {
+    /// Function (returns a value).
+    Function,
+    /// Procedure (`CALL`).
+    Procedure,
+}
+
+/// Details of an [`ObjectKind::Routine`]. Build with [`RoutineInfo::new`].
+///
+/// The path segment of a routine may carry its signature so overloads stay distinct
+/// (pgwire: `f(integer, text)`); [`routine_name`](Self::routine_name) is the bare name to call
+/// or complete.
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct RoutineInfo {
+    /// Function or procedure.
+    pub kind: RoutineKind,
+    /// Bare name, unquoted, without arguments.
+    pub routine_name: String,
+    /// Argument list as the engine spells it (`a integer, b text`), when known.
+    pub arguments: Option<String>,
+    /// Return type of a function, when known.
+    pub return_type: Option<String>,
+    /// Language (`sql`, `plpgsql`, `SQL`…), when known.
+    pub language: Option<String>,
+}
+
+impl RoutineInfo {
+    /// A routine of `kind` named `routine_name`, with nothing else known.
+    #[must_use]
+    pub fn new(kind: RoutineKind, routine_name: impl Into<String>) -> Self {
+        Self {
+            kind,
+            routine_name: routine_name.into(),
+            arguments: None,
+            return_type: None,
+            language: None,
+        }
+    }
+}
+
+/// Details of an [`ObjectKind::Sequence`]. Build with `SequenceInfo::default()` and set fields.
+/// Values the engine does not report are `None`.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct SequenceInfo {
+    /// Value type (`bigint`).
+    pub data_type: Option<String>,
+    /// Start value.
+    pub start: Option<i64>,
+    /// Increment.
+    pub increment: Option<i64>,
+    /// Minimum value.
+    pub min_value: Option<i64>,
+    /// Maximum value.
+    pub max_value: Option<i64>,
+    /// Wraps around at the limit.
+    pub cycle: bool,
+}
+
+/// Details of an [`ObjectKind::Type`]. Build with [`TypeInfo::new`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct TypeInfo {
+    /// `enum`, `composite`, `domain`, `range`, `multirange` or `base`.
+    pub flavour: String,
+    /// Underlying type of a domain, or subtype of a range.
+    pub base_type: Option<String>,
+    /// Labels of an enum, in order.
+    pub labels: Vec<String>,
+}
+
+impl TypeInfo {
+    /// A type of `flavour` with no base type and no labels.
+    #[must_use]
+    pub fn new(flavour: impl Into<String>) -> Self {
+        Self {
+            flavour: flavour.into(),
+            base_type: None,
+            labels: Vec::new(),
+        }
+    }
+}
+
+/// Details of an [`ObjectKind::Partition`]. Build with `PartitionInfo::default()` and set
+/// fields.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct PartitionInfo {
+    /// Bound as the engine spells it (`FOR VALUES FROM (1) TO (10)`, MySQL's
+    /// `PARTITION_DESCRIPTION`).
+    pub bound: Option<String>,
+    /// Partitioning method of the parent (`RANGE`, `LIST`, `HASH`, `KEY`…).
+    pub method: Option<String>,
+    /// Row estimate from statistics, if cheap to get.
+    pub estimated_rows: Option<u64>,
+    /// Schema of the partition when the engine lets it differ from its parent's (pgwire).
+    pub schema: Option<String>,
+    /// The partition is itself partitioned (it has sub-partitions).
+    pub partitioned: bool,
 }
 
 /// Navigator metadata. Obtained from [`Session::metadata`](crate::Session::metadata).
 ///
 /// Calls are lazy (one level, one kind at a time) and paged. Dropping a returned future
-/// abandons the call; the core applies its own timeout around metadata calls.
+/// abandons the call, and drivers stop the statement it was running where the engine can
+/// (the same server-side cancel as [`Session::cancel_handle`](crate::Session::cancel_handle),
+/// which also reaches a running metadata call); the core applies its own timeout around
+/// metadata calls.
+///
+/// Metadata calls only read: they work on read-only sessions and never write (I3). Each page
+/// is bounded by [`PageRequest::limit`] (clamped by drivers to at most 10 000) and by the
+/// driver's own byte cap on internal results (I6). [`ObjectDetails`] carry what the
+/// navigator, the object editor and completion need (column details, key and index columns,
+/// foreign-key targets); comments are in [`ObjectInfo::comment`]. Names in paths and details
+/// are unquoted.
 ///
 /// When a driver serves metadata from a **separate connection** (so the navigator works while a
 /// query streams), that connection is opened with the session's exact security settings (L5):
@@ -253,4 +539,28 @@ pub trait Metadata: Send + Sync {
     /// [`MetadataCapabilities::ddl`](crate::MetadataCapabilities::ddl); otherwise
     /// [`DriverError::Unsupported`](crate::DriverError::Unsupported).
     async fn ddl(&self, object: &ObjectPath) -> DriverResult<String>;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn referential_actions_round_trip() {
+        for a in [
+            ReferentialAction::NoAction,
+            ReferentialAction::Restrict,
+            ReferentialAction::Cascade,
+            ReferentialAction::SetNull,
+            ReferentialAction::SetDefault,
+        ] {
+            assert_eq!(ReferentialAction::parse(a.as_sql()), Some(a));
+            assert_eq!(
+                ReferentialAction::parse(&a.as_sql().to_ascii_lowercase()),
+                Some(a)
+            );
+        }
+        assert_eq!(ReferentialAction::parse("SET  NULL"), None);
+        assert_eq!(ReferentialAction::parse(""), None);
+    }
 }

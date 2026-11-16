@@ -1170,11 +1170,14 @@ async fn metadata_lists_with_filters_and_pages() {
                 .iter()
                 .any(|i| i.name() == "ninesql_write_one")
         );
-        assert!(matches!(
-            md.list(&schema, ObjectKind::Sequence, PageRequest::first())
-                .await,
-            Err(DriverError::Unsupported(_))
-        ));
+        let sequences = md
+            .list(&schema, ObjectKind::Sequence, PageRequest::first())
+            .await;
+        if dev.engine == EngineId::MARIADB {
+            sequences.unwrap();
+        } else {
+            assert!(matches!(sequences, Err(DriverError::Unsupported(_))));
+        }
         s.close().await.unwrap();
     }
 }

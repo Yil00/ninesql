@@ -130,6 +130,9 @@ pub(crate) enum Command {
     /// checks the session afterwards (always in read-only sessions).
     Internal {
         sql: String,
+        /// Largest value kept: `None` cuts values at 64 KiB silently; `Some(n)` fails the
+        /// statement when a value is longer than `n` (DDL text is never returned cut).
+        value_limit: Option<u64>,
         verify: bool,
         guard: ExecutionGuard,
         reply: oneshot::Sender<DriverResult<Rows>>,
@@ -287,11 +290,12 @@ impl Actor {
                 Command::Execute(req) => self.execute(*req).await,
                 Command::Internal {
                     sql,
+                    value_limit,
                     verify,
                     guard,
                     reply,
                 } => {
-                    let mut result = self.internal(&sql).await;
+                    let mut result = self.internal_limited(&sql, value_limit).await;
                     if result.is_ok()
                         && let Err(e) = self.verify_session(verify).await
                     {
@@ -355,7 +359,17 @@ impl Actor {
     /// Runs a driver statement and returns its rows as text, bounded by
     /// [`INTERNAL_TIMEOUT`]: past it the connection is out of sync and the session is closed.
     pub(crate) async fn internal(&mut self, sql: &str) -> DriverResult<Rows> {
-        let r = match tokio::time::timeout(INTERNAL_TIMEOUT, self.conn.query(sql)).await {
+        self.internal_limited(sql, None).await
+    }
+
+    /// [`internal`](Self::internal) with a value limit (see `Command::Internal`).
+    pub(crate) async fn internal_limited(
+        &mut self,
+        sql: &str,
+        value_limit: Option<u64>,
+    ) -> DriverResult<Rows> {
+        let query = self.conn.query_limited(sql, value_limit);
+        let r = match tokio::time::timeout(INTERNAL_TIMEOUT, query).await {
             Ok(r) => r,
             Err(_) => {
                 self.close_session("driver statement timed out");
@@ -367,6 +381,21 @@ impl Actor {
         };
         self.sync_status();
         match r? {
+            Ok(rows) if rows.overflow => Err(DriverError::Query {
+                code: None,
+                message: "the listing is larger than the driver's 32 MiB limit; use a smaller \
+                          page or a filter"
+                    .into(),
+                position: None,
+            }),
+            Ok(rows) if rows.cut && value_limit.is_some() => Err(DriverError::Query {
+                code: None,
+                message: format!(
+                    "the definition is larger than {} KiB and was not loaded",
+                    value_limit.unwrap_or(0) / 1024
+                ),
+                position: None,
+            }),
             Ok(rows) => Ok(rows.rows),
             Err(e) => Err(statement_error(&e, false)),
         }
