@@ -400,7 +400,13 @@ impl Metadata for SqliteMetadata {
         match parent {
             None => vec![ObjectKind::Schema],
             Some(ObjectKind::Schema) => vec![ObjectKind::Table, ObjectKind::View],
-            Some(ObjectKind::Table | ObjectKind::View) => vec![ObjectKind::Column],
+            Some(ObjectKind::Table) => vec![
+                ObjectKind::Column,
+                ObjectKind::ForeignKey,
+                ObjectKind::Index,
+                ObjectKind::Trigger,
+            ],
+            Some(ObjectKind::View) => vec![ObjectKind::Column, ObjectKind::Trigger],
             Some(_) => Vec::new(),
         }
     }
