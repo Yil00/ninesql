@@ -10,7 +10,9 @@
 pub mod connect;
 pub mod connection;
 pub mod connection_type;
+pub mod dbeaver_export;
 pub mod dbeaver_roots;
+pub mod edit;
 mod error;
 pub mod execution;
 pub mod history;
@@ -34,7 +36,14 @@ pub use connection::{
     SshAuth, SshHop, SshTunnel, TlsConfig, TlsMode,
 };
 pub use connection_type::{Color, ConnectionType, ConnectionTypeId, ConnectionTypes, SafetyPolicy};
+pub use dbeaver_export::{DbeaverExportError, DbeaverExportOutcome};
 pub use dbeaver_roots::{DbeaverRoots, FileCheck};
+pub use edit::{
+    BuiltQuery, ColumnFilter, ColumnStatus, EditError, EditService, EditableTable,
+    FilterHistoryEntry, FilterOp, FilterRecorded, NewRowId, NotEditable, PendingEdits, QueryError,
+    RowId, RowKey, SaveConfirmation, SaveEvent, SaveJob, SaveOptions, SavePlan, SaveSummary,
+    SaveToken, SortDirection, SortKey, TableColumn, TableQuery,
+};
 pub use error::{ConnectionError, CoreError, WorkspaceError};
 pub use execution::{
     ErrorPosition, ExecutionService, FetchMode, FirstError, MAX_PAUSED_RESULT_IDLE,

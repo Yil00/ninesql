@@ -5,7 +5,7 @@
 //! - [`export`]: [`Exporter`] writes result items row by row in one of the [`ExportFormat`]s,
 //!   with escaping that keeps values from injecting into the output format and an on-by-default
 //!   spreadsheet formula guard for CSV / TSV.
-//! - [`file`]: [`OutputFile`], the export file: a new private file written next to the target
+//! - [`file`](mod@file): [`OutputFile`], the export file: a new private file written next to the target
 //!   and moved into place at the end, never through a symbolic link, never over an existing file
 //!   without confirmation, removed on cancel or error (I4).
 //! - [`csv`]: [`CsvReader`], a streaming CSV reader with file-size, record-length and
@@ -13,7 +13,7 @@
 //! - [`import`]: target types, the column mapping, typed conversion into bind parameters, the
 //!   preview and the [`RowSource`] that batches the file.
 //! - [`sql`]: the SQL renderers of the "SQL INSERT" export and of the import's parameterized
-//!   `INSERT`s, behind traits for the P5-B integration point.
+//!   `INSERT`s, on the P5-B DML renderer of `ninesql-driver-api`.
 //! - [`value`]: typed access to Arrow values and their text forms.
 //!
 //! The session side (running the statement, transactions, confirmation, cancel, progress) lives

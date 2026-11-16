@@ -30,7 +30,10 @@
 //!   become `<br>`.
 //! - **HTML:** `&`, `<`, `>`, `"` and `'` are escaped in every text; the document carries a
 //!   Content-Security-Policy that forbids scripts and remote content.
-//! - **SQL:** literals and names come from a [`SqlLiteralRenderer`] (the dialect's quoting).
+//! - **SQL:** names and typed literals come from a [`SqlLiteralRenderer`] (the P5-B DML
+//!   renderer: dialect quoting, literals that read the same in every lexical mode, a self-check
+//!   per row); a value the driver cut at the value budget fails the export instead of being
+//!   written cut.
 
 use std::collections::{BTreeSet, HashMap};
 use std::io::Write;
@@ -516,18 +519,17 @@ impl<W: Write> Exporter<W> {
     /// Starts the result set with `schema` (header row, document prologue).
     ///
     /// # Errors
-    /// I/O errors.
+    /// I/O errors; for the SQL format, a table or column name the dialect refuses.
     pub fn start(&mut self, schema: &Schema) -> Result<(), TransferError> {
         self.state = State::Writing;
         self.columns = schema.fields().iter().map(|f| f.name().clone()).collect();
         self.json_keys = unique_keys(&self.columns);
-        if let Some(sql) = &self.sql {
-            let cols: Vec<String> = self.columns.iter().map(|c| sql.column_name(c)).collect();
-            self.sql_prefix = format!(
-                "INSERT INTO {} ({}) VALUES",
-                sql.table_name(&self.options.sql.table),
-                cols.join(", ")
-            );
+        if let Some(sql) = self
+            .sql
+            .as_ref()
+            .filter(|_| self.options.format == ExportFormat::SqlInsert)
+        {
+            self.sql_prefix = sql.insert_prefix(&self.options.sql.table, schema)?;
         }
         self.write_prologue()
     }
@@ -756,21 +758,14 @@ impl<W: Write> Exporter<W> {
                         line.push(',');
                         line.push_str(eol);
                     }
-                    line.push('(');
-                    for (i, col) in columns.iter().enumerate() {
-                        if i > 0 {
-                            line.push_str(", ");
-                        }
-                        match sql.literal(&cell(col, row)) {
-                            Ok(lit) => line.push_str(&lit),
-                            Err(e) => {
-                                self.line = line;
-                                self.line.clear();
-                                return Err(e);
-                            }
+                    match sql.row_values(&self.options.sql.table, batch, row) {
+                        Ok(tuple) => line.push_str(&tuple),
+                        Err(e) => {
+                            self.line = line;
+                            self.line.clear();
+                            return Err(e);
                         }
                     }
-                    line.push(')');
                     self.rows_in_statement += 1;
                     if self.rows_in_statement >= self.options.sql.rows_per_statement {
                         line.push(';');

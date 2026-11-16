@@ -29,7 +29,10 @@
 //!   [`OpenOutcome::NeedsVaultUnlock`](crate::OpenOutcome::NeedsVaultUnlock), then opens again;
 //! - [`CoreServices::lock_now`] for a "lock secrets" action;
 //! - [`CoreServices::preview_import`] / [`CoreServices::apply_import`] for the DBeaver import
-//!   (P2-B / P2-C, [`crate::import`]);
+//!   (P2-B / P2-C, [`crate::import`]); [`CoreServices::export_dbeaver`] for the export to a new
+//!   DBeaver file (P5-D, [`crate::dbeaver_export`]);
+//! - [`CoreServices::edit`] for row editing, filtered table queries and foreign-key navigation
+//!   (P5-A core, [`crate::edit`]);
 //! - [`CoreServices::lock_watcher_status`] to say whether sleep / screen lock are watched;
 //! - [`CoreServices::execution`] to run statements and scripts, read the history and the
 //!   preferences; [`CoreServices::save_preferences`] to change them (P3-C);
@@ -52,7 +55,9 @@ use ninesql_secrets::{
 use ninesql_storage::{Paths, ProjectName};
 use tokio::task::JoinHandle;
 
-use crate::connection::Connection;
+use crate::connection::{Connection, ConnectionId};
+use crate::dbeaver_export::{DbeaverExportError, DbeaverExportOutcome};
+use crate::edit::EditService;
 use crate::error::{CoreError, WorkspaceError};
 use crate::execution::ExecutionService;
 use crate::history::History;
@@ -195,6 +200,7 @@ struct Inner {
     execution: ExecutionService,
     metadata: MetadataService,
     transfer: TransferService,
+    edit: EditService,
     navigator_issues: Vec<String>,
     history_error: Option<String>,
     preference_issues: Vec<PreferenceIssue>,
@@ -437,6 +443,9 @@ impl CoreServices {
         // 9. Transfer service (P5-C).
         let transfer = TransferService::new(manager.clone(), &paths);
 
+        // 10. Edit service (P5-A core): row editing, filtered queries, foreign-key navigation.
+        let edit = EditService::new(manager.clone(), metadata.clone(), execution.clone());
+
         Ok(Self {
             inner: Arc::new(Inner {
                 workspace,
@@ -454,6 +463,7 @@ impl CoreServices {
                 execution,
                 metadata,
                 transfer,
+                edit,
                 navigator_issues,
                 history_error,
                 preference_issues,
@@ -613,6 +623,44 @@ impl CoreServices {
     #[must_use]
     pub fn execution(&self) -> &ExecutionService {
         &self.inner.execution
+    }
+
+    /// Exports the connections `ids` (in that order) to a **new** DBeaver `data-sources.json`
+    /// file or a new DBeaver project folder (P5-D, F-CON-15), on the blocking pool (I6): no
+    /// secret is written (I1), and a target inside a DBeaver location, the session's DBeaver
+    /// roots included, is refused (I4). See [`crate::dbeaver_export`]. On
+    /// [`DbeaverExportError::Changed`] nothing was written: ask for the target again.
+    pub fn export_dbeaver(
+        &self,
+        ids: Vec<ConnectionId>,
+        target: ninesql_dbeaver::export::ExportTarget,
+    ) -> Reply<Result<DbeaverExportOutcome, DbeaverExportError>> {
+        let (tx, reply) = Reply::channel();
+        let workspace = self.inner.workspace.clone();
+        let roots = self.inner.manager.dbeaver_roots().clone();
+        let task = self
+            .inner
+            .manager
+            .runtime()
+            .handle()
+            .spawn_blocking(move || {
+                crate::dbeaver_export::export_dbeaver_blocking(&workspace, &roots, &ids, &target)
+            });
+        self.inner.manager.runtime().spawn(async move {
+            let result = task.await.unwrap_or_else(|_| {
+                Err(DbeaverExportError::Runtime("the export task failed".into()))
+            });
+            let _ = tx.send(result);
+        });
+        reply
+    }
+
+    /// The edit service (P5-A core): row editing with a DML preview and a transactional save,
+    /// server-side sort and filter queries with a filter history, foreign-key navigation
+    /// ([`crate::edit`]).
+    #[must_use]
+    pub fn edit(&self) -> &EditService {
+        &self.inner.edit
     }
 
     /// The transfer service: export rows to files, preview and import CSV files (P5-C).
