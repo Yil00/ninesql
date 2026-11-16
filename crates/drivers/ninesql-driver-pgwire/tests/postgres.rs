@@ -338,7 +338,9 @@ async fn conformance_reserved_properties_and_multiple_statements() {
 }
 
 /// I1: statement text holding a credential (init SQL included) is never logged.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+// Current-thread runtime: every task the driver spawns runs on this thread, where the
+// log capture of the check is installed.
+#[tokio::test(flavor = "current_thread")]
 async fn statements_with_credentials_are_never_logged() {
     let Some(dev) = dev() else { return };
     conformance::assert_credential_statements_not_logged(&PgWireDriver::new(), params(&dev)).await;

@@ -759,8 +759,9 @@ impl tracing::Subscriber for LogCapture {
 /// as both, and asserts that the log shows the harmless ones (so logging was on) but neither
 /// the credential statements nor [`LOG_HYGIENE_SECRET`] (I1, `text_may_hold_credentials`).
 ///
-/// Events are captured on the calling thread: the driver must log statement text from the
-/// task that calls `connect` / `execute` (every NineSQL driver does).
+/// Events are captured on the calling thread only, so call it from a current-thread runtime
+/// (`#[tokio::test(flavor = "current_thread")]`): every task the driver spawns then runs on
+/// that thread and its events are captured too.
 ///
 /// # Panics
 /// When a credential statement is logged, or when no statement is (logging was not on).
