@@ -792,6 +792,35 @@ async fn writes_transactions_edits_and_parameters() {
     );
 }
 
+/// Phase 4 exit criterion: the "nine" dataset browses fully on a read-only session, every
+/// node and every declared DDL (`conformance::assert_read_only_browse`), and the file is left
+/// byte for byte as it was, with no file created next to it. Indexes created by a constraint
+/// (`sqlite_autoindex_*`) are sqlite's documented DDL refusal.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn nine_dataset_browses_fully_on_a_read_only_session() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = nine_copy(dir.path());
+    let before = files_in(dir.path());
+    let mut s = connect(ro_params(&path)).await;
+    let r = conformance::assert_read_only_browse(s.as_ref(), ObjectPath::root(), &|item| {
+        item.path.kind() == Some(ObjectKind::Index) && item.name().starts_with("sqlite_autoindex_")
+    })
+    .await;
+    assert_eq!(r.count(ObjectKind::Schema), 1, "{r:?}");
+    assert_eq!(r.count(ObjectKind::Table), 6, "{r:?}");
+    assert_eq!(r.count(ObjectKind::View), 1, "{r:?}");
+    assert!(r.count(ObjectKind::Column) >= 30, "{r:?}");
+    assert_eq!(r.count(ObjectKind::ForeignKey), 2, "{r:?}");
+    assert!(r.count(ObjectKind::Index) >= 2, "{r:?}");
+    assert!(r.ddl >= 8, "{r:?}");
+    assert!(matches!(
+        run(s.as_mut(), "CREATE TABLE ninesql_p4_browse (a INT)").await,
+        Err(DriverError::ReadOnly(_))
+    ));
+    s.close().await.unwrap();
+    assert_eq!(files_in(dir.path()), before);
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn metadata_lists_and_generates_ddl() {
     let mut s = connect(ro_params(nine_db())).await;

@@ -657,35 +657,16 @@ const NINE_TABLES: &[&str] = &[
 ];
 
 /// Lists every child kind of every object of the "nine" dataset and generates every DDL the
-/// capabilities declare. Returns how many objects were visited.
-async fn browse(
-    m: &dyn Metadata,
-    caps: &ninesql_driver_api::Capabilities,
-    root: ObjectPath,
-) -> usize {
-    let mut visited = 0;
-    let mut stack = vec![root];
-    while let Some(parent) = stack.pop() {
-        for kind in m.child_kinds(parent.kind()) {
-            assert!(caps.metadata.kinds.contains(&kind), "{kind:?} not declared");
-            for item in all(m, &parent, kind).await {
-                visited += 1;
-                if caps.metadata.ddl.contains(&kind) {
-                    let ddl = m.ddl(&item.path).await;
-                    let skip =
-                        matches!(&item.details, ObjectDetails::Type(t) if t.flavour == "base");
-                    if !skip {
-                        let ddl = ddl.unwrap_or_else(|e| panic!("DDL of {:?}: {e}", item.path));
-                        assert!(!ddl.is_empty());
-                    }
-                }
-                if !m.child_kinds(Some(kind)).is_empty() {
-                    stack.push(item.path.clone());
-                }
-            }
-        }
-    }
-    visited
+/// capabilities declare, on the read-only session `s` (the shared conformance crawl; base types
+/// are a documented DDL refusal). Returns how many objects were visited.
+async fn browse(s: &dyn Session, root: ObjectPath) -> usize {
+    conformance::assert_read_only_browse(
+        s,
+        root,
+        &|item| matches!(&item.details, ObjectDetails::Type(t) if t.flavour == "base"),
+    )
+    .await
+    .visited
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -694,7 +675,6 @@ async fn nine_dataset_browses_fully_on_timescaledb_and_yugabytedb() {
         let mut p = params(&dev);
         p.read_only = true;
         let s = connect(p).await;
-        let caps = s.capabilities().clone();
         let m = s.metadata();
         let schemas = names(&all(m.as_ref(), &ObjectPath::root(), ObjectKind::Schema).await);
         assert!(schemas.contains(&"public".to_owned()), "{schemas:?}");
@@ -752,7 +732,7 @@ async fn nine_dataset_browses_fully_on_timescaledb_and_yugabytedb() {
                     .starts_with("CREATE OR REPLACE VIEW")
             );
         }
-        let visited = browse(m.as_ref(), &caps, public).await;
+        let visited = browse(s.as_ref(), public).await;
         assert!(visited > 50, "{}: {visited}", dev.engine);
         assert!(s.is_read_only());
         s.close().await.unwrap();
@@ -765,7 +745,6 @@ async fn nine_dataset_browses_fully_on_questdb() {
     let mut p = questdb_ro(&dev);
     p.read_only = true;
     let s = connect(p).await;
-    let caps = s.capabilities().clone();
     let m = s.metadata();
     assert_eq!(
         m.child_kinds(None),
@@ -858,7 +837,7 @@ async fn nine_dataset_browses_fully_on_questdb() {
     );
     let missing = ObjectPath::root().child(ObjectKind::Table, "no_such\"table");
     assert!(m.ddl(&missing).await.is_err());
-    let visited = browse(m.as_ref(), &caps, ObjectPath::root()).await;
+    let visited = browse(s.as_ref(), ObjectPath::root()).await;
     assert!(visited > 40, "{visited}");
     s.close().await.unwrap();
 }
@@ -1027,6 +1006,10 @@ fn engine_dialects_classify_their_own_statements() {
             StatementClass::Unknown,
         ),
         ("SELECT reload_config()", StatementClass::Unknown),
+        ("SELECT flush_query_cache()", StatementClass::Unknown),
+        ("SELECT dump_memory_usage()", StatementClass::Unknown),
+        ("SELECT dump_thread_stacks()", StatementClass::Unknown),
+        ("SELECT cancel_query(42)", StatementClass::Unknown),
         (
             "SELECT * FROM orders LATEST ON ordered_at PARTITION BY status",
             StatementClass::Read,

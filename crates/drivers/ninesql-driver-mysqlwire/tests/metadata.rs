@@ -12,7 +12,7 @@ use std::time::Duration;
 use ninesql_driver_api::{
     Auth, ConnectParams, ConstraintKind, Driver, DriverError, Endpoint, EngineId, ExecOptions,
     Metadata, ObjectDetails, ObjectInfo, ObjectKind, ObjectPath, PageRequest, ReferentialAction,
-    RoutineKind, Secret, Session, Statement, TlsMode,
+    RoutineKind, Secret, Session, Statement, TlsMode, conformance,
 };
 use ninesql_driver_mysqlwire::MySqlWireDriver;
 use tokio::sync::Mutex;
@@ -212,6 +212,42 @@ fn one<'a>(items: &'a [ObjectInfo], name: &str) -> &'a ObjectInfo {
         .iter()
         .find(|o| o.name() == name)
         .unwrap_or_else(|| panic!("{name} not in {items:?}"))
+}
+
+/// Phase 4 exit criterion: the "nine" dataset (with this file's fixture, which adds triggers,
+/// routines, events, partitions and, on MariaDB, a sequence) browses fully on a read-only
+/// session, every node and every declared DDL (`conformance::assert_read_only_browse`).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn nine_dataset_browses_fully_on_a_read_only_session() {
+    let _serial = SERIAL.lock().await;
+    for dev in devs() {
+        let e = &dev.engine;
+        let mut admin = connect(&dev, false).await;
+        fixture(&dev, admin.as_mut()).await;
+        let mut s = connect(&dev, true).await;
+        let schema = ObjectPath::root().child(ObjectKind::Schema, &dev.database);
+        let r = conformance::assert_read_only_browse(s.as_ref(), schema, &|_| false).await;
+        assert!(r.count(ObjectKind::Table) >= 9, "{e}: {r:?}");
+        assert!(r.count(ObjectKind::View) >= 2, "{e}: {r:?}");
+        assert!(r.count(ObjectKind::Column) >= 30, "{e}: {r:?}");
+        assert!(r.count(ObjectKind::ForeignKey) >= 3, "{e}: {r:?}");
+        assert!(r.count(ObjectKind::Index) >= 4, "{e}: {r:?}");
+        assert!(r.count(ObjectKind::Constraint) >= 6, "{e}: {r:?}");
+        assert_eq!(r.count(ObjectKind::Partition), 2, "{e}: {r:?}");
+        assert!(r.count(ObjectKind::Trigger) >= 1, "{e}: {r:?}");
+        assert!(r.count(ObjectKind::Routine) >= 4, "{e}: {r:?}");
+        assert!(r.count(ObjectKind::Event) >= 1, "{e}: {r:?}");
+        if *e == EngineId::MARIADB {
+            assert!(r.count(ObjectKind::Sequence) >= 1, "{e}: {r:?}");
+        }
+        // Writes are still refused after the browse.
+        assert!(matches!(
+            exec(s.as_mut(), "CREATE TABLE ninesql_p4_browse (a INT)").await,
+            Err(DriverError::ReadOnly(_))
+        ));
+        s.close().await.unwrap();
+        admin.close().await.unwrap();
+    }
 }
 
 /// Every declared kind lists the expected objects, on a read-only session.

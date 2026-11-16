@@ -11,7 +11,7 @@ use std::time::Duration;
 use ninesql_driver_api::{
     Auth, ConnectParams, ConstraintKind, Driver, DriverError, Endpoint, EngineId, ExecOptions,
     Metadata, ObjectDetails, ObjectInfo, ObjectKind, ObjectPath, PageRequest, ReferentialAction,
-    RoutineKind, ScriptItemKind, Secret, Session, Statement, TlsMode,
+    RoutineKind, ScriptItemKind, Secret, Session, Statement, TlsMode, conformance,
 };
 use ninesql_driver_pgwire::PgWireDriver;
 use tokio::sync::Mutex;
@@ -524,6 +524,64 @@ async fn every_declared_kind_lists_its_objects() {
     ));
     // Still read-only after all of it.
     assert!(s.is_read_only());
+    s.close().await.unwrap();
+    admin.close().await.unwrap();
+}
+
+/// pgwire's documented DDL refusals (docs/08): base types and foreign tables.
+fn pg_ddl_refused(item: &ObjectInfo) -> bool {
+    match &item.details {
+        ObjectDetails::Type(t) => t.flavour == "base",
+        ObjectDetails::Table(t) => t.flavour.as_deref() == Some("foreign"),
+        _ => false,
+    }
+}
+
+/// Phase 4 exit criterion: the "nine" dataset browses fully on a read-only session, every
+/// node and every declared DDL (`conformance::assert_read_only_browse`); then the richer
+/// `ninesql_meta` fixture (partitions, routines, triggers, materialized views) the same way.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn nine_dataset_browses_fully_on_a_read_only_session() {
+    let Some(dev) = dev() else { return };
+    let mut s = connect(&dev, true).await;
+    let root = ObjectPath::root();
+    let schemas = names(s.metadata().as_ref(), &root, ObjectKind::Schema).await;
+    assert!(schemas.contains(&"public".to_owned()), "{schemas:?}");
+    let public = root.child(ObjectKind::Schema, "public");
+    let r = conformance::assert_read_only_browse(s.as_ref(), public, &pg_ddl_refused).await;
+    assert!(r.count(ObjectKind::Table) >= 6, "{r:?}");
+    assert!(r.count(ObjectKind::View) >= 1, "{r:?}");
+    assert!(r.count(ObjectKind::Type) >= 1, "{r:?}");
+    assert!(r.count(ObjectKind::Column) >= 30, "{r:?}");
+    assert_eq!(r.count(ObjectKind::ForeignKey), 2, "{r:?}");
+    assert!(r.count(ObjectKind::Index) >= 2, "{r:?}");
+    assert!(r.count(ObjectKind::Constraint) >= 6, "{r:?}");
+    assert!(r.ddl >= 9, "{r:?}");
+    // Writes are still refused after the browse.
+    assert!(matches!(
+        exec(s.as_mut(), "CREATE TABLE ninesql_p4_browse (a int)").await,
+        Err(DriverError::ReadOnly(_))
+    ));
+    s.close().await.unwrap();
+
+    let _serial = SERIAL.lock().await;
+    let mut admin = connect(&dev, false).await;
+    script(admin.as_mut(), FIXTURE).await;
+    let s = connect(&dev, true).await;
+    let sch = root.child(ObjectKind::Schema, "ninesql_meta");
+    let r = conformance::assert_read_only_browse(s.as_ref(), sch, &pg_ddl_refused).await;
+    for kind in [
+        ObjectKind::Table,
+        ObjectKind::View,
+        ObjectKind::MaterializedView,
+        ObjectKind::Partition,
+        ObjectKind::Trigger,
+        ObjectKind::Routine,
+        ObjectKind::Sequence,
+        ObjectKind::Type,
+    ] {
+        assert!(r.count(kind) >= 1, "{kind:?}: {r:?}");
+    }
     s.close().await.unwrap();
     admin.close().await.unwrap();
 }
