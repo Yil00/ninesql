@@ -1,4 +1,4 @@
-//! [`Session`] and [`Metadata`] of the mysqlwire driver: thin fronts that check the contract
+//! [`Session`] of the mysqlwire driver: thin fronts that check the contract
 //! (one statement, classification, read-only refusal, busy state) and send commands to the
 //! connection task.
 
@@ -7,16 +7,16 @@ use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
 use ninesql_driver_api::{
-    CancelHandle, Capabilities, ColumnInfo, Dialect, DriverError, DriverResult, ExecOptions,
-    ExecutionTracker, Feature, IsolationLevel, Metadata, ObjectDetails, ObjectInfo, ObjectKind,
-    ObjectPath, Page, PageRequest, QueryLanguage, ResultItem, ResultStream, Session, Statement,
-    StatementClass, TableInfo, ensure_single_statement, escape_like,
+    CancelHandle, Capabilities, Dialect, DriverError, DriverResult, EngineId, ExecOptions,
+    ExecutionTracker, Feature, IsolationLevel, Metadata, QueryLanguage, ResultItem, ResultStream,
+    Session, Statement, StatementClass, ensure_single_statement,
 };
 use tokio::sync::{mpsc, oneshot};
 
 use crate::actor::{Chunk, Command, Demand, ExecRequest, Rows, Shared};
 use crate::cancel::{Control, ExecCancel, MyCancel};
-use crate::dialect::{MyDialect, literal, params_supported};
+use crate::dialect::{MyDialect, params_supported};
+use crate::metadata::MyMetadata;
 
 /// Handles shared by the session and its metadata.
 #[derive(Clone)]
@@ -29,14 +29,34 @@ pub(crate) struct Link {
 impl Link {
     /// Runs a driver statement (text results), as one execution of the session.
     pub(crate) async fn internal(&self, sql: &str, verify: bool) -> DriverResult<Rows> {
+        self.internal_limited(sql, verify, None, None).await
+    }
+
+    /// [`internal`](Self::internal) with a value limit (`Command::Internal::value_limit`) and,
+    /// for navigator calls, the control connection: if the caller drops the future before the
+    /// answer, the statement is stopped with `KILL QUERY` (scoped to this execution).
+    pub(crate) async fn internal_limited(
+        &self,
+        sql: &str,
+        verify: bool,
+        value_limit: Option<u64>,
+        cancel_on_drop: Option<&Arc<Control>>,
+    ) -> DriverResult<Rows> {
         if self.shared.closed.load(Ordering::SeqCst) {
             return Err(self.shared.closed_error());
         }
         let guard = self.tracker.begin()?;
+        let mut on_drop = cancel_on_drop.map(|control| CancelOnDrop {
+            tracker: self.tracker.clone(),
+            id: guard.id(),
+            control: Arc::clone(control),
+            armed: true,
+        });
         let (reply, rx) = oneshot::channel();
         self.tx
             .send(Command::Internal {
                 sql: sql.to_owned(),
+                value_limit,
                 verify,
                 guard,
                 reply,
@@ -45,13 +65,48 @@ impl Link {
             .map_err(|_| self.shared.closed_error())?;
         // The connection task bounds the statement itself; this also bounds a queue that
         // never drains (a stuck task). Past it the session is closed.
-        match tokio::time::timeout(crate::actor::INTERNAL_TIMEOUT * 2, rx).await {
-            Ok(r) => r.map_err(|_| self.shared.closed_error())?,
+        let result = match tokio::time::timeout(crate::actor::INTERNAL_TIMEOUT * 2, rx).await {
+            Ok(r) => r.map_err(|_| self.shared.closed_error()),
             Err(_) => {
                 self.shared.mark_closed("driver statement timed out");
                 Err(self.shared.closed_error())
             }
+        };
+        // Answered: nothing left to cancel.
+        if let Some(d) = on_drop.as_mut() {
+            d.armed = false;
         }
+        result?
+    }
+}
+
+/// Stops execution `id` with `KILL QUERY` when dropped (a navigator call abandoned by its
+/// caller, for example by the core's timeout). Scoped by the tracker: a no-op once `id` ended.
+struct CancelOnDrop {
+    tracker: ExecutionTracker,
+    id: ninesql_driver_api::ExecutionId,
+    control: Arc<Control>,
+    armed: bool,
+}
+
+impl Drop for CancelOnDrop {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        let Ok(rt) = tokio::runtime::Handle::try_current() else {
+            return;
+        };
+        let handle = self.tracker.cancel_handle(
+            self.id,
+            Arc::new(MyCancel {
+                control: Arc::clone(&self.control),
+                exec: Arc::new(ExecCancel::default()),
+            }),
+        );
+        rt.spawn(async move {
+            let _ = handle.cancel().await;
+        });
     }
 }
 
@@ -246,6 +301,8 @@ impl Session for MySession {
     fn metadata(&self) -> Arc<dyn Metadata> {
         Arc::new(MyMetadata {
             link: self.link.clone(),
+            control: Arc::clone(&self.control),
+            mariadb: self.capabilities.engine == EngineId::MARIADB,
         })
     }
 
@@ -397,224 +454,6 @@ impl Session for MySession {
         }
         self.link.shared.mark_closed("session closed");
         Ok(())
-    }
-}
-
-/// Navigator metadata, served on the session's connection: a call made while a result streams
-/// fails with [`DriverError::Busy`]. User input (filter, names, cursor) only reaches the
-/// statement as hexadecimal literals, compared as binary strings, so neither the session's
-/// `sql_mode` nor its character set or collations change what the driver's SQL means.
-pub struct MyMetadata {
-    link: Link,
-}
-
-impl std::fmt::Debug for MyMetadata {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("MyMetadata").finish_non_exhaustive()
-    }
-}
-
-/// A binary-string literal of `s` (inert in any `sql_mode`).
-fn bin(s: &str) -> String {
-    if s.is_empty() {
-        return "X''".to_owned();
-    }
-    literal(&ninesql_driver_api::Param::Bytes(s.as_bytes().to_vec()))
-        .unwrap_or_else(|_| "X''".to_owned())
-}
-
-fn segment(parent: &ObjectPath, idx: usize, kinds: &[ObjectKind]) -> DriverResult<String> {
-    parent
-        .0
-        .get(idx)
-        .filter(|s| kinds.contains(&s.kind))
-        .map(|s| s.name.clone())
-        .ok_or_else(|| DriverError::InvalidParams("unexpected object path".into()))
-}
-
-fn cell(row: &[Option<String>], i: usize) -> Option<String> {
-    row.get(i).cloned().flatten()
-}
-
-/// `AND CAST(col AS BINARY) LIKE <filter> ESCAPE '!'` for a filter, empty otherwise.
-fn filter_clause(col: &str, filter: Option<&str>) -> String {
-    match filter {
-        Some(f) => format!(
-            " AND CAST({col} AS BINARY) LIKE {} ESCAPE '!'",
-            bin(&escape_like(f, '!'))
-        ),
-        None => String::new(),
-    }
-}
-
-/// `AND CAST(key AS BINARY) > <cursor>` for a cursor, empty otherwise.
-fn cursor_clause(key: &str, cursor: Option<&str>) -> String {
-    match cursor {
-        Some(c) => format!(" AND CAST({key} AS BINARY) > {}", bin(c)),
-        None => String::new(),
-    }
-}
-
-#[async_trait::async_trait]
-impl Metadata for MyMetadata {
-    fn child_kinds(&self, parent: Option<ObjectKind>) -> Vec<ObjectKind> {
-        match parent {
-            None => vec![ObjectKind::Schema],
-            Some(ObjectKind::Schema) => {
-                vec![ObjectKind::Table, ObjectKind::View, ObjectKind::Routine]
-            }
-            Some(ObjectKind::Table | ObjectKind::View) => vec![ObjectKind::Column],
-            Some(_) => Vec::new(),
-        }
-    }
-
-    async fn list(
-        &self,
-        parent: &ObjectPath,
-        kind: ObjectKind,
-        page: PageRequest,
-    ) -> DriverResult<Page<ObjectInfo>> {
-        let limit = page.limit.clamp(1, 10_000);
-        let fetch = u64::from(limit) + 1;
-        let filter = page.filter.as_deref();
-        let cursor = page.cursor.as_deref();
-        let sql = match (parent.kind(), kind) {
-            (None, ObjectKind::Schema) => format!(
-                "SELECT SCHEMA_NAME, NULL, CAST(SCHEMA_NAME AS BINARY) \
-                 FROM information_schema.SCHEMATA WHERE TRUE{}{} \
-                 ORDER BY CAST(SCHEMA_NAME AS BINARY) LIMIT {fetch}",
-                filter_clause("SCHEMA_NAME", filter),
-                cursor_clause("SCHEMA_NAME", cursor),
-            ),
-            (Some(ObjectKind::Schema), ObjectKind::Table | ObjectKind::View) => {
-                let schema = segment(parent, 0, &[ObjectKind::Schema])?;
-                let types = if kind == ObjectKind::Table {
-                    "'BASE TABLE', 'SYSTEM VERSIONED'"
-                } else {
-                    "'VIEW', 'SYSTEM VIEW'"
-                };
-                format!(
-                    "SELECT TABLE_NAME, TABLE_COMMENT, CAST(TABLE_NAME AS BINARY), TABLE_ROWS, \
-                     TABLE_TYPE FROM information_schema.TABLES \
-                     WHERE CAST(TABLE_SCHEMA AS BINARY) = {} AND TABLE_TYPE IN ({types}){}{} \
-                     ORDER BY CAST(TABLE_NAME AS BINARY) LIMIT {fetch}",
-                    bin(&schema),
-                    filter_clause("TABLE_NAME", filter),
-                    cursor_clause("TABLE_NAME", cursor),
-                )
-            }
-            (Some(ObjectKind::Schema), ObjectKind::Routine) => {
-                let schema = segment(parent, 0, &[ObjectKind::Schema])?;
-                // Functions and procedures may share a name: the key adds the type.
-                format!(
-                    "SELECT ROUTINE_NAME, ROUTINE_COMMENT, \
-                     CONCAT(CAST(ROUTINE_NAME AS BINARY), X'00', CAST(ROUTINE_TYPE AS BINARY)) \
-                     FROM information_schema.ROUTINES \
-                     WHERE CAST(ROUTINE_SCHEMA AS BINARY) = {}{}{} \
-                     ORDER BY CONCAT(CAST(ROUTINE_NAME AS BINARY), X'00', \
-                     CAST(ROUTINE_TYPE AS BINARY)) LIMIT {fetch}",
-                    bin(&schema),
-                    filter_clause("ROUTINE_NAME", filter),
-                    cursor_clause(
-                        "CONCAT(CAST(ROUTINE_NAME AS BINARY), X'00', CAST(ROUTINE_TYPE AS BINARY))",
-                        cursor
-                    ),
-                )
-            }
-            (Some(ObjectKind::Table | ObjectKind::View), ObjectKind::Column) => {
-                let schema = segment(parent, 0, &[ObjectKind::Schema])?;
-                let table = segment(parent, 1, &[ObjectKind::Table, ObjectKind::View])?;
-                let after = match cursor {
-                    Some(c) => {
-                        let n: u32 = c.parse().map_err(|_| {
-                            DriverError::InvalidParams("invalid page cursor".into())
-                        })?;
-                        format!(" AND ORDINAL_POSITION > {n}")
-                    }
-                    None => String::new(),
-                };
-                format!(
-                    "SELECT COLUMN_NAME, COLUMN_COMMENT, ORDINAL_POSITION, COLUMN_TYPE, \
-                     IS_NULLABLE, COLUMN_DEFAULT, COLUMN_KEY, EXTRA \
-                     FROM information_schema.COLUMNS \
-                     WHERE CAST(TABLE_SCHEMA AS BINARY) = {} \
-                     AND CAST(TABLE_NAME AS BINARY) = {}{}{after} \
-                     ORDER BY ORDINAL_POSITION LIMIT {fetch}",
-                    bin(&schema),
-                    bin(&table),
-                    filter_clause("COLUMN_NAME", filter),
-                )
-            }
-            _ => return Err(DriverError::Unsupported(Feature::Metadata(kind))),
-        };
-        let mut rows = self.link.internal(&sql, false).await?;
-        let more = rows.len() > limit as usize;
-        rows.truncate(limit as usize);
-        let mut items = Vec::with_capacity(rows.len());
-        let mut next_cursor = None;
-        for row in &rows {
-            let name = cell(row, 0).unwrap_or_default();
-            let comment = cell(row, 1).filter(|c| !c.is_empty());
-            let details = match kind {
-                ObjectKind::Table | ObjectKind::View => {
-                    let mut t = TableInfo::default();
-                    t.estimated_rows = cell(row, 3).and_then(|v| v.parse().ok());
-                    t.flavour = match cell(row, 4).as_deref() {
-                        Some("SYSTEM VERSIONED") => Some("system-versioned".to_owned()),
-                        Some("SYSTEM VIEW") => Some("system".to_owned()),
-                        _ => None,
-                    };
-                    ObjectDetails::Table(t)
-                }
-                ObjectKind::Column => {
-                    let ordinal = cell(row, 2).and_then(|v| v.parse().ok()).unwrap_or(0);
-                    let mut c = ColumnInfo::new(ordinal, cell(row, 3).unwrap_or_default());
-                    c.nullable = cell(row, 4).as_deref() == Some("YES");
-                    c.default = cell(row, 5);
-                    c.primary_key = cell(row, 6).as_deref() == Some("PRI");
-                    let extra = cell(row, 7).unwrap_or_default().to_ascii_lowercase();
-                    c.auto_generated = extra.contains("auto_increment")
-                        || extra.contains("virtual")
-                        || extra.contains("stored")
-                        || extra.contains("persistent");
-                    next_cursor = Some(ordinal.to_string());
-                    ObjectDetails::Column(c)
-                }
-                _ => ObjectDetails::None,
-            };
-            if kind != ObjectKind::Column {
-                next_cursor = cell(row, 2);
-            }
-            items.push(ObjectInfo {
-                path: parent.child(kind, name),
-                comment,
-                details,
-            });
-        }
-        Ok(Page {
-            items,
-            next_cursor: if more { next_cursor } else { None },
-        })
-    }
-
-    async fn ddl(&self, _object: &ObjectPath) -> DriverResult<String> {
-        Err(DriverError::Unsupported(Feature::Ddl))
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn user_input_becomes_hex() {
-        assert_eq!(bin("a'b"), "X'612762'");
-        assert_eq!(bin(""), "X''");
-        assert_eq!(
-            filter_clause("TABLE_NAME", Some("a_%'")),
-            " AND CAST(TABLE_NAME AS BINARY) LIKE X'2561215F21252725' ESCAPE '!'"
-        );
-        assert!(cursor_clause("k", None).is_empty());
     }
 }
 
