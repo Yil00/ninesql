@@ -977,7 +977,23 @@ struct ExportTask {
 
 impl ExportTask {
     async fn run(self) {
-        let event = match self.run_inner().await {
+        let mut slot = None;
+        let result = self.run_inner(&mut slot).await;
+        // End the read-only transaction before reporting, so the session is idle and out of
+        // any transaction when the UI hears the export ended.
+        if let Some(guard) = slot.as_mut()
+            && guard.read_only_tx
+        {
+            guard.read_only_tx = false;
+            if let Err(e) = tx_op(guard.lease.rollback()).await {
+                tracing::warn!(
+                    kind = e.kind(),
+                    "ending the export's read-only transaction failed"
+                );
+            }
+        }
+        drop(slot);
+        let event = match result {
             Ok(summary) => {
                 tracing::info!(
                     rows = summary.rows,
@@ -994,7 +1010,10 @@ impl ExportTask {
         let _ = self.events.send(event).await;
     }
 
-    async fn run_inner(&self) -> Result<ExportSummary, TransferJobError> {
+    async fn run_inner(
+        &self,
+        slot: &mut Option<ExportLease>,
+    ) -> Result<ExportSummary, TransferJobError> {
         let started = Instant::now();
         let request = &self.request;
         let dialect = self.session.dialect();
@@ -1028,12 +1047,12 @@ impl ExportTask {
             });
 
         // The session is the export's alone until it ends (review L9).
-        let mut guard = ExportLease {
+        let guard = slot.insert(ExportLease {
             lease: acquire_lease(&self.session)
                 .await
                 .ok_or(TransferJobError::SessionBusy)?,
             read_only_tx: false,
-        };
+        });
 
         // The file: checked and created on the blocking pool.
         let service = self.service.clone();

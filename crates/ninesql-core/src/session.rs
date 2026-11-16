@@ -2549,40 +2549,52 @@ impl SessionTask {
                 flow
             }
             Command::Transaction { op, reply } => {
-                let Some(session) = self.session.as_mut() else {
-                    let _ = reply.send(Err(CoreError::SessionClosed));
-                    return Flow::Continue;
-                };
-                if matches!(op, TxOp::SetAutoCommit(true))
-                    && !session.auto_commit()
-                    && session.in_transaction()
-                {
-                    // Switching auto-commit on would end the open transaction one way or the
-                    // other, depending on the engine: the user commits or rolls back first.
-                    let _ = reply.send(Err(CoreError::PendingTransaction));
-                    return Flow::Continue;
-                }
-                let result = match op {
-                    TxOp::Begin => session.begin().await,
-                    TxOp::Commit => session.commit().await,
-                    TxOp::Rollback => session.rollback().await,
-                    TxOp::SetAutoCommit(on) => session.set_auto_commit(on).await,
-                    TxOp::Ping => session.ping().await,
-                };
-                let flow = match &result {
-                    Err(e) if e.is_fatal() => Flow::Lost(e.clone()),
-                    _ => Flow::Continue,
-                };
-                let state = TransactionState {
-                    auto_commit: session.auto_commit(),
-                    in_transaction: session.in_transaction(),
-                };
-                // Recorded before the answer, so `transaction_state()` agrees with it.
-                self.update_transaction_state();
-                let _ = reply.send(result.map(|()| state).map_err(CoreError::from));
+                // Marks the session busy (a lease waits for it), like a statement does.
+                *lock(&self.handle.inner.current) = Some(CancelToken::new());
+                let flow = self.transaction_command(op, reply).await;
+                *lock(&self.handle.inner.current) = None;
                 flow
             }
         }
+    }
+
+    async fn transaction_command(
+        &mut self,
+        op: TxOp,
+        reply: oneshot::Sender<Result<TransactionState, CoreError>>,
+    ) -> Flow {
+        let Some(session) = self.session.as_mut() else {
+            let _ = reply.send(Err(CoreError::SessionClosed));
+            return Flow::Continue;
+        };
+        if matches!(op, TxOp::SetAutoCommit(true))
+            && !session.auto_commit()
+            && session.in_transaction()
+        {
+            // Switching auto-commit on would end the open transaction one way or the
+            // other, depending on the engine: the user commits or rolls back first.
+            let _ = reply.send(Err(CoreError::PendingTransaction));
+            return Flow::Continue;
+        }
+        let result = match op {
+            TxOp::Begin => session.begin().await,
+            TxOp::Commit => session.commit().await,
+            TxOp::Rollback => session.rollback().await,
+            TxOp::SetAutoCommit(on) => session.set_auto_commit(on).await,
+            TxOp::Ping => session.ping().await,
+        };
+        let flow = match &result {
+            Err(e) if e.is_fatal() => Flow::Lost(e.clone()),
+            _ => Flow::Continue,
+        };
+        let state = TransactionState {
+            auto_commit: session.auto_commit(),
+            in_transaction: session.in_transaction(),
+        };
+        // Recorded before the answer, so `transaction_state()` agrees with it.
+        self.update_transaction_state();
+        let _ = reply.send(result.map(|()| state).map_err(CoreError::from));
+        flow
     }
 
     async fn execute(

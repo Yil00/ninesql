@@ -270,6 +270,34 @@ fn postgresql_big_events_export_and_100k_import() {
         );
         assert_eq!(std::fs::metadata(&target).unwrap().len(), summary.bytes);
 
+        // The export ran in an engine-side read-only transaction (review L7), ended after it.
+        let ro = out.path().join("ro.csv");
+        let mut job = transfer.export(
+            &h,
+            ExportRequest::statement(
+                "SELECT current_setting('transaction_read_only') AS ro",
+                &ro,
+                ExportOptions::new(ExportFormat::Csv),
+            ),
+        );
+        loop {
+            match job.next().await {
+                Some(ExportEvent::Done(_)) => break,
+                Some(ExportEvent::Failed(e)) => panic!("{e}"),
+                Some(_) => {}
+                None => panic!("ended"),
+            }
+        }
+        assert_eq!(std::fs::read_to_string(&ro).unwrap(), "ro\non\n");
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while h.is_leased() || h.transaction_state().in_transaction {
+            assert!(
+                Instant::now() < deadline,
+                "the read-only transaction stayed open"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
         // 100 000-line CSV import.
         let file = write_csv(out.path());
         let table = format!("p5c_import_{}", std::process::id());
