@@ -41,6 +41,40 @@ actions!(
         NextResultTab,
         /// Show the previous result tab.
         PreviousResultTab,
+        /// Show the active result as a grid.
+        ShowGridView,
+        /// Show the selected row as a record (one line per column).
+        ShowRecordView,
+        /// Show the loaded rows as plain text.
+        ShowTextView,
+        /// Record view: show the next row.
+        NextRecord,
+        /// Record view: show the previous row.
+        PreviousRecord,
+        /// Show or hide the value panel of the selected cell.
+        ToggleValuePanel,
+        /// Show the next viewer of the value panel (text, JSON, XML, hex, image).
+        NextValueViewer,
+        /// Show or hide the aggregate panel of the selection.
+        ToggleAggregatePanel,
+        /// Show or hide the metadata panel of the result's columns.
+        ToggleMetadataPanel,
+        /// Sort the loaded rows by the selected column, ascending.
+        SortAscending,
+        /// Sort the loaded rows by the selected column, descending.
+        SortDescending,
+        /// Filter the loaded rows (opens the filter bar).
+        FilterLoadedRows,
+        /// Keep only the loaded rows whose value in the selected column equals the selected value.
+        FilterBySelectedValue,
+        /// Remove the client-side sort and filters.
+        ClearSortAndFilter,
+        /// Copy the selected cells as a Markdown table.
+        CopySelectionAsMarkdown,
+        /// Copy the selected cells as a JSON array of objects.
+        CopySelectionAsJson,
+        /// Copy the selected rows as SQL INSERT statements (asks for the table when unknown).
+        CopySelectionAsSqlInsert,
     ]
 );
 
@@ -164,6 +198,108 @@ pub const GRID_ACTIONS: &[GridActionSpec] = &[
         "Previous result tab",
         ["alt-left"],
         keywords = ["notices", "update counts"]
+    ),
+    spec!(
+        ShowGridView,
+        "Show results as grid",
+        ["alt-1"],
+        keywords = ["table", "view", "mode"]
+    ),
+    spec!(
+        ShowRecordView,
+        "Show row as record",
+        ["alt-2"],
+        keywords = ["form", "record", "row", "view", "mode"]
+    ),
+    spec!(
+        ShowTextView,
+        "Show results as text",
+        ["alt-3"],
+        keywords = ["plain", "text", "view", "mode"]
+    ),
+    spec!(
+        NextRecord,
+        "Next record",
+        ["alt-down"],
+        keywords = ["record", "row", "form"]
+    ),
+    spec!(
+        PreviousRecord,
+        "Previous record",
+        ["alt-up"],
+        keywords = ["record", "row", "form"]
+    ),
+    spec!(
+        ToggleValuePanel,
+        "Toggle value panel",
+        ["alt-v"],
+        keywords = ["viewer", "json", "xml", "hex", "binary", "image", "cell"]
+    ),
+    spec!(
+        NextValueViewer,
+        "Next value viewer",
+        ["alt-shift-v"],
+        keywords = ["viewer", "json", "xml", "hex", "binary", "image"]
+    ),
+    spec!(
+        ToggleAggregatePanel,
+        "Toggle aggregate panel",
+        ["alt-a"],
+        keywords = ["sum", "count", "average", "min", "max", "calc"]
+    ),
+    spec!(
+        ToggleMetadataPanel,
+        "Toggle metadata panel",
+        ["alt-m"],
+        keywords = ["columns", "types", "nullable", "schema"]
+    ),
+    spec!(
+        SortAscending,
+        "Sort loaded rows ascending",
+        ["alt-s a"],
+        keywords = ["order", "client"]
+    ),
+    spec!(
+        SortDescending,
+        "Sort loaded rows descending",
+        ["alt-s d"],
+        keywords = ["order", "client"]
+    ),
+    spec!(
+        FilterLoadedRows,
+        "Filter loaded rows",
+        ["alt-s f"],
+        keywords = ["search", "where", "client"]
+    ),
+    spec!(
+        FilterBySelectedValue,
+        "Filter loaded rows by selected value",
+        ["alt-s v"],
+        keywords = ["equals", "where", "client"]
+    ),
+    spec!(
+        ClearSortAndFilter,
+        "Clear sort and filters",
+        ["alt-s c"],
+        keywords = ["reset", "order", "where"]
+    ),
+    spec!(
+        CopySelectionAsMarkdown,
+        "Copy selected cells as Markdown",
+        ["ctrl-alt-m"],
+        keywords = ["markdown", "table", "clipboard"]
+    ),
+    spec!(
+        CopySelectionAsJson,
+        "Copy selected cells as JSON",
+        ["ctrl-alt-j"],
+        keywords = ["json", "clipboard"]
+    ),
+    spec!(
+        CopySelectionAsSqlInsert,
+        "Copy selected rows as SQL INSERT",
+        ["ctrl-alt-i"],
+        keywords = ["sql", "insert", "clipboard", "dml"]
     ),
 ];
 

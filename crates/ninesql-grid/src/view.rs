@@ -12,7 +12,7 @@
 use std::ops::Range;
 use std::rc::Rc;
 
-use gpui_kit::component::table::{Column, DataTable, TableDelegate, TableEvent, TableState};
+use gpui_kit::component::table::{Column, TableDelegate, TableEvent, TableState};
 use gpui_kit::component::{ActiveTheme as _, h_flex, v_flex};
 use gpui_kit::{
     App, AppContext as _, ClipboardItem, Context, Entity, EventEmitter, FocusHandle, Focusable,
@@ -22,20 +22,29 @@ use gpui_kit::{
 };
 
 use crate::actions::{
-    AutoSizeAllColumns, AutoSizeColumn, CopySelection, CopySelectionAsCsv,
+    AutoSizeAllColumns, AutoSizeColumn, ClearSortAndFilter, CopySelection, CopySelectionAsCsv,
+    CopySelectionAsJson, CopySelectionAsMarkdown, CopySelectionAsSqlInsert,
     CopySelectionWithHeaders, ExtendSelectionDown, ExtendSelectionLeft, ExtendSelectionRight,
-    ExtendSelectionUp, FetchAllRows, FetchNextPage, GRID_CONTEXT, NextResultTab, PreviousResultTab,
-    SelectAllCells,
+    ExtendSelectionUp, FetchAllRows, FetchNextPage, FilterBySelectedValue, FilterLoadedRows,
+    GRID_CONTEXT, NextRecord, NextResultTab, NextValueViewer, PreviousRecord, PreviousResultTab,
+    SelectAllCells, ShowGridView, ShowRecordView, ShowTextView, SortAscending, SortDescending,
+    ToggleAggregatePanel, ToggleMetadataPanel, ToggleValuePanel,
 };
-use crate::copy::{CopyFormat, CopyOptions, CopyOutput, copy_selection};
+use crate::advanced_copy::AdvancedFormat;
+use crate::copy::{CopyFormat, CopyOptions, CopyOutput, copy_selection_in};
+use crate::edit::EditBuffer;
 use crate::execution::{
     ExecutionResults, GridBudget, ResultTab, SharedResult, StatementStatus, format_bytes,
 };
 use crate::format::{Align, DisplayOptions, ValueKind, display_line};
 use crate::model::{FetchState, ResultSetModel};
+use crate::rows::{RowView, SortDirection};
 use crate::selection::{ColumnOrder, GridSelection};
 use crate::source::{ExecutionEvent, ResultSource};
 use ninesql_core::driver_api::{NoticeSeverity, TruncationReason};
+
+mod panels;
+pub use panels::{SidePanel, ViewMode};
 
 /// Rows sampled by "fit column width" besides the visible ones (bounded work).
 pub const AUTO_SIZE_SAMPLE_ROWS: usize = 500;
@@ -64,6 +73,12 @@ pub enum GridEvent {
 pub struct GridDelegate {
     model: SharedResult,
     order: ColumnOrder,
+    /// Client-side sort and filter of the loaded rows (display row → model row).
+    rows: RowView,
+    /// Bumped whenever the rows shown or the selection change (panel caches).
+    version: u64,
+    /// Pending edits (dirty markers); read-only until the core's editor is attached.
+    edits: EditBuffer,
     selection: GridSelection,
     options: Rc<DisplayOptions>,
     visible_rows: Range<usize>,
@@ -82,6 +97,9 @@ impl GridDelegate {
         Self {
             model,
             order: ColumnOrder::identity(cols),
+            rows: RowView::new(),
+            version: 0,
+            edits: EditBuffer::new(),
             selection: GridSelection::None,
             options,
             visible_rows: 0..0,
@@ -108,6 +126,68 @@ impl GridDelegate {
         self.selection
     }
 
+    /// Sets the selection (display coordinates).
+    pub fn set_selection(&mut self, selection: GridSelection) {
+        self.selection = selection;
+        self.version += 1;
+    }
+
+    /// The client-side sort and filter.
+    #[must_use]
+    pub fn rows(&self) -> &RowView {
+        &self.rows
+    }
+
+    /// Changes the client-side sort / filter, then rebuilds it from the loaded rows.
+    pub fn update_rows(&mut self, f: impl FnOnce(&mut RowView, &ResultSetModel)) {
+        let model = self.model.clone();
+        let m = model.borrow();
+        f(&mut self.rows, &m);
+        self.selection = GridSelection::None;
+        self.version += 1;
+    }
+
+    /// Rebuilds the client-side view after rows arrived, once the page is loaded (a sort is
+    /// not redone for every batch of a "fetch all").
+    pub fn refresh_rows(&mut self) {
+        let model = self.model.clone();
+        let m = model.borrow();
+        if self.rows.is_stale(&m) && !m.state().is_fetching() {
+            self.rows.rebuild(&m);
+            self.version += 1;
+        }
+    }
+
+    /// Version of the rows shown and the selection.
+    #[must_use]
+    pub fn version(&self) -> u64 {
+        self.version
+    }
+
+    /// Pending edits.
+    #[must_use]
+    pub fn edits(&self) -> &EditBuffer {
+        &self.edits
+    }
+
+    /// Pending edits, mutable (the core's editor attaches here).
+    pub fn edits_mut(&mut self) -> &mut EditBuffer {
+        &mut self.edits
+    }
+
+    /// The model row of display row `display`.
+    #[must_use]
+    pub fn model_row(&self, display: usize) -> Option<usize> {
+        self.rows.model_row(display)
+    }
+
+    /// The focused cell as (model row, model column).
+    #[must_use]
+    pub fn focused_cell(&self) -> Option<(usize, usize)> {
+        let (r, c) = self.selection.focus()?;
+        Some((self.rows.model_row(r)?, self.order.model(c)?))
+    }
+
     /// Rows the table drew last.
     #[must_use]
     pub fn visible_rows(&self) -> Range<usize> {
@@ -128,7 +208,11 @@ impl GridDelegate {
             .chars()
             .count()
             .max(meta.type_name().chars().count());
-        let sample = (0..AUTO_SIZE_SAMPLE_ROWS.min(m.row_count())).chain(self.visible_rows.clone());
+        let sample = (0..AUTO_SIZE_SAMPLE_ROWS.min(m.row_count())).chain(
+            self.visible_rows
+                .clone()
+                .filter_map(|r| self.rows.model_row(r)),
+        );
         for row in sample {
             if let Some(cell) = m.cell(row, c, &self.options) {
                 chars = chars.max(cell.text.chars().count());
@@ -158,7 +242,7 @@ impl TableDelegate for GridDelegate {
     }
 
     fn rows_count(&self, _cx: &App) -> usize {
-        self.model.borrow().row_count()
+        self.rows.len(self.model.borrow().row_count())
     }
 
     fn column(&self, col_ix: usize, _cx: &App) -> Column {
@@ -231,12 +315,17 @@ impl TableDelegate for GridDelegate {
         cx: &mut Context<TableState<Self>>,
     ) -> impl IntoElement {
         let m = self.model.borrow();
-        let cell = self
-            .order
-            .model(col_ix)
-            .and_then(|c| m.cell(row_ix, c, &self.options));
-        let rows = m.row_count();
+        let model_row = self.rows.model_row(row_ix);
+        let model_col = self.order.model(col_ix);
+        let cell = model_row
+            .zip(model_col)
+            .and_then(|(r, c)| m.cell(r, c, &self.options));
+        let rows = self.rows.len(m.row_count());
         drop(m);
+        let (dirty, deleted) = match (model_row, model_col) {
+            (Some(r), Some(c)) => (self.edits.is_cell_dirty(r, c), self.edits.is_row_deleted(r)),
+            _ => (false, false),
+        };
         let selected = self.selection.cell_count(rows, self.order.len()) > 1
             && self.selection.row_range(rows).contains(&row_ix)
             && self.selection.col_range(self.order.len()).contains(&col_ix);
@@ -252,6 +341,13 @@ impl TableDelegate for GridDelegate {
                 d.italic().text_color(cx.theme().muted_foreground)
             })
             .when(selected, |d| d.bg(cx.theme().table_active))
+            // Dirty marker: a pending edit (the core saves it), never a saved value.
+            .when(dirty, |d| {
+                d.border_l_2()
+                    .border_color(cx.theme().warning)
+                    .font_weight(gpui_kit::FontWeight::BOLD)
+            })
+            .when(deleted, |d| d.line_through().text_color(cx.theme().danger))
             .child(cell.text)
             .into_any_element()
     }
@@ -259,14 +355,14 @@ impl TableDelegate for GridDelegate {
     fn cell_label(&self, row_ix: usize, col_ix: usize, _cx: &App) -> Option<SharedString> {
         let m = self.model.borrow();
         let c = self.order.model(col_ix)?;
-        let cell = m.cell(row_ix, c, &self.options)?;
+        let cell = m.cell(self.rows.model_row(row_ix)?, c, &self.options)?;
         Some(cell.text.into())
     }
 
     fn cell_text(&self, row_ix: usize, col_ix: usize, _cx: &App) -> String {
         let mut out = String::new();
-        if let Some(c) = self.order.model(col_ix) {
-            self.model.borrow().write_cell_copy(&mut out, row_ix, c, "");
+        if let (Some(c), Some(r)) = (self.order.model(col_ix), self.rows.model_row(row_ix)) {
+            self.model.borrow().write_cell_copy(&mut out, r, c, "");
         }
         out
     }
@@ -280,6 +376,7 @@ impl TableDelegate for GridDelegate {
     ) {
         self.order.move_column(col_ix, to_ix);
         self.selection = GridSelection::None;
+        self.version += 1;
     }
 
     fn fit_column(
@@ -344,6 +441,8 @@ pub struct ResultsView {
     focus_handle: FocusHandle,
     /// The last copy or fetch message for the status line.
     status: Option<String>,
+    /// View modes, panels, client-side sort / filter bar, advanced copy (P5-A).
+    p5: panels::P5State,
 }
 
 impl EventEmitter<GridEvent> for ResultsView {}
@@ -351,8 +450,9 @@ impl EventEmitter<GridEvent> for ResultsView {}
 impl Focusable for ResultsView {
     fn focus_handle(&self, cx: &App) -> FocusHandle {
         match self.active_table() {
-            Some(t) => t.read(cx).focus_handle(cx),
-            None => self.focus_handle.clone(),
+            // The record and text views draw no table: the view keeps the focus itself.
+            Some(t) if self.p5.mode == ViewMode::Grid => t.read(cx).focus_handle(cx),
+            _ => self.focus_handle.clone(),
         }
     }
 }
@@ -368,6 +468,7 @@ impl ResultsView {
             options: Rc::new(DisplayOptions::default()),
             focus_handle: cx.focus_handle(),
             status: None,
+            p5: panels::P5State::default(),
         }
     }
 
@@ -472,7 +573,10 @@ impl ResultsView {
         if let Some(ix) = applied.changed_tab
             && let Some(table) = self.table(ix)
         {
-            table.update(cx, |_, cx| cx.notify());
+            table.update(cx, |t, cx| {
+                t.delegate_mut().refresh_rows();
+                cx.notify();
+            });
         }
         if let Some(statement) = applied.release
             && let Some(source) = &self.source
@@ -516,9 +620,10 @@ impl ResultsView {
             };
             if let Some(selection) = selection {
                 table.update(cx, |t, cx| {
-                    t.delegate_mut().selection = selection;
+                    t.delegate_mut().set_selection(selection);
                     cx.notify();
                 });
+                cx.notify();
             }
         });
         TableTab {
@@ -552,9 +657,10 @@ impl ResultsView {
             let t = table.read(cx);
             let d = t.delegate();
             let m = d.model.borrow();
-            copy_selection(
+            copy_selection_in(
                 &m,
                 &d.order,
+                &d.rows,
                 &d.selection,
                 &CopyOptions::new(format, headers),
             )?
@@ -581,9 +687,10 @@ impl ResultsView {
     fn select_all(&mut self, cx: &mut Context<Self>) {
         if let Some(table) = self.active_table() {
             table.update(cx, |t, cx| {
-                t.delegate_mut().selection = GridSelection::All;
+                t.delegate_mut().set_selection(GridSelection::All);
                 cx.notify();
             });
+            cx.notify();
         }
     }
 
@@ -592,10 +699,14 @@ impl ResultsView {
             return;
         };
         table.update(cx, |t, cx| {
-            let rows = t.delegate().model.borrow().row_count();
+            let rows = t
+                .delegate()
+                .rows
+                .len(t.delegate().model.borrow().row_count());
             let cols = t.delegate().order.len();
             let d = t.delegate_mut();
             d.selection.extend(d_row, d_col, rows, cols);
+            d.version += 1;
             if let Some((row, col)) = d.selection.focus() {
                 t.vertical_scroll_handle
                     .scroll_to_item(row, ScrollStrategy::Nearest);
@@ -804,7 +915,61 @@ impl Render for ResultsView {
                 this.copy(CopyFormat::Tsv, true, cx);
             }))
             .on_action(cx.listener(|this, _: &CopySelectionAsCsv, _, cx| {
-                this.copy(CopyFormat::Csv, true, cx);
+                // Through the P5-C exporter: RFC 4180 and the spreadsheet formula guard.
+                let _ = this.copy_as(AdvancedFormat::Csv, cx);
+            }))
+            .on_action(cx.listener(|this, _: &CopySelectionAsMarkdown, _, cx| {
+                let _ = this.copy_as(AdvancedFormat::Markdown, cx);
+            }))
+            .on_action(cx.listener(|this, _: &CopySelectionAsJson, _, cx| {
+                let _ = this.copy_as(AdvancedFormat::Json, cx);
+            }))
+            .on_action(
+                cx.listener(|this, _: &CopySelectionAsSqlInsert, window, cx| {
+                    this.copy_insert_or_ask(window, cx);
+                }),
+            )
+            .on_action(cx.listener(|this, _: &ShowGridView, window, cx| {
+                this.set_mode(ViewMode::Grid, cx);
+                let handle = this.focus_handle(cx);
+                window.focus(&handle, cx);
+            }))
+            .on_action(cx.listener(|this, _: &ShowRecordView, window, cx| {
+                this.set_mode(ViewMode::Record, cx);
+                let handle = this.focus_handle(cx);
+                window.focus(&handle, cx);
+            }))
+            .on_action(cx.listener(|this, _: &ShowTextView, window, cx| {
+                this.set_mode(ViewMode::Text, cx);
+                let handle = this.focus_handle(cx);
+                window.focus(&handle, cx);
+            }))
+            .on_action(cx.listener(|this, _: &NextRecord, _, cx| this.step_record(1, cx)))
+            .on_action(cx.listener(|this, _: &PreviousRecord, _, cx| this.step_record(-1, cx)))
+            .on_action(cx.listener(|this, _: &ToggleValuePanel, _, cx| {
+                this.toggle_panel(SidePanel::Value, cx);
+            }))
+            .on_action(cx.listener(|this, _: &NextValueViewer, _, cx| this.next_viewer(cx)))
+            .on_action(cx.listener(|this, _: &ToggleAggregatePanel, _, cx| {
+                this.toggle_panel(SidePanel::Aggregate, cx);
+            }))
+            .on_action(cx.listener(|this, _: &ToggleMetadataPanel, _, cx| {
+                this.toggle_panel(SidePanel::Metadata, cx);
+            }))
+            .on_action(cx.listener(|this, _: &SortAscending, _, cx| {
+                this.sort_focused(SortDirection::Ascending, cx);
+            }))
+            .on_action(cx.listener(|this, _: &SortDescending, _, cx| {
+                this.sort_focused(SortDirection::Descending, cx);
+            }))
+            .on_action(cx.listener(|this, _: &FilterLoadedRows, window, cx| {
+                this.open_filter_bar(window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &FilterBySelectedValue, _, cx| {
+                this.filter_by_focused_value(cx);
+            }))
+            .on_action(cx.listener(|this, _: &ClearSortAndFilter, _, cx| {
+                this.clear_sort_filter(cx);
             }))
             .on_action(cx.listener(|this, _: &SelectAllCells, _, cx| this.select_all(cx)))
             .on_action(cx.listener(|this, _: &ExtendSelectionUp, _, cx| this.extend(-1, 0, cx)))
@@ -851,7 +1016,7 @@ impl Render for ResultsView {
 }
 
 impl ResultsView {
-    fn render_result(&self, ix: usize, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render_result(&mut self, ix: usize, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme().clone();
         let banner = self.banner(ix);
         let budget_banner = match self.results.tabs().get(ix) {
@@ -863,6 +1028,9 @@ impl ResultsView {
             _ => false,
         };
         let status = self.status_line(ix);
+        let rows_bar = self.render_rows_bar(cx);
+        let main = self.render_main(ix, cx);
+        let panel = self.render_panel(cx);
         let fetch_button = |id: &'static str, label: &'static str, all: bool| {
             div()
                 .id(id)
@@ -895,17 +1063,13 @@ impl ResultsView {
                         .child(text),
                 )
             })
+            .when_some(rows_bar, |d, bar| d.child(bar))
             .child(
-                div()
+                h_flex()
                     .flex_1()
                     .min_h_0()
-                    .when_some(self.table(ix), |d, table| {
-                        d.child(
-                            DataTable::new(table)
-                                .stripe(true)
-                                .accessibility_label("Query results"),
-                        )
-                    }),
+                    .child(div().flex_1().min_w_0().h_full().child(main))
+                    .when_some(panel, |d, panel| d.child(panel)),
             )
             .child(
                 h_flex()

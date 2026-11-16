@@ -11,6 +11,7 @@
 //!   [`CopyOutput::cut_values`] says so, and the UI tells the user.
 
 use crate::model::ResultSetModel;
+use crate::rows::RowView;
 use crate::selection::{ColumnOrder, GridSelection};
 
 /// Upper bound of a copied text: 64 MiB.
@@ -80,7 +81,20 @@ pub fn copy_selection(
     selection: &GridSelection,
     options: &CopyOptions,
 ) -> Option<CopyOutput> {
-    let rows = selection.row_range(model.row_count());
+    copy_selection_in(model, order, &RowView::new(), selection, options)
+}
+
+/// [`copy_selection`] through a client-side sort / filter: display rows are mapped to model
+/// rows, so what is copied is what is shown.
+#[must_use]
+pub fn copy_selection_in(
+    model: &ResultSetModel,
+    order: &ColumnOrder,
+    view: &RowView,
+    selection: &GridSelection,
+    options: &CopyOptions,
+) -> Option<CopyOutput> {
+    let rows = selection.row_range(view.len(model.row_count()));
     let cols: Vec<usize> = selection
         .col_range(order.len())
         .filter_map(|d| order.model(d))
@@ -110,7 +124,10 @@ pub fn copy_selection(
     let mut copied = 0usize;
     let mut capped = false;
     let mut line = String::new();
-    for row in rows.clone() {
+    for display in rows.clone() {
+        let Some(row) = view.model_row(display) else {
+            continue;
+        };
         line.clear();
         for (i, &c) in cols.iter().enumerate() {
             if i > 0 {

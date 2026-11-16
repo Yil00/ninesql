@@ -593,3 +593,5 @@ fn an_idle_close_says_so_and_disables_fetching(cx: &mut TestAppContext) {
     assert!(recorder.fetches.borrow().is_empty());
     assert_eq!(super::idle_duration_text(45), "45 s");
 }
+
+mod p5;

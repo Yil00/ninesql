@@ -148,6 +148,46 @@ impl ClientFilter {
     }
 }
 
+/// Parses the filter bar's text for `column` (`None`: any column): `= v`, `!= v` (or `<> v`),
+/// `> v`, `>= v`, `< v`, `<= v`, `is null`, `is not null`; anything else is "contains". A
+/// leading `\` keeps the rest literal (`\>5` searches for `>5`). Without a column only
+/// "contains" exists, so the whole text is the needle. `None` for an empty text.
+#[must_use]
+pub fn parse_filter_text(text: &str, column: Option<usize>) -> Option<ClientFilter> {
+    let t = text.trim();
+    if t.is_empty() {
+        return None;
+    }
+    let Some(column) = column else {
+        return Some(ClientFilter::anywhere(t));
+    };
+    if let Some(rest) = t.strip_prefix('\\') {
+        return Some(ClientFilter::on(column, FilterOp::Contains, rest));
+    }
+    let lower = t.to_ascii_lowercase();
+    if lower == "is null" {
+        return Some(ClientFilter::on(column, FilterOp::IsNull, ""));
+    }
+    if lower == "is not null" {
+        return Some(ClientFilter::on(column, FilterOp::IsNotNull, ""));
+    }
+    const OPS: [(&str, FilterOp); 7] = [
+        (">=", FilterOp::GreaterOrEqual),
+        ("<=", FilterOp::LessOrEqual),
+        ("!=", FilterOp::NotEquals),
+        ("<>", FilterOp::NotEquals),
+        ("=", FilterOp::Equals),
+        (">", FilterOp::Greater),
+        ("<", FilterOp::Less),
+    ];
+    for (prefix, op) in OPS {
+        if let Some(rest) = t.strip_prefix(prefix) {
+            return Some(ClientFilter::on(column, op, rest.trim()));
+        }
+    }
+    Some(ClientFilter::on(column, FilterOp::Contains, t))
+}
+
 /// What a server-side sort / filter would ask the core for: column names, never values from
 /// other rows. The core turns it into `ORDER BY` / `WHERE` with the session dialect and bound
 /// values (P5-A core part).
@@ -676,6 +716,35 @@ mod tests {
             &m,
         );
         assert!(!w.is_active());
+    }
+
+    #[test]
+    fn filter_text_is_parsed() {
+        assert_eq!(parse_filter_text("  ", Some(0)), None);
+        assert_eq!(
+            parse_filter_text(">= 10", Some(1)),
+            Some(ClientFilter::on(1, FilterOp::GreaterOrEqual, "10"))
+        );
+        assert_eq!(
+            parse_filter_text("<>x", Some(1)),
+            Some(ClientFilter::on(1, FilterOp::NotEquals, "x"))
+        );
+        assert_eq!(
+            parse_filter_text("IS NOT NULL", Some(0)),
+            Some(ClientFilter::on(0, FilterOp::IsNotNull, ""))
+        );
+        assert_eq!(
+            parse_filter_text("\\>5", Some(0)),
+            Some(ClientFilter::on(0, FilterOp::Contains, ">5"))
+        );
+        assert_eq!(
+            parse_filter_text("abc", Some(0)),
+            Some(ClientFilter::on(0, FilterOp::Contains, "abc"))
+        );
+        assert_eq!(
+            parse_filter_text("> 3", None),
+            Some(ClientFilter::anywhere("> 3"))
+        );
     }
 
     #[test]
