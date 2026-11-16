@@ -323,6 +323,11 @@ impl PgSession {
             Err(DriverError::ReadOnly(_)) => true,
             _ => false,
         };
+        // Both checks, ANDed on purpose (security review L3): neither alone is trusted. The
+        // settings can claim a read-only user that may write (QuestDB 10.2: a read-only user
+        // enabled by `reload_config()` rather than at startup logs in with write access), and
+        // a permission error alone does not say the whole session is read-only. Tested on
+        // open-source QuestDB only (QuestDB Enterprise has its own access control).
         if engine::questdb_settings_read_only(&settings, &user) && denied {
             self.link.shared.read_only.store(true, Ordering::SeqCst);
             Ok(())
