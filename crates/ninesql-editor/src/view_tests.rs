@@ -381,3 +381,38 @@ fn loaded_scripts_are_sanitized(cx: &mut TestAppContext) {
     assert_eq!(removed, 2);
     assert_eq!(text(&view, vcx), "a\nb");
 }
+
+#[gpui::test]
+fn transform_formats_the_selection_or_the_document(cx: &mut TestAppContext) {
+    let (view, _, vcx) = open(cx);
+    set_text(&view, vcx, "select 1; select 2", 0);
+    let changed = view.update_in(vcx, |v, window, cx| {
+        v.transform_selection_or_all(str::to_uppercase, window, cx)
+    });
+    assert!(changed);
+    assert_eq!(text(&view, vcx), "SELECT 1; SELECT 2");
+    // Only the selection when there is one; the output is sanitized.
+    view.update_in(vcx, |v, _, cx| {
+        v.editor()
+            .update(cx, |s, cx| s.set_selected_range(0..8, cx));
+    });
+    view.update_in(vcx, |v, window, cx| {
+        v.transform_selection_or_all(|_| "select\u{0}1".to_owned(), window, cx)
+    });
+    assert_eq!(text(&view, vcx), "select1; SELECT 2");
+    let unchanged = view.update_in(vcx, |v, window, cx| {
+        v.transform_selection_or_all(str::to_owned, window, cx)
+    });
+    assert!(!unchanged);
+}
+
+#[gpui::test]
+fn insert_text_places_the_caret(cx: &mut TestAppContext) {
+    let (view, _, vcx) = open(cx);
+    set_text(&view, vcx, "-- x\n", 5);
+    view.update_in(vcx, |v, window, cx| {
+        v.insert_text("SELECT * FROM t WHERE ", Some(7), window, cx);
+    });
+    assert_eq!(text(&view, vcx), "-- x\nSELECT * FROM t WHERE ");
+    assert_eq!(selected(&view, vcx), 12..12);
+}

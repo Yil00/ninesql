@@ -817,6 +817,19 @@ pub fn detail_text(details: &ObjectDetails) -> String {
             if let Some(m) = &ix.method {
                 parts.push(display_name(m));
             }
+            // P5-B flags: a partial unique index must not look like a plain unique one.
+            if ix.partial || ix.predicate.is_some() {
+                parts.push("partial".to_owned());
+            }
+            if !ix.valid {
+                parts.push("invalid".to_owned());
+            }
+            if ix.deferrable {
+                parts.push("deferrable".to_owned());
+            }
+            if !ix.nulls_distinct {
+                parts.push("NULLS NOT DISTINCT".to_owned());
+            }
             if let Some(p) = &ix.predicate {
                 parts.push(format!("WHERE {}", display_name(p)));
             }
@@ -1012,9 +1025,35 @@ mod tests {
         ix.columns = vec!["lower(email)".into()];
         ix.unique = true;
         ix.method = Some("btree".into());
+        ix.valid = true;
         assert_eq!(
             detail_text(&ObjectDetails::Index(ix)),
             "unique · (lower(email)) · btree"
+        );
+    }
+
+    #[test]
+    fn index_flags_are_shown() {
+        // A SQLite partial unique index: no predicate text, but flagged partial.
+        let mut ix = IndexInfo::default();
+        ix.columns = vec!["email".into()];
+        ix.unique = true;
+        ix.partial = true;
+        ix.valid = true;
+        assert_eq!(
+            detail_text(&ObjectDetails::Index(ix)),
+            "unique · (email) · partial"
+        );
+        let mut ix = IndexInfo::default();
+        ix.columns = vec!["a".into()];
+        ix.unique = true;
+        ix.valid = false;
+        ix.deferrable = true;
+        ix.nulls_distinct = false;
+        ix.predicate = Some("a > 0".into());
+        assert_eq!(
+            detail_text(&ObjectDetails::Index(ix)),
+            "unique · (a) · partial · invalid · deferrable · NULLS NOT DISTINCT · WHERE a > 0"
         );
     }
 

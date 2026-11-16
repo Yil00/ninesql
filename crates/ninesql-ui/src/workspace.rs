@@ -28,6 +28,7 @@ use crate::actions::{
     GenerateSelectSql, GenerateUpdateSql, LoadMoreObjects, OpenObjectEditor, RefreshNavigatorNode,
     ShowObjectDdl,
 };
+use crate::actions::{ExportResults, ExportTable, FormatSql, ImportCsv, InsertSnippet};
 use crate::appearance;
 use crate::browse::generate::{KeySource, Template, TemplateInput, names_survive_editor, template};
 use crate::browse::object_editor::{ObjectEditor, ObjectEditorEvent};
@@ -1214,6 +1215,16 @@ impl Workspace {
             self.show_selected_ddl(window, cx);
         } else if any.is::<CopyObjectDdl>() {
             self.copy_object_ddl(window, cx);
+        } else if any.is::<FormatSql>() {
+            self.format_sql(window, cx);
+        } else if any.is::<InsertSnippet>() {
+            self.insert_snippet(window, cx);
+        } else if any.is::<ExportResults>() {
+            self.export_results(window, cx);
+        } else if any.is::<ExportTable>() {
+            self.export_table(window, cx);
+        } else if any.is::<ImportCsv>() {
+            self.import_csv(window, cx);
         } else if any.is::<CloseWindow>() {
             window.remove_window();
         } else {
@@ -2043,6 +2054,202 @@ impl Workspace {
     }
 
     /// "Copy DDL": the active object editor's DDL, else the selected object's.
+    /// "Format SQL" in the active SQL editor.
+    pub fn format_sql(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(tab) = self.active_editor().cloned() else {
+            return Self::notify("Open a SQL editor first.", window, cx);
+        };
+        tab.update(cx, |t, cx| t.format_sql(window, cx));
+    }
+
+    /// "Insert snippet": reads the project's snippets off the UI thread, then the picker.
+    pub fn insert_snippet(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(tab) = self.active_editor().cloned() else {
+            return Self::notify("Open a SQL editor first.", window, cx);
+        };
+        let Some(paths) = self.hub.read(cx).project_paths() else {
+            return Self::notify(
+                "No project is open: snippets are kept per project.",
+                window,
+                cx,
+            );
+        };
+        let engine = tab
+            .read(cx)
+            .session()
+            .map(|s| s.info().capabilities.engine.as_str().to_owned());
+        let loaded = cx.background_spawn(async move { ninesql_core::SnippetStore::load(&paths) });
+        cx.spawn_in(window, async move |_, cx| {
+            let result = loaded.await;
+            let _ = cx.update(|window, cx| match result {
+                Ok((store, _dropped)) => {
+                    let list: Vec<ninesql_core::Snippet> =
+                        store.list(engine.as_deref()).into_iter().cloned().collect();
+                    let tab = tab.clone();
+                    let on_pick: crate::snippets::OnPick = Rc::new(move |snippet, window, cx| {
+                        let tab = tab.clone();
+                        let on_expand: crate::snippets::OnExpand =
+                            Rc::new(move |expansion, window, cx| {
+                                tab.update(cx, |t, cx| {
+                                    t.insert_snippet_text(
+                                        &expansion.text,
+                                        expansion.cursor,
+                                        window,
+                                        cx,
+                                    );
+                                });
+                            });
+                        crate::snippets::open_placeholder_prompt(snippet, on_expand, window, cx);
+                    });
+                    crate::snippets::open_snippet_picker(list, on_pick, window, cx);
+                }
+                Err(e) => Self::notify(
+                    format!(
+                        "The snippets could not be read: {}",
+                        crate::browse::display_message(&e.to_string())
+                    ),
+                    window,
+                    cx,
+                ),
+            });
+        })
+        .detach();
+    }
+
+    /// "Export results…": the active result's statement, run again into a file.
+    pub fn export_results(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(tab) = self.active_editor().cloned() else {
+            return Self::notify("Open a SQL editor and run a query first.", window, cx);
+        };
+        let (session, text) = {
+            let t = tab.read(cx);
+            (t.session().cloned(), t.export_statement(cx))
+        };
+        let Some(session) = session else {
+            return Self::notify("The editor has no open connection.", window, cx);
+        };
+        let text = match text {
+            Ok(t) => t,
+            Err(why) => return Self::notify(why, window, cx),
+        };
+        let Some(transfer) = self.hub.read(cx).transfer() else {
+            return Self::notify("The driver runtime is not running.", window, cx);
+        };
+        if let Some(why) = crate::transfer::session_problem(&session, false) {
+            return Self::notify(why, window, cx);
+        }
+        crate::transfer::export::open_export_dialog(
+            session,
+            transfer,
+            crate::transfer::export::ExportTarget::Statement { text },
+            window,
+            cx,
+        );
+    }
+
+    /// The open session and the transfer service for a navigator table, or a notification.
+    fn transfer_target(
+        &self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Option<(
+        ConnectionId,
+        ObjectPath,
+        ninesql_core::SessionHandle,
+        ninesql_core::TransferService,
+    )> {
+        let Some((connection, path, _)) = self.target_object(cx) else {
+            Self::notify("Select a table in the navigator first.", window, cx);
+            return None;
+        };
+        if !path.kind().is_some_and(is_table_like) {
+            Self::notify("Select a table or a view in the navigator.", window, cx);
+            return None;
+        }
+        let hub = self.hub.read(cx);
+        let Some(session) = hub.sessions(connection).first().cloned() else {
+            Self::notify("Connect first.", window, cx);
+            return None;
+        };
+        let Some(transfer) = hub.transfer() else {
+            Self::notify("The driver runtime is not running.", window, cx);
+            return None;
+        };
+        Some((connection, path, session, transfer))
+    }
+
+    /// "Export table…" on the navigator's table.
+    pub fn export_table(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some((_, path, session, transfer)) = self.transfer_target(window, cx) else {
+            return;
+        };
+        if let Some(why) = crate::transfer::session_problem(&session, false) {
+            return Self::notify(why, window, cx);
+        }
+        let parts = crate::transfer::table_parts(&path);
+        crate::transfer::export::open_export_dialog(
+            session,
+            transfer,
+            crate::transfer::export::ExportTarget::Table { parts },
+            window,
+            cx,
+        );
+    }
+
+    /// "Import CSV…" into the navigator's table: its columns are read from the metadata cache
+    /// (loaded when needed), then the dialog opens.
+    pub fn import_csv(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some((connection, path, session, transfer)) = self.transfer_target(window, cx) else {
+            return;
+        };
+        if path.kind() != Some(ObjectKind::Table) {
+            return Self::notify("Rows can be imported into a table only.", window, cx);
+        }
+        if let Some(why) = crate::transfer::session_problem(&session, true) {
+            return Self::notify(why, window, cx);
+        }
+        let Some(service) = self.hub.read(cx).metadata() else {
+            return;
+        };
+        let columns = service.children(connection, NodeKey::new(path.clone(), ObjectKind::Column));
+        cx.spawn_in(window, async move |_, cx| {
+            let columns = columns.await;
+            let _ = cx.update(|window, cx| {
+                let targets = match columns {
+                    Ok(node) if node.complete && node.hidden_by_filter == 0 => {
+                        crate::transfer::import::targets_from(&node.items)
+                    }
+                    Ok(_) => {
+                        return Self::notify(
+                            "The table's columns are not all listed (a navigator filter hides some, or the list is incomplete): the import needs every column.",
+                            window,
+                            cx,
+                        );
+                    }
+                    Err(e) => {
+                        return Self::notify(
+                            format!(
+                                "The table's columns could not be read: {}",
+                                crate::browse::display_message(&e.to_string())
+                            ),
+                            window,
+                            cx,
+                        );
+                    }
+                };
+                crate::transfer::import::open_import_dialog(
+                    session,
+                    transfer,
+                    crate::transfer::table_parts(&path),
+                    targets,
+                    window,
+                    cx,
+                );
+            });
+        })
+        .detach();
+    }
+
     pub fn copy_object_ddl(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if !self.navigator.focus_handle(cx).contains_focused(window, cx)
             && let Some(editor) = self.active_object_editor().cloned()

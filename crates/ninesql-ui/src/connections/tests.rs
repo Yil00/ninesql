@@ -152,6 +152,29 @@ pub(crate) fn mock_hub_with_metadata(
     init(cx, config)
 }
 
+/// [`mock_hub`] with a transfer service over the same session manager (P5-C), NineSQL's own
+/// storage under `dir/ninesql`.
+pub(crate) fn mock_hub_with_transfer(
+    cx: &mut TestAppContext,
+    dir: &std::path::Path,
+    connections: Vec<Connection>,
+) -> Entity<ConnectionHub> {
+    let manager = mock_manager(dir);
+    let root = dir.join("ninesql");
+    let paths = ninesql_core::storage::Paths::new(&ninesql_core::storage::XdgDirs {
+        config_home: root.join("config"),
+        data_home: root.join("data"),
+        state_home: root.join("state"),
+    });
+    let mut config = HubConfig::empty();
+    config.registry = manager.registry().clone();
+    config.transfer = Some(ninesql_core::TransferService::new(manager.clone(), &paths));
+    config.manager = Some(manager);
+    config.connections =
+        ninesql_core::Connections::from_vec(connections).unwrap_or_else(|e| panic!("{e}"));
+    init(cx, config)
+}
+
 fn shipped_hub(cx: &mut TestAppContext) -> Entity<ConnectionHub> {
     let mut config = HubConfig::empty();
     config.registry = shipped();

@@ -135,6 +135,16 @@ pub fn idle_close_message(after: std::time::Duration, in_transaction: bool) -> S
     text
 }
 
+/// The text of the editor item a core statement span belongs to, for "Export results…";
+/// `None` when it had bind values (they are not kept after the run) or no item matches.
+fn statement_text(request: &ExecutionRequest, span: &Range<usize>) -> Option<String> {
+    let item = request
+        .items
+        .iter()
+        .find(|i| i.span.start <= span.start && span.start < i.span.end.max(i.span.start + 1))?;
+    item.params.is_empty().then(|| item.text.clone())
+}
+
 /// A statement waiting for the user's confirmation.
 #[derive(Clone)]
 struct PendingConfirmation {
@@ -215,6 +225,9 @@ pub struct SqlEditorTab {
     budget: GridBudget,
     /// Where [`ConfirmationGuard`]s report their dialog gone.
     confirmation_dropped: Sender<u64>,
+    /// Text of each grid statement of the last run, for "Export results…" (`None`: it had bind
+    /// values, which are not kept after the run).
+    statement_texts: HashMap<u32, Option<String>>,
     /// The default schema completion resolves unqualified names in, once known.
     default_schema: Rc<RefCell<Option<String>>>,
     /// Resolves the default schema and warms it; dropped (cancelled) on rebind.
@@ -250,9 +263,11 @@ impl SqlEditorTab {
             editor
         });
         let source = Rc::new(RunSource::new(current.clone()));
+        let dialect = session.as_ref().map(SessionHandle::dialect);
         let results = cx.new(|cx| {
             let mut view = ResultsView::new(budget, cx);
             view.set_source(source);
+            view.set_dialect(dialect);
             view
         });
         let requests = cx.spawn_in(window, async move |this, cx| {
@@ -296,6 +311,7 @@ impl SqlEditorTab {
             message: None,
             budget,
             confirmation_dropped: dropped_tx,
+            statement_texts: HashMap::new(),
             default_schema,
             warming: None,
             _tasks: vec![requests, dropped],
@@ -459,6 +475,8 @@ impl SqlEditorTab {
             completion_provider(&self.hub, session.as_ref(), &self.default_schema, cx),
         );
         self.transaction = session.as_ref().map(SessionHandle::transaction_state);
+        let dialect = session.as_ref().map(SessionHandle::dialect);
+        self.results.update(cx, |r, _| r.set_dialect(dialect));
         self.session = session;
         self.message = None;
         self.editor.update(cx, |e, cx| {
@@ -469,6 +487,61 @@ impl SqlEditorTab {
         self.warm_metadata(cx);
         cx.notify();
         true
+    }
+
+    /// The statement of the active result, for "Export results…".
+    ///
+    /// # Errors
+    /// A user-facing reason: no result, a run going on, bind values.
+    pub fn export_statement(&self, cx: &App) -> Result<String, &'static str> {
+        if self.is_running() {
+            return Err("Wait for the run to end before exporting its results.");
+        }
+        let statement = self
+            .results
+            .read(cx)
+            .active_statement()
+            .ok_or("Run a query first: Export results exports the active result.")?;
+        match self.statement_texts.get(&statement) {
+            Some(Some(text)) => Ok(text.clone()),
+            Some(None) => Err(
+                "This statement had bind parameters, which are not kept after the run: export it with the values written in the statement.",
+            ),
+            None => Err("The statement of this result is not known any more: run it again."),
+        }
+    }
+
+    /// "Format SQL": formats the selection, or the whole script, with the session's dialect
+    /// (ANSI without a session). Refused during a run. Returns whether the text changed.
+    pub fn format_sql(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        if self.is_running() {
+            self.say("Wait for the run to end before formatting.", true, cx);
+            return false;
+        }
+        let dialect: Arc<dyn ninesql_core::driver_api::Dialect> = match self.session() {
+            Some(s) => s.dialect(),
+            None => Arc::new(AnsiDialect),
+        };
+        let options = ninesql_core::FormatOptions::default();
+        self.editor.update(cx, |e, cx| {
+            e.transform_selection_or_all(
+                |text| ninesql_core::format_sql(dialect.as_ref(), text, &options),
+                window,
+                cx,
+            )
+        })
+    }
+
+    /// Inserts a snippet expansion at the cursor (in place of the selection).
+    pub fn insert_snippet_text(
+        &mut self,
+        text: &str,
+        cursor: Option<usize>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.editor
+            .update(cx, |e, cx| e.insert_text(text, cursor, window, cx));
     }
 
     /// Whether closing this tab must ask first: its session has an open transaction and the
@@ -547,6 +620,7 @@ impl SqlEditorTab {
                 Err(why) => return refuse(self, why, cx),
             };
         self.message = None;
+        self.statement_texts.clear();
         self.grid(ExecutionEvent::Started, window, cx);
         self.run = Some(ActiveRun {
             session,
@@ -645,6 +719,8 @@ impl SqlEditorTab {
         let n = |index: usize| base.saturating_add(u32::try_from(index).unwrap_or(u32::MAX));
         match event {
             RunEvent::StatementStarted { index, span, .. } => {
+                let text = statement_text(&active.request, &span);
+                self.statement_texts.insert(n(index), text);
                 active.spans.insert(index, span);
                 self.grid(
                     ExecutionEvent::StatementStarted {

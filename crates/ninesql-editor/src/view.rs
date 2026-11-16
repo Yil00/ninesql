@@ -160,6 +160,70 @@ impl SqlEditor {
         fixes.len()
     }
 
+    /// Replaces the selection with `f(selected text)`, or the whole document with `f(text)`
+    /// when nothing is selected ("Format SQL"). The result is sanitized like typed text and
+    /// goes through the input's undo history. Returns `false` when `f` changed nothing.
+    pub fn transform_selection_or_all(
+        &mut self,
+        f: impl FnOnce(&str) -> String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let (text, selection) = {
+            let s = self.editor.read(cx);
+            (s.value().to_string(), s.selected_range())
+        };
+        let range = if selection.is_empty() {
+            0..text.len()
+        } else {
+            selection
+        };
+        let Some(source) = text.get(range.clone()) else {
+            return false;
+        };
+        let out = f(source);
+        if out == source {
+            return false;
+        }
+        let clean = hygiene::apply_fixes(&out, &hygiene::fixes(&out));
+        let end = range.start + clean.len();
+        self.editor.update(cx, |s, cx| {
+            s.set_selected_range(range.clone(), cx);
+            s.replace(clean.clone(), window, cx);
+            s.set_selected_range(range.start..end, cx);
+        });
+        let full = self.text(cx);
+        self.refresh_bidi(&full, cx);
+        cx.notify();
+        true
+    }
+
+    /// Inserts `text` in place of the selection (a snippet expansion), sanitized like typed
+    /// text, and puts the caret at byte `cursor` of the inserted text (its end without one).
+    pub fn insert_text(
+        &mut self,
+        text: &str,
+        cursor: Option<usize>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let fixes = hygiene::fixes(text);
+        let clean = hygiene::apply_fixes(text, &fixes);
+        // A sanitized text may be shorter: keep the caret inside it.
+        let caret = cursor
+            .filter(|_| fixes.is_empty())
+            .unwrap_or(clean.len())
+            .min(clean.len());
+        let start = self.editor.read(cx).selected_range().start;
+        self.editor.update(cx, |s, cx| {
+            s.replace(clean.clone(), window, cx);
+            s.set_selected_range(start + caret..start + caret, cx);
+        });
+        let full = self.text(cx);
+        self.refresh_bidi(&full, cx);
+        cx.notify();
+    }
+
     /// Replaces the setup (the editor's connection changed): splitting, parameter style,
     /// completion keywords, quoting and metadata follow the new dialect. The text is kept.
     pub fn set_setup(&mut self, setup: EditorSetup, cx: &mut Context<Self>) {

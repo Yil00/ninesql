@@ -745,6 +745,15 @@ impl ResultsView {
         window.focus(&handle, cx);
     }
 
+    /// The statement number of the active result tab ("Export results…" re-runs it).
+    #[must_use]
+    pub fn active_statement(&self) -> Option<u32> {
+        match self.results.tabs().get(self.active_index()?)? {
+            ResultTab::Table(m) => Some(m.borrow().statement()),
+            ResultTab::Documents { .. } => None,
+        }
+    }
+
     fn active_index(&self) -> Option<usize> {
         match self.active {
             ActivePane::Result(ix) => Some(ix),

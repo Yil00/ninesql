@@ -30,6 +30,8 @@ pub mod palette;
 pub mod persist;
 pub mod services;
 pub mod settings;
+pub mod snippets;
+pub mod transfer;
 pub mod workspace;
 
 #[cfg(test)]

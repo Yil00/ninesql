@@ -105,6 +105,16 @@ actions!(
         ShowObjectDdl,
         /// Copy the DDL of the active object editor (or of the selected object).
         CopyObjectDdl,
+        /// Format the selection (or the whole script) of the active SQL editor.
+        FormatSql,
+        /// Insert a snippet of the project in the active SQL editor (asks for its placeholders).
+        InsertSnippet,
+        /// Export the rows of the active result to a file (runs its statement again).
+        ExportResults,
+        /// Export every row of the selected table to a file.
+        ExportTable,
+        /// Import a CSV file into the selected table.
+        ImportCsv,
     ]
 );
 
@@ -554,6 +564,50 @@ pub const ACTIONS: &[ActionSpec] = &[
         Workspace,
         ["ctrl-k ctrl-shift-c"],
         keywords = ["create", "definition", "clipboard"]
+    ),
+    spec!(
+        FormatSql,
+        "Format SQL",
+        "SQL editor",
+        Workspace,
+        ["ctrl-shift-f"],
+        keywords = ["beautify", "pretty", "indent", "keyword case", "layout"]
+    ),
+    spec!(
+        InsertSnippet,
+        "Insert snippet",
+        "SQL editor",
+        Workspace,
+        ["ctrl-k ctrl-j"],
+        keywords = ["template", "snippet", "placeholder", "expand"]
+    ),
+    spec!(
+        ExportResults,
+        "Export results…",
+        "Data",
+        Workspace,
+        ["ctrl-alt-e"],
+        keywords = [
+            "csv", "tsv", "json", "markdown", "html", "insert", "file", "save", "transfer"
+        ]
+    ),
+    spec!(
+        ExportTable,
+        "Export table…",
+        "Data",
+        Workspace,
+        ["alt-g x"],
+        keywords = [
+            "csv", "tsv", "json", "markdown", "html", "insert", "file", "dump", "transfer"
+        ]
+    ),
+    spec!(
+        ImportCsv,
+        "Import CSV…",
+        "Data",
+        Workspace,
+        ["alt-g m"],
+        keywords = ["csv", "load", "file", "insert", "mapping", "transfer"]
     ),
 ];
 
