@@ -386,8 +386,12 @@ pub struct IndexInfo {
     pub primary: bool,
     /// Access method as the engine spells it (`btree`, `hash`, `gin`, `BTREE`, `FULLTEXT`…).
     pub method: Option<String>,
-    /// Predicate of a partial index (`WHERE` text without the keyword).
+    /// Predicate of a partial index (`WHERE` text without the keyword), when the driver reads
+    /// its text.
     pub predicate: Option<String>,
+    /// A partial index (it has a predicate), whether or not the driver reads the predicate's
+    /// text ([`predicate`](Self::predicate) may be `None`, as on SQLite). Default `false`.
+    pub partial: bool,
     /// The index is valid and ready: PostgreSQL `indisvalid` and `indisready` (an index left by a
     /// failed `CREATE INDEX CONCURRENTLY` is not). Default `false`.
     pub valid: bool,
@@ -411,6 +415,7 @@ impl Default for IndexInfo {
             primary: false,
             method: None,
             predicate: None,
+            partial: false,
             valid: false,
             deferrable: false,
             nulls_distinct: true,

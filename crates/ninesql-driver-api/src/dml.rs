@@ -38,7 +38,7 @@
 //! `NO_BACKSLASH_ESCAPES` and `ANSI_QUOTES`, PostgreSQL `standard_conforming_strings`) and,
 //! for MySQL, in every client character set: a string holding a backslash or a hidden
 //! character is written in a form that has no backslash escape to misread (MySQL
-//! `CONVERT(X'…' USING utf8mb4)`, PostgreSQL `E'…'`, `E'\\x…'::bytea`). The rules a preview
+//! `CONCAT(_utf8mb4 X'…')`, PostgreSQL `E'…'`, `E'\\x…'::bytea`). The rules a preview
 //! was rendered with are still recorded in [`DmlStatement::lexical_rules`]. The bound form
 //! does not depend on them.
 //!
@@ -1246,7 +1246,7 @@ impl KeyCandidate {
             primary: index.primary,
             not_null: not_null || index.primary,
             nulls_distinct: index.nulls_distinct,
-            partial: index.predicate.is_some(),
+            partial: index.partial || index.predicate.is_some(),
             expression: index.has_expression(),
             valid: index.valid,
             deferrable: index.deferrable,
@@ -1600,7 +1600,7 @@ mod tests {
         let nullable = KeyCandidate::from_index(&index(&["n"], true, false), false).unwrap();
         assert!(KeyCandidate::from_index(&index(&["x"], false, false), true).is_none());
         let mut partial = index(&["p"], true, false);
-        partial.predicate = Some("p > 0".into());
+        partial.partial = true;
         let partial = KeyCandidate::from_index(&partial, true).unwrap();
         let mut invalid = index(&["v"], true, false);
         invalid.valid = false;

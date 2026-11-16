@@ -6,7 +6,7 @@
 //! `'…'` with `'` doubled. Every literal means the same in every `sql_mode` and client
 //! character set, so a preview or an export rendered in one session can be replayed in another
 //! (security review H1): a string holding a backslash, a NUL, a control, invisible or
-//! bidirectional character is written `CONVERT(X'…' USING utf8mb4)`, exactly as the bound form.
+//! bidirectional character is written `CONCAT(_utf8mb4 X'…')` (coercible: the column's collation applies), exactly as the bound form.
 //! `ANSI_QUOTES` does not matter: identifiers are always backquoted and strings single-quoted.
 
 use ninesql_driver_api::Param;
@@ -72,14 +72,14 @@ pub(crate) fn check_identifier(name: &str) -> Result<(), DmlError> {
 
 /// The string literal of `s`, with the same meaning in every `sql_mode` and client character
 /// set (security review H1): a string holding a backslash, a NUL or a character
-/// [`needs_escape`] flags is written `CONVERT(X'…' USING utf8mb4)` (the bound form); any other
+/// [`needs_escape`] flags is written `CONCAT(_utf8mb4 X'…')` (coercible: the column's collation applies) (the bound form); any other
 /// string is `'…'` with `'` doubled, which reads the same with and without
 /// `NO_BACKSLASH_ESCAPES` and holds no byte a multi-byte client character set (GBK, SJIS, Big5,
 /// CP932) could pair with a quote.
 pub(crate) fn string_literal(s: &str) -> String {
     let hex = s.chars().any(|c| c == '\\' || c == '\0' || needs_escape(c));
     if hex {
-        return format!("CONVERT(X'{}' USING utf8mb4)", hex_lower(s.as_bytes()));
+        return format!("CONCAT(_utf8mb4 X'{}')", hex_lower(s.as_bytes()));
     }
     format!("'{}'", s.replace('\'', "''"))
 }
@@ -113,16 +113,13 @@ mod tests {
     #[test]
     fn strings_are_mode_independent() {
         assert_eq!(string_literal("it's"), "'it''s'");
-        assert_eq!(string_literal("a\\b"), "CONVERT(X'615c62' USING utf8mb4)");
+        assert_eq!(string_literal("a\\b"), "CONCAT(_utf8mb4 X'615c62')");
         assert_eq!(
             string_literal("\\'' -- '"),
-            "CONVERT(X'5c2727202d2d2027' USING utf8mb4)"
+            "CONCAT(_utf8mb4 X'5c2727202d2d2027')"
         );
-        assert_eq!(string_literal("a\nb"), "CONVERT(X'610a62' USING utf8mb4)");
-        assert_eq!(
-            string_literal("\u{202e}"),
-            "CONVERT(X'e280ae' USING utf8mb4)"
-        );
+        assert_eq!(string_literal("a\nb"), "CONCAT(_utf8mb4 X'610a62')");
+        assert_eq!(string_literal("\u{202e}"), "CONCAT(_utf8mb4 X'e280ae')");
         assert_eq!(string_literal("é"), "'é'");
         assert_eq!(string_literal(""), "''");
     }

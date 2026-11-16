@@ -197,10 +197,10 @@ const FOREIGN_KEYS_SQL: &str = concat!(
 
 /// Indexes of relation `$4`: key parts are column names, or expression text (hex-encoded).
 ///
-/// An index that is not valid and ready (`indisvalid`, `indisready`: a failed `CREATE INDEX
-/// CONCURRENTLY`) or whose uniqueness is deferred (`indimmediate = false`) is reported as **not
-/// unique** (P5-B review M1), with its flags in columns 7 to 9; column 10 holds one `t` / `f`
-/// per key part (`t` for an expression, `indkey = 0`). `indnullsnotdistinct` (PostgreSQL 15+) is
+/// `unique` is `indisunique`; whether the index is valid and ready (`indisvalid`, `indisready`:
+/// not after a failed `CREATE INDEX CONCURRENTLY`) and whether its uniqueness is deferred
+/// (`indimmediate = false`) are columns 7 and 8 (P5-B review M1: key selection refuses both);
+/// column 10 holds one `t` / `f` per key part (`t` for an expression, `indkey = 0`). `indnullsnotdistinct` (PostgreSQL 15+) is
 /// read through `to_jsonb` so the statement also runs on servers without the column.
 const INDEXES_SQL: &str = concat!(
     "SELECT ic.relname::pg_catalog.text, ",
@@ -213,7 +213,7 @@ const INDEXES_SQL: &str = concat!(
     "ELSE pg_catalog.pg_get_indexdef(i.indexrelid, k.ord, true) END, ",
     "'UTF8'::pg_catalog.name), 'hex'::pg_catalog.text), ','::pg_catalog.text ORDER BY k.ord) ",
     "FROM pg_catalog.generate_series(1, i.indnkeyatts::pg_catalog.int4) AS k(ord)), ",
-    "(i.indisunique AND i.indisvalid AND i.indisready AND i.indimmediate)::pg_catalog.text, ",
+    "i.indisunique::pg_catalog.text, ",
     "i.indisprimary::pg_catalog.text, am.amname::pg_catalog.text, ",
     "pg_catalog.pg_get_expr(i.indpred, i.indrelid, true), ",
     "(i.indisvalid AND i.indisready)::pg_catalog.text, ",
@@ -1007,6 +1007,7 @@ impl Metadata for PgMetadata {
                     i.primary = truthy(row, 4);
                     i.method = cell(row, 5);
                     i.predicate = cell(row, 6);
+                    i.partial = i.predicate.is_some();
                     i.valid = truthy(row, 7);
                     i.deferrable = truthy(row, 8);
                     i.nulls_distinct = !truthy(row, 9);

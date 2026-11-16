@@ -1497,14 +1497,12 @@ impl Worker {
                         info.unique = row.get(1) == Some(&Val::Int(1));
                         info.primary = text(row.get(2)) == "pk";
                         // SQLite indexes are always valid and checked at once; `NULL`s are
-                        // distinct. A partial index's predicate text is not read here: it is
-                        // reported as `(partial)` so that it never counts as a row key.
+                        // distinct. A partial index is flagged; its predicate text is not read
+                        // (`predicate` stays `None`).
                         info.valid = true;
                         info.deferrable = false;
                         info.nulls_distinct = true;
-                        if row.get(3) == Some(&Val::Int(1)) {
-                            info.predicate = Some("(partial)".to_owned());
-                        }
+                        info.partial = row.get(3) == Some(&Val::Int(1));
                         // Key parts; SQLite does not report the text of an expression part.
                         let parts = self.query_internal(
                             "SELECT name, cid FROM pragma_index_xinfo(?1, ?2) \

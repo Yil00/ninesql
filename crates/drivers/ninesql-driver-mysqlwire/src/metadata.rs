@@ -537,6 +537,8 @@ impl Metadata for MyMetadata {
                     i.valid = true;
                     i.deferrable = false;
                     i.nulls_distinct = true;
+                    // No partial indexes in the MySQL family.
+                    i.partial = false;
                     ObjectDetails::Index(i)
                 }
                 ObjectKind::Trigger => {

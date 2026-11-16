@@ -786,9 +786,9 @@ mod tests {
         p.insert("lockWaitTimeout".into(), PropertyValue::Plain("5".into()));
         let out = accepted_properties(&EngineId::MYSQL, &p).unwrap();
         assert!(out.contains(&"SET SESSION lock_wait_timeout = 5".to_owned()));
-        assert!(out.contains(
-            &"SET SESSION time_zone = CONVERT(X'2B30303A3030' USING utf8mb4)".to_owned()
-        ));
+        assert!(
+            out.contains(&"SET SESSION time_zone = CONCAT(_utf8mb4 X'2B30303A3030')".to_owned())
+        );
         for (k, v) in [
             ("lock_wait_timeout", "5; DROP TABLE t"),
             ("useCompression", "secret-v"),

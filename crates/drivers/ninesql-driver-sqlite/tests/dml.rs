@@ -649,7 +649,7 @@ async fn index_flags_and_row_key() {
     assert!(a.valid && a.unique && a.expressions == vec![true], "{a:?}");
     let b = get("p5b_idx_b");
     assert!(
-        b.predicate.is_some() && b.expressions == vec![false],
+        b.partial && b.predicate.is_none() && b.expressions == vec![false],
         "{b:?}"
     );
     let cd = get("p5b_idx_cd");

@@ -938,9 +938,9 @@ async fn postgresql_row_key_from_index_flags() {
         other => panic!("{other:?}"),
     };
     let a = index("p5b_idx_a");
-    assert!(!a.valid && !a.unique, "{a:?}");
+    assert!(!a.valid && a.unique, "{a:?}");
     let b = index("p5b_idx_b");
-    assert!(b.valid && b.deferrable && !b.unique, "{b:?}");
+    assert!(b.valid && b.deferrable && b.unique, "{b:?}");
     let c = index("p5b_idx_c");
     assert!(
         c.unique && c.expressions == vec![true] && c.has_expression(),
@@ -948,7 +948,7 @@ async fn postgresql_row_key_from_index_flags() {
     );
     let d = index("p5b_idx_d");
     assert!(
-        d.unique && d.predicate.is_some() && d.expressions == vec![false],
+        d.unique && d.partial && d.predicate.is_some() && d.expressions == vec![false],
         "{d:?}"
     );
     let mut candidates: Vec<KeyCandidate> = Vec::new();

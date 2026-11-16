@@ -1068,3 +1068,100 @@ async fn index_flags_and_transactional_tables() {
         sql(s, "DROP TABLE IF EXISTS p5b_tx, p5b_notx").await;
     }
 }
+
+/// Key comparisons use the column's collation (P5-B re-review M-a): a `latin1` unique key
+/// holding `u` and `ü`, and an accent- and case-sensitive primary key holding `a` and `A`, each
+/// match exactly one row through the bound form and through the preview.
+#[tokio::test]
+async fn key_comparisons_use_the_column_collation() {
+    for engine in ENGINES {
+        let Some(dev) = dev(engine) else { continue };
+        let mut s = connect(&dev).await;
+        let s = s.as_mut();
+        let (latin1, cs) = match engine {
+            "mysql" => ("latin1_swedish_ci", "utf8mb4_0900_as_cs"),
+            "mariadb" => ("latin1_swedish_ci", "utf8mb4_uca1400_as_cs"),
+            _ => ("latin1_bin", "utf8mb4_0900_bin"),
+        };
+        sql(s, "DROP TABLE IF EXISTS p5b_coll1, p5b_coll2").await;
+        sql(
+            s,
+            &format!(
+                "CREATE TABLE p5b_coll1 (id INT PRIMARY KEY, \
+                 u VARCHAR(10) CHARACTER SET latin1 COLLATE {latin1} NOT NULL, v INT, UNIQUE KEY (u))"
+            ),
+        )
+        .await;
+        sql(
+            s,
+            &format!(
+                "CREATE TABLE p5b_coll2 (k VARCHAR(10) CHARACTER SET utf8mb4 COLLATE {cs} \
+                 PRIMARY KEY, v INT)"
+            ),
+        )
+        .await;
+        sql(
+            s,
+            "INSERT INTO p5b_coll1 VALUES (1, 'u', 0), (2, _utf8mb4 X'c3bc', 0)",
+        )
+        .await;
+        sql(
+            s,
+            "INSERT INTO p5b_coll2 VALUES ('a', 0), ('A', 0), ('á', 0)",
+        )
+        .await;
+        let d = s.dialect();
+        let caps = s.capabilities().editing;
+        let c1 = columns(s, "p5b_coll1").await;
+        let c2 = columns(s, "p5b_coll2").await;
+        for preview in [false, true] {
+            let n = i64::from(preview) + 1;
+            let st = dml::generate(
+                &*d,
+                &caps,
+                &DmlRequest::update(
+                    vec!["p5b_coll1".into()],
+                    KeyKind::Unique {
+                        nulls_distinct: true,
+                    },
+                    vec![ColumnValue::new(c1[1].clone(), Param::Text("u".into()))],
+                    vec![ColumnChange::new(
+                        c1[2].clone(),
+                        Param::Int(n - 1),
+                        Param::Int(n),
+                    )],
+                )
+                .with_concurrency(Concurrency::EditedColumns),
+            )
+            .unwrap();
+            let st2 = dml::generate(
+                &*d,
+                &caps,
+                &DmlRequest::update(
+                    vec!["p5b_coll2".into()],
+                    KeyKind::PrimaryKey,
+                    vec![ColumnValue::new(c2[0].clone(), Param::Text("a".into()))],
+                    vec![ColumnChange::new(
+                        c2[1].clone(),
+                        Param::Int(n - 1),
+                        Param::Int(n),
+                    )],
+                )
+                .with_concurrency(Concurrency::EditedColumns),
+            )
+            .unwrap();
+            if preview {
+                run_preview(s, &st).await;
+                run_preview(s, &st2).await;
+            } else {
+                run_dml(s, &st).await;
+                run_dml(s, &st2).await;
+            }
+        }
+        let other = sql(s, "SELECT COUNT(*) FROM p5b_coll1 WHERE id = 2 AND v = 0").await;
+        assert_eq!(count(&other), 1, "{engine}: the ü row changed");
+        let other = sql(s, "SELECT COUNT(*) FROM p5b_coll2 WHERE v = 0").await;
+        assert_eq!(count(&other), 2, "{engine}: another as_cs row changed");
+        sql(s, "DROP TABLE p5b_coll1, p5b_coll2").await;
+    }
+}
