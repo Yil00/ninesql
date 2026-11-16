@@ -18,8 +18,13 @@ use ninesql_storage::hygiene::is_secret_like_key;
 /// Which JDBC driver's property semantics apply, from the DBeaver driver and the engine.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Rules {
-    /// pgjdbc → `ninesql-driver-pgwire` (PostgreSQL, TimescaleDB, YugabyteDB, QuestDB).
+    /// pgjdbc → `ninesql-driver-pgwire` (PostgreSQL, TimescaleDB, YugabyteDB).
     PgJdbc,
+    /// pgjdbc → `ninesql-driver-pgwire` for QuestDB, which accepts no driver property
+    /// (QuestDB ignores PostgreSQL session settings): every property is dropped with a report
+    /// entry, but pgjdbc's semantics still apply to read them (URL precedence, `options` read
+    /// for its read-only and secret-like entries).
+    QuestDb,
     /// MySQL Connector/J → `ninesql-driver-mysqlwire` (MySQL, TiDB). `mariadb`: the server is
     /// MariaDB (`max_statement_time` instead of `max_execution_time`). `legacy`: DBeaver's
     /// `mysql5` driver (Connector/J 5.1), which has no `forceConnectionTimeZoneToSession`.
@@ -39,9 +44,10 @@ impl Rules {
         if *engine == EngineId::POSTGRESQL
             || *engine == EngineId::TIMESCALEDB
             || *engine == EngineId::YUGABYTEDB
-            || *engine == EngineId::QUESTDB
         {
             Self::PgJdbc
+        } else if *engine == EngineId::QUESTDB {
+            Self::QuestDb
         } else if *engine == EngineId::MYSQL || *engine == EngineId::TIDB {
             if mariadb_driver {
                 Self::MariaDbJ { mariadb: false }
@@ -67,9 +73,23 @@ impl Rules {
         }
     }
 
+    /// Why a property with no equivalent is dropped, for messages.
+    fn no_equivalent_message(self) -> String {
+        match self {
+            Self::QuestDb => "not imported: NineSQL's QuestDB driver accepts no driver property \
+                              (QuestDB ignores PostgreSQL session settings)"
+                .to_owned(),
+            _ => format!(
+                "not imported: no NineSQL equivalent (the NineSQL driver accepts {})",
+                self.accepted()
+            ),
+        }
+    }
+
     /// The NineSQL driver's accepted property names, for messages.
     fn accepted(self) -> &'static str {
         match self {
+            Self::QuestDb => "",
             Self::PgJdbc => {
                 "search_path, TimeZone, statement_timeout, lock_timeout, work_mem, \
                  client_min_messages"
@@ -95,12 +115,12 @@ impl Rules {
     /// sqlite-jdbc (`extractPragmasFromFilename` keeps a property already set) let the
     /// property win. For engines without a NineSQL driver the property wins.
     pub(crate) fn url_wins(self) -> bool {
-        matches!(self, Self::PgJdbc | Self::MariaDbJ { .. })
+        matches!(self, Self::PgJdbc | Self::QuestDb | Self::MariaDbJ { .. })
     }
 
     pub(crate) fn jdbc_driver(self) -> &'static str {
         match self {
-            Self::PgJdbc => "pgjdbc",
+            Self::PgJdbc | Self::QuestDb => "pgjdbc",
             Self::ConnectorJ { .. } => "MySQL Connector/J",
             Self::MariaDbJ { .. } => "MariaDB Connector/J",
             Self::SqliteJdbc => "sqlite-jdbc",
@@ -119,7 +139,7 @@ impl Rules {
                 MARIADB_TARGETS
             }
             Self::SqliteJdbc => SQLITE_TARGETS,
-            Self::Keep => &[],
+            Self::QuestDb | Self::Keep => &[],
         }
     }
 }
@@ -134,7 +154,7 @@ const PG_TARGETS: &[(&str, &str)] = &[
     ("clientminmessages", "client_min_messages"),
 ];
 
-/// mysqlwire's accepted properties for MySQL (and TiDB, which mysqlwire does not serve yet).
+/// mysqlwire's accepted properties for MySQL and TiDB.
 const MYSQL_TARGETS: &[(&str, &str)] = &[
     ("timezone", "time_zone"),
     ("lockwaittimeout", "lock_wait_timeout"),
@@ -237,7 +257,7 @@ fn is_plain_name(name: &str) -> bool {
 /// by one here and kept only when allowlisted.
 pub(crate) fn handles_reserved(rules: Rules, key: &str) -> bool {
     match rules {
-        Rules::PgJdbc => key.eq_ignore_ascii_case("options"),
+        Rules::PgJdbc | Rules::QuestDb => key.eq_ignore_ascii_case("options"),
         Rules::ConnectorJ { .. } | Rules::MariaDbJ { .. } => {
             key.eq_ignore_ascii_case("sessionVariables")
         }
@@ -273,6 +293,10 @@ pub(crate) fn map(rules: Rules, path: &str, key: &str, value: &str) -> Option<Ve
                 vec![no_equivalent(rules, path, key)]
             }
         }
+        // `options` is still read entry by entry (read-only intent, secret-like entries); every
+        // other entry and property is dropped.
+        Rules::QuestDb if key.eq_ignore_ascii_case("options") => pg_options(rules, path, value),
+        Rules::QuestDb => vec![no_equivalent(rules, path, key)],
         Rules::ConnectorJ { .. } | Rules::MariaDbJ { .. } => {
             // Connector/J 8 and later (`mysql8`, `tidb`): the time zone options below.
             let cj = matches!(rules, Rules::ConnectorJ { legacy: false, .. });
@@ -344,10 +368,7 @@ fn no_equivalent(rules: Rules, path: &str, key: &str) -> Action {
             rules.jdbc_driver()
         )
     } else {
-        format!(
-            "not imported: no NineSQL equivalent (the NineSQL driver accepts {})",
-            rules.accepted()
-        )
+        rules.no_equivalent_message()
     };
     Action::Drop {
         path: path.to_owned(),
@@ -525,7 +546,7 @@ fn pg_options(rules: Rules, path: &str, value: &str) -> Vec<Action> {
             // Read-only unless explicitly false (fail safe, I3).
             return Some(Embedded::ReadOnly(pg_bool(v) != Some(false)));
         }
-        let target = PG_TARGETS.iter().find(|(n, _)| *n == norm)?.1;
+        let target = rules.targets().iter().find(|(n, _)| *n == norm)?.1;
         if v.contains('\0') {
             return Some(Embedded::Invalid);
         }
@@ -746,10 +767,7 @@ fn embedded_settings(
             None => out.push(Action::Drop {
                 path: sub,
                 reason: Drop::NoEquivalent,
-                message: format!(
-                    "not imported: no NineSQL equivalent (the NineSQL driver accepts {})",
-                    rules.accepted()
-                ),
+                message: rules.no_equivalent_message(),
             }),
         }
     }
@@ -968,6 +986,21 @@ mod tests {
         assert_eq!(
             Rules::for_connection(&EngineId::TIMESCALEDB, "x"),
             Rules::PgJdbc
+        );
+        assert_eq!(
+            Rules::for_connection(&EngineId::YUGABYTEDB, "postgres-yugabytedb-jdbc"),
+            Rules::PgJdbc
+        );
+        assert_eq!(
+            Rules::for_connection(&EngineId::QUESTDB, "questdb"),
+            Rules::QuestDb
+        );
+        assert_eq!(
+            Rules::for_connection(&EngineId::TIDB, "tidb"),
+            Rules::ConnectorJ {
+                mariadb: false,
+                legacy: false
+            }
         );
         assert_eq!(
             Rules::for_connection(&EngineId::CLICKHOUSE, "com_clickhouse"),

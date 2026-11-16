@@ -396,7 +396,9 @@ pub struct ImportedConnection {
     /// names** from that driver's `ConnectCapabilities::accepted_properties`, with values the
     /// driver accepts: JDBC properties and URL parameters with an equivalent are converted
     /// (`currentSchema` → `search_path`…), the others are listed in
-    /// [`dropped_properties`](Self::dropped_properties). For other engines (no NineSQL driver
+    /// [`dropped_properties`](Self::dropped_properties). QuestDB accepts no property, so every
+    /// one is listed there (a read-only setting in `options` still sets
+    /// [`read_only`](Self::read_only)). For other engines (no NineSQL driver
     /// yet), the non-reserved, non-secret JDBC properties as DBeaver stored them.
     pub properties: BTreeMap<String, String>,
     /// Driver properties and URL parameters that were not imported, with the reason (also in
