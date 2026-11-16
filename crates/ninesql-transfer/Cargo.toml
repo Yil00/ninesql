@@ -13,3 +13,12 @@ publish.workspace = true
 workspace = true
 
 [dependencies]
+ninesql-driver-api.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+# `O_NOFOLLOW` / `O_CLOEXEC` for the export file (constants only, no `unsafe`).
+libc.workspace = true
+
+[dev-dependencies]
+proptest.workspace = true
+tempfile.workspace = true
