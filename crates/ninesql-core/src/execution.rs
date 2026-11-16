@@ -364,6 +364,197 @@ pub struct RunSummary {
     pub elapsed: Duration,
     /// Transaction state of the session at the end.
     pub transaction: TransactionState,
+    /// What each statement did, in order (F-SQL-16): at most [`MAX_STATEMENT_OUTCOMES`]; the
+    /// rest is counted in [`Self::outcomes_dropped`].
+    pub outcomes: Vec<StatementOutcome>,
+    /// Statement outcomes not kept past [`MAX_STATEMENT_OUTCOMES`].
+    pub outcomes_dropped: usize,
+    /// The first statement that failed, timed out or was refused, if any.
+    pub first_error: Option<FirstError>,
+}
+
+/// Statement outcomes kept in a [`RunSummary`].
+pub const MAX_STATEMENT_OUTCOMES: usize = 10_000;
+
+/// How one statement of a run ended ([`StatementOutcome::status`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum StatementStatus {
+    /// Finished normally.
+    Succeeded,
+    /// Its result was closed early (released, idle, or a script moving on); counted as
+    /// succeeded.
+    Closed,
+    /// Failed (engine error, refused piece, closed session).
+    Failed,
+    /// Cancelled by the user.
+    Cancelled,
+    /// Exceeded its timeout.
+    TimedOut,
+    /// Not sent: it needs the user's confirmation.
+    NeedsConfirmation,
+}
+
+/// One statement of a run, for the run summary (F-SQL-16). Never holds statement text or
+/// values.
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct StatementOutcome {
+    /// Item index ([`RunEvent`] indexes).
+    pub index: usize,
+    /// Its byte range in the editor buffer, when it was sent or asked for confirmation.
+    pub span: Option<Range<usize>>,
+    /// How it ended.
+    pub status: StatementStatus,
+    /// Rows / documents delivered.
+    pub rows: u64,
+    /// Sum of the update counts reported, if any.
+    pub update_count: Option<u64>,
+    /// Wall-clock time (zero when it was not sent).
+    pub elapsed: Duration,
+}
+
+/// The first error of a run ([`RunSummary::first_error`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct FirstError {
+    /// Item index.
+    pub index: usize,
+    /// The error, for display only (an engine message may quote values: never logged).
+    pub message: String,
+    /// Its short, stable kind ([`CoreError::kind`]), safe to log.
+    pub kind: &'static str,
+    /// Where it points, when the engine reports a position.
+    pub position: Option<ErrorPosition>,
+}
+
+/// Statement outcomes of a run, collected from the events it sends.
+#[derive(Default)]
+struct RunLog {
+    outcomes: Vec<StatementOutcome>,
+    dropped: usize,
+    first_error: Option<FirstError>,
+    /// Statement index → (span, start) of statements sent and not ended yet.
+    started: Option<(usize, Range<usize>, Instant)>,
+}
+
+impl RunLog {
+    fn push(
+        &mut self,
+        index: usize,
+        status: StatementStatus,
+        rows: u64,
+        update_count: Option<u64>,
+        elapsed: Option<Duration>,
+        span: Option<Range<usize>>,
+    ) {
+        let (span, elapsed) = match self.started.take() {
+            Some((i, s, at)) if i == index => {
+                (span.or(Some(s)), elapsed.unwrap_or_else(|| at.elapsed()))
+            }
+            other => {
+                self.started = other;
+                (span, elapsed.unwrap_or_default())
+            }
+        };
+        if self.outcomes.len() >= MAX_STATEMENT_OUTCOMES {
+            self.dropped += 1;
+            return;
+        }
+        self.outcomes.push(StatementOutcome {
+            index,
+            span,
+            status,
+            rows,
+            update_count,
+            elapsed,
+        });
+    }
+
+    fn observe(&mut self, event: &RunEvent) {
+        match event {
+            RunEvent::StatementStarted { index, span, .. } => {
+                self.started = Some((*index, span.clone(), Instant::now()));
+            }
+            RunEvent::StatementFinished {
+                index,
+                rows,
+                update_count,
+                elapsed,
+                ..
+            } => self.push(
+                *index,
+                StatementStatus::Succeeded,
+                *rows,
+                *update_count,
+                Some(*elapsed),
+                None,
+            ),
+            RunEvent::StatementClosed { index, rows } => {
+                self.push(*index, StatementStatus::Closed, *rows, None, None, None);
+            }
+            RunEvent::StatementFailed {
+                index,
+                error,
+                position,
+                elapsed,
+            } => {
+                self.push(
+                    *index,
+                    StatementStatus::Failed,
+                    0,
+                    None,
+                    Some(*elapsed),
+                    None,
+                );
+                if self.first_error.is_none() {
+                    self.first_error = Some(FirstError {
+                        index: *index,
+                        message: error.to_string(),
+                        kind: error.kind(),
+                        position: *position,
+                    });
+                }
+            }
+            RunEvent::StatementCancelled { index, elapsed } => {
+                self.push(
+                    *index,
+                    StatementStatus::Cancelled,
+                    0,
+                    None,
+                    Some(*elapsed),
+                    None,
+                );
+            }
+            RunEvent::StatementTimedOut { index, after } => {
+                self.push(
+                    *index,
+                    StatementStatus::TimedOut,
+                    0,
+                    None,
+                    Some(*after),
+                    None,
+                );
+                if self.first_error.is_none() {
+                    self.first_error = Some(FirstError {
+                        index: *index,
+                        message: format!("the statement exceeded its timeout of {after:?}"),
+                        kind: "timeout",
+                        position: None,
+                    });
+                }
+            }
+            RunEvent::NeedsConfirmation { index, span, .. } => self.push(
+                *index,
+                StatementStatus::NeedsConfirmation,
+                0,
+                None,
+                Some(Duration::ZERO),
+                Some(span.clone()),
+            ),
+            _ => {}
+        }
+    }
 }
 
 /// Event of one run. Exactly one [`RunEvent::Done`] ends it. `index` is the 0-based index of
@@ -1179,6 +1370,8 @@ struct RunOutput {
     terminal: Option<mpsc::OwnedPermit<RunEvent>>,
     /// [`RunEvent::Done`] was sent (or given up on because the UI is gone).
     finished: bool,
+    /// Statement outcomes for the summary (F-SQL-16).
+    log: std::sync::Mutex<RunLog>,
 }
 
 impl RunOutput {
@@ -1189,7 +1382,21 @@ impl RunOutput {
             cancel,
             terminal,
             finished: false,
+            log: std::sync::Mutex::new(RunLog::default()),
         }
+    }
+
+    fn observe(&self, event: &RunEvent) {
+        self.log
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .observe(event);
+    }
+
+    /// A statement end sent without waiting (refusals before anything runs).
+    fn try_send_end(&self, event: RunEvent) {
+        self.observe(&event);
+        let _ = self.events.try_send(event);
     }
 
     fn gone(&self) -> bool {
@@ -1198,6 +1405,7 @@ impl RunOutput {
 
     /// `false` when not delivered (cancelled while the queue was full, or the UI is gone).
     async fn send(&self, event: RunEvent) -> bool {
+        self.observe(&event);
         tokio::select! {
             biased;
             sent = self.events.send(event) => sent.is_ok(),
@@ -1209,6 +1417,7 @@ impl RunOutput {
     /// A statement end: delivered unless the queue is full after a cancel.
     async fn send_end(&self, event: RunEvent) {
         if self.cancel.is_cancelled() {
+            self.observe(&event);
             let _ = self.events.try_send(event);
         } else {
             let _ = self.send(event).await;
@@ -1319,6 +1528,7 @@ enum StatementEnd {
 
 impl RunJob {
     fn summary(&self, statements: usize, counts: (usize, usize, usize), end: RunEnd) -> RunSummary {
+        let log = std::mem::take(&mut *self.out.log.lock().unwrap_or_else(PoisonError::into_inner));
         RunSummary {
             statements,
             executed: counts.0,
@@ -1327,6 +1537,9 @@ impl RunJob {
             end,
             elapsed: self.started.elapsed(),
             transaction: self.session.transaction_state(),
+            outcomes: log.outcomes,
+            outcomes_dropped: log.dropped,
+            first_error: log.first_error,
         }
     }
 
@@ -1337,7 +1550,7 @@ impl RunJob {
         position: Option<ErrorPosition>,
         statements: usize,
     ) {
-        let _ = self.out.events.try_send(RunEvent::StatementFailed {
+        self.out.try_send_end(RunEvent::StatementFailed {
             index,
             error,
             position,
@@ -1433,7 +1646,7 @@ impl RunJob {
             // A refused piece found by a re-split (or by looking ahead) stops the run before
             // anything more is sent (review N2).
             if let Some(refusal) = cursor.refusal.take() {
-                let _ = self.out.events.try_send(RunEvent::StatementFailed {
+                self.out.try_send_end(RunEvent::StatementFailed {
                     index: refusal.index,
                     error: refusal.error,
                     position: Some(refusal_position(refusal.at, request.offset)),
