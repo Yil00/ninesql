@@ -8,6 +8,8 @@
 //!   [`persist`] saves changes made from the UI back to settings.toml.
 //! - [`services`]: the seam to `ninesql-core` services (driver runtime: P1-D).
 //! - [`import`]: the DBeaver import flow (P2-B): first-run offer, preview, apply, outcome.
+//! - [`navigator`], [`browse`]: the metadata tree, navigator filters, "Find object", the object
+//!   editor, "Generate SQL" and the editor's object completion (P4-B).
 //!
 //! GPUI comes from `gpui-kit` under the controls of ADR-0013. GPUI's credentials and HTTP
 //! client APIs are never used: secrets go through `ninesql-secrets` only (I1), and NineSQL has
@@ -17,6 +19,7 @@
 pub mod actions;
 pub mod app;
 pub mod appearance;
+pub mod browse;
 pub mod connections;
 pub mod editor_tab;
 pub mod import;

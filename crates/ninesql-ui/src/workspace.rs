@@ -23,7 +23,16 @@ use crate::actions::{
     RollbackTransaction, Scope, ShowConnectionProblems, ShowSettingsProblems, SplitDown,
     SplitRight, TestConnection, ToggleNavigator, WORKSPACE_CONTEXT,
 };
+use crate::actions::{
+    ConfigureNavigatorFilters, CopyObjectDdl, FindObject, GenerateDeleteSql, GenerateInsertSql,
+    GenerateSelectSql, GenerateUpdateSql, LoadMoreObjects, OpenObjectEditor, RefreshNavigatorNode,
+    ShowObjectDdl,
+};
 use crate::appearance;
+use crate::browse::generate::{Template, TemplateColumn, template};
+use crate::browse::object_editor::{ObjectEditor, ObjectEditorEvent};
+use crate::browse::search::{FindChoice, SearchScope, open_find_object};
+use crate::browse::{is_table_like, kind_singular};
 use crate::connections::connect_flow::{ConnectFlow, FlowFinished, FlowResult, Purpose};
 use crate::connections::dialog::{
     ConnectionDialog, ConnectionDialogCancelled, ConnectionSaved, new_form,
@@ -38,10 +47,14 @@ use crate::import::flow::{ImportFlow, open_import_dialog};
 use crate::keymap::EffectiveKeymap;
 use crate::layout::{EditorLayout, Node, PaneId, SplitAxis, TabId};
 use crate::navigator::Navigator;
+use crate::navigator::{NavigatorEvent, Selection};
 use crate::services::Services;
 use crate::settings::SettingsState;
 use gpui_kit::component::notification::Notification;
 use ninesql_core::ConnectionId;
+use ninesql_core::NodeKey;
+use ninesql_core::driver_api::ObjectKind;
+use ninesql_core::driver_api::metadata::{ObjectInfo, ObjectPath};
 
 /// What runs once sessions were closed as the user chose (see `Workspace::close_sessions_then`).
 type AfterClose = Rc<dyn Fn(&mut Workspace, &mut Window, &mut Context<Workspace>)>;
@@ -54,6 +67,7 @@ pub struct Workspace {
     focus: FocusHandle,
     layout: EditorLayout,
     tabs: HashMap<TabId, Entity<SqlEditorTab>>,
+    objects: HashMap<TabId, (Entity<ObjectEditor>, Subscription)>,
     navigator: Entity<Navigator>,
     navigator_visible: bool,
     next_script: usize,
@@ -71,16 +85,19 @@ impl Workspace {
     pub fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
         let hub = hub_or_install_empty(cx);
         let flow = cx.new(|_| ConnectFlow::new(hub.clone()));
+        let navigator = cx.new(Navigator::new);
         let subscriptions = vec![
             cx.observe(&hub, |_, _, cx| cx.notify()),
             cx.subscribe_in(&flow, window, Self::on_flow_finished),
             cx.subscribe_in(&hub, window, Self::on_hub_event),
+            cx.subscribe_in(&navigator, window, Self::on_navigator_event),
         ];
         let mut this = Self {
             focus: cx.focus_handle(),
             layout: EditorLayout::new(),
             tabs: HashMap::new(),
-            navigator: cx.new(Navigator::new),
+            objects: HashMap::new(),
+            navigator,
             navigator_visible: true,
             next_script: 1,
             hub,
@@ -113,16 +130,39 @@ impl Workspace {
         self.layout
             .all_tabs()
             .into_iter()
-            .filter_map(|t| self.tabs.get(&t))
-            .map(|e| e.read(cx).title().clone())
+            .filter_map(|t| self.title_of(t, cx))
             .collect()
+    }
+
+    fn title_of(&self, tab: TabId, cx: &App) -> Option<SharedString> {
+        if let Some(e) = self.tabs.get(&tab) {
+            return Some(e.read(cx).title().clone());
+        }
+        self.objects
+            .get(&tab)
+            .map(|(o, _)| o.read(cx).title().clone())
+    }
+
+    /// The object editor of a tab.
+    #[must_use]
+    pub fn object_editor(&self, tab: TabId) -> Option<&Entity<ObjectEditor>> {
+        self.objects.get(&tab).map(|(o, _)| o)
+    }
+
+    /// The object editor of the active pane, if its active tab is one.
+    #[must_use]
+    pub fn active_object_editor(&self) -> Option<&Entity<ObjectEditor>> {
+        self.layout
+            .active_tab()
+            .and_then(|t| self.objects.get(&t))
+            .map(|(o, _)| o)
     }
 
     /// Title of the active tab.
     #[must_use]
     pub fn active_title(&self, cx: &App) -> Option<SharedString> {
         let tab = self.layout.active_tab()?;
-        self.tabs.get(&tab).map(|e| e.read(cx).title().clone())
+        self.title_of(tab, cx)
     }
 
     /// Whether the navigator dock is shown.
@@ -174,6 +214,9 @@ impl Workspace {
     /// (always for production, ADR-0007 §5) and no other editor of this window uses that
     /// session, asks first: commit, roll back, or keep the tab.
     pub fn close_tab(&mut self, tab: TabId, window: &mut Window, cx: &mut Context<Self>) {
+        if self.objects.contains_key(&tab) {
+            return self.close_tab_now(tab, window, cx);
+        }
         let Some(editor) = self.tabs.get(&tab).cloned() else {
             return;
         };
@@ -235,6 +278,8 @@ impl Workspace {
     pub fn close_tab_now(&mut self, tab: TabId, window: &mut Window, cx: &mut Context<Self>) {
         if self.layout.close_tab(tab) {
             self.tabs.remove(&tab);
+            // Dropping an object editor drops its loads (cancelled in the core).
+            self.objects.remove(&tab);
             self.after_change(window, cx);
         }
     }
@@ -993,9 +1038,13 @@ impl Workspace {
 
     /// Focuses the active editor, or the workspace when the active pane is empty.
     pub fn focus_active(&self, window: &mut Window, cx: &mut App) {
-        match self.layout.active_tab().and_then(|t| self.tabs.get(&t)) {
-            Some(editor) => editor.focus_handle(cx).focus(window, cx),
-            None => self.focus.focus(window, cx),
+        let tab = self.layout.active_tab();
+        if let Some(editor) = tab.and_then(|t| self.tabs.get(&t)) {
+            editor.focus_handle(cx).focus(window, cx);
+        } else if let Some((object, _)) = tab.and_then(|t| self.objects.get(&t)) {
+            object.focus_handle(cx).focus(window, cx);
+        } else {
+            self.focus.focus(window, cx);
         }
     }
 
@@ -1143,6 +1192,28 @@ impl Workspace {
             self.end_transaction(true, cx);
         } else if any.is::<RollbackTransaction>() {
             self.end_transaction(false, cx);
+        } else if any.is::<RefreshNavigatorNode>() {
+            self.refresh_navigator_node(window, cx);
+        } else if any.is::<LoadMoreObjects>() {
+            self.load_more_objects(window, cx);
+        } else if any.is::<ConfigureNavigatorFilters>() {
+            self.configure_navigator_filters(window, cx);
+        } else if any.is::<FindObject>() {
+            self.find_object(window, cx);
+        } else if any.is::<OpenObjectEditor>() {
+            self.open_selected_object(window, cx);
+        } else if any.is::<GenerateSelectSql>() {
+            self.generate_selected(Template::Select, window, cx);
+        } else if any.is::<GenerateInsertSql>() {
+            self.generate_selected(Template::Insert, window, cx);
+        } else if any.is::<GenerateUpdateSql>() {
+            self.generate_selected(Template::Update, window, cx);
+        } else if any.is::<GenerateDeleteSql>() {
+            self.generate_selected(Template::Delete, window, cx);
+        } else if any.is::<ShowObjectDdl>() {
+            self.show_selected_ddl(window, cx);
+        } else if any.is::<CopyObjectDdl>() {
+            self.copy_object_ddl(window, cx);
         } else if any.is::<CloseWindow>() {
             window.remove_window();
         } else {
@@ -1163,11 +1234,7 @@ impl Workspace {
             .tabs()
             .iter()
             .map(|tab| {
-                let title = self
-                    .tabs
-                    .get(tab)
-                    .map(|e| e.read(cx).title().clone())
-                    .unwrap_or_default();
+                let title = self.title_of(*tab, cx).unwrap_or_default();
                 let tab_id = *tab;
                 let this = this.clone();
                 Tab::new().label(title.clone()).suffix(
@@ -1217,7 +1284,14 @@ impl Workspace {
         if let Some(ix) = model.active_index() {
             bar = bar.selected_index(ix);
         }
+        let object = model
+            .active_tab()
+            .and_then(|t| self.objects.get(&t))
+            .map(|(o, _)| o.clone());
         let content = match model.active_tab().and_then(|t| self.tabs.get(&t)) {
+            None if object.is_some() => {
+                div().flex_1().min_h_0().children(object).into_any_element()
+            }
             Some(editor) => div()
                 .flex_1()
                 .min_h_0()
@@ -1530,6 +1604,447 @@ impl Workspace {
     }
 }
 
+/// Metadata browsing (P4-B): the navigator's actions, "Find object", the object editor and
+/// "Generate SQL".
+impl Workspace {
+    fn on_navigator_event(
+        &mut self,
+        _: &Entity<Navigator>,
+        event: &NavigatorEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        match event {
+            NavigatorEvent::Connect(id) => {
+                if !self.flow.read(cx).is_busy() {
+                    self.connect(*id, Purpose::Open, window, cx);
+                }
+            }
+            NavigatorEvent::OpenObject { connection, path } => {
+                self.open_object_editor(*connection, path.clone(), None, window, cx);
+            }
+            NavigatorEvent::RevealFailed(message) => {
+                window.push_notification(Notification::info(message.clone()), cx);
+            }
+        }
+    }
+
+    fn on_object_editor_event(
+        &mut self,
+        editor: &Entity<ObjectEditor>,
+        event: &ObjectEditorEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let ObjectEditorEvent::Generate(which) = event;
+        let (connection, path) = {
+            let e = editor.read(cx);
+            (e.connection(), e.path().clone())
+        };
+        self.generate(connection, path, *which, window, cx);
+    }
+
+    fn notify(message: impl Into<SharedString>, window: &mut Window, cx: &mut App) {
+        window.push_notification(Notification::info(message.into()), cx);
+    }
+
+    /// The navigator's selection.
+    fn navigator_selection(&self, cx: &App) -> Option<Selection> {
+        self.navigator.read(cx).selection()
+    }
+
+    /// The object the metadata actions apply to: the navigator's selected object, else the
+    /// active object editor's.
+    fn target_object(&self, cx: &App) -> Option<(ConnectionId, ObjectPath, Option<ObjectInfo>)> {
+        if let Some(Selection::Object(c, info)) = self.navigator_selection(cx) {
+            return Some((c, info.path.clone(), Some(info)));
+        }
+        let editor = self.active_object_editor()?.read(cx);
+        Some((
+            editor.connection(),
+            editor.path().clone(),
+            editor.info().cloned(),
+        ))
+    }
+
+    /// "Refresh navigator node".
+    pub fn refresh_navigator_node(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(editor) = self.active_object_editor().cloned()
+            && !self.navigator.focus_handle(cx).contains_focused(window, cx)
+        {
+            editor.update(cx, |e, cx| e.refresh(window, cx));
+            return;
+        }
+        let done = self.navigator.update(cx, |n, cx| n.refresh_selected(cx));
+        if !done {
+            Self::notify(
+                "Select an open connection, a group or an object in the navigator first.",
+                window,
+                cx,
+            );
+        }
+    }
+
+    /// "Load more objects".
+    pub fn load_more_objects(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let done = self.navigator.update(cx, |n, cx| n.load_more_selected(cx));
+        if !done {
+            Self::notify(
+                "The selected group has no more objects to load.",
+                window,
+                cx,
+            );
+        }
+    }
+
+    /// The connection the metadata dialogs apply to: the navigator's selection, else the
+    /// active editor's.
+    fn metadata_connection(&self, cx: &App) -> Option<ConnectionId> {
+        self.navigator_selection(cx)
+            .map(|s| s.connection())
+            .or_else(|| self.active_editor().and_then(|e| e.read(cx).connection()))
+            .or_else(|| self.active_object_editor().map(|e| e.read(cx).connection()))
+    }
+
+    /// "Configure navigator filters": the kinds come from the open session's declared
+    /// capabilities, else from the driver's (I8).
+    pub fn configure_navigator_filters(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(id) = self.metadata_connection(cx) else {
+            return Self::notify_no_selection(window, cx);
+        };
+        let hub = self.hub.read(cx);
+        let Some(service) = hub.metadata() else {
+            return Self::notify(
+                "Metadata is not available: the driver runtime did not start.",
+                window,
+                cx,
+            );
+        };
+        let Some(c) = hub.connection(id) else {
+            return;
+        };
+        let declared = match hub.sessions(id).first() {
+            Some(s) => s.info().capabilities.metadata.kinds.clone(),
+            None => hub
+                .registry()
+                .capabilities(&c.engine)
+                .map(|caps| caps.metadata.kinds)
+                .unwrap_or_default(),
+        };
+        let kinds: Vec<ObjectKind> = ninesql_core::metadata::model::KIND_NAMES
+            .iter()
+            .map(|(k, _)| *k)
+            .filter(|k| declared.contains(k))
+            .collect();
+        let name = c.name.clone();
+        crate::browse::filters::open_filter_dialog(service, id, name, kinds, window, cx);
+    }
+
+    /// "Find object" over the open connections.
+    pub fn find_object(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let hub = self.hub.read(cx);
+        let Some(service) = hub.metadata() else {
+            return Self::notify(
+                "Metadata is not available: the driver runtime did not start.",
+                window,
+                cx,
+            );
+        };
+        let mut scopes: Vec<SearchScope> = Vec::new();
+        for s in hub.open_sessions() {
+            let id = s.info().connection;
+            if !scopes.iter().any(|x| x.id == id) {
+                scopes.push(SearchScope {
+                    id,
+                    name: s.info().connection_name.clone(),
+                    selected: true,
+                });
+            }
+        }
+        let this = cx.entity().downgrade();
+        open_find_object(
+            service,
+            scopes,
+            std::rc::Rc::new(move |choice, window, cx| {
+                let _ = this.update(cx, |ws, cx| match choice {
+                    FindChoice::Reveal(connection, path) => {
+                        ws.reveal_object(connection, path, window, cx);
+                    }
+                    FindChoice::Open(connection, path) => {
+                        ws.open_object_editor(connection, path, None, window, cx);
+                    }
+                });
+            }),
+            window,
+            cx,
+        );
+    }
+
+    /// Reveals an object in the navigator (shown and focused).
+    pub fn reveal_object(
+        &mut self,
+        connection: ConnectionId,
+        path: ObjectPath,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.navigator_visible = true;
+        self.navigator.update(cx, |n, cx| {
+            n.focus_tree(window, cx);
+            n.reveal(connection, path, cx);
+        });
+        cx.notify();
+    }
+
+    /// "Open object editor" on the navigator's selection.
+    pub fn open_selected_object(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        match self.navigator_selection(cx) {
+            Some(Selection::Object(connection, info)) => {
+                let path = info.path.clone();
+                self.open_object_editor(connection, path, Some(info), window, cx);
+            }
+            _ => Self::notify("Select an object in the navigator first.", window, cx),
+        }
+    }
+
+    /// Opens (or activates) the object editor of an object in the active pane.
+    pub fn open_object_editor(
+        &mut self,
+        connection: ConnectionId,
+        path: ObjectPath,
+        info: Option<ObjectInfo>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let existing = self.objects.iter().find_map(|(tab, (e, _))| {
+            let e = e.read(cx);
+            (e.connection() == connection && *e.path() == path).then_some(*tab)
+        });
+        if let Some(tab) = existing {
+            return self.activate_tab(tab, window, cx);
+        }
+        let hub = self.hub.clone();
+        let editor = cx.new(|cx| ObjectEditor::new(hub, connection, path, info, window, cx));
+        let sub = cx.subscribe_in(&editor, window, Self::on_object_editor_event);
+        let id = self.layout.allocate_tab();
+        self.objects.insert(id, (editor, sub));
+        self.layout.open_tab(id);
+        self.after_change(window, cx);
+    }
+
+    /// Opens a new SQL editor on an open session of `connection` with `text` (never run).
+    pub fn open_sql_tab(
+        &mut self,
+        title: String,
+        connection: ConnectionId,
+        text: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Option<TabId> {
+        let session = self.hub.read(cx).sessions(connection).first().cloned()?;
+        let id = self.layout.allocate_tab();
+        let hub = self.hub.clone();
+        let editor = cx.new(|cx| SqlEditorTab::new(title, hub, Some(session), window, cx));
+        let inner = editor.read(cx).editor().clone();
+        let text = text.to_owned();
+        inner.update(cx, |e, cx| {
+            e.set_text(&text, window, cx);
+        });
+        self.tabs.insert(id, editor);
+        self.layout.open_tab(id);
+        self.active_connection = Some(connection);
+        self.after_change(window, cx);
+        Some(id)
+    }
+
+    /// "Generate SQL" on the target object.
+    pub fn generate_selected(
+        &mut self,
+        which: Template,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some((connection, path, _)) = self.target_object(cx) else {
+            return Self::notify(
+                "Select a table or a view in the navigator first.",
+                window,
+                cx,
+            );
+        };
+        self.generate(connection, path, which, window, cx);
+    }
+
+    /// Opens a template for `path` in a new SQL editor, quoted with the session dialect. The
+    /// columns are loaded first when the driver lists them and they are not cached.
+    pub fn generate(
+        &mut self,
+        connection: ConnectionId,
+        path: ObjectPath,
+        which: Template,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(kind) = path.kind() else {
+            return;
+        };
+        if !which.applies_to(kind) {
+            return Self::notify(
+                format!(
+                    "{} is not offered for a {}.",
+                    which.label(),
+                    kind_singular(kind)
+                ),
+                window,
+                cx,
+            );
+        }
+        let hub = self.hub.read(cx);
+        let (Some(service), true) = (hub.metadata(), hub.is_open(connection)) else {
+            return Self::notify(
+                "Connect first: the template is quoted for the session's engine.",
+                window,
+                cx,
+            );
+        };
+        let lists_columns = service
+            .child_kinds(connection, &path)
+            .is_ok_and(|k| k.contains(&ObjectKind::Column));
+        let key = NodeKey::new(path.clone(), ObjectKind::Column);
+        if !lists_columns {
+            return self.open_template(connection, &path, which, &[], window, cx);
+        }
+        if let Some(c) = service.cached_children(connection, &key) {
+            let columns = TemplateColumn::from_infos(&c.items);
+            return self.open_template(connection, &path, which, &columns, window, cx);
+        }
+        let request = service.children(connection, key);
+        cx.spawn_in(window, async move |this, cx| {
+            let columns = request
+                .await
+                .map(|c| TemplateColumn::from_infos(&c.items))
+                .unwrap_or_default();
+            let _ = this.update_in(cx, |ws, window, cx| {
+                ws.open_template(connection, &path, which, &columns, window, cx);
+            });
+        })
+        .detach();
+    }
+
+    fn open_template(
+        &mut self,
+        connection: ConnectionId,
+        path: &ObjectPath,
+        which: Template,
+        columns: &[TemplateColumn],
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(session) = self.hub.read(cx).sessions(connection).first().cloned() else {
+            return Self::notify("The connection is not open any more.", window, cx);
+        };
+        let dialect = session.dialect();
+        let text = template(which, path, columns, &|i: &str| dialect.quote_identifier(i));
+        let name = path
+            .leaf()
+            .map(|s| crate::browse::display_name(&s.name))
+            .unwrap_or_default();
+        self.open_sql_tab(
+            format!("{} {name}", which.label()),
+            connection,
+            &text,
+            window,
+            cx,
+        );
+    }
+
+    /// "Show DDL" on the target object: its DDL in a new SQL editor, when the driver declares
+    /// DDL for its kind (I8).
+    pub fn show_selected_ddl(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some((connection, path, _)) = self.target_object(cx) else {
+            return Self::notify("Select an object in the navigator first.", window, cx);
+        };
+        self.with_ddl(
+            connection,
+            path,
+            window,
+            cx,
+            |ws, connection, path, text, window, cx| {
+                let name = path
+                    .leaf()
+                    .map(|s| crate::browse::display_name(&s.name))
+                    .unwrap_or_default();
+                ws.open_sql_tab(format!("DDL {name}"), connection, text, window, cx);
+            },
+        );
+    }
+
+    /// "Copy DDL": the active object editor's DDL, else the selected object's.
+    pub fn copy_object_ddl(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.navigator.focus_handle(cx).contains_focused(window, cx)
+            && let Some(editor) = self.active_object_editor().cloned()
+            && editor.read(cx).ddl_text().is_some()
+        {
+            editor.update(cx, |e, cx| e.copy_ddl(cx));
+            return Self::notify("DDL copied.", window, cx);
+        }
+        let Some((connection, path, _)) = self.target_object(cx) else {
+            return Self::notify("Select an object in the navigator first.", window, cx);
+        };
+        self.with_ddl(connection, path, window, cx, |_, _, _, text, window, cx| {
+            cx.write_to_clipboard(ClipboardItem::new_string(text.to_owned()));
+            Self::notify("DDL copied.", window, cx);
+        });
+    }
+
+    fn with_ddl(
+        &mut self,
+        connection: ConnectionId,
+        path: ObjectPath,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+        then: impl FnOnce(&mut Self, ConnectionId, &ObjectPath, &str, &mut Window, &mut Context<Self>)
+        + 'static,
+    ) {
+        let hub = self.hub.read(cx);
+        let Some(service) = hub.metadata() else {
+            return;
+        };
+        let kind = path.kind();
+        if !hub.is_open(connection) || !kind.is_some_and(|k| service.supports_ddl(connection, k)) {
+            return Self::notify(
+                "DDL is not available for this object on this engine (or the connection is not open).",
+                window,
+                cx,
+            );
+        }
+        if let Some(d) = service.cached_ddl(connection, &path) {
+            let text = d.text.clone();
+            return then(self, connection, &path, &text, window, cx);
+        }
+        let request = service.ddl(connection, path.clone());
+        cx.spawn_in(window, async move |this, cx| {
+            let result = request.await;
+            let _ = this.update_in(cx, |ws, window, cx| match result {
+                Ok(d) => then(ws, connection, &path, &d.text, window, cx),
+                Err(e) => window.push_notification(
+                    Notification::error(e.to_string()).title("DDL not loaded"),
+                    cx,
+                ),
+            });
+        })
+        .detach();
+    }
+
+    /// Whether "Generate SQL" applies to the navigator's selection (table-like objects).
+    #[must_use]
+    pub fn selection_is_table_like(&self, cx: &App) -> bool {
+        matches!(
+            self.navigator_selection(cx),
+            Some(Selection::Object(_, info)) if info.path.kind().is_some_and(is_table_like)
+        )
+    }
+}
+
 fn collect_first(node: &Node, out: &mut Vec<PaneId>) {
     match node {
         Node::Pane(p) => out.push(*p),
@@ -1605,6 +2120,17 @@ impl Render for Workspace {
             ChooseEditorConnection,
             CommitTransaction,
             RollbackTransaction,
+            RefreshNavigatorNode,
+            LoadMoreObjects,
+            ConfigureNavigatorFilters,
+            FindObject,
+            OpenObjectEditor,
+            GenerateSelectSql,
+            GenerateInsertSql,
+            GenerateUpdateSql,
+            GenerateDeleteSql,
+            ShowObjectDdl,
+            CopyObjectDdl,
         );
         let content = root
             .when(client_decorated, |el| {

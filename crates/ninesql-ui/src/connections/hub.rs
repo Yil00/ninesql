@@ -50,6 +50,9 @@ pub struct HubConfig {
     /// Problems found while starting: load issues (`LoadIssue`), secret-looking keys removed,
     /// a workspace or runtime that could not start. Shown in the "connection problems" dialog.
     pub problems: Vec<String>,
+    /// Limits of the metadata service built when there is no core (tests); the core's own
+    /// service is used otherwise.
+    pub metadata: ninesql_core::MetadataConfig,
 }
 
 impl HubConfig {
@@ -67,6 +70,7 @@ impl HubConfig {
             backend: None,
             core: None,
             problems: Vec::new(),
+            metadata: ninesql_core::MetadataConfig::default(),
         }
     }
 
@@ -237,7 +241,10 @@ pub struct ConnectionHub {
     importing: bool,
     detected: Option<Vec<DetectedDbeaver>>,
     local_execution: Option<ninesql_core::ExecutionService>,
+    local_metadata: Option<ninesql_core::MetadataService>,
+    metadata_config: ninesql_core::MetadataConfig,
     _events: Option<Task<()>>,
+    _metadata_events: Option<Task<()>>,
 }
 
 impl ConnectionHub {
@@ -263,7 +270,10 @@ impl ConnectionHub {
             importing: false,
             detected: None,
             local_execution: None,
+            local_metadata: None,
+            metadata_config: config.metadata,
             _events: None,
+            _metadata_events: None,
         }
     }
 
@@ -454,6 +464,16 @@ impl ConnectionHub {
             ));
         }
         self.local_execution.clone()
+    }
+
+    /// The metadata service (P4-B): the core's, or one over the session manager when the hub
+    /// was assembled without a core (tests). `None` when the driver runtime did not start.
+    #[must_use]
+    pub fn metadata(&self) -> Option<ninesql_core::MetadataService> {
+        match &self.core {
+            Some(core) => Some(core.metadata().clone()),
+            None => self.local_metadata.clone(),
+        }
     }
 
     /// The preferences in effect (`[execution]`, `[history]`, `[confirmations]` of
@@ -885,6 +905,7 @@ impl ConnectionHub {
     }
 
     fn start_event_pump(&mut self, cx: &mut Context<Self>) {
+        self.start_metadata_pump(cx);
         let events = match &self.core {
             Some(core) => core.take_events(),
             None => self.manager.as_ref().and_then(SessionManager::take_events),
@@ -896,6 +917,36 @@ impl ConnectionHub {
             while let Some(event) = events.recv().await {
                 if this
                     .update(cx, |hub, cx| hub.on_core_event(event, cx))
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        }));
+    }
+
+    /// Reads the metadata service's events and re-emits them as [`MetadataUpdate`]s for the
+    /// navigator and the object editors.
+    fn start_metadata_pump(&mut self, cx: &mut Context<Self>) {
+        if self.core.is_none()
+            && self.local_metadata.is_none()
+            && let Some(manager) = &self.manager
+        {
+            self.local_metadata = Some(ninesql_core::MetadataService::new(
+                manager.clone(),
+                self.metadata_config.clone(),
+            ));
+        }
+        let Some(mut events) = self
+            .metadata()
+            .and_then(|m| ninesql_core::MetadataService::take_events(&m))
+        else {
+            return;
+        };
+        self._metadata_events = Some(cx.spawn(async move |this, cx| {
+            while let Some(event) = events.recv().await {
+                if this
+                    .update(cx, |_, cx| cx.emit(MetadataUpdate(event)))
                     .is_err()
                 {
                     break;
@@ -1030,6 +1081,12 @@ pub enum HubEvent {
 }
 
 impl EventEmitter<HubEvent> for ConnectionHub {}
+
+/// A metadata event of the core (`MetadataEvent`), re-emitted by the hub (P4-B).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MetadataUpdate(pub ninesql_core::MetadataEvent);
+
+impl EventEmitter<MetadataUpdate> for ConnectionHub {}
 
 /// What the status notice says about a lock.
 #[must_use]
