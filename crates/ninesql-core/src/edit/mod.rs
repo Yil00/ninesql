@@ -58,9 +58,9 @@
 //!   the whole save**, showing the preview script, with a single-use [`SaveToken`] bound to the
 //!   session, the table and the exact statements and values (ten minutes), the design of the
 //!   P5-C import confirmation (the service keeps a SHA-256 digest of them, not a copy). A save
-//!   holds at most [`MAX_CHANGES_PER_SAVE`] changes. Once confirmed, the per-statement confirmation the session asks
-//!   for each statement (types that confirm every write) is answered by the service for the
-//!   confirmed statements only; anything else fails the save. A statement the dialect classifies
+//!   holds at most [`MAX_CHANGES_PER_SAVE`] changes. Once confirmed, the per-statement
+//!   confirmation the session asks for each statement (types that confirm every write) is
+//!   answered by the service for the confirmed statements only; anything else fails the save. A statement the dialect classifies
 //!   as anything but a filtered write never runs (the P5-B self-check).
 //! - **Non-transactional tables** (`TableInfo::transactional == Some(false)`): refused, with
 //!   no override, since a rollback would undo nothing.
