@@ -31,7 +31,7 @@ use std::path::Path;
 
 use ninesql_driver_api::dialect::classify_with_rules;
 use ninesql_driver_api::hygiene::text_may_hold_credentials;
-use ninesql_driver_api::{EngineId, LexicalRules, StatementClass};
+use ninesql_driver_api::{CodeTokenKind, EngineId, LexicalRules, StatementClass, code_tokens};
 use ninesql_storage::hygiene::{find_secret_like_keys, is_secret_like_entry, is_secret_like_key};
 use serde::ser::{Serialize, SerializeMap, SerializeSeq, Serializer};
 
@@ -427,6 +427,14 @@ fn export_one(
             );
         }
     }
+    // Folder names and the type id become keys of the DBeaver file: one that looks like it
+    // names a secret skips this connection only.
+    if conn.folder.iter().any(|f| is_secret_like_key(f)) {
+        return Err("a folder name looks like it names a secret");
+    }
+    if is_secret_like_key(&dbeaver_type_id(&ty.id)) {
+        return Err("its connection type id looks like it names a secret");
+    }
     let folder = folder_path(&conn.folder, issues);
     if let Some(f) = &folder {
         c.push(("folder".to_owned(), J::s(f)));
@@ -615,7 +623,8 @@ fn export_one(
             "init_sql",
             format!(
                 "{writing_queries} init statement(s) of this read-only connection are not plain \
-                 reads (or touch the access mode) and are not exported"
+                 reads (they write, call a function, hold a TiDB `/*T!` comment or touch the \
+                 access mode) and are not exported"
             ),
         );
     }
@@ -707,11 +716,11 @@ fn check_url_safe_host(host: &str) -> Result<(), &'static str> {
     }
     if host
         .chars()
-        .any(|c| c.is_whitespace() || c.is_control() || "?&;#/\\%".contains(c))
+        .any(|c| c.is_whitespace() || c.is_control() || "?&;#/\\%,[]".contains(c))
     {
         return Err(
             "the host contains a character DBeaver would paste into the JDBC URL as \
-                    syntax (`? & ; # / \\ %` or whitespace)",
+                    syntax (`? & ; # / \\ % , [ ]` or whitespace; a `,` is a host list for pgjdbc and Connector/J)",
         );
     }
     Ok(())
@@ -731,6 +740,19 @@ fn read_only_safe(sql: &str, family: Family) -> bool {
         Family::Other => LexicalRules::ANSI,
     };
     if classify_with_rules(sql, rules) != StatementClass::Read {
+        return false;
+    }
+    // The generic classifier does not know engine-specific side-effect functions
+    // (`drop_chunks`, `GET_LOCK`, QuestDB's…): any function call is dropped, and so is a TiDB
+    // executable comment (`/*T! … */`), whose content runs on TiDB.
+    if sql.contains("/*T!") {
+        return false;
+    }
+    let tokens = code_tokens(sql, rules);
+    if tokens.windows(2).any(|w| {
+        matches!(w[0].kind, CodeTokenKind::Word | CodeTokenKind::QuotedIdent)
+            && w[1].kind == CodeTokenKind::OpenParen
+    }) {
         return false;
     }
     let norm: String = sql

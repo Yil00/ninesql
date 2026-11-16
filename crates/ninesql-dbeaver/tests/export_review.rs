@@ -358,3 +358,82 @@ fn l7_unconfirmed_init_sql_is_not_exported() {
         i.field.as_deref() == Some("init_sql") && i.message.contains("not confirmed")
     }));
 }
+
+#[test]
+fn la_read_only_init_sql_with_function_calls_is_dropped() {
+    let mut c = conn("ts-ro", "timescaledb");
+    c.read_only = Some(true);
+    c.init_sql = vec![
+        "SELECT 1".to_owned(),
+        "SELECT drop_chunks('metrics', INTERVAL '1 day')".to_owned(),
+        "SELECT \"my_fn\" (1)".to_owned(),
+        "SELECT 1 /*T! , 2 */".to_owned(),
+        // Parentheses inside a string or a comment are not calls.
+        "SELECT 'f(x)' /* g(y) */".to_owned(),
+    ];
+    let mut my = conn("my-ro", "mysql");
+    my.read_only = Some(true);
+    my.init_sql = vec!["SELECT GET_LOCK('x', 10)".to_owned()];
+    let export = export_connections(&[c, my], &opts()).unwrap();
+    let v: Value = serde_json::from_slice(&export.json).unwrap();
+    let queries: Vec<Value> = v["connections"]
+        .as_object()
+        .unwrap()
+        .values()
+        .map(|c| c["configuration"]["bootstrap"]["query"].clone())
+        .collect();
+    assert!(queries.contains(&serde_json::json!(["SELECT 1", "SELECT 'f(x)' /* g(y) */"])));
+    assert!(
+        queries.contains(&Value::Null),
+        "the MySQL connection keeps no init SQL"
+    );
+    assert!(
+        export.report.connections[0]
+            .issues
+            .iter()
+            .any(|i| { i.field.as_deref() == Some("init_sql") && i.message.starts_with('3') })
+    );
+}
+
+#[test]
+fn lb_host_lists_and_brackets_are_skipped() {
+    let cases: Vec<ExportConnection> = ["db1.example.test,db2.example.test", "[db]", "db]"]
+        .iter()
+        .map(|h| {
+            let mut c = conn(h, "postgresql");
+            c.endpoint = ExportEndpoint::Tcp {
+                host: (*h).to_owned(),
+                port: None,
+                database: None,
+            };
+            c
+        })
+        .collect();
+    let export = export_connections(&cases, &opts()).unwrap();
+    assert_eq!(export.report.exported_count(), 0);
+}
+
+#[test]
+fn lc_sensitive_folder_or_type_skips_only_that_connection() {
+    let mut folder = conn("folder", "postgresql");
+    folder.folder = vec!["Team".to_owned(), "api_token".to_owned()];
+    let mut ty = conn("type", "postgresql");
+    ty.connection_type = "secret".to_owned();
+    let ok = conn("ok", "postgresql");
+    let mut o = opts();
+    o.connection_types.push(ExportConnectionType {
+        id: "secret".to_owned(),
+        ..o.connection_types[0].clone()
+    });
+    let export = export_connections(&[folder, ty, ok], &o).unwrap();
+    let exported: Vec<&str> = export
+        .report
+        .connections
+        .iter()
+        .filter(|c| c.exported())
+        .map(|c| c.name.as_str())
+        .collect();
+    assert_eq!(exported, ["ok"]);
+    let text = String::from_utf8(export.json).unwrap();
+    assert!(!text.contains("api_token") && !text.contains("ninesql-secret"));
+}
