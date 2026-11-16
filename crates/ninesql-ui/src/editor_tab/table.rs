@@ -27,6 +27,7 @@ use gpui_kit::*;
 use ninesql_core::driver_api::arrow_array::RecordBatch;
 use ninesql_core::driver_api::metadata::{ForeignKeyInfo, ObjectDetails, ObjectPath};
 use ninesql_core::driver_api::{ObjectKind, Param};
+use ninesql_core::edit::QuerySource;
 use ninesql_core::edit::{
     referenced_rows_query, referencing_rows_query, row_values_by_name, table_parts,
 };
@@ -53,9 +54,9 @@ pub struct TableSource {
     pub path: ObjectPath,
     /// The current query (filters, raw `WHERE`, order).
     pub query: TableQuery,
-    /// A query to run first instead of [`Self::query`] (foreign-key navigation: the text and
-    /// bind values of a core-built `BuiltQuery`). Values are dropped once submitted.
-    pub initial: Option<(String, Vec<Param>)>,
+    /// A core-built query to run first instead of [`Self::query`] (foreign-key navigation);
+    /// its source makes its result editable. Taken when submitted.
+    pub initial: Option<BuiltQuery>,
 }
 
 impl std::fmt::Debug for TableSource {
@@ -134,6 +135,15 @@ pub struct TableState {
     pub source_request: Option<RequestId>,
     /// The current run (or the last one) is the table query.
     pub source_live: bool,
+    /// The provenance of the submitted table query (`QuerySource`, only the core creates it).
+    pending_source: Option<QuerySource>,
+    /// The provenance of the current run's result, when it is the table query: paired with
+    /// that run's statement 0 only, never with another statement's result.
+    live_source: Option<QuerySource>,
+    /// Tests: the text run instead of the query's (the mock driver understands a tiny
+    /// language); the query's provenance is kept.
+    #[cfg(test)]
+    pub(super) run_text_override: Option<String>,
     /// The table's description, once read.
     pub described: Option<Result<EditableTable, String>>,
     /// Edit state.
@@ -154,6 +164,10 @@ impl Default for TableState {
             source: None,
             source_request: None,
             source_live: false,
+            pending_source: None,
+            live_source: None,
+            #[cfg(test)]
+            run_text_override: None,
             described: None,
             mode: EditMode::ReadOnly(TYPED_READ_ONLY.to_owned()),
             confirmation: None,
@@ -165,14 +179,14 @@ impl Default for TableState {
     }
 }
 
-/// Builds the pending changes of a result of `source` (one place, so the core's provenance
-/// check plugs in here).
+/// Builds the pending changes of the result of the query from `source` (the core checks the
+/// table and the result's columns against the query's provenance).
 fn pending_for(
     table: EditableTable,
     model: &ResultSetModel,
-    _source: &TableSource,
+    source: &QuerySource,
 ) -> Result<PendingEdits, String> {
-    PendingEdits::new(table, model.schema()).map_err(|e| format!("Read-only: {e}."))
+    PendingEdits::new(table, source, model.schema()).map_err(|e| format!("Read-only: {e}."))
 }
 
 /// The batch and in-batch row of model row `row`.
@@ -318,7 +332,7 @@ impl SqlEditorTab {
             );
             return false;
         };
-        let (text, params) = match source.initial.take() {
+        let built = match source.initial.take() {
             Some(b) => b,
             None => {
                 let Some(edit) = self.hub.update(cx, |h, _| h.edit()) else {
@@ -327,7 +341,7 @@ impl SqlEditorTab {
                 };
                 let q = self.table.source.as_ref().map(|s| s.query.clone());
                 match q.map(|q| edit.table_query(&session, &q)) {
-                    Some(Ok(b)) => (b.text, b.params),
+                    Some(Ok(b)) => b,
                     Some(Err(e)) => {
                         let text = crate::browse::display_message(&e.to_string());
                         self.say(text, true, cx);
@@ -337,12 +351,17 @@ impl SqlEditorTab {
                 }
             }
         };
+        let query_source = built.source().clone();
+        let BuiltQuery { text, params, .. } = built;
+        #[cfg(test)]
+        let text = self.table.run_text_override.clone().unwrap_or(text);
         let submitted = self
             .editor
             .update(cx, |e, cx| e.submit_built(&text, params, window, cx));
         match submitted {
             Ok(id) => {
                 self.table.source_request = Some(id);
+                self.table.pending_source = Some(query_source);
                 true
             }
             Err(why) => {
@@ -356,6 +375,11 @@ impl SqlEditorTab {
     /// run makes the result read-only.
     pub(super) fn table_run_started(&mut self, request: RequestId) {
         self.table.source_live = self.table.source_request == Some(request);
+        self.table.live_source = if self.table.source_live {
+            self.table.pending_source.take()
+        } else {
+            None
+        };
         if self.table.source_live {
             self.table.mode = match &self.table.described {
                 None => EditMode::Describing,
@@ -383,7 +407,8 @@ impl SqlEditorTab {
                 return;
             }
         };
-        let Some(source) = self.table.source.clone() else {
+        let Some(source) = self.table.live_source.clone() else {
+            self.table.mode = EditMode::ReadOnly(TYPED_READ_ONLY.to_owned());
             return;
         };
         let results = self.results.read(cx);
@@ -949,14 +974,20 @@ impl SqlEditorTab {
             }
             SaveEvent::Failed(e) => {
                 self.table.saving = false;
-                self.say(
-                    format!(
-                        "Not saved: {} The changes are still pending.",
-                        edit_text(&e)
-                    ),
-                    true,
-                    cx,
-                );
+                let text = save_failed_text(&e);
+                if matches!(
+                    e,
+                    EditError::TransactionRolledBack { .. } | EditError::UndoFailed { .. }
+                ) {
+                    // Earlier uncommitted work is concerned: never only a toolbar line.
+                    use gpui_kit::component::WindowExt as _;
+                    window.push_notification(
+                        gpui_kit::component::notification::Notification::error(text.clone())
+                            .title("Save failed"),
+                        cx,
+                    );
+                }
+                self.say(text, true, cx);
             }
             _ => {}
         }
@@ -1305,6 +1336,24 @@ impl SqlEditorTab {
     #[must_use]
     pub fn table_session(&self) -> Option<SessionHandle> {
         self.session().cloned()
+    }
+}
+
+/// The message after a failed save. A save whose undo rolled back the session's whole
+/// transaction says that earlier uncommitted work was lost; one whose undo failed asks to roll
+/// back or close the session.
+#[must_use]
+pub fn save_failed_text(e: &EditError) -> String {
+    match e {
+        EditError::TransactionRolledBack { .. } => format!(
+            "Not saved, and the session's whole transaction was rolled back: earlier uncommitted changes in this session were lost too. {}",
+            edit_text(e)
+        ),
+        EditError::UndoFailed { .. } => format!(
+            "Not saved, and the save could not be undone: roll back the transaction (Roll back transaction) or close the session before anything else. {}",
+            edit_text(e)
+        ),
+        _ => format!("Not saved: {} The changes are still pending.", edit_text(e)),
     }
 }
 

@@ -5,7 +5,7 @@
 
 use gpui::{Entity, TestAppContext, VisualTestContext};
 use gpui_kit::component::WindowExt as _;
-use ninesql_core::driver_api::metadata::{ObjectDetails, ObjectInfo, ObjectPath};
+use ninesql_core::driver_api::metadata::{ObjectDetails, ObjectInfo, ObjectPath, TableInfo};
 use ninesql_core::driver_api::mock::MOCK_ENGINE;
 use ninesql_core::driver_api::{ColumnInfo, IndexInfo, ObjectKind};
 use ninesql_core::{Auth, ConnectionId, ConnectionTypeId, EditableTable, SessionHandle};
@@ -79,10 +79,12 @@ fn keyed_table() -> EditableTable {
         comment: None,
         details: ObjectDetails::Index(pk),
     };
+    let mut info = TableInfo::default();
+    info.transactional = Some(true);
     EditableTable::from_metadata(
         &MOCK_ENGINE,
         path(),
-        None,
+        Some(&info),
         &[col("id", 1, "bigint"), col("label", 2, "text")],
         true,
         &[idx],
@@ -90,14 +92,23 @@ fn keyed_table() -> EditableTable {
     .unwrap_or_else(|e| panic!("{e}"))
 }
 
+/// Opens `t000`: the core builds its query (and provenance); the mock runs `text` instead.
+fn open_with_text(l: &mut Live, text: &str) {
+    let tab = l.tab.clone();
+    let text = text.to_owned();
+    l.vcx.update(|window, cx| {
+        tab.update(cx, |t, cx| {
+            t.table.run_text_override = Some(text);
+            t.open_table(TableSource::of_path(path()), window, cx);
+        });
+    });
+}
+
 /// Opens `t000` with a first query the mock answers (`numbers(3)`: `id`, `label`), waits for
 /// the run, then gives the tab the keyed description (the mock lists no index).
 fn open_editable(l: &mut Live) {
-    let mut source = TableSource::of_path(path());
-    source.initial = Some(("SELECT * FROM numbers(3)".to_owned(), Vec::new()));
+    open_with_text(l, "SELECT * FROM numbers(3)");
     let tab = l.tab.clone();
-    l.vcx
-        .update(|window, cx| tab.update(cx, |t, cx| t.open_table(source, window, cx)));
     wait_until(&mut l.vcx, |vcx| {
         tab.read_with(vcx, |t, cx| {
             !t.is_running()
@@ -191,7 +202,7 @@ fn table_without_key_stays_read_only_with_its_reason(cx: &mut TestAppContext) {
     let text = l
         .tab
         .read_with(&l.vcx, |t, cx| t.editor().read(cx).text(cx));
-    assert_eq!(text, "SELECT * FROM \"public\".\"t000\"");
+    assert_eq!(text, "SELECT * FROM \"nine\".\"public\".\"t000\"");
     // No dirty marker can be set.
     let r = l
         .vcx
@@ -329,6 +340,7 @@ fn refused_raw_where_keeps_the_query_and_filters_are_recorded(cx: &mut TestAppCo
     }));
     let ok = l.vcx.update(|window, cx| {
         tab.update(cx, |t, cx| {
+            t.table.run_text_override = None;
             t.set_raw_where(Some("id > 1".into()), window, cx)
         })
     });
@@ -358,6 +370,73 @@ fn pending_edits_block_a_new_run(cx: &mut TestAppContext) {
     l.vcx
         .update(|_, cx| tab.update(cx, |t, cx| t.discard_changes(cx)));
     assert!(!l.tab.read_with(&l.vcx, |t, _| t.has_pending_edits()));
+}
+
+#[gpui::test]
+fn result_not_matching_the_query_provenance_is_read_only(cx: &mut TestAppContext) {
+    // An aliased column: the result's names are not the table's, whatever the query said.
+    let tmp = tempfile::tempdir().unwrap_or_else(|e| panic!("{e}"));
+    let mut l = live(cx, ConnectionTypeId::dev(), tmp.path());
+    open_with_text(&mut l, "SELECT 1 AS id");
+    let tab = l.tab.clone();
+    wait_until(&mut l.vcx, |vcx| {
+        tab.read_with(vcx, |t, cx| {
+            !t.is_running()
+                && t.table_state().describing.is_none()
+                && t.results().read(cx).tab_of_statement(0).is_some()
+        })
+    });
+    l.vcx
+        .update(|_, cx| tab.update(cx, |t, cx| t.set_description(Ok(keyed_table()), cx)));
+    assert!(l.tab.read_with(&l.vcx, |t, _| t.editing().is_none()));
+    let reason = l
+        .tab
+        .read_with(&l.vcx, |t, _| t.read_only_reason().map(str::to_owned))
+        .unwrap_or_default();
+    assert!(reason.starts_with("Read-only:"), "{reason}");
+}
+
+#[gpui::test]
+fn typed_select_in_a_table_tab_is_never_editable(cx: &mut TestAppContext) {
+    let tmp = tempfile::tempdir().unwrap_or_else(|e| panic!("{e}"));
+    let mut l = live(cx, ConnectionTypeId::dev(), tmp.path());
+    open_editable(&mut l);
+    // The user types an aliased SELECT of the same columns: no provenance, read-only.
+    let editor = l.tab.read_with(&l.vcx, |t, _| t.editor().clone());
+    l.vcx.update(|window, cx| {
+        editor.update(cx, |e, cx| {
+            e.set_text("SELECT * FROM numbers(3) AS t000", window, cx);
+            e.execute(ExecutionKind::Statement, window, cx);
+        });
+    });
+    let tab = l.tab.clone();
+    wait_until(&mut l.vcx, |vcx| {
+        tab.read_with(vcx, |t, cx| {
+            !t.is_running() && t.results().read(cx).tab_of_statement(0).is_some()
+        })
+    });
+    assert!(l.tab.read_with(&l.vcx, |t, _| t.editing().is_none()));
+    assert_eq!(
+        l.tab
+            .read_with(&l.vcx, |t, _| t.read_only_reason().map(str::to_owned)),
+        Some(TYPED_READ_ONLY.to_owned())
+    );
+}
+
+#[test]
+fn a_rolled_back_transaction_is_said_plainly() {
+    use ninesql_core::EditError;
+    let text = super::table::save_failed_text(&EditError::TransactionRolledBack {
+        source: Box::new(EditError::Cancelled),
+    });
+    assert!(text.contains("whole transaction was rolled back"), "{text}");
+    assert!(text.contains("earlier uncommitted changes"), "{text}");
+    let text = super::table::save_failed_text(&EditError::UndoFailed {
+        source: Box::new(EditError::Cancelled),
+    });
+    assert!(text.contains("Roll back transaction"), "{text}");
+    let text = super::table::save_failed_text(&EditError::TooManyChanges { max: 10_000 });
+    assert!(text.contains("still pending"), "{text}");
 }
 
 #[test]
