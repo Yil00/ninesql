@@ -1110,10 +1110,12 @@ async fn metadata_lists_with_bound_filters_and_pages() {
         .await
         .unwrap();
     assert!(routines.items.iter().any(|o| o.name() == "write_one()"));
-    assert!(matches!(
-        m.ddl(&customers).await,
-        Err(DriverError::Unsupported(_))
-    ));
+    assert!(
+        m.ddl(&customers)
+            .await
+            .unwrap()
+            .starts_with("CREATE TABLE public.customers (")
+    );
     assert_eq!(m.child_kinds(None), vec![ObjectKind::Schema]);
 }
 
@@ -1201,11 +1203,21 @@ async fn driver_queries_never_resolve_to_user_operators() {
     .unwrap();
     let evil = root.child(ObjectKind::Schema, "ninesql_evil");
     let public = root.child(ObjectKind::Schema, "public");
+    let calls_table = evil.child(ObjectKind::Table, "calls");
+    let orders = public.child(ObjectKind::Table, "orders");
     for (parent, kind) in [
         (&evil, ObjectKind::Routine),
         (&evil, ObjectKind::Table),
+        (&evil, ObjectKind::Sequence),
+        (&evil, ObjectKind::Type),
         (&public, ObjectKind::View),
         (&public, ObjectKind::MaterializedView),
+        (&orders, ObjectKind::Constraint),
+        (&orders, ObjectKind::ForeignKey),
+        (&orders, ObjectKind::Index),
+        (&orders, ObjectKind::Trigger),
+        (&orders, ObjectKind::Partition),
+        (&calls_table, ObjectKind::Constraint),
     ] {
         m.list(
             parent,
@@ -1222,7 +1234,18 @@ async fn driver_queries_never_resolve_to_user_operators() {
     )
     .await
     .unwrap();
-    let _ = m.ddl(&evil).await;
+    for o in [
+        evil.clone(),
+        calls_table.clone(),
+        evil.child(ObjectKind::Type, "mood2"),
+        evil.child(ObjectKind::Routine, "cat(name, text)"),
+        public.child(ObjectKind::View, "customer_order_totals"),
+        orders.child(ObjectKind::Index, "orders_customer_idx"),
+        orders.child(ObjectKind::ForeignKey, "orders_customer_id_fkey"),
+        orders.child(ObjectKind::Constraint, "orders_pkey"),
+    ] {
+        m.ddl(&o).await.unwrap();
+    }
     run(s.as_mut(), "SELECT 'a'::ninesql_evil.mood2 AS m")
         .await
         .unwrap();

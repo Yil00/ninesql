@@ -38,6 +38,7 @@ mod auth;
 mod cancel;
 mod conn;
 mod dialect;
+mod metadata;
 mod session;
 mod tls;
 mod types;
@@ -57,7 +58,8 @@ use tokio::sync::mpsc;
 
 pub use actor::IDLE_CURSOR_TIMEOUT;
 pub use dialect::PgDialect;
-pub use session::{PgMetadata, PgSession};
+pub use metadata::PgMetadata;
+pub use session::PgSession;
 
 use crate::actor::{Actor, Shared};
 use crate::cancel::CancelTarget;
@@ -313,8 +315,22 @@ fn postgres_capabilities(server_version: Option<&str>) -> Capabilities {
         ObjectKind::View,
         ObjectKind::MaterializedView,
         ObjectKind::Column,
+        ObjectKind::Constraint,
+        ObjectKind::ForeignKey,
+        ObjectKind::Index,
+        ObjectKind::Trigger,
+        ObjectKind::Partition,
         ObjectKind::Routine,
+        ObjectKind::Sequence,
+        ObjectKind::Type,
     ]);
+    // Every listed kind but `Column` has DDL (P4-A, F-NAV-07).
+    metadata.ddl = metadata
+        .kinds
+        .iter()
+        .copied()
+        .filter(|k| *k != ObjectKind::Column)
+        .collect();
     c.metadata = metadata;
     let mut editing = EditingCapabilities::default();
     editing.insert = true;

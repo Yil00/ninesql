@@ -134,6 +134,9 @@ pub(crate) enum Command {
         sql: String,
         params: Vec<Option<String>>,
         max_rows: i32,
+        /// Largest value kept: `None` cuts values at 64 KiB silently; `Some(n)` fails the
+        /// statement when a value is longer than `n` (DDL text is never returned cut).
+        value_limit: Option<usize>,
         verify: bool,
         guard: ExecutionGuard,
         reply: oneshot::Sender<DriverResult<Rows>>,
@@ -442,11 +445,14 @@ impl Actor {
                     sql,
                     params,
                     max_rows,
+                    value_limit,
                     verify,
                     guard,
                     reply,
                 } => {
-                    let mut result = self.internal(&sql, &params, max_rows).await;
+                    let mut result = self
+                        .internal_limited(&sql, &params, max_rows, value_limit)
+                        .await;
                     if result.is_ok()
                         && verify
                         && let Err(e) = self.verify_session().await
@@ -517,6 +523,17 @@ impl Actor {
         params: &[Option<String>],
         max_rows: i32,
     ) -> DriverResult<Rows> {
+        self.internal_limited(sql, params, max_rows, None).await
+    }
+
+    /// [`internal`](Self::internal) with a value limit (see `Command::Internal`).
+    pub(crate) async fn internal_limited(
+        &mut self,
+        sql: &str,
+        params: &[Option<String>],
+        max_rows: i32,
+        value_limit: Option<usize>,
+    ) -> DriverResult<Rows> {
         let out = self.conn.out();
         let proto = |e: std::io::Error| DriverError::Protocol(e.to_string());
         frontend::parse("", sql, params.iter().map(|_| 0), out).map_err(proto)?;
@@ -542,6 +559,7 @@ impl Actor {
         frontend::sync(out);
         self.conn.flush().await?;
         let mut rows = crate::conn::TextRows::default();
+        rows.value_limit = value_limit;
         let mut error = None;
         loop {
             match self.conn.next(RowSink::Text(&mut rows)).await? {
@@ -553,6 +571,14 @@ impl Actor {
         self.sync_status();
         match error {
             Some(e) => Err(statement_error(&e, false)),
+            None if rows.cut && value_limit.is_some() => Err(DriverError::Query {
+                code: None,
+                message: format!(
+                    "the definition is larger than {} KiB and was not loaded",
+                    value_limit.unwrap_or(0) / 1024
+                ),
+                position: None,
+            }),
             None => Ok(rows.rows),
         }
     }
