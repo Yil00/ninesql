@@ -391,3 +391,81 @@ pub fn open_dbeaver_export(
     });
     dialog
 }
+
+#[cfg(test)]
+mod tests {
+    use gpui::TestAppContext;
+    use ninesql_core::{Auth, ConnectionTypeId};
+
+    use super::{DbeaverExportStage, TargetKind, open_dbeaver_export};
+    use crate::connections::form::BuiltConnection;
+    use crate::connections::tests::{await_task, core_hub, mock_connection, open_live, wait_until};
+
+    #[gpui::test]
+    fn exports_chosen_connections_to_a_new_file_and_refuses_an_existing_one(
+        cx: &mut TestAppContext,
+    ) {
+        let tmp = tempfile::tempdir().unwrap_or_else(|e| panic!("{e}"));
+        let out = tempfile::tempdir().unwrap_or_else(|e| panic!("{e}"));
+        let (hub, core) = core_hub(cx, tmp.path());
+        let (_ws, mut vcx) = open_live(cx);
+        let c = mock_connection("Exported", ConnectionTypeId::dev(), Auth::None);
+        let task = hub.update(&mut vcx, |h, cx| {
+            h.save(
+                BuiltConnection {
+                    connection: c,
+                    to_store: Vec::new(),
+                    to_delete: Vec::new(),
+                },
+                cx,
+            )
+        });
+        let id = await_task(&mut vcx, task).unwrap_or_else(|e| panic!("{e}"));
+        let target = out.path().join("data-sources-ninesql.json");
+        let dialog = vcx.update(|window, cx| {
+            open_dbeaver_export(
+                Some(core.clone()),
+                vec![(id, "Exported".into())],
+                window,
+                cx,
+            )
+        });
+        assert!(dialog.read_with(&vcx, |d, cx| d.start_problem(cx).is_some()));
+        let input = dialog.read_with(&vcx, |d, _| d.path_input().clone());
+        let text = target.to_string_lossy().into_owned();
+        vcx.update(|window, cx| {
+            input.update(cx, |s, cx| s.set_value(text.clone(), window, cx));
+            dialog.update(cx, |d, cx| {
+                d.toggle(id, true, cx);
+                d.set_kind(TargetKind::File, cx);
+                d.start(window, cx);
+            });
+        });
+        wait_until(&mut vcx, |vcx| {
+            dialog.read_with(vcx, |d, _| {
+                !matches!(d.stage(), DbeaverExportStage::Running)
+            })
+        });
+        let done = dialog.read_with(&vcx, |d, _| match d.stage() {
+            DbeaverExportStage::Done(o) => Ok(o.report.connections.len()),
+            other => Err(format!("{other:?}")),
+        });
+        assert_eq!(done, Ok(1));
+        assert!(target.exists());
+
+        // A second export to the same path is refused, with nothing overwritten.
+        let before = std::fs::read(&target).unwrap_or_default();
+        vcx.update(|window, cx| {
+            dialog.update(cx, |d, cx| {
+                d.back(cx);
+                d.start(window, cx);
+            });
+        });
+        wait_until(&mut vcx, |vcx| {
+            dialog.read_with(vcx, |d, _| {
+                matches!(d.stage(), DbeaverExportStage::Failed(_))
+            })
+        });
+        assert_eq!(std::fs::read(&target).unwrap_or_default(), before);
+    }
+}

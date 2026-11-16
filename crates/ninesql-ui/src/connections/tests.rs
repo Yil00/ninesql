@@ -950,7 +950,7 @@ fn wait_reply<T>(mut reply: ninesql_core::Reply<T>) -> T {
 
 /// A real `CoreServices` on the mock driver under `base` (no Secret Service, no desktop lock
 /// watcher, so new secrets go to the vault), installed as the hub.
-fn core_hub(
+pub(crate) fn core_hub(
     cx: &mut TestAppContext,
     base: &std::path::Path,
 ) -> (Entity<ConnectionHub>, ninesql_core::CoreServices) {
@@ -974,7 +974,7 @@ fn create_test_vault(core: &ninesql_core::CoreServices) {
 }
 
 /// Awaits a hub task that runs on the driver runtime, with parking allowed.
-fn await_task<T: 'static>(vcx: &mut VisualTestContext, task: gpui::Task<T>) -> T {
+pub(crate) fn await_task<T: 'static>(vcx: &mut VisualTestContext, task: gpui::Task<T>) -> T {
     let done = std::rc::Rc::new(std::cell::RefCell::new(None));
     let slot = done.clone();
     vcx.foreground_executor()
