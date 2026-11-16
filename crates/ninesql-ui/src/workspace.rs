@@ -2463,7 +2463,7 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) -> TabId {
         let mut source = crate::editor_tab::table::TableSource::of_path(target.path);
-        source.initial = Some(target.query);
+        source.initial = Some((target.query.text, target.query.params));
         self.open_table_tab(session, source, window, cx)
     }
 

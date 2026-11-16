@@ -53,8 +53,9 @@ pub struct TableSource {
     pub path: ObjectPath,
     /// The current query (filters, raw `WHERE`, order).
     pub query: TableQuery,
-    /// A query to run first instead of [`Self::query`] (foreign-key navigation).
-    pub initial: Option<BuiltQuery>,
+    /// A query to run first instead of [`Self::query`] (foreign-key navigation: the text and
+    /// bind values of a core-built `BuiltQuery`). Values are dropped once submitted.
+    pub initial: Option<(String, Vec<Param>)>,
 }
 
 impl std::fmt::Debug for TableSource {
@@ -141,6 +142,8 @@ pub struct TableState {
     pub confirmation: Option<SaveConfirmation>,
     /// A save is running.
     pub saving: bool,
+    /// The next run of the table query keeps the toolbar message (the save's).
+    pub(super) keep_message: bool,
     pub(super) describing: Option<Task<()>>,
     pub(super) save_task: Option<Task<()>>,
 }
@@ -155,6 +158,7 @@ impl Default for TableState {
             mode: EditMode::ReadOnly(TYPED_READ_ONLY.to_owned()),
             confirmation: None,
             saving: false,
+            keep_message: false,
             describing: None,
             save_task: None,
         }
@@ -314,7 +318,7 @@ impl SqlEditorTab {
             );
             return false;
         };
-        let built = match source.initial.take() {
+        let (text, params) = match source.initial.take() {
             Some(b) => b,
             None => {
                 let Some(edit) = self.hub.update(cx, |h, _| h.edit()) else {
@@ -323,7 +327,7 @@ impl SqlEditorTab {
                 };
                 let q = self.table.source.as_ref().map(|s| s.query.clone());
                 match q.map(|q| edit.table_query(&session, &q)) {
-                    Some(Ok(b)) => b,
+                    Some(Ok(b)) => (b.text, b.params),
                     Some(Err(e)) => {
                         let text = crate::browse::display_message(&e.to_string());
                         self.say(text, true, cx);
@@ -333,7 +337,6 @@ impl SqlEditorTab {
                 }
             }
         };
-        let BuiltQuery { text, params, .. } = built;
         let submitted = self
             .editor
             .update(cx, |e, cx| e.submit_built(&text, params, window, cx));
@@ -914,7 +917,15 @@ impl SqlEditorTab {
                 self.table.saving = false;
                 self.table.confirmation = Some(c.clone());
                 self.message = None;
-                super::edit_dialogs::open_save_confirmation(cx.entity(), c, window, cx);
+                let (color, guard) = self.save_confirmation_parts(c.production, cx);
+                super::edit_dialogs::open_save_confirmation(
+                    cx.entity(),
+                    c,
+                    color,
+                    guard,
+                    window,
+                    cx,
+                );
             }
             SaveEvent::Started { statements } => {
                 self.say(format!("Saving {statements} changes…"), false, cx);
@@ -929,9 +940,11 @@ impl SqlEditorTab {
                 self.say(save_done_text(&summary), !summary.committed, cx);
                 // Show the rows as saved (the same session sees its own open transaction).
                 if self.table.source.is_some() {
-                    let message = self.message.clone();
-                    self.run_source(window, cx);
-                    self.message = message;
+                    self.table.keep_message = true;
+                    if !self.run_source(window, cx) {
+                        self.table.keep_message = false;
+                    }
+                    self.say(save_done_text(&summary), !summary.committed, cx);
                 }
             }
             SaveEvent::Failed(e) => {

@@ -642,7 +642,11 @@ impl SqlEditorTab {
                 Ok(t) => t,
                 Err(why) => return refuse(self, why, cx),
             };
-        self.message = None;
+        let keep = self.table.keep_message && self.table.source_request == Some(request.id);
+        self.table.keep_message = false;
+        if !keep {
+            self.message = None;
+        }
         self.statement_texts.clear();
         self.table_run_started(request.id);
         self.grid(ExecutionEvent::Started, window, cx);
@@ -1450,5 +1454,7 @@ impl Render for SqlEditorTab {
     }
 }
 
+#[cfg(test)]
+mod table_tests;
 #[cfg(test)]
 mod tests;

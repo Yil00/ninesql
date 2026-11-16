@@ -16,6 +16,30 @@ use ninesql_core::{FilterHistoryEntry, SaveConfirmation, SavePlan};
 use super::{ConfirmationGuard, SqlEditorTab};
 use crate::connections::visuals::{ConnectionBadges, hsla};
 
+impl SqlEditorTab {
+    /// The color of the save confirmation (the session's type, production's when the core says
+    /// production and the session shows none) and the guard telling the tab when the dialog is
+    /// gone.
+    pub(super) fn save_confirmation_parts(
+        &self,
+        production: bool,
+        cx: &App,
+    ) -> (Hsla, Rc<dyn std::any::Any>) {
+        let badges = self
+            .session()
+            .map(|s| ConnectionBadges::of_open_session(self.hub.read(cx), s));
+        let color = match badges {
+            Some(b) if b.production || !production => b.color,
+            _ => hsla(ninesql_core::ConnectionType::production().color),
+        };
+        let guard: Rc<dyn std::any::Any> = Rc::new(ConfirmationGuard {
+            generation: SAVE_CONFIRMATION_GENERATION,
+            dropped: self.confirmation_dropped.clone(),
+        });
+        (color, guard)
+    }
+}
+
 /// Height of the script boxes.
 const SCRIPT_BOX_MAX_HEIGHT: f32 = 320.;
 /// Generation the save confirmation's guard reports (never a run's).
@@ -51,24 +75,11 @@ fn counts_text(deletes: usize, updates: usize, inserts: usize) -> String {
 pub fn open_save_confirmation(
     tab: Entity<SqlEditorTab>,
     confirmation: SaveConfirmation,
+    color: Hsla,
+    guard: Rc<dyn std::any::Any>,
     window: &mut Window,
     cx: &mut App,
 ) {
-    let (color, guard) = {
-        let t = tab.read(cx);
-        let badges = t
-            .session()
-            .map(|s| ConnectionBadges::of_open_session(t.hub.read(cx), s));
-        let color = match badges {
-            Some(b) if b.production || !confirmation.production => b.color,
-            _ => hsla(ninesql_core::ConnectionType::production().color),
-        };
-        let guard: Rc<dyn std::any::Any> = Rc::new(ConfirmationGuard {
-            generation: SAVE_CONFIRMATION_GENERATION,
-            dropped: t.confirmation_dropped.clone(),
-        });
-        (color, guard)
-    };
     let decided = Rc::new(std::cell::Cell::new(false));
     let c = Rc::new(confirmation);
     window.open_dialog(cx, move |dialog, _window, cx| {
