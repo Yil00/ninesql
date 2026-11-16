@@ -22,6 +22,7 @@ pub mod registry;
 pub mod runtime;
 pub mod services;
 pub mod session;
+pub mod transfer;
 pub mod workspace;
 
 pub use connect::{FlaggedInitStatement, SecretPrompt};
@@ -69,6 +70,11 @@ pub use session::{
     Reply, SecretsLockReason, SessionHandle, SessionId, SessionInfo, SessionManager,
     SessionWarning, TransactionEnd, TransactionState,
 };
+pub use transfer::{
+    CsvPreviewRequest, ExportEvent, ExportJob, ExportRequest, ExportSource, ExportSummary,
+    ImportConfirmation, ImportEnd, ImportEvent, ImportJob, ImportRequest, ImportSummary,
+    ImportToken, ImportTransaction, Job, TransferJobError, TransferService,
+};
 pub use workspace::{
     ConnectionTypesFile, Connections, ConnectionsFile, LoadIssue, LoadedConnections, MarkerClear,
     ProjectFile, ProjectId, Workspace,
@@ -80,4 +86,3 @@ pub use ninesql_driver_api as driver_api;
 pub use ninesql_secrets as secrets;
 pub use ninesql_ssh as ssh;
 pub use ninesql_storage as storage;
-pub use ninesql_transfer as transfer;
