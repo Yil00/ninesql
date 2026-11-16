@@ -479,6 +479,9 @@ impl Focusable for ResultsView {
 impl ResultsView {
     /// An empty view under `budget`.
     pub fn new(budget: GridBudget, cx: &mut Context<Self>) -> Self {
+        let mut p5 = panels::P5State::default();
+        p5.subscriptions
+            .push(cx.on_release(|this: &mut Self, cx| this.release_images(cx)));
         Self {
             results: ExecutionResults::new(budget),
             tables: Vec::new(),
@@ -487,7 +490,7 @@ impl ResultsView {
             options: Rc::new(DisplayOptions::default()),
             focus_handle: cx.focus_handle(),
             status: None,
-            p5: panels::P5State::default(),
+            p5,
             edit_buffers: std::collections::HashMap::new(),
         }
     }
@@ -966,6 +969,19 @@ pub fn idle_duration_text(secs: u64) -> String {
 
 impl Render for ResultsView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        self.begin_image_frame();
+        let element = self.render_frame(window, cx);
+        self.evict_images(window, cx);
+        element
+    }
+}
+
+impl ResultsView {
+    fn render_frame(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> gpui_kit::AnyElement {
         if let ActivePane::Result(ix) = self.active {
             self.ensure_table(ix, window, cx);
         }
@@ -1134,6 +1150,7 @@ impl Render for ResultsView {
             })
             .child(strip)
             .child(div().flex_1().min_h_0().child(body))
+            .into_any_element()
     }
 }
 

@@ -238,6 +238,15 @@ fn production_save_shows_the_exact_script_and_resumes_with_the_token(cx: &mut Te
     assert!(l.vcx.update(|window, cx| window.has_active_dialog(cx)));
     // Nothing ran: the edit is still pending.
     assert!(l.tab.read_with(&l.vcx, |t, _| t.has_pending_edits()));
+    // "Revert row changes" cannot change what the confirmation shows (review L2).
+    l.vcx
+        .update(|_, cx| tab.update(cx, |t, cx| t.revert_selected_rows(cx)));
+    assert!(l.tab.read_with(&l.vcx, |t, _| t.has_pending_edits()));
+    let said = l
+        .tab
+        .read_with(&l.vcx, |t, _| t.message().map(|m| m.text.to_string()))
+        .unwrap_or_default();
+    assert!(said.contains("waits for its confirmation"), "{said}");
 
     l.vcx.update(|window, cx| {
         window.close_dialog(cx);
@@ -466,4 +475,27 @@ fn table_actions_have_keys_and_palette_entries() {
         assert!(spec.in_palette, "{name}");
         assert!(!spec.default_keys.is_empty(), "{name}");
     }
+}
+
+#[test]
+fn labels_mark_invisible_characters() {
+    use ninesql_core::{ColumnFilter, FilterOp, SortDirection, SortKey};
+    let p = ObjectPath::root()
+        .child(ObjectKind::Schema, "pub\u{202E}lic")
+        .child(ObjectKind::Table, "t\u{200B}1");
+    assert_eq!(TableSource::of_path(p).label(), "pub\u{FFFD}lic.t\u{FFFD}1");
+    assert_eq!(
+        super::table::display_columns(&["a\u{2028}b".into(), "c".into()]),
+        "a\u{FFFD}b, c"
+    );
+    assert_eq!(
+        super::edit_dialogs::unchecked_columns_text(&["x\u{202E}".into()]),
+        "Concurrent changes to these columns are not detected: x\u{FFFD}"
+    );
+    let filters = [ColumnFilter::new("na\u{202E}me", FilterOp::IsNull, None)];
+    let order = [SortKey::new("i\u{200F}d", SortDirection::Descending)];
+    assert_eq!(
+        super::edit_dialogs::filter_label(&filters, None, &order),
+        "na\u{FFFD}me is null · order by i\u{FFFD}d desc"
+    );
 }

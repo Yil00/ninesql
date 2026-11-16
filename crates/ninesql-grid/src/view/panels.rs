@@ -29,7 +29,7 @@ use crate::rows::{
 };
 use crate::selection::GridSelection;
 use crate::viewer::{
-    CellInspection, ImageKind, ViewerKind, image_for_preview, inspect_cell, render,
+    CellInspection, ImageKind, ViewerKind, ViewerOutput, image_for_preview, inspect_cell, render,
 };
 
 /// How the active result is shown.
@@ -65,7 +65,13 @@ pub(super) struct PanelCache {
     inspection: Option<(CacheKey, Focus, Option<CellInspection>)>,
     aggregates: Option<(CacheKey, Aggregates)>,
     text: Option<(CacheKey, Rc<TextView>)>,
+    output: Option<(CacheKey, Focus, ViewerKind, Rc<ViewerOutput>)>,
     image: Option<(CacheKey, Focus, Arc<Image>)>,
+    /// The cached image was asked for during the current frame.
+    image_used: bool,
+    /// Images replaced or no longer shown, removed from GPUI's asset cache and sprite atlas at
+    /// the end of the next frame ([`ResultsView::evict_images`]).
+    stale_images: Vec<Arc<Image>>,
 }
 
 /// The P5-A state of the results view.
@@ -207,7 +213,8 @@ impl ResultsView {
             cx.notify();
             return false;
         };
-        self.update_delegate(cx, |d| {
+        let mut dropped = false;
+        let done = self.update_delegate(cx, |d| {
             d.update_rows(|rows, m| {
                 rows.set_sort(
                     Some(SortKey {
@@ -216,8 +223,15 @@ impl ResultsView {
                     }),
                     m,
                 );
+                dropped = rows.sort_dropped();
             });
-        })
+        });
+        if dropped {
+            self.status = Some(crate::rows::sort_dropped_text());
+            cx.notify();
+            return false;
+        }
+        done
     }
 
     /// Adds a client-side filter on the active result.
@@ -582,17 +596,95 @@ impl ResultsView {
             && *k == key
             && *f == focused
         {
+            self.p5.cache.image_used = true;
             return Some(i.clone());
         }
+        if let Some((_, _, old)) = self.p5.cache.image.take() {
+            self.p5.cache.stale_images.push(old);
+        }
+        // Only single-frame formats reach GPUI's decoder (`sniff_image` refuses GIF and
+        // animated PNG, whose frames GPUI decodes with no limit).
         let info = image_for_preview(inspection).ok()?;
         let format = match info.kind {
             ImageKind::Png => ImageFormat::Png,
             ImageKind::Jpeg => ImageFormat::Jpeg,
-            ImageKind::Gif => ImageFormat::Gif,
         };
-        let image = Arc::new(Image::from_bytes(format, inspection.bytes.clone()?));
+        let image = Arc::new(Image::from_bytes(
+            format,
+            inspection.bytes.as_deref()?.to_vec(),
+        ));
         self.p5.cache.image = Some((key, focused, image.clone()));
+        self.p5.cache.image_used = true;
         Some(image)
+    }
+
+    /// The viewer output of the focused cell (cached by result, focus and viewer).
+    pub(super) fn viewer_output(
+        &mut self,
+        inspection: &CellInspection,
+        kind: ViewerKind,
+        cx: &gpui_kit::App,
+    ) -> Rc<ViewerOutput> {
+        let key = self.cache_key(cx);
+        let focused = self
+            .active_delegate(cx, GridDelegate::focused_cell)
+            .flatten();
+        if let (Some(key), Some((k, f, v, o))) = (key, &self.p5.cache.output)
+            && *k == key
+            && *f == focused
+            && *v == kind
+        {
+            return o.clone();
+        }
+        let out = Rc::new(render(inspection, kind));
+        if let Some(key) = key {
+            self.p5.cache.output = Some((key, focused, kind, out.clone()));
+        }
+        out
+    }
+
+    /// Number of decoded preview images this view still holds or has yet to evict (tests).
+    #[cfg(test)]
+    pub(super) fn held_images(&self) -> (Option<Arc<Image>>, usize) {
+        (
+            self.p5.cache.image.as_ref().map(|(_, _, i)| i.clone()),
+            self.p5.cache.stale_images.len(),
+        )
+    }
+
+    /// Called at the start of a frame: no image asked for yet.
+    pub(super) fn begin_image_frame(&mut self) {
+        self.p5.cache.image_used = false;
+    }
+
+    /// Called at the end of a frame: an image not shown in this frame (panel closed, another
+    /// viewer, another cell or result) and every replaced image is removed from GPUI's asset
+    /// cache and from the sprite atlas of every window, so decoded bitmaps do not pile up (I6).
+    pub(super) fn evict_images(&mut self, window: &mut Window, cx: &mut gpui_kit::App) {
+        if !self.p5.cache.image_used
+            && let Some((_, _, old)) = self.p5.cache.image.take()
+        {
+            self.p5.cache.stale_images.push(old);
+        }
+        for old in std::mem::take(&mut self.p5.cache.stale_images) {
+            // Every image here was handed to `img` in an earlier frame, so its asset is loading
+            // or loaded: this reads the cache, it does not start a decode.
+            if let Some(render) = old.clone().get_render_image(window, cx) {
+                cx.drop_image(render, Some(window));
+            }
+            old.remove_asset(cx);
+        }
+    }
+
+    /// Drops every cached image when the view goes away (no window: asset cache only).
+    pub(super) fn release_images(&mut self, cx: &mut gpui_kit::App) {
+        let held = self.p5.cache.image.take().map(|(_, _, i)| i);
+        for old in held
+            .into_iter()
+            .chain(std::mem::take(&mut self.p5.cache.stale_images))
+        {
+            old.remove_asset(cx);
+        }
     }
 
     // --- rendering ---------------------------------------------------------------------------
@@ -768,7 +860,7 @@ impl ResultsView {
                 .into_any_element();
         };
         let kind = self.viewer_for(&inspection);
-        let output = render(&inspection, kind);
+        let output = self.viewer_output(&inspection, kind, cx);
         let image = (kind == ViewerKind::Image)
             .then(|| self.image(&inspection, cx))
             .flatten();
@@ -800,8 +892,8 @@ impl ResultsView {
             .children(
                 output
                     .notes
-                    .into_iter()
-                    .map(|n| div().text_xs().text_color(theme.warning).child(n)),
+                    .iter()
+                    .map(|n| div().text_xs().text_color(theme.warning).child(n.clone())),
             )
             .when_some(image, |d, image| {
                 d.child(img(image).max_w(px(320.)).max_h(px(480.)))
@@ -814,7 +906,7 @@ impl ResultsView {
                         .when(inspection.is_null, |d| {
                             d.italic().text_color(theme.muted_foreground)
                         })
-                        .child(output.text),
+                        .child(SharedString::from(output.text.clone())),
                 )
             })
             .into_any_element()

@@ -176,3 +176,75 @@ fn client_filter_survives_new_pages(cx: &mut TestAppContext) {
     // New rows are filtered too once the page is in.
     assert_eq!(view.read_with(&vcx, |v, cx| v.shown_rows(cx)), Some(3));
 }
+
+fn png_value(width: u32, height: u32) -> Vec<u8> {
+    let mut v = b"\x89PNG\r\n\x1a\n\x00\x00\x00\x0dIHDR".to_vec();
+    v.extend_from_slice(&width.to_be_bytes());
+    v.extend_from_slice(&height.to_be_bytes());
+    v.extend_from_slice(&[8, 6, 0, 0, 0, 0, 0, 0, 0]);
+    v.extend_from_slice(b"\x00\x00\x00\x00IEND\x00\x00\x00\x00");
+    v
+}
+
+#[gpui::test]
+fn preview_images_are_evicted_and_outputs_cached(cx: &mut TestAppContext) {
+    use ninesql_core::driver_api::ResultSetHeader;
+    use ninesql_core::driver_api::arrow_array::{BinaryArray, RecordBatch};
+    use ninesql_core::driver_api::arrow_schema::{DataType, Field, Schema};
+
+    let (view, _, mut vcx) = open(cx, small_budget());
+    let schema = Arc::new(Schema::new(vec![Field::new("b", DataType::Binary, true)]));
+    let a = png_value(2, 2);
+    let b = png_value(3, 3);
+    let rows = RecordBatch::try_new(
+        schema.clone(),
+        vec![Arc::new(BinaryArray::from(vec![
+            Some(a.as_slice()),
+            Some(b.as_slice()),
+        ]))],
+    )
+    .unwrap();
+    send(
+        &view,
+        &mut vcx,
+        vec![
+            ExecutionEvent::Started,
+            item(
+                0,
+                ResultItem::ResultSet(ResultSetHeader::tabular(0, schema)),
+            ),
+            item(0, ResultItem::Rows(rows)),
+        ],
+    );
+    vcx.simulate_keystrokes("alt-v");
+    select_cell(&view, &mut vcx, 0, 0);
+    vcx.run_until_parked();
+    let first = view
+        .read_with(&vcx, |v, _| v.held_images())
+        .0
+        .expect("first image");
+    assert!(vcx.update(|_, cx| first.is_asset_cached(cx)));
+    // The viewer output is cached: the same Rc until the focus moves.
+    let o1 = view.update(&mut vcx, |v, cx| {
+        let i = v.inspection(cx).unwrap();
+        v.viewer_output(&i, ViewerKind::Image, cx)
+    });
+    let o2 = view.update(&mut vcx, |v, cx| {
+        let i = v.inspection(cx).unwrap();
+        v.viewer_output(&i, ViewerKind::Image, cx)
+    });
+    assert!(std::rc::Rc::ptr_eq(&o1, &o2));
+    // Another cell: the first image leaves GPUI's asset cache.
+    select_cell(&view, &mut vcx, 1, 0);
+    vcx.run_until_parked();
+    let (second, stale) = view.read_with(&vcx, |v, _| v.held_images());
+    let second = second.expect("second image");
+    assert_eq!(stale, 0);
+    assert!(!vcx.update(|_, cx| first.is_asset_cached(cx)));
+    assert!(vcx.update(|_, cx| second.is_asset_cached(cx)));
+    // Closing the panel evicts the shown image too.
+    vcx.simulate_keystrokes("alt-v");
+    vcx.run_until_parked();
+    assert_eq!(view.read_with(&vcx, |v, _| v.held_images()), (None, 0));
+    assert!(!vcx.update(|_, cx| second.is_asset_cached(cx)));
+}

@@ -3,6 +3,7 @@
 //! and a summary.
 
 use std::path::PathBuf;
+use std::rc::Rc;
 
 use gpui_kit::base::async_util::unbounded;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
@@ -19,6 +20,7 @@ use ninesql_core::{
 };
 
 use super::{bytes_text, error_text, session_problem};
+use crate::script_view::{ScriptRows, script_view};
 
 /// Rows per commit in "commit every N rows" mode.
 pub const COMMIT_EVERY_ROWS: u64 = 1000;
@@ -65,6 +67,8 @@ pub struct ImportCsvDialog {
     transaction: ImportTransaction,
     skip_invalid: bool,
     stage: ImportStage,
+    /// The statement of the confirmation, laid out once ([`ScriptRows`]).
+    confirm_script: Option<Rc<ScriptRows>>,
     tasks: Vec<Task<()>>,
 }
 
@@ -92,6 +96,7 @@ impl ImportCsvDialog {
             transaction: ImportTransaction::AllOrNothing,
             skip_invalid: false,
             stage: ImportStage::ChooseFile,
+            confirm_script: None,
             tasks: Vec::new(),
         }
     }
@@ -353,7 +358,10 @@ impl ImportCsvDialog {
             return;
         }
         match event {
-            ImportEvent::NeedsConfirmation(c) => self.stage = ImportStage::Confirm(Box::new(c)),
+            ImportEvent::NeedsConfirmation(c) => {
+                self.confirm_script = Some(Rc::new(ScriptRows::new(&c.statement)));
+                self.stage = ImportStage::Confirm(Box::new(c));
+            }
             ImportEvent::Failed(e) => self.stage = ImportStage::Failed(error_text(&e)),
             ImportEvent::Started { file_bytes } => {
                 self.stage = ImportStage::Running {
@@ -420,14 +428,22 @@ impl ImportCsvDialog {
                     .join(", "),
             ),
             (
-                "Statement".into(),
-                crate::browse::display_message(&c.statement),
-            ),
-            (
                 "File".into(),
-                format!("{} ({})", c.file.display(), bytes_text(c.file_bytes)),
+                format!(
+                    "{} ({})",
+                    crate::browse::display_message(&c.file.display().to_string()),
+                    bytes_text(c.file_bytes)
+                ),
             ),
         ]
+    }
+
+    /// The statement of the confirmation, whole (never cut), as the confirmation shows it.
+    #[must_use]
+    pub fn confirmation_script(&self) -> Option<Rc<ScriptRows>> {
+        matches!(self.stage, ImportStage::Confirm(_))
+            .then(|| self.confirm_script.clone())
+            .flatten()
     }
 
     /// The summary lines of a finished import.
@@ -639,7 +655,11 @@ impl Render for ImportCsvDialog {
                             .items_start()
                             .child(div().w(px(90.)).text_color(theme.muted_foreground).child(k))
                             .child(div().flex_1().font_family("monospace").text_xs().child(v))
-                    })),
+                    }))
+                    .when_some(self.confirmation_script(), |d, script| {
+                        d.child(div().text_color(theme.muted_foreground).child("Statement"))
+                            .child(script_view("import-statement", script, cx))
+                    }),
             ),
             ImportStage::Running {
                 rows,

@@ -211,14 +211,19 @@ fn copy_exported(
     exporter.start(&schema).map_err(refused)?;
     let mut copied = 0usize;
     let mut capped = false;
-    for chunk in model_rows.chunks(CHUNK_ROWS) {
-        if exporter.bytes() as usize > options.max_bytes {
-            capped = true;
-            break;
-        }
+    // Rows are gathered by chunks (one Arrow gather per chunk) but written and checked against
+    // the cap one row at a time, so a chunk of large values cannot overshoot it by more than
+    // one row.
+    'chunks: for chunk in model_rows.chunks(CHUNK_ROWS) {
         let batch = gather(model, cols, chunk, &schema).map_err(CopyError::Refused)?;
-        exporter.write_batch(&batch).map_err(refused)?;
-        copied += chunk.len();
+        for i in 0..batch.num_rows() {
+            if exporter.bytes() as usize > options.max_bytes {
+                capped = true;
+                break 'chunks;
+            }
+            exporter.write_batch(&batch.slice(i, 1)).map_err(refused)?;
+            copied += 1;
+        }
     }
     let (bytes, _) = exporter.finish().map_err(refused)?;
     let text = String::from_utf8(bytes).map_err(|_| CopyError::Refused("not UTF-8".into()))?;
@@ -469,7 +474,9 @@ mod tests {
         small.max_bytes = 10;
         let out = copy(&m, &small).unwrap();
         assert!(out.capped);
-        assert_eq!(out.rows, CHUNK_ROWS);
+        // Checked per row, not per chunk: at most one row past the cap.
+        assert!((1..=2).contains(&out.rows), "{}", out.rows);
+        assert!(out.text.len() <= small.max_bytes + 32, "{}", out.text);
     }
 
     #[test]
