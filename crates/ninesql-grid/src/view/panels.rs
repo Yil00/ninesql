@@ -227,7 +227,7 @@ impl ResultsView {
             });
         });
         if dropped {
-            self.status = Some(crate::rows::sort_dropped_text().into());
+            self.status = Some(crate::rows::sort_dropped_text());
             cx.notify();
             return false;
         }

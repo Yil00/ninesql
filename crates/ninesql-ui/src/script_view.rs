@@ -232,18 +232,18 @@ mod tests {
         assert!(s.rows()[1..].iter().all(|r| r.continuation && r.line == 1));
         // Concatenating the rows gives the line back, WHERE clause included.
         let joined: String = (0..s.rows().len())
-            .map(|i| s.row_text(i).unwrap())
+            .map(|i| s.row_text(i).unwrap_or_default())
             .collect();
         assert_eq!(joined, long);
         assert!(
             s.row_text(s.rows().len() - 1)
-                .unwrap()
+                .unwrap_or_default()
                 .ends_with("WHERE id = 42;")
         );
         // Every row fits the box.
         assert!(
             (0..s.rows().len())
-                .all(|i| s.row_text(i).unwrap().chars().count() <= SCRIPT_ROW_COLUMNS)
+                .all(|i| s.row_text(i).unwrap_or_default().chars().count() <= SCRIPT_ROW_COLUMNS)
         );
     }
 
@@ -257,7 +257,7 @@ mod tests {
         assert_eq!(s.rows().len(), 100_001);
         assert_eq!(s.rows()[99_999].line, 100_000);
         assert_eq!(
-            s.row_text(99_999).unwrap(),
+            s.row_text(99_999).unwrap_or_default(),
             "DELETE FROM t WHERE id = 99999;"
         );
         assert!(
@@ -280,9 +280,12 @@ mod tests {
     fn invisible_characters_are_marked_and_crlf_dropped() {
         let s = ScriptRows::new("UPDATE t SET a = 'x\u{202E}y'\r\nWHERE\u{00A0}id\t= 1;\u{200B}");
         assert_eq!(s.rows().len(), 2);
-        assert_eq!(s.row_text(0).unwrap(), "UPDATE t SET a = 'x\u{FFFD}y'");
         assert_eq!(
-            s.row_text(1).unwrap(),
+            s.row_text(0).unwrap_or_default(),
+            "UPDATE t SET a = 'x\u{FFFD}y'"
+        );
+        assert_eq!(
+            s.row_text(1).unwrap_or_default(),
             "WHERE\u{2423}id\u{2192}= 1;\u{FFFD}"
         );
     }
@@ -292,7 +295,7 @@ mod tests {
         let s = ScriptRows::new(&"表".repeat(SCRIPT_ROW_COLUMNS));
         assert_eq!(s.rows().len(), 2);
         assert_eq!(
-            s.row_text(0).unwrap().chars().count(),
+            s.row_text(0).unwrap_or_default().chars().count(),
             SCRIPT_ROW_COLUMNS / 2
         );
     }

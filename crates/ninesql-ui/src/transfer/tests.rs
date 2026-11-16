@@ -222,7 +222,7 @@ fn import_previews_maps_and_confirms_on_production(cx: &mut TestAppContext) {
     // The statement is shown whole in the script view, never cut.
     let script = dialog
         .read_with(&l.vcx, |d, _| d.confirmation_script())
-        .expect("statement shown");
+        .unwrap_or_else(|| panic!("statement shown"));
     assert!(
         script.shown_text().starts_with("INSERT INTO \"people\""),
         "{}",

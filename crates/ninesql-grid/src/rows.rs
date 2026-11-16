@@ -465,10 +465,11 @@ impl<'a> SortValue<'a> {
         if let Some(o) = compare_typed(self.value, other.value) {
             return o;
         }
-        if self.value.is_number() && other.value.is_number() {
-            if let (Some(x), Some(y)) = (self.number, other.number) {
-                return x.total_cmp(&y);
-            }
+        if self.value.is_number()
+            && other.value.is_number()
+            && let (Some(x), Some(y)) = (self.number, other.number)
+        {
+            return x.total_cmp(&y);
         }
         self.text.cmp(&other.text)
     }
@@ -501,10 +502,11 @@ pub fn compare(a: &CellValue<'_>, b: &CellValue<'_>) -> Ordering {
     if let Some(o) = compare_typed(a, b) {
         return o;
     }
-    if a.is_number() && b.is_number() {
-        if let (Some(x), Some(y)) = (as_f64(a), as_f64(b)) {
-            return x.total_cmp(&y);
-        }
+    if a.is_number()
+        && b.is_number()
+        && let (Some(x), Some(y)) = (as_f64(a), as_f64(b))
+    {
+        return x.total_cmp(&y);
     }
     text_of(a).cmp(&text_of(b))
 }
