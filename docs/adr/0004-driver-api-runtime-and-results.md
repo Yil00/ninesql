@@ -1,6 +1,6 @@
 # ADR-0004: Driver API, async runtime and result model
 
-- **Status**: Accepted. Amended (sqlite session threads, accepted by the maintainer on 2026-11-15) by the [section at the end](#amendment-sqlite-session-threads-2026-11-15): a synchronous client may own one dedicated thread per session instead of using `spawn_blocking`; the Decision above is unchanged.
+- **Status**: Accepted. Amended (sqlite session threads, accepted by the maintainer on 2026-11-15) by the [section at the end](#amendment-sqlite-session-threads-2026-11-15): a synchronous client may own one dedicated thread per session instead of using `spawn_blocking`; the Decision above is unchanged. Amended (result model, accepted by the maintainer on 2026-11-15) by [ADR-0024](0024-phase-3-execution-history-and-preferences-decisions.md) §4, recorded in the [pointer section at the end](#amendment-adr-0024-4-2026-11-15): the memory budget is per execution, and "fetch all" is capped at the budget.
 - **Date**: 2026-11-14
 
 ## Context
@@ -61,3 +61,7 @@ The UI (GPUI) has its own foreground and background executors. Most Rust databas
 - **`spawn_blocking` per call**: a paused result would hold a blocking-pool thread for up to 300 s, and the connection would have to move between pool threads between calls.
 - **Reading the whole result in one blocking call**: breaks the memory budget (I6).
 
+## Amendment (ADR-0024 §4, 2026-11-15)
+**Status: Accepted** (maintainer, 2026-11-15, with [ADR-0024](0024-phase-3-execution-history-and-preferences-decisions.md)). A pointer only: the text of the "Result model" above is unchanged, and [ADR-0024 §4](0024-phase-3-execution-history-and-preferences-decisions.md#4-results-one-memory-budget-per-execution-retain-and-never-evict-amends-adr-0004-result-model) is the reference. Two sentences of the "Result model" no longer describe the product:
+- "`max_bytes` (default 256 MiB per result tab)": each driver stream still stops at its own `max_bytes`, but the grid keeps one budget **per execution** (one editor tab: every kept batch and notice of the run), 256 MiB by default (`[execution] result_memory_mib`). Batches are retained, never evicted.
+- "fetch all asks the user above the budget": "fetch all" is **capped at the budget** and asks nothing; there is no way above the budget in the grid. Seeing more means narrowing the query, or an export (`ninesql-transfer`, streamed).

@@ -103,7 +103,9 @@ Values are shown by type: NULL distinctly, numbers right-aligned, dates and time
 
 Only reads wait for you between pages; a statement that changes data (a `DELETE … RETURNING`, for example) is fetched to its end. While a result waits for more fetching, its session is busy: another statement on it reports "The session is busy with another statement or a paused result: cancel it, or fetch the result to its end, then try again." In a script, every result but the last is closed after its first page; the grid then says "The result was closed before its end: N rows loaded. Run the statement again to see more."
 
-**Memory budget.** One execution (one editor tab) never keeps more than `result_memory_mib` (256 MiB by default) of results, all its result sets together. At the budget the grid stops loading, closes the result on the server and says "Truncated: memory budget reached. N rows kept (… of …); narrow the query to see the rest." Rows already loaded are never dropped, and "Fetch all" never goes past the budget, so it asks no question.
+**A result left waiting is closed.** If you do not fetch more for `paused_result_idle_secs` (240 s by default, section 10), NineSQL closes the result itself, before the servers' own 300 s limit would drop the whole session. The rows already loaded stay in the grid and the session stays usable. To read further, run the statement again. A transaction that was open stays open: commit or roll back it (section 7).
+
+**Memory budget.** One execution (one editor tab) never keeps more than `result_memory_mib` (256 MiB by default) of results, all its result sets together. At the budget the grid stops loading, closes the result on the server and says "Truncated: memory budget reached. N rows kept (… of …); narrow the query to see the rest." Rows already loaded are never dropped, and "Fetch all" never goes past the budget, so it asks no question. Every result set and every update count takes a small fixed share of the budget, even when empty, and one execution shows at most 1 000 result tabs by default; past that NineSQL stops reading results and says so in a banner.
 
 **Selection and copy.**
 
@@ -139,6 +141,7 @@ on_error = "stop"               # scripts: "stop" or "continue"
 keep_alive_secs = 0             # ping idle sessions; 0 = off, else 10 to 86400
 auto_reconnect = true           # read, not used yet: the interface does not reconnect
 reconnect_attempts = 3          # 1 to 20, for the reconnect to come
+paused_result_idle_secs = 240   # close a result left waiting for a fetch, 30 to 280
 
 [execution.connection_timeouts] # per-connection timeout in seconds, by connection id
 # "6f1c2b0e-…" = 30
