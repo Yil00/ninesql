@@ -820,8 +820,9 @@ pub trait Dialect: Send + Sync {
     }
 
     /// The typed literal of `value` for a DML preview or an SQL `INSERT` export
-    /// ([`crate::dml`]), for a column of type `ty`. It must read back, in the session's lexical
-    /// modes, as exactly the value the bound parameter gives, and never show a character
+    /// ([`crate::dml`]), for a column of type `ty`. It must read back as exactly the value the
+    /// bound parameter gives **in every lexical mode of the engine** (the text may be replayed
+    /// in another session, security review H1), and never show a character
     /// [`needs_escape`](crate::dml::needs_escape) escapes raw. Default:
     /// [`ansi_dml_literal`](crate::dml::ansi_dml_literal).
     ///
@@ -847,6 +848,14 @@ pub trait Dialect: Send + Sync {
     fn dml_comparable(&self, ty: &ColumnType) -> bool {
         let _ = ty;
         true
+    }
+
+    /// The engine (at this server version) has unique keys whose `NULL`s are not distinct
+    /// (PostgreSQL 15+ `NULLS NOT DISTINCT`), so a `NULL` key value identifies one row.
+    /// [`KeyKind::Unique { nulls_distinct: false }`](crate::dml::KeyKind::Unique) is refused
+    /// when this is `false`. Default: `false`.
+    fn supports_unique_nulls_not_distinct(&self) -> bool {
+        false
     }
 
     /// `INSERT` of a row with every column at its default (`table` already quoted). Default:

@@ -40,6 +40,8 @@ use crate::engine::Flavor;
 pub struct PgDialect {
     standard_conforming_strings: Arc<AtomicBool>,
     flavor: Flavor,
+    /// The server has `UNIQUE NULLS NOT DISTINCT` (PostgreSQL 15+); unknown offline: `false`.
+    nulls_not_distinct: bool,
 }
 
 impl Default for PgDialect {
@@ -60,6 +62,7 @@ impl PgDialect {
         Self {
             standard_conforming_strings: Arc::new(AtomicBool::new(true)),
             flavor,
+            nulls_not_distinct: false,
         }
     }
 
@@ -87,6 +90,7 @@ impl PgDialect {
         Self {
             standard_conforming_strings: Arc::new(AtomicBool::new(on)),
             flavor: Flavor::Postgres,
+            nulls_not_distinct: false,
         }
     }
 
@@ -97,7 +101,15 @@ impl PgDialect {
         Self {
             standard_conforming_strings: Arc::new(AtomicBool::new(on)),
             flavor: self.flavor,
+            nulls_not_distinct: self.nulls_not_distinct,
         }
+    }
+
+    /// The same dialect for a server of major version `major` (`NULLS NOT DISTINCT` from 15 on).
+    #[must_use]
+    pub fn with_server_major(mut self, major: Option<u32>) -> Self {
+        self.nulls_not_distinct = self.flavor != Flavor::QuestDb && major.is_some_and(|m| m >= 15);
+        self
     }
 
     /// A dialect that follows a session's `standard_conforming_strings` flag.
@@ -106,6 +118,7 @@ impl PgDialect {
         Self {
             standard_conforming_strings: flag,
             flavor,
+            nulls_not_distinct: false,
         }
     }
 }
@@ -145,11 +158,8 @@ impl Dialect for PgDialect {
     }
 
     fn dml_literal(&self, value: &Param, ty: &ColumnType) -> Result<String, &'static str> {
-        crate::dml::literal(
-            value,
-            ty,
-            self.standard_conforming_strings.load(Ordering::SeqCst),
-        )
+        // Independent of `standard_conforming_strings` (security review H1, L3).
+        crate::dml::literal(value, ty)
     }
 
     fn dml_check_identifier(&self, name: &str) -> Result<(), DmlError> {
@@ -158,6 +168,10 @@ impl Dialect for PgDialect {
 
     fn dml_comparable(&self, ty: &ColumnType) -> bool {
         crate::dml::comparable(ty)
+    }
+
+    fn supports_unique_nulls_not_distinct(&self) -> bool {
+        self.nulls_not_distinct
     }
 
     fn split_statements(&self, script: &str) -> Vec<StatementSpan> {

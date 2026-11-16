@@ -163,6 +163,14 @@ proptest! {
         }
     }
 
+    /// A literal does not depend on `standard_conforming_strings` (security review H1, L3).
+    #[test]
+    fn literals_are_mode_independent(v in any_param(), ty in any_type()) {
+        let on = PgDialect::new().dml_literal(&v, &ty);
+        let off = PgDialect::new().with_scs(false).dml_literal(&v, &ty);
+        prop_assert_eq!(on, off);
+    }
+
     /// A preview literal is one token: `SELECT <literal>` is one read statement.
     #[test]
     fn literals_stay_in_their_token(v in any_param(), ty in any_type()) {
@@ -352,10 +360,9 @@ async fn columns(s: &mut dyn Session, table: &str) -> Vec<DmlColumn> {
 /// The row whose `id` is `id`, read back as parameters through [`cell_value`].
 async fn read_row(s: &mut dyn Session, table: &str, id: i64) -> Vec<Param> {
     let out = sql(s, &format!("SELECT * FROM {table} WHERE id = {id}")).await;
-    let schema = out.schema.unwrap();
     let b = out.batches.iter().find(|b| b.num_rows() > 0).unwrap();
     (0..b.num_columns())
-        .map(|i| cell_value(schema.field(i), b.column(i).as_ref(), 0).unwrap())
+        .map(|i| cell_value(b, i, 0).unwrap())
         .collect()
 }
 
@@ -872,4 +879,151 @@ fn postgresql_preview_round_trips_property() {
     with_session(&rt, &session, async |s: &mut dyn Session| {
         sql(s, &format!("DROP TABLE {table}")).await;
     });
+}
+
+/// Row-key choice uses the driver's index flags (P5-B review M1): an invalid index (left by a
+/// failed `CREATE UNIQUE INDEX CONCURRENTLY`), a deferrable unique constraint, an expression
+/// index and a partial index never count; `NULLS NOT DISTINCT` is reported.
+#[tokio::test]
+async fn postgresql_row_key_from_index_flags() {
+    use ninesql_driver_api::{
+        KeyCandidate, ObjectDetails, ObjectKind, ObjectPath, PageRequest, choose_row_key,
+    };
+    let Some(dev) = dev("postgresql") else { return };
+    let mut s = connect(&dev).await;
+    let s = s.as_mut();
+    sql(s, "DROP TABLE IF EXISTS p5b_idx").await;
+    sql(
+        s,
+        "CREATE TABLE p5b_idx (a int NOT NULL, b int NOT NULL, c text NOT NULL, d int NOT NULL, \
+         e int, CONSTRAINT p5b_idx_b UNIQUE (b) DEFERRABLE INITIALLY IMMEDIATE)",
+    )
+    .await;
+    sql(
+        s,
+        "INSERT INTO p5b_idx VALUES (1, 1, 'x', 1, NULL), (1, 2, 'y', 2, 2)",
+    )
+    .await;
+    // Fails on the duplicate `a`, leaving an invalid index behind.
+    assert!(
+        exec(
+            s,
+            Statement::sql("CREATE UNIQUE INDEX CONCURRENTLY p5b_idx_a ON p5b_idx (a)")
+        )
+        .await
+        .is_err()
+    );
+    sql(s, "CREATE UNIQUE INDEX p5b_idx_c ON p5b_idx (lower(c))").await;
+    sql(
+        s,
+        "CREATE UNIQUE INDEX p5b_idx_d ON p5b_idx (d) WHERE d > 0",
+    )
+    .await;
+    let table = ObjectPath::root()
+        .child(ObjectKind::Schema, "public")
+        .child(ObjectKind::Table, "p5b_idx");
+    let page = s
+        .metadata()
+        .list(&table, ObjectKind::Index, PageRequest::first())
+        .await
+        .unwrap();
+    let index = |name: &str| match &page
+        .items
+        .iter()
+        .find(|o| o.name() == name)
+        .unwrap()
+        .details
+    {
+        ObjectDetails::Index(i) => i.clone(),
+        other => panic!("{other:?}"),
+    };
+    let a = index("p5b_idx_a");
+    assert!(!a.valid && !a.unique, "{a:?}");
+    let b = index("p5b_idx_b");
+    assert!(b.valid && b.deferrable && !b.unique, "{b:?}");
+    let c = index("p5b_idx_c");
+    assert!(
+        c.unique && c.expressions == vec![true] && c.has_expression(),
+        "{c:?}"
+    );
+    let d = index("p5b_idx_d");
+    assert!(
+        d.unique && d.predicate.is_some() && d.expressions == vec![false],
+        "{d:?}"
+    );
+    let mut candidates: Vec<KeyCandidate> = Vec::new();
+    for i in [&a, &b, &c, &d] {
+        let mut forced = i.clone();
+        // Even if reported unique, the flags alone rule them out.
+        forced.unique = true;
+        candidates.extend(KeyCandidate::from_index(&forced, true));
+    }
+    assert_eq!(choose_row_key(&candidates), None);
+    // A plain unique index, and one with NULLS NOT DISTINCT (PostgreSQL 15+).
+    sql(
+        s,
+        "CREATE UNIQUE INDEX p5b_idx_e ON p5b_idx (e) NULLS NOT DISTINCT",
+    )
+    .await;
+    let page = s
+        .metadata()
+        .list(&table, ObjectKind::Index, PageRequest::first())
+        .await
+        .unwrap();
+    let e = match &page
+        .items
+        .iter()
+        .find(|o| o.name() == "p5b_idx_e")
+        .unwrap()
+        .details
+    {
+        ObjectDetails::Index(i) => i.clone(),
+        other => panic!("{other:?}"),
+    };
+    assert!(
+        e.valid && e.unique && !e.nulls_distinct && !e.deferrable,
+        "{e:?}"
+    );
+    candidates.extend(KeyCandidate::from_index(&e, false));
+    assert_eq!(
+        choose_row_key(&candidates),
+        Some((
+            vec!["e".to_owned()],
+            KeyKind::Unique {
+                nulls_distinct: false
+            }
+        ))
+    );
+    assert!(s.dialect().supports_unique_nulls_not_distinct());
+    sql(s, "DROP TABLE p5b_idx").await;
+}
+
+#[test]
+fn nulls_not_distinct_needs_postgresql_15() {
+    let caps = editing(&EngineId::POSTGRESQL);
+    let key = vec![ColumnValue::new(
+        DmlColumn::new("u", ColumnType::new(DataType::Int32)),
+        Param::Null,
+    )];
+    let req = DmlRequest::delete(
+        vec!["t".into()],
+        KeyKind::Unique {
+            nulls_distinct: false,
+        },
+        key,
+    );
+    assert_eq!(
+        dml::generate(&PgDialect::new(), &caps, &req),
+        Err(DmlError::NullsNotDistinctUnsupported)
+    );
+    assert_eq!(
+        dml::generate(
+            &PgDialect::yugabytedb().with_server_major(Some(11)),
+            &caps,
+            &req
+        ),
+        Err(DmlError::NullsNotDistinctUnsupported)
+    );
+    let st = dml::generate(&PgDialect::new().with_server_major(Some(15)), &caps, &req).unwrap();
+    assert!(st.preview.ends_with("WHERE \"u\" IS NULL"));
 }

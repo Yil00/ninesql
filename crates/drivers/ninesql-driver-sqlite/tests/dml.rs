@@ -220,10 +220,9 @@ async fn columns(s: &mut dyn Session, table: &str) -> Vec<DmlColumn> {
 /// The row whose `id` is `id`, read back as parameters through [`cell_value`].
 async fn read_row(s: &mut dyn Session, table: &str, id: i64) -> Vec<Param> {
     let out = sql(s, &format!("SELECT * FROM {table} WHERE id = {id}")).await;
-    let schema = out.schema.unwrap();
     let b = out.batches.iter().find(|b| b.num_rows() > 0).unwrap();
     (0..b.num_columns())
-        .map(|i| cell_value(schema.field(i), b.column(i).as_ref(), 0).unwrap())
+        .map(|i| cell_value(b, i, 0).unwrap())
         .collect()
 }
 
@@ -593,4 +592,85 @@ fn preview_round_trips_property() {
             },
         )
         .unwrap();
+}
+
+/// Index flags from the driver (P5-B review M1): expression and partial indexes never count as
+/// row keys; tables report themselves transactional (M2).
+#[tokio::test]
+async fn index_flags_and_row_key() {
+    use ninesql_driver_api::{
+        KeyCandidate, ObjectDetails, ObjectKind, ObjectPath, PageRequest, choose_row_key,
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let mut s = connect(&dir.path().join("idx.db")).await;
+    let s = s.as_mut();
+    sql(
+        s,
+        "CREATE TABLE p5b_idx (a TEXT NOT NULL, b INTEGER NOT NULL, c INTEGER NOT NULL, d INTEGER)",
+    )
+    .await;
+    sql(s, "CREATE UNIQUE INDEX p5b_idx_a ON p5b_idx (lower(a))").await;
+    sql(
+        s,
+        "CREATE UNIQUE INDEX p5b_idx_b ON p5b_idx (b) WHERE b > 0",
+    )
+    .await;
+    sql(s, "CREATE UNIQUE INDEX p5b_idx_cd ON p5b_idx (c, d)").await;
+    let schema = ObjectPath::root().child(ObjectKind::Schema, "main");
+    let tables = s
+        .metadata()
+        .list(&schema, ObjectKind::Table, PageRequest::first())
+        .await
+        .unwrap();
+    match &tables
+        .items
+        .iter()
+        .find(|o| o.name() == "p5b_idx")
+        .unwrap()
+        .details
+    {
+        ObjectDetails::Table(t) => assert_eq!(t.transactional, Some(true)),
+        other => panic!("{other:?}"),
+    }
+    let idx = s
+        .metadata()
+        .list(
+            &schema.child(ObjectKind::Table, "p5b_idx"),
+            ObjectKind::Index,
+            PageRequest::first(),
+        )
+        .await
+        .unwrap();
+    let get = |n: &str| match &idx.items.iter().find(|o| o.name() == n).unwrap().details {
+        ObjectDetails::Index(i) => i.clone(),
+        other => panic!("{other:?}"),
+    };
+    let a = get("p5b_idx_a");
+    assert!(a.valid && a.unique && a.expressions == vec![true], "{a:?}");
+    let b = get("p5b_idx_b");
+    assert!(
+        b.predicate.is_some() && b.expressions == vec![false],
+        "{b:?}"
+    );
+    let cd = get("p5b_idx_cd");
+    assert!(
+        cd.valid && cd.nulls_distinct && cd.expressions == vec![false, false],
+        "{cd:?}"
+    );
+    let candidates: Vec<KeyCandidate> = [a, b]
+        .iter()
+        .filter_map(|i| KeyCandidate::from_index(i, true))
+        .collect();
+    assert_eq!(choose_row_key(&candidates), None);
+    // `d` is nullable: a unique key whose NULLs are distinct.
+    let cd = KeyCandidate::from_index(&cd, false).unwrap();
+    assert_eq!(
+        choose_row_key(&[cd]),
+        Some((
+            vec!["c".into(), "d".into()],
+            KeyKind::Unique {
+                nulls_distinct: true
+            }
+        ))
+    );
 }

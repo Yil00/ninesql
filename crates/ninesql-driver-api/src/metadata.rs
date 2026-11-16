@@ -239,6 +239,12 @@ pub struct TableInfo {
     pub flavour: Option<String>,
     /// Partition key of a partitioned table, as the engine spells it (`RANGE (ordered_at)`).
     pub partition_key: Option<String>,
+    /// Changes to the table are transactional: `Some(false)` for a MySQL-family table whose
+    /// storage engine has no transactions (MyISAM, MEMORY, ARCHIVE, CSV…), where a rolled-back
+    /// edit stays written; `Some(true)` for InnoDB and other transactional engines; `None` when
+    /// the driver does not know (P5-B review M2; PostgreSQL and SQLite tables are always
+    /// transactional and report `Some(true)`).
+    pub transactional: Option<bool>,
 }
 
 /// Kind of a [`ConstraintInfo`].
@@ -364,7 +370,11 @@ impl ForeignKeyInfo {
 }
 
 /// Details of an [`ObjectKind::Index`]. Build with `IndexInfo::default()` and set fields.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+///
+/// The defaults are the most conservative for choosing a row key ([`crate::dml::KeyCandidate`],
+/// P5-B review M1): not valid, an unknown expression flag per part, `NULL`s distinct, not
+/// deferrable. Drivers set what they read from the catalog.
+#[derive(Clone, Debug, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct IndexInfo {
     /// Key parts in order: a column name (unquoted), or the expression text for an expression
@@ -378,6 +388,43 @@ pub struct IndexInfo {
     pub method: Option<String>,
     /// Predicate of a partial index (`WHERE` text without the keyword).
     pub predicate: Option<String>,
+    /// The index is valid and ready: PostgreSQL `indisvalid` and `indisready` (an index left by a
+    /// failed `CREATE INDEX CONCURRENTLY` is not). Default `false`.
+    pub valid: bool,
+    /// Uniqueness is checked at the end of the transaction rather than at once (PostgreSQL
+    /// deferrable constraints, `indimmediate = false`). Default `false`.
+    pub deferrable: bool,
+    /// `NULL`s are distinct for uniqueness (`false` for PostgreSQL `NULLS NOT DISTINCT`).
+    /// Default `true`.
+    pub nulls_distinct: bool,
+    /// Per key part, in the order of [`columns`](Self::columns): `true` when the part is an
+    /// expression rather than a plain column. Empty (or another length than `columns`) means
+    /// unknown, which key selection treats as an expression.
+    pub expressions: Vec<bool>,
+}
+
+impl Default for IndexInfo {
+    fn default() -> Self {
+        Self {
+            columns: Vec::new(),
+            unique: false,
+            primary: false,
+            method: None,
+            predicate: None,
+            valid: false,
+            deferrable: false,
+            nulls_distinct: true,
+            expressions: Vec::new(),
+        }
+    }
+}
+
+impl IndexInfo {
+    /// `true` when some key part is an expression, or the expression flags are unknown.
+    #[must_use]
+    pub fn has_expression(&self) -> bool {
+        self.expressions.len() != self.columns.len() || self.expressions.iter().any(|e| *e)
+    }
 }
 
 /// Details of an [`ObjectKind::Trigger`]. Build with `TriggerInfo::default()` and set fields.

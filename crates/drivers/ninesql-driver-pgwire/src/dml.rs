@@ -5,13 +5,18 @@
 //! `bytea`), so the server reads it with the **column's** input function. The preview mirrors
 //! that exactly: the same text, quoted, cast to the column's type when that type is a built-in
 //! name of [`BUILTIN_TYPES`] (never a name copied from an unknown engine type), or left untyped
-//! (an `unknown` literal, resolved to the column's type exactly as the parameter is). Numbers
-//! and booleans in a numeric or boolean column are written bare.
+//! (an `unknown` literal, resolved to the column's type exactly as the parameter is). A cast
+//! names `pg_catalog.<type>` (a user type of the same name on the `search_path` cannot capture
+//! it), except for the types spelled with SQL keywords (`integer`, `timestamp with time zone`…),
+//! which no user type can shadow (security review L2). A number is written bare only when its
+//! kind matches the column's (an integer in an integer column, a float in a floating-point
+//! column, a decimal in a `numeric` column); otherwise it is quoted and cast (L4). Booleans are
+//! bare in a boolean column.
 //!
-//! Strings with a backslash, a control character or an invisible character use `E'…'`, whose
-//! meaning does not depend on `standard_conforming_strings`; a NUL is refused (PostgreSQL text
-//! cannot hold it). `bytea` is `'\x…'::bytea`, or `E'\\x…'::bytea` when
-//! `standard_conforming_strings` is off.
+//! Every literal means the same whatever `standard_conforming_strings` is (security review H1,
+//! L3): strings with a backslash, a control character or an invisible character use `E'…'`, and
+//! `bytea` is always `E'\\x…'::pg_catalog.bytea`; a NUL is refused (PostgreSQL text cannot hold
+//! it).
 
 use std::fmt::Write as _;
 
@@ -22,8 +27,10 @@ use ninesql_driver_api::dml::{
     is_plain_decimal, needs_escape, timestamp_text,
 };
 
-/// PostgreSQL keeps identifiers up to `NAMEDATALEN - 1` bytes and silently truncates longer
-/// quoted names: a longer name would target another column.
+/// PostgreSQL keeps identifiers up to `NAMEDATALEN - 1` = 63 **bytes of their UTF-8 encoding**
+/// (the server encoding is UTF-8 for NineSQL sessions; a multi-byte character counts for 2 to 4
+/// bytes) and silently truncates longer quoted names: a longer name would target another column
+/// (security review L6).
 const MAX_IDENTIFIER_BYTES: usize = 63;
 
 /// Built-in type names a preview literal may be cast to (lower case, as `format_type` and the
@@ -31,7 +38,6 @@ const MAX_IDENTIFIER_BYTES: usize = 63;
 /// one character or bit) nor `"char"`.
 const BUILTIN_TYPES: &[&str] = &[
     "bigint",
-    "bigserial",
     "bit varying",
     "bool",
     "boolean",
@@ -90,22 +96,39 @@ const BUILTIN_TYPES: &[&str] = &[
     "xml",
 ];
 
-/// Numeric types: integers, floats and decimals are written bare in these columns.
-const NUMERIC_TYPES: &[&str] = &[
+/// Integer types: an `Int` is written bare in these columns.
+const INTEGER_TYPES: &[&str] = &[
+    "bigint", "int", "int2", "int4", "int8", "integer", "oid", "smallint",
+];
+
+/// Floating-point types: a finite `Float` (not `-0.0`) is written bare in these columns.
+const FLOAT_TYPES: &[&str] = &["double precision", "float4", "float8", "real"];
+
+/// Arbitrary-precision types: a plain `Decimal` is written bare in these columns.
+const DECIMAL_TYPES: &[&str] = &["decimal", "numeric"];
+
+/// Built-in types spelled with SQL keywords: the grammar resolves them, so they cannot be
+/// qualified with `pg_catalog.` and no user type can shadow them.
+const KEYWORD_TYPES: &[&str] = &[
     "bigint",
+    "bit varying",
+    "boolean",
+    "character varying",
     "decimal",
     "double precision",
-    "float4",
-    "float8",
     "int",
-    "int2",
-    "int4",
-    "int8",
     "integer",
+    "interval",
     "numeric",
-    "oid",
     "real",
     "smallint",
+    "time",
+    "time with time zone",
+    "time without time zone",
+    "timestamp",
+    "timestamp with time zone",
+    "timestamp without time zone",
+    "varchar",
 ];
 
 /// Types without a reliable `=`: `json` and `xml` have no equality operator, the geometric
@@ -170,17 +193,30 @@ fn base_name(ty: &ColumnType) -> Option<String> {
     Some(t.trim_end_matches("[]").to_owned())
 }
 
-/// `true` when values of `ty` are written bare.
-fn numeric(ty: &ColumnType) -> bool {
-    !is_array(ty) && base_name(ty).is_some_and(|b| NUMERIC_TYPES.contains(&b.as_str()))
-}
-
 fn is_array(ty: &ColumnType) -> bool {
     cast_type(ty).is_some_and(|t| t.ends_with("[]"))
 }
 
+/// `true` when the column's scalar type is in `kinds`.
+fn kind_of(ty: &ColumnType, kinds: &[&str]) -> bool {
+    !is_array(ty) && base_name(ty).is_some_and(|b| kinds.contains(&b.as_str()))
+}
+
 fn boolean(ty: &ColumnType) -> bool {
-    !is_array(ty) && base_name(ty).is_some_and(|b| b == "boolean" || b == "bool")
+    kind_of(ty, &["boolean", "bool"])
+}
+
+/// The SQL spelling of the cast to `ty`: `pg_catalog.<name>` (with its `[]`), or the keyword
+/// spelling for [`KEYWORD_TYPES`].
+pub(crate) fn cast_sql(ty: &ColumnType) -> Option<String> {
+    let t = cast_type(ty)?;
+    let base = t.trim_end_matches("[]");
+    let dims = &t[base.len()..];
+    Some(if KEYWORD_TYPES.contains(&base) {
+        t.clone()
+    } else {
+        format!("pg_catalog.{base}{dims}")
+    })
 }
 
 /// [`Dialect::dml_comparable`](ninesql_driver_api::Dialect::dml_comparable) for the family.
@@ -242,26 +278,27 @@ pub(crate) fn string_literal(s: &str) -> Result<String, &'static str> {
 
 fn quoted_with_cast(text: &str, ty: &ColumnType) -> Result<String, &'static str> {
     let lit = string_literal(text)?;
-    Ok(match cast_type(ty) {
+    Ok(match cast_sql(ty) {
         Some(t) => format!("{lit}::{t}"),
         None => lit,
     })
 }
 
-/// The typed literal of `value` for a column of type `ty`.
-pub(crate) fn literal(
-    value: &Param,
-    ty: &ColumnType,
-    standard_conforming_strings: bool,
-) -> Result<String, &'static str> {
+/// The typed literal of `value` for a column of type `ty`; it does not depend on any session
+/// mode.
+pub(crate) fn literal(value: &Param, ty: &ColumnType) -> Result<String, &'static str> {
     Ok(match value {
         Param::Null => "NULL".to_owned(),
         Param::Bool(b) if boolean(ty) => if *b { "TRUE" } else { "FALSE" }.to_owned(),
         Param::Bool(b) => quoted_with_cast(if *b { "t" } else { "f" }, ty)?,
-        Param::Int(i) if numeric(ty) => i.to_string(),
+        Param::Int(i) if kind_of(ty, INTEGER_TYPES) => i.to_string(),
         Param::Int(i) => quoted_with_cast(&i.to_string(), ty)?,
         // `-0.0` written bare would be the numeric zero, losing the sign.
-        Param::Float(f) if f.is_finite() && numeric(ty) && !(*f == 0.0 && f.is_sign_negative()) => {
+        Param::Float(f)
+            if f.is_finite()
+                && kind_of(ty, FLOAT_TYPES)
+                && !(*f == 0.0 && f.is_sign_negative()) =>
+        {
             float_text(*f)
         }
         Param::Float(f) => {
@@ -274,16 +311,11 @@ pub(crate) fn literal(
             };
             quoted_with_cast(&text, ty)?
         }
-        Param::Decimal(d) if numeric(ty) && is_plain_decimal(d) => d.clone(),
+        Param::Decimal(d) if kind_of(ty, DECIMAL_TYPES) && is_plain_decimal(d) => d.clone(),
         Param::Decimal(d) => quoted_with_cast(d, ty)?,
         Param::Text(s) | Param::Json(s) => quoted_with_cast(s, ty)?,
-        Param::Bytes(b) => {
-            if standard_conforming_strings {
-                format!("'\\x{}'::bytea", hex_lower(b))
-            } else {
-                format!("E'\\\\x{}'::bytea", hex_lower(b))
-            }
-        }
+        // Bound as `bytea` (OID 17) whatever the column; `E'…'` reads the same in every mode.
+        Param::Bytes(b) => format!("E'\\\\x{}'::pg_catalog.bytea", hex_lower(b)),
         Param::Date(d) => quoted_with_cast(&date_text(*d)?, ty)?,
         Param::Timestamp { micros, utc } => {
             let mut text = timestamp_text(*micros)?;
@@ -325,33 +357,57 @@ mod tests {
     fn literals() {
         let int = ColumnType::new(DataType::Int32);
         let text = ColumnType::new(DataType::Utf8);
-        assert_eq!(literal(&Param::Int(-5), &int, true).unwrap(), "-5");
-        assert_eq!(literal(&Param::Int(5), &text, true).unwrap(), "'5'");
+        let f8 = ColumnType::new(DataType::Float64);
+        assert_eq!(literal(&Param::Int(-5), &int).unwrap(), "-5");
+        assert_eq!(literal(&Param::Int(5), &text).unwrap(), "'5'");
+        // Kinds must match to be bare (L4).
         assert_eq!(
-            literal(&Param::Text("it's".into()), &ty("uuid"), true).unwrap(),
-            "'it''s'::uuid"
+            literal(&Param::Int(5), &f8).unwrap(),
+            "'5'::double precision"
+        );
+        assert_eq!(literal(&Param::Float(1.5), &int).unwrap(), "'1.5'::integer");
+        assert_eq!(
+            literal(&Param::Int(5), &ty("numeric")).unwrap(),
+            "'5'::numeric"
         );
         assert_eq!(
-            literal(&Param::Text("a\\b\n\u{202E}".into()), &text, false).unwrap(),
+            literal(&Param::Decimal("1.50".into()), &ty("numeric")).unwrap(),
+            "1.50"
+        );
+        assert_eq!(
+            literal(&Param::Decimal("1.50".into()), &f8).unwrap(),
+            "'1.50'::double precision"
+        );
+        // Non-keyword types are qualified (L2).
+        assert_eq!(
+            literal(&Param::Text("it's".into()), &ty("uuid")).unwrap(),
+            "'it''s'::pg_catalog.uuid"
+        );
+        assert_eq!(
+            literal(&Param::Text("{1}".into()), &ty("integer[]")).unwrap(),
+            "'{1}'::integer[]"
+        );
+        assert_eq!(
+            literal(&Param::Text("{}".into()), &ty("jsonb[]")).unwrap(),
+            "'{}'::pg_catalog.jsonb[]"
+        );
+        assert_eq!(
+            literal(&Param::Text("a\\b\n\u{202E}".into()), &text).unwrap(),
             "E'a\\\\b\\n\\u202E'"
         );
-        assert!(literal(&Param::Text("a\0".into()), &text, true).is_err());
+        assert!(literal(&Param::Text("a\0".into()), &text).is_err());
+        // Always the escape-string form (L3).
         assert_eq!(
-            literal(&Param::Bytes(vec![0, 0xff]), &text, true).unwrap(),
-            "'\\x00ff'::bytea"
+            literal(&Param::Bytes(vec![0, 0xff]), &text).unwrap(),
+            "E'\\\\x00ff'::pg_catalog.bytea"
         );
+        assert_eq!(literal(&Param::Float(0.1), &f8).unwrap(), "0.1");
         assert_eq!(
-            literal(&Param::Bytes(vec![0, 0xff]), &text, false).unwrap(),
-            "E'\\\\x00ff'::bytea"
-        );
-        let f8 = ColumnType::new(DataType::Float64);
-        assert_eq!(literal(&Param::Float(0.1), &f8, true).unwrap(), "0.1");
-        assert_eq!(
-            literal(&Param::Float(f64::NAN), &f8, true).unwrap(),
+            literal(&Param::Float(f64::NAN), &f8).unwrap(),
             "'NaN'::double precision"
         );
         assert_eq!(
-            literal(&Param::Float(-0.0), &f8, true).unwrap(),
+            literal(&Param::Float(-0.0), &f8).unwrap(),
             "'-0.0'::double precision"
         );
         assert_eq!(
@@ -364,27 +420,25 @@ mod tests {
                     ninesql_driver_api::arrow_schema::TimeUnit::Microsecond,
                     Some("UTC".into())
                 )),
-                true
             )
             .unwrap(),
             "'1970-01-01 00:00:00.000000+00'::timestamp with time zone"
         );
         assert_eq!(
-            literal(&Param::Decimal("NaN".into()), &ty("numeric"), true).unwrap(),
+            literal(&Param::Date(0), &ColumnType::new(DataType::Date32)).unwrap(),
+            "'1970-01-01'::pg_catalog.date"
+        );
+        assert_eq!(
+            literal(&Param::Decimal("NaN".into()), &ty("numeric")).unwrap(),
             "'NaN'::numeric"
         );
         assert_eq!(
-            literal(
-                &Param::Bool(true),
-                &ColumnType::new(DataType::Boolean),
-                true
-            )
-            .unwrap(),
+            literal(&Param::Bool(true), &ColumnType::new(DataType::Boolean)).unwrap(),
             "TRUE"
         );
         assert_eq!(
-            literal(&Param::Bool(true), &ty("text"), true).unwrap(),
-            "'t'::text"
+            literal(&Param::Bool(true), &ty("text")).unwrap(),
+            "'t'::pg_catalog.text"
         );
     }
 
@@ -392,6 +446,9 @@ mod tests {
     fn identifiers_and_comparability() {
         assert!(check_identifier(&"a".repeat(63)).is_ok());
         assert!(check_identifier(&"a".repeat(64)).is_err());
+        // Measured in UTF-8 bytes: 32 two-byte characters are 64 bytes.
+        assert!(check_identifier(&"é".repeat(31)).is_ok());
+        assert!(check_identifier(&"é".repeat(32)).is_err());
         assert!(check_identifier("").is_err());
         assert!(check_identifier("a\0b").is_err());
         assert!(!comparable(&ty("json")));

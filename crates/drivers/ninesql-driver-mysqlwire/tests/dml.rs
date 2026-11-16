@@ -169,6 +169,19 @@ proptest! {
         }
     }
 
+    /// A literal is the same text in every `sql_mode` and holds no backslash (security review
+    /// H1): a preview rendered in one session means the same when replayed in another.
+    #[test]
+    fn literals_are_mode_independent(v in any_param(), ty in any_type()) {
+        let lits: Vec<_> = dialects().iter().map(|d| d.dml_literal(&v, &ty)).collect();
+        for l in &lits {
+            prop_assert_eq!(l, &lits[0]);
+        }
+        if let Ok(l) = &lits[0] {
+            prop_assert!(!l.contains('\\'), "backslash in a literal");
+        }
+    }
+
     /// A preview literal is one token in every mode.
     #[test]
     fn literals_stay_in_their_token(v in any_param(), ty in any_type()) {
@@ -350,10 +363,9 @@ async fn columns(s: &mut dyn Session, table: &str) -> Vec<DmlColumn> {
 /// The row whose `id` is `id`, read back as parameters through [`cell_value`].
 async fn read_row(s: &mut dyn Session, table: &str, id: i64) -> Vec<Param> {
     let out = sql(s, &format!("SELECT * FROM {table} WHERE id = {id}")).await;
-    let schema = out.schema.unwrap();
     let b = out.batches.iter().find(|b| b.num_rows() > 0).unwrap();
     (0..b.num_columns())
-        .map(|i| cell_value(schema.field(i), b.column(i).as_ref(), 0).unwrap())
+        .map(|i| cell_value(b, i, 0).unwrap())
         .collect()
 }
 
@@ -852,5 +864,207 @@ fn preview_round_trips_property() {
     for engine in ENGINES {
         property(engine, None);
         property(engine, Some(STRICT_ANSI));
+    }
+}
+
+/// A preview rendered in one `sql_mode` and replayed in a session with the other gives the
+/// same row and touches no other row (security review H1, both directions).
+#[tokio::test]
+async fn previews_replay_across_modes() {
+    let hostile = [
+        "\\'' -- '",
+        "\\'; UPDATE p5b_xmode SET t = 'pwned' -- ",
+        "a\\",
+        "\\",
+        "it's",
+        "x' OR '1'='1",
+        "\\x27 \u{3a3}\u{5c}",
+    ];
+    for engine in ENGINES {
+        let Some(dev) = dev(engine) else { continue };
+        let mut plain = connect(&dev).await;
+        let mut moded = connect(&dev).await;
+        sql(moded.as_mut(), STRICT_ANSI).await;
+        let plain = plain.as_mut();
+        let moded = moded.as_mut();
+        sql(plain, "DROP TABLE IF EXISTS p5b_xmode").await;
+        sql(
+            plain,
+            "CREATE TABLE p5b_xmode (id BIGINT PRIMARY KEY, t TEXT, vb VARBINARY(64)) \
+             DEFAULT CHARSET utf8mb4 COLLATE utf8mb4_bin",
+        )
+        .await;
+        sql(plain, "INSERT INTO p5b_xmode VALUES (0, 'victim', X'00')").await;
+        let cols = columns(plain, "p5b_xmode").await;
+        let caps = plain.capabilities().editing;
+        for (n, text) in hostile.iter().enumerate() {
+            let base = i64::try_from(n).unwrap() * 10 + 1;
+            let vals = [
+                Param::Text((*text).to_owned()),
+                Param::Bytes(text.as_bytes().to_vec()),
+            ];
+            // Reference row through the bound form.
+            let st = dml::generate(
+                &*plain.dialect(),
+                &caps,
+                &DmlRequest::insert(vec!["p5b_xmode".into()], values(&cols, base, &vals)),
+            )
+            .unwrap();
+            run_dml(plain, &st).await;
+            // Rendered in the moded session, replayed in the plain one, and the reverse.
+            let ins = |d: &dyn Dialect, id: i64| {
+                dml::generate(
+                    d,
+                    &caps,
+                    &DmlRequest::insert(vec!["p5b_xmode".into()], values(&cols, id, &vals)),
+                )
+                .unwrap()
+            };
+            let to_plain = ins(&*moded.dialect(), base + 1);
+            run_preview(plain, &to_plain).await;
+            let to_moded = ins(&*plain.dialect(), base + 2);
+            run_preview(moded, &to_moded).await;
+        }
+        // Updates rendered in one mode and replayed in the other, there and back.
+        let upd = |d: &dyn Dialect, from: &str, to: &str| {
+            dml::generate(
+                d,
+                &caps,
+                &DmlRequest::update(
+                    vec!["p5b_xmode".into()],
+                    KeyKind::PrimaryKey,
+                    id_key(&cols, 1),
+                    vec![ColumnChange::new(
+                        cols[1].clone(),
+                        Param::Text(from.into()),
+                        Param::Text(to.into()),
+                    )],
+                )
+                .with_concurrency(Concurrency::EditedColumns),
+            )
+            .unwrap()
+        };
+        let st = upd(&*moded.dialect(), hostile[0], hostile[1]);
+        run_preview(plain, &st).await;
+        let st = upd(&*plain.dialect(), hostile[1], hostile[0]);
+        run_preview(moded, &st).await;
+        let st = upd(&*plain.dialect(), hostile[0], hostile[1]);
+        run_preview(moded, &st).await;
+        let st = upd(&*moded.dialect(), hostile[1], hostile[0]);
+        run_preview(plain, &st).await;
+        for n in 0..hostile.len() {
+            let base = i64::try_from(n).unwrap() * 10 + 1;
+            assert!(
+                same_rows(plain, "p5b_xmode", &cols, base, base + 1).await,
+                "{engine}: {n} moded -> plain"
+            );
+            assert!(
+                same_rows(plain, "p5b_xmode", &cols, base, base + 2).await,
+                "{engine}: {n} plain -> moded"
+            );
+        }
+        let victim = sql(
+            plain,
+            "SELECT COUNT(*) FROM p5b_xmode WHERE id = 0 AND t = 'victim'",
+        )
+        .await;
+        assert_eq!(count(&victim), 1, "{engine}: another row was changed");
+        let total = sql(plain, "SELECT COUNT(*) FROM p5b_xmode").await;
+        assert_eq!(count(&total), i64::try_from(hostile.len() * 3 + 1).unwrap());
+        sql(plain, "DROP TABLE p5b_xmode").await;
+    }
+}
+
+/// Index flags and the storage engine's transactional flag on live servers (P5-B review M1,
+/// M2).
+#[tokio::test]
+async fn index_flags_and_transactional_tables() {
+    use ninesql_driver_api::{
+        KeyCandidate, ObjectDetails, ObjectKind, ObjectPath, PageRequest, choose_row_key,
+    };
+    for engine in ENGINES {
+        let Some(dev) = dev(engine) else { continue };
+        let mut s = connect(&dev).await;
+        let s = s.as_mut();
+        sql(s, "DROP TABLE IF EXISTS p5b_tx, p5b_notx").await;
+        sql(s, "CREATE TABLE p5b_tx (id INT PRIMARY KEY, c VARCHAR(20) NOT NULL, UNIQUE KEY p5b_tx_c (c)) ENGINE = InnoDB").await;
+        if engine != "tidb" {
+            // MySQL 8 functional key part; MariaDB has none.
+            if engine == "mysql" {
+                sql(s, "CREATE UNIQUE INDEX p5b_tx_l ON p5b_tx ((lower(c)))").await;
+            }
+            sql(
+                s,
+                "CREATE TABLE p5b_notx (id INT PRIMARY KEY) ENGINE = MyISAM",
+            )
+            .await;
+        }
+        let schema = ObjectPath::root().child(ObjectKind::Schema, dev.database.clone());
+        let tables = s
+            .metadata()
+            .list(
+                &schema,
+                ObjectKind::Table,
+                PageRequest::first().with_filter(Some("p5b_".into())),
+            )
+            .await
+            .unwrap();
+        let flag = |name: &str| {
+            tables
+                .items
+                .iter()
+                .find(|o| o.name() == name)
+                .map(|o| match &o.details {
+                    ObjectDetails::Table(t) => t.transactional,
+                    other => panic!("{other:?}"),
+                })
+        };
+        assert_eq!(flag("p5b_tx"), Some(Some(true)), "{engine}");
+        if engine != "tidb" {
+            assert_eq!(flag("p5b_notx"), Some(Some(false)), "{engine}");
+        }
+        let idx = s
+            .metadata()
+            .list(
+                &schema.child(ObjectKind::Table, "p5b_tx"),
+                ObjectKind::Index,
+                PageRequest::first(),
+            )
+            .await
+            .unwrap();
+        let candidates: Vec<KeyCandidate> = idx
+            .items
+            .iter()
+            .filter_map(|o| match &o.details {
+                ObjectDetails::Index(i) => {
+                    assert!(
+                        i.valid && !i.deferrable && i.nulls_distinct,
+                        "{engine}: {i:?}"
+                    );
+                    if o.name() == "p5b_tx_l" {
+                        assert_eq!(i.expressions, vec![true], "{engine}");
+                    }
+                    KeyCandidate::from_index(i, true)
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            choose_row_key(&candidates),
+            Some((vec!["id".to_owned()], KeyKind::PrimaryKey)),
+            "{engine}"
+        );
+        let no_pk: Vec<KeyCandidate> = candidates.into_iter().filter(|c| !c.primary).collect();
+        assert_eq!(
+            choose_row_key(&no_pk),
+            Some((
+                vec!["c".to_owned()],
+                KeyKind::Unique {
+                    nulls_distinct: true
+                }
+            )),
+            "{engine}"
+        );
+        sql(s, "DROP TABLE IF EXISTS p5b_tx, p5b_notx").await;
     }
 }

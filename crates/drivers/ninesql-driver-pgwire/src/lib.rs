@@ -239,6 +239,7 @@ impl PgWireDriver {
             return Err(e);
         }
         let cancel_key = conn.process_id != 0 || conn.secret_key != 0;
+        let server_major = conn.server.major_version();
         let shared = Arc::new(Shared::new(
             conn.server.major_version(),
             conn.txn_status,
@@ -264,7 +265,7 @@ impl PgWireDriver {
                 tracker: ninesql_driver_api::ExecutionTracker::new(),
             },
             capabilities: engine::capabilities(flavor, version.as_deref(), Some(&info)),
-            dialect: Arc::new(PgDialect::tracking(scs, flavor)),
+            dialect: Arc::new(PgDialect::tracking(scs, flavor).with_server_major(server_major)),
             cancel_target,
             auto_commit: auto_commit && flavor != Flavor::QuestDb,
             log_statements,

@@ -339,10 +339,8 @@ impl Dialect for MyDialect {
 
     fn dml_literal(&self, value: &Param, ty: &ColumnType) -> Result<String, &'static str> {
         let _ = ty;
-        crate::dml::literal(
-            value,
-            !self.modes.no_backslash_escapes.load(Ordering::SeqCst),
-        )
+        // Mode-independent (security review H1): the text may be replayed in another session.
+        crate::dml::literal(value)
     }
 
     fn dml_check_identifier(&self, name: &str) -> Result<(), DmlError> {

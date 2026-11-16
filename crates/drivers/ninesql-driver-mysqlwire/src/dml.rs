@@ -3,10 +3,10 @@
 //! The executed statement's parameters are inlined by the driver as hexadecimal literals
 //! ([`crate::dialect`], ADR-0020 §2). The preview writes the same values readably, with the same
 //! types: digits, `…e…` doubles, `X'…'` bytes, `DATE '…'` / `TIMESTAMP '…'`, and strings as
-//! `'…'` escaped for the session's `NO_BACKSLASH_ESCAPES` (`''` always, `\\` when backslashes
-//! are escapes). A string holding a character the preview must not show raw (controls,
-//! invisible or bidirectional characters) is written `CONVERT(X'…' USING utf8mb4)`, exactly as
-//! the bound form, except `\0`, `\n`, `\r`, `\t`, `\b` and `\Z` when backslashes are escapes.
+//! `'…'` with `'` doubled. Every literal means the same in every `sql_mode` and client
+//! character set, so a preview or an export rendered in one session can be replayed in another
+//! (security review H1): a string holding a backslash, a NUL, a control, invisible or
+//! bidirectional character is written `CONVERT(X'…' USING utf8mb4)`, exactly as the bound form.
 //! `ANSI_QUOTES` does not matter: identifiers are always backquoted and strings single-quoted.
 
 use ninesql_driver_api::Param;
@@ -70,36 +70,22 @@ pub(crate) fn check_identifier(name: &str) -> Result<(), DmlError> {
     Ok(())
 }
 
-/// The string literal of `s` for the session's backslash mode.
-pub(crate) fn string_literal(s: &str, backslash_escapes: bool) -> String {
-    let named = |c: char| matches!(c, '\0' | '\n' | '\r' | '\t' | '\u{8}' | '\u{1a}');
-    let hex = s
-        .chars()
-        .any(|c| (c == '\0' || needs_escape(c)) && !(backslash_escapes && named(c)));
+/// The string literal of `s`, with the same meaning in every `sql_mode` and client character
+/// set (security review H1): a string holding a backslash, a NUL or a character
+/// [`needs_escape`] flags is written `CONVERT(X'…' USING utf8mb4)` (the bound form); any other
+/// string is `'…'` with `'` doubled, which reads the same with and without
+/// `NO_BACKSLASH_ESCAPES` and holds no byte a multi-byte client character set (GBK, SJIS, Big5,
+/// CP932) could pair with a quote.
+pub(crate) fn string_literal(s: &str) -> String {
+    let hex = s.chars().any(|c| c == '\\' || c == '\0' || needs_escape(c));
     if hex {
         return format!("CONVERT(X'{}' USING utf8mb4)", hex_lower(s.as_bytes()));
     }
-    let mut out = String::with_capacity(s.len() + 2);
-    out.push('\'');
-    for c in s.chars() {
-        match c {
-            '\'' => out.push_str("''"),
-            '\\' if backslash_escapes => out.push_str("\\\\"),
-            '\0' => out.push_str("\\0"),
-            '\n' => out.push_str("\\n"),
-            '\r' => out.push_str("\\r"),
-            '\t' => out.push_str("\\t"),
-            '\u{8}' => out.push_str("\\b"),
-            '\u{1a}' => out.push_str("\\Z"),
-            c => out.push(c),
-        }
-    }
-    out.push('\'');
-    out
+    format!("'{}'", s.replace('\'', "''"))
 }
 
 /// The typed literal of `value`.
-pub(crate) fn literal(value: &Param, backslash_escapes: bool) -> Result<String, &'static str> {
+pub(crate) fn literal(value: &Param) -> Result<String, &'static str> {
     Ok(match value {
         Param::Null => "NULL".to_owned(),
         Param::Bool(b) => if *b { "TRUE" } else { "FALSE" }.to_owned(),
@@ -109,7 +95,7 @@ pub(crate) fn literal(value: &Param, backslash_escapes: bool) -> Result<String, 
         Param::Float(_) => return Err("MySQL has no NaN or infinite floating-point values"),
         Param::Decimal(d) if is_plain_decimal(d) => d.clone(),
         Param::Decimal(_) => return Err("not a plain decimal number"),
-        Param::Text(s) | Param::Json(s) => string_literal(s, backslash_escapes),
+        Param::Text(s) | Param::Json(s) => string_literal(s),
         Param::Bytes(b) => format!("X'{}'", hex_lower(b)),
         Param::Date(d) => format!("DATE '{}'", date_text(*d)?),
         Param::Timestamp { utc: true, .. } => {
@@ -125,40 +111,36 @@ mod tests {
     use super::*;
 
     #[test]
-    fn strings_per_mode() {
-        assert_eq!(string_literal("it's", true), "'it''s'");
-        assert_eq!(string_literal("a\\b", true), "'a\\\\b'");
-        assert_eq!(string_literal("a\\b", false), "'a\\b'");
-        assert_eq!(string_literal("a\nb", true), "'a\\nb'");
+    fn strings_are_mode_independent() {
+        assert_eq!(string_literal("it's"), "'it''s'");
+        assert_eq!(string_literal("a\\b"), "CONVERT(X'615c62' USING utf8mb4)");
         assert_eq!(
-            string_literal("a\nb", false),
-            "CONVERT(X'610a62' USING utf8mb4)"
+            string_literal("\\'' -- '"),
+            "CONVERT(X'5c2727202d2d2027' USING utf8mb4)"
         );
+        assert_eq!(string_literal("a\nb"), "CONVERT(X'610a62' USING utf8mb4)");
         assert_eq!(
-            string_literal("\u{202e}", true),
+            string_literal("\u{202e}"),
             "CONVERT(X'e280ae' USING utf8mb4)"
         );
-        assert_eq!(string_literal("é", false), "'é'");
-        assert_eq!(string_literal("", false), "''");
+        assert_eq!(string_literal("é"), "'é'");
+        assert_eq!(string_literal(""), "''");
     }
 
     #[test]
     fn values() {
-        assert_eq!(literal(&Param::Float(1.5), true).unwrap(), "1.5e0");
-        assert_eq!(literal(&Param::Int(-3), true).unwrap(), "-3");
-        assert!(literal(&Param::Float(f64::NAN), true).is_err());
+        assert_eq!(literal(&Param::Float(1.5)).unwrap(), "1.5e0");
+        assert_eq!(literal(&Param::Int(-3)).unwrap(), "-3");
+        assert!(literal(&Param::Float(f64::NAN)).is_err());
         assert!(
-            literal(
-                &Param::Timestamp {
-                    micros: 0,
-                    utc: true
-                },
-                true
-            )
+            literal(&Param::Timestamp {
+                micros: 0,
+                utc: true
+            })
             .is_err()
         );
-        assert!(literal(&Param::Decimal("1;".into()), true).is_err());
-        assert_eq!(literal(&Param::Bytes(vec![]), true).unwrap(), "X''");
+        assert!(literal(&Param::Decimal("1;".into())).is_err());
+        assert_eq!(literal(&Param::Bytes(vec![])).unwrap(), "X''");
     }
 
     #[test]

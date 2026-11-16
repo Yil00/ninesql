@@ -23,20 +23,24 @@
 //!   without reliable equality are left out and listed in
 //!   [`DmlStatement::unchecked_columns`].
 //! - Every statement expects exactly one affected row ([`DmlStatement::expected_rows`]); the
-//!   caller checks the engine's update count with [`DmlStatement::check_affected`] and rolls
-//!   back otherwise.
+//!   caller runs it in an explicit transaction, checks the engine's update count with
+//!   [`DmlStatement::check_affected`] and rolls the transaction back otherwise (contract on
+//!   that method).
 //! - [`EditingCapabilities`] are honoured: a kind of edit the driver does not declare is
 //!   refused before anything is rendered (QuestDB declares none).
 //! - **Self-check**: both texts must classify as [`StatementClass::Write`] with the dialect's
 //!   own classifier and split into exactly one statement with
 //!   [`Dialect::split_statements`]; otherwise generation fails. A preview holds no NUL.
 //!
-//! # Lexical modes
-//! Literals in the preview depend on the session's lexical modes (MySQL
-//! `NO_BACKSLASH_ESCAPES`, PostgreSQL `standard_conforming_strings` for `bytea`), recorded in
-//! [`DmlStatement::lexical_rules`]. A caller that shows a preview after the session's
-//! [`Dialect::lexical_rules`] changed generates it again. The bound form does not depend on
-//! them.
+//! # Lexical modes (security review H1)
+//! A preview or an export text may be copied and replayed in another session, so every
+//! literal must mean the same **in every lexical mode** of the engine (MySQL
+//! `NO_BACKSLASH_ESCAPES` and `ANSI_QUOTES`, PostgreSQL `standard_conforming_strings`) and,
+//! for MySQL, in every client character set: a string holding a backslash or a hidden
+//! character is written in a form that has no backslash escape to misread (MySQL
+//! `CONVERT(X'…' USING utf8mb4)`, PostgreSQL `E'…'`, `E'\\x…'::bytea`). The rules a preview
+//! was rendered with are still recorded in [`DmlStatement::lexical_rules`]. The bound form
+//! does not depend on them.
 //!
 //! # Values in logs and errors
 //! `Debug` of [`DmlStatement`] and [`DmlBatch`] never prints the preview or the parameter
@@ -45,7 +49,6 @@
 use std::collections::BTreeSet;
 use std::fmt;
 
-use arrow_array::Array;
 use arrow_array::cast::AsArray;
 use arrow_array::types::{
     Date32Type, Date64Type, Decimal128Type, Decimal256Type, Float32Type, Float64Type, Int8Type,
@@ -54,6 +57,7 @@ use arrow_array::types::{
     TimestampMillisecondType, TimestampNanosecondType, TimestampSecondType, UInt8Type, UInt16Type,
     UInt32Type, UInt64Type,
 };
+use arrow_array::{Array, RecordBatch};
 use arrow_schema::{DataType, Field, TimeUnit};
 
 use crate::capabilities::{EditingCapabilities, Feature};
@@ -353,6 +357,10 @@ pub enum DmlError {
     /// A key column has no reliable equality on the engine.
     #[error("the key column {0} cannot be compared reliably on this engine")]
     KeyNotComparable(String),
+    /// A key declared `NULLS NOT DISTINCT` on an engine (or server version) that has no such
+    /// keys ([`Dialect::supports_unique_nulls_not_distinct`]).
+    #[error("this engine has no unique keys with NULLS NOT DISTINCT")]
+    NullsNotDistinctUnsupported,
     /// An `UPDATE` without edited columns.
     #[error("nothing to update")]
     NoChanges,
@@ -463,16 +471,27 @@ pub struct DmlStatement {
     /// Edited (or delete-check) columns left out of the [`Concurrency::EditedColumns`] guard
     /// because the engine has no reliable equality for their type.
     pub unchecked_columns: Vec<String>,
-    /// Lexical rules the preview was rendered for.
+    /// Lexical rules in force when the preview was rendered (informational: dialect literals
+    /// do not depend on them, see the [module documentation](self#lexical-modes-security-review-h1)).
     pub lexical_rules: LexicalRules,
 }
 
 impl DmlStatement {
     /// Checks the update count the engine reported for [`statement`](Self::statement).
     ///
+    /// # Transaction contract (P5-B review M2)
+    /// The check only protects data if the statement can still be undone: the caller runs every
+    /// generated statement **inside an explicit transaction** (`begin` before the first
+    /// statement of a save, never in auto-commit mode) and **rolls the whole transaction back**
+    /// on any [`DmlError::RowCount`] (and on any execution error), committing only when every
+    /// statement of the save passed this check. On a table that is not transactional
+    /// ([`TableInfo::transactional`](crate::TableInfo::transactional) `Some(false)`, MySQL
+    /// MyISAM / MEMORY / ARCHIVE) a rollback undoes nothing: the caller refuses editing there or
+    /// warns before saving.
+    ///
     /// # Errors
     /// [`DmlError::RowCount`] when the count is unknown or not [`expected_rows`](Self::expected_rows);
-    /// the caller then rolls the change back.
+    /// the caller then rolls the transaction back.
     pub fn check_affected(&self, count: Option<u64>) -> Result<(), DmlError> {
         if count == Some(self.expected_rows) {
             Ok(())
@@ -583,7 +602,9 @@ pub fn generate_batch<D: Dialect + ?Sized>(
 
 /// The preview text of an `INSERT` of one row, without a trailing `;`, for the "SQL `INSERT`"
 /// export and copy (F-XFER-01, F-DATA-06). Nothing is executed, so no editing capability is
-/// needed; the text passes the same self-check as [`generate`].
+/// needed; the text passes the same self-check as [`generate`]. Its literals do not depend on
+/// the session's lexical modes (see the [module documentation](self)), so the file can be run
+/// in a session with other modes; it is still meant for the same engine family.
 ///
 /// # Errors
 /// As [`generate`] for an insert.
@@ -747,6 +768,14 @@ fn check_key<D: Dialect + ?Sized>(
     if key.is_empty() {
         return Err(DmlError::NoKey);
     }
+    if kind
+        == (KeyKind::Unique {
+            nulls_distinct: false,
+        })
+        && !dialect.supports_unique_nulls_not_distinct()
+    {
+        return Err(DmlError::NullsNotDistinctUnsupported);
+    }
     check_unique(key.iter().map(|k| k.column.name.as_str()))?;
     for k in key {
         if !dialect.dml_comparable(&k.column.ty) {
@@ -758,7 +787,7 @@ fn check_key<D: Dialect + ?Sized>(
                 KeyKind::Unique {
                     nulls_distinct: false
                 }
-            );
+            ) && dialect.supports_unique_nulls_not_distinct();
             if !null_ok {
                 return Err(DmlError::NullKey(echo_name(&k.column.name)));
             }
@@ -838,24 +867,36 @@ fn self_check<D: Dialect + ?Sized>(dialect: &D, sql: &str, preview: &str) -> Res
 // Shared literal helpers for dialects
 
 /// `true` for characters a preview literal never shows raw: control characters (C0, DEL, C1),
-/// line and paragraph separators, bidirectional controls and invisible formatting characters
-/// (zero-width spaces and joiners, word joiner, invisible operators, BOM, soft hyphen, Mongolian
-/// vowel separator, interlinear annotation marks). The SQL editor strips or flags some of them
-/// (ADR-0025 §3) and others would hide text, so dialects escape them in strings.
+/// line and paragraph separators, bidirectional controls and invisible or blank-rendering
+/// characters (zero-width spaces and joiners, word joiner, invisible operators, BOM, soft
+/// hyphen, combining grapheme joiner, Hangul fillers, Khmer inherent vowels, Mongolian vowel
+/// separator, variation selectors, tag characters, interlinear annotation marks). The SQL editor
+/// strips or flags some of them (ADR-0025 §3) and others would hide text, so dialects escape
+/// them in strings.
 #[must_use]
 pub fn needs_escape(c: char) -> bool {
     c.is_control()
         || matches!(
             c,
             '\u{00AD}'
+                | '\u{034F}'
                 | '\u{061C}'
+                | '\u{115F}'
+                | '\u{1160}'
+                | '\u{17B4}'
+                | '\u{17B5}'
                 | '\u{180E}'
                 | '\u{200B}'..='\u{200F}'
                 | '\u{2028}'..='\u{202E}'
                 | '\u{2060}'..='\u{2064}'
                 | '\u{2066}'..='\u{206F}'
+                | '\u{3164}'
+                | '\u{FE00}'..='\u{FE0F}'
                 | '\u{FEFF}'
+                | '\u{FFA0}'
                 | '\u{FFF9}'..='\u{FFFB}'
+                | '\u{E0000}'..='\u{E007F}'
+                | '\u{E0100}'..='\u{E01EF}'
         )
 }
 
@@ -970,17 +1011,18 @@ fn ansi_string(rules: LexicalRules, s: &str) -> Result<String, &'static str> {
     if s.contains('\0') {
         return Err("the text holds a NUL character");
     }
-    let special = s.chars().any(needs_escape);
+    // A backslash or a hidden character needs the `U&'…'` form, whose meaning would change
+    // with backslash escapes: refused then (literals must not depend on modes).
+    let special = s.chars().any(|c| c == '\\' || needs_escape(c));
     if special && rules.backslash_escapes {
-        return Err("the text holds control characters");
+        return Err("the text holds a backslash or control characters");
     }
     let mut out = String::with_capacity(s.len() + 4);
     out.push_str(if special { "U&'" } else { "'" });
     for c in s.chars() {
         match c {
             '\'' => out.push_str("''"),
-            '\\' if special => out.push_str("\\\\"),
-            '\\' if rules.backslash_escapes => out.push_str("\\\\"),
+            '\\' => out.push_str("\\\\"),
             c if special && needs_escape(c) => {
                 let cp = u32::from(c);
                 if cp > 0xFFFF {
@@ -999,8 +1041,9 @@ fn ansi_string(rules: LexicalRules, s: &str) -> Result<String, &'static str> {
 // ---------------------------------------------------------------------------------------------
 // Arrow cells
 
-/// Reads row `row` of `array` (a column of a result batch whose field is `field`) as a
-/// [`Param`] for [`generate`] or [`insert_preview`].
+/// Reads row `row` of column `column` of `batch` (a batch of a result stream, with **its own**
+/// schema: a batch may flag a column [`TRUNCATED_VALUES_METADATA_KEY`] that the result header
+/// does not, security review L1) as a [`Param`] for [`generate`] or [`insert_preview`].
 ///
 /// Mapping: integers → `Int` (`UInt64` above `i64::MAX` → `Decimal`), floats → `Float`,
 /// `Decimal128` / `Decimal256` → `Decimal`, `Utf8` → `Text` (so `numeric`, `uuid`, `interval`,
@@ -1011,8 +1054,16 @@ fn ansi_string(rules: LexicalRules, s: &str) -> Result<String, &'static str> {
 /// # Errors
 /// [`DmlError::TruncatedValue`] when the field carries [`TRUNCATED_VALUES_METADATA_KEY`]
 /// (a cut value must never be written back); [`DmlError::UnsupportedType`] for other Arrow
-/// types, a row out of range, or a value that loses precision in microseconds.
-pub fn cell_value(field: &Field, array: &dyn Array, row: usize) -> Result<Param, DmlError> {
+/// types, a column or row out of range, or a value that loses precision in microseconds.
+pub fn cell_value(batch: &RecordBatch, column: usize, row: usize) -> Result<Param, DmlError> {
+    let schema = batch.schema();
+    if column >= batch.num_columns() {
+        return Err(DmlError::UnsupportedType(format!("#{}", column + 1)));
+    }
+    field_cell_value(schema.field(column), batch.column(column).as_ref(), row)
+}
+
+fn field_cell_value(field: &Field, array: &dyn Array, row: usize) -> Result<Param, DmlError> {
     let name = field.name();
     if field
         .metadata()
@@ -1141,7 +1192,9 @@ fn time_text(micros: i64) -> Option<String> {
 // ---------------------------------------------------------------------------------------------
 // Row key choice
 
-/// A unique key candidate of a table, from its metadata.
+/// A unique key candidate of a table, from its metadata. Build it with
+/// [`KeyCandidate::from_index`]; [`KeyCandidate::new`] starts unusable (not valid, an expression)
+/// until the caller sets the flags it read from the catalog.
 #[derive(Clone, Debug, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct KeyCandidate {
@@ -1153,12 +1206,19 @@ pub struct KeyCandidate {
     pub not_null: bool,
     /// `NULL`s are distinct (`false` only for PostgreSQL `NULLS NOT DISTINCT`).
     pub nulls_distinct: bool,
-    /// A partial index or an expression key: never identifies a row.
-    pub partial_or_expression: bool,
+    /// A partial index (with a predicate): never identifies a row.
+    pub partial: bool,
+    /// Some key part is an expression, or that is unknown: never identifies a row.
+    pub expression: bool,
+    /// The index is valid and ready (PostgreSQL `indisvalid`, `indisready`).
+    pub valid: bool,
+    /// Uniqueness is deferred (checked at commit): never used as a row key.
+    pub deferrable: bool,
 }
 
 impl KeyCandidate {
-    /// A candidate over `columns`; set the flags with struct update syntax or the fields.
+    /// An unusable candidate over `columns` (`valid = false`, `expression = true`); set the
+    /// fields from the catalog.
     #[must_use]
     pub fn new(columns: Vec<String>) -> Self {
         Self {
@@ -1166,8 +1226,39 @@ impl KeyCandidate {
             primary: false,
             not_null: false,
             nulls_distinct: true,
-            partial_or_expression: false,
+            partial: false,
+            expression: true,
+            valid: false,
+            deferrable: false,
         }
+    }
+
+    /// The candidate of a unique index, from the driver's flags only (never from names or
+    /// definitions): `None` when the index is not unique. `not_null` tells whether every key
+    /// column is `NOT NULL` (from the column metadata).
+    #[must_use]
+    pub fn from_index(index: &crate::metadata::IndexInfo, not_null: bool) -> Option<Self> {
+        if !index.unique && !index.primary {
+            return None;
+        }
+        Some(Self {
+            columns: index.columns.clone(),
+            primary: index.primary,
+            not_null: not_null || index.primary,
+            nulls_distinct: index.nulls_distinct,
+            partial: index.predicate.is_some(),
+            expression: index.has_expression(),
+            valid: index.valid,
+            deferrable: index.deferrable,
+        })
+    }
+
+    fn usable(&self) -> bool {
+        self.valid
+            && !self.deferrable
+            && !self.partial
+            && !self.expression
+            && !self.columns.is_empty()
     }
 }
 
@@ -1175,12 +1266,10 @@ impl KeyCandidate {
 /// columns that has the fewest columns, else the unique key with nullable columns that has the
 /// fewest columns (whose rows with a `NULL` key value then cannot be edited, see
 /// [`KeyKind::Unique`]). `None` (the grid stays read-only, [`DmlError::NoKey`]) when there is
-/// none; partial and expression keys never count.
+/// none. Invalid, deferrable, partial and expression keys never count (P5-B review M1).
 #[must_use]
 pub fn choose_row_key(candidates: &[KeyCandidate]) -> Option<(Vec<String>, KeyKind)> {
-    let usable = candidates
-        .iter()
-        .filter(|c| !c.partial_or_expression && !c.columns.is_empty());
+    let usable = candidates.iter().filter(|c| c.usable());
     if let Some(pk) = usable.clone().find(|c| c.primary) {
         return Some((pk.columns.clone(), KeyKind::PrimaryKey));
     }
@@ -1307,17 +1396,23 @@ mod tests {
             ),
             Err(DmlError::NullKey(_))
         ));
-        let s = generate(
-            &d,
-            &all(),
-            &del(
-                vec![cv("u", Param::Null)],
-                KeyKind::Unique {
-                    nulls_distinct: false,
-                },
-            ),
-        )
-        .unwrap();
+        let nnd = del(
+            vec![cv("u", Param::Null)],
+            KeyKind::Unique {
+                nulls_distinct: false,
+            },
+        );
+        assert_eq!(
+            generate(&d, &all(), &nnd),
+            Err(DmlError::NullsNotDistinctUnsupported)
+        );
+        struct Nnd;
+        impl Dialect for Nnd {
+            fn supports_unique_nulls_not_distinct(&self) -> bool {
+                true
+            }
+        }
+        let s = generate(&Nnd, &all(), &nnd).unwrap();
         assert_eq!(s.statement.text, "DELETE FROM \"t\" WHERE \"u\" IS NULL");
         assert!(s.statement.params.is_empty());
         assert!(matches!(
@@ -1406,44 +1501,76 @@ mod tests {
         );
         assert!(ansi_dml_literal(r, &Param::Date(-800_000)).is_err());
         assert_eq!(echo_name("a\"\n"), "\"a\\\"\\n\"");
+        for c in [
+            '\u{034F}',
+            '\u{115F}',
+            '\u{1160}',
+            '\u{17B4}',
+            '\u{17B5}',
+            '\u{3164}',
+            '\u{FE00}',
+            '\u{FE0F}',
+            '\u{FFA0}',
+            '\u{E0000}',
+            '\u{E007F}',
+            '\u{E0100}',
+            '\u{E01EF}',
+        ] {
+            assert!(needs_escape(c), "{c:?}");
+        }
+        assert!(!needs_escape('é') && !needs_escape(' ') && !needs_escape('\u{E0080}'));
     }
 
     #[test]
     fn cells() {
         let f = Field::new("a", DataType::Utf8, true);
         let a = StringArray::from(vec![Some("x"), None]);
-        assert_eq!(cell_value(&f, &a, 0).unwrap(), Param::Text("x".into()));
-        assert_eq!(cell_value(&f, &a, 1).unwrap(), Param::Null);
-        assert!(cell_value(&f, &a, 2).is_err());
+        assert_eq!(
+            field_cell_value(&f, &a, 0).unwrap(),
+            Param::Text("x".into())
+        );
+        assert_eq!(field_cell_value(&f, &a, 1).unwrap(), Param::Null);
+        assert!(field_cell_value(&f, &a, 2).is_err());
         let cut = f
             .clone()
             .with_metadata([(TRUNCATED_VALUES_METADATA_KEY.to_owned(), "true".to_owned())]);
         assert!(matches!(
-            cell_value(&cut, &a, 0),
+            field_cell_value(&cut, &a, 0),
             Err(DmlError::TruncatedValue(_))
         ));
+        // Through a batch: its own schema's truncation flag is honoured.
+        let schema = Arc::new(arrow_schema::Schema::new(vec![cut.clone()]));
+        let batch = RecordBatch::try_new(schema, vec![Arc::new(a.clone())]).unwrap();
+        assert!(matches!(
+            cell_value(&batch, 0, 0),
+            Err(DmlError::TruncatedValue(_))
+        ));
+        assert!(cell_value(&batch, 1, 0).is_err());
+        let schema = Arc::new(arrow_schema::Schema::new(vec![f.clone()]));
+        let batch = RecordBatch::try_new(schema, vec![Arc::new(a.clone())]).unwrap();
+        assert_eq!(cell_value(&batch, 0, 0).unwrap(), Param::Text("x".into()));
         let u = UInt64Array::from(vec![u64::MAX]);
         assert_eq!(
-            cell_value(&Field::new("u", DataType::UInt64, true), &u, 0).unwrap(),
+            field_cell_value(&Field::new("u", DataType::UInt64, true), &u, 0).unwrap(),
             Param::Decimal(u64::MAX.to_string())
         );
         let d = Decimal128Array::from(vec![-1250_i128])
             .with_precision_and_scale(10, 2)
             .unwrap();
         assert_eq!(
-            cell_value(&Field::new("d", d.data_type().clone(), true), &d, 0).unwrap(),
+            field_cell_value(&Field::new("d", d.data_type().clone(), true), &d, 0).unwrap(),
             Param::Decimal("-12.50".into())
         );
         let t = Time64MicrosecondArray::from(vec![3_723_000_001]);
         assert_eq!(
-            cell_value(&Field::new("t", t.data_type().clone(), true), &t, 0).unwrap(),
+            field_cell_value(&Field::new("t", t.data_type().clone(), true), &t, 0).unwrap(),
             Param::Text("01:02:03.000001".into())
         );
         let ns = TimestampNanosecondArray::from(vec![1_500, 2_000]).with_timezone(Arc::from("UTC"));
         let nf = Field::new("n", ns.data_type().clone(), true);
-        assert!(cell_value(&nf, &ns, 0).is_err());
+        assert!(field_cell_value(&nf, &ns, 0).is_err());
         assert_eq!(
-            cell_value(&nf, &ns, 1).unwrap(),
+            field_cell_value(&nf, &ns, 1).unwrap(),
             Param::Timestamp {
                 micros: 2,
                 utc: true
@@ -1451,23 +1578,45 @@ mod tests {
         );
         let b = BinaryArray::from(vec![&b"\x00\xff"[..]]);
         assert_eq!(
-            cell_value(&Field::new("b", DataType::Binary, true), &b, 0).unwrap(),
+            field_cell_value(&Field::new("b", DataType::Binary, true), &b, 0).unwrap(),
             Param::Bytes(vec![0, 0xff])
         );
     }
 
     #[test]
     fn row_key_choice() {
-        let mut pk = KeyCandidate::new(vec!["id".into()]);
-        pk.primary = true;
-        let mut u2 = KeyCandidate::new(vec!["a".into(), "b".into()]);
-        u2.not_null = true;
-        let mut u1 = KeyCandidate::new(vec!["c".into()]);
-        u1.not_null = true;
-        let nullable = KeyCandidate::new(vec!["n".into()]);
-        let mut partial = KeyCandidate::new(vec!["p".into()]);
-        partial.not_null = true;
-        partial.partial_or_expression = true;
+        use crate::metadata::IndexInfo;
+        let index = |cols: &[&str], unique: bool, primary: bool| IndexInfo {
+            columns: cols.iter().map(|c| (*c).to_owned()).collect(),
+            expressions: vec![false; cols.len()],
+            unique,
+            primary,
+            valid: true,
+            ..IndexInfo::default()
+        };
+        let pk = KeyCandidate::from_index(&index(&["id"], true, true), false).unwrap();
+        let u2 = KeyCandidate::from_index(&index(&["a", "b"], true, false), true).unwrap();
+        let u1 = KeyCandidate::from_index(&index(&["c"], true, false), true).unwrap();
+        let nullable = KeyCandidate::from_index(&index(&["n"], true, false), false).unwrap();
+        assert!(KeyCandidate::from_index(&index(&["x"], false, false), true).is_none());
+        let mut partial = index(&["p"], true, false);
+        partial.predicate = Some("p > 0".into());
+        let partial = KeyCandidate::from_index(&partial, true).unwrap();
+        let mut invalid = index(&["v"], true, false);
+        invalid.valid = false;
+        let invalid = KeyCandidate::from_index(&invalid, true).unwrap();
+        let mut deferred = index(&["w"], true, false);
+        deferred.deferrable = true;
+        let deferred = KeyCandidate::from_index(&deferred, true).unwrap();
+        let mut expr = index(&["lower(e)"], true, false);
+        expr.expressions = vec![true];
+        let expr = KeyCandidate::from_index(&expr, true).unwrap();
+        let mut unknown = index(&["e"], true, false);
+        unknown.expressions.clear();
+        let unknown = KeyCandidate::from_index(&unknown, true).unwrap();
+        let mut nnd = index(&["z"], true, false);
+        nnd.nulls_distinct = false;
+        let nnd = KeyCandidate::from_index(&nnd, false).unwrap();
         assert_eq!(
             choose_row_key(&[u1.clone(), pk]),
             Some((vec!["id".into()], KeyKind::PrimaryKey))
@@ -1477,7 +1626,14 @@ mod tests {
             Some(vec!["c".into()])
         );
         assert_eq!(
-            choose_row_key(&[partial.clone(), nullable]),
+            choose_row_key(&[
+                partial.clone(),
+                invalid.clone(),
+                deferred.clone(),
+                expr.clone(),
+                unknown.clone(),
+                nullable
+            ]),
             Some((
                 vec!["n".into()],
                 KeyKind::Unique {
@@ -1485,7 +1641,23 @@ mod tests {
                 }
             ))
         );
-        assert_eq!(choose_row_key(&[partial]), None);
+        assert_eq!(
+            choose_row_key(&[nnd]),
+            Some((
+                vec!["z".into()],
+                KeyKind::Unique {
+                    nulls_distinct: false
+                }
+            ))
+        );
+        assert_eq!(
+            choose_row_key(&[partial, invalid, deferred, expr, unknown]),
+            None
+        );
+        assert_eq!(
+            choose_row_key(&[KeyCandidate::new(vec!["id".into()])]),
+            None
+        );
         assert_eq!(choose_row_key(&[]), None);
     }
 
