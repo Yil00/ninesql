@@ -1681,6 +1681,7 @@ async fn open_session(
             // One slot more than configured: the terminal event's reserved slot.
             result_queue: shared.config.result_queue.max(1) + 1,
             leased: Mutex::new(false),
+            pending: std::sync::atomic::AtomicUsize::new(0),
         }),
     };
     lock(&shared.sessions).insert(id, handle.clone());
@@ -2041,6 +2042,10 @@ struct HandleInner {
     /// Held by a [`SessionLease`] (a CSV import): statements and transaction commands from
     /// anyone else are refused with [`CoreError::SessionLeased`] meanwhile.
     leased: Mutex<bool>,
+    /// Commands sent and not yet fully handled by the session task (queued or running): raised
+    /// before each send, lowered by the task once the command is done. A lease is granted only
+    /// at zero, so a command the task already took but has not finished is never missed.
+    pending: std::sync::atomic::AtomicUsize,
 }
 
 /// Exclusive use of a session by one transfer ([`SessionHandle::lease`]); released on drop.
@@ -2128,7 +2133,12 @@ impl SessionHandle {
             events: events_tx,
             cancel: cancel.clone(),
         };
-        match self.inner.commands.try_send(command) {
+        self.inner.pending.fetch_add(1, Ordering::SeqCst);
+        let sent = self.inner.commands.try_send(command);
+        if sent.is_err() {
+            self.inner.pending.fetch_sub(1, Ordering::SeqCst);
+        }
+        match sent {
             Ok(()) => Execution { events, cancel },
             Err(mpsc::error::TrySendError::Full(_)) => {
                 Execution::failed(CoreError::Driver(DriverError::Busy))
@@ -2160,8 +2170,9 @@ impl SessionHandle {
     /// keep-alive ping and `close` still work).
     pub(crate) fn lease(&self) -> Option<SessionLease> {
         let mut leased = lock(&self.inner.leased);
-        let idle = lock(&self.inner.current).is_none()
-            && self.inner.commands.capacity() == self.inner.commands.max_capacity();
+        // Sends happen under the `leased` lock (or by the lease holder), so no command can be
+        // raised between this check and the lease being set.
+        let idle = self.inner.pending.load(Ordering::SeqCst) == 0;
         if *leased || !idle || self.is_closed() {
             return None;
         }
@@ -2179,11 +2190,15 @@ impl SessionHandle {
 
     fn send_transaction(&self, op: TxOp) -> Reply<Result<TransactionState, CoreError>> {
         let (tx, reply) = Reply::channel();
-        match self
+        self.inner.pending.fetch_add(1, Ordering::SeqCst);
+        let sent = self
             .inner
             .commands
-            .try_send(Command::Transaction { op, reply: tx })
-        {
+            .try_send(Command::Transaction { op, reply: tx });
+        if sent.is_err() {
+            self.inner.pending.fetch_sub(1, Ordering::SeqCst);
+        }
+        match sent {
             Ok(()) => reply,
             Err(mpsc::error::TrySendError::Full(_)) => {
                 Reply::ready(Err(CoreError::Driver(DriverError::Busy)))
@@ -2443,6 +2458,7 @@ impl SessionTask {
                     };
                     let flow = self.handle_command(command).await;
                     self.update_transaction_state();
+                    self.handle.inner.pending.fetch_sub(1, Ordering::SeqCst);
                     last_activity = tokio::time::Instant::now();
                     match flow {
                         Flow::Continue => {}
@@ -2466,6 +2482,7 @@ impl SessionTask {
         // Pending commands fail with `SessionClosed` once the receiver is dropped.
         commands.close();
         while let Ok(command) = commands.try_recv() {
+            self.handle.inner.pending.fetch_sub(1, Ordering::SeqCst);
             match command {
                 Command::Execute { events, .. } => {
                     let _ = events.try_send(ExecEvent::Failed(CoreError::SessionClosed));
@@ -2548,13 +2565,7 @@ impl SessionTask {
                 drop(out);
                 flow
             }
-            Command::Transaction { op, reply } => {
-                // Marks the session busy (a lease waits for it), like a statement does.
-                *lock(&self.handle.inner.current) = Some(CancelToken::new());
-                let flow = self.transaction_command(op, reply).await;
-                *lock(&self.handle.inner.current) = None;
-                flow
-            }
+            Command::Transaction { op, reply } => self.transaction_command(op, reply).await,
         }
     }
 

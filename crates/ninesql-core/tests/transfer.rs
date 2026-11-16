@@ -689,3 +689,258 @@ fn review_fixes_lease_file_identity_key_and_protected_aliases() {
         assert!(matches!(e, TransferError::ForbiddenLocation { .. }));
     });
 }
+
+// ---------------------------------------------------------------------------------------------
+// Second review round (R1, R2, R3, R6): a mock with PostgreSQL lexical rules, so exports open a
+// `BEGIN READ ONLY`, which can be slowed down.
+
+mod pglike {
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    use ninesql_core::driver_api::mock::MockDriver;
+    use ninesql_core::driver_api::{
+        self as api, CancelHandle, Capabilities, ConnectParams, Dialect, Driver, DriverResult,
+        ExecOptions, LexicalRules, Metadata, ResultStream, Session, Statement,
+    };
+
+    pub struct PgRules;
+    impl Dialect for PgRules {
+        fn lexical_rules(&self) -> LexicalRules {
+            LexicalRules::ANSI.with_e_string_backslash(true)
+        }
+    }
+
+    pub struct PgLike {
+        pub mock: MockDriver,
+        pub begin_delay: Duration,
+    }
+
+    #[async_trait::async_trait]
+    impl Driver for PgLike {
+        fn family(&self) -> &'static str {
+            "pglike-mock"
+        }
+        fn engines(&self) -> &[api::EngineId] {
+            self.mock.engines()
+        }
+        fn capabilities(&self, e: &api::EngineId, v: Option<&str>) -> DriverResult<Capabilities> {
+            self.mock.capabilities(e, v)
+        }
+        fn dialect(&self, _: &api::EngineId) -> DriverResult<Arc<dyn Dialect>> {
+            Ok(Arc::new(PgRules))
+        }
+        async fn connect(&self, params: ConnectParams) -> DriverResult<Box<dyn Session>> {
+            Ok(Box::new(PgSession {
+                inner: self.mock.connect(params).await?,
+                begin_delay: self.begin_delay,
+            }))
+        }
+    }
+
+    pub struct PgSession {
+        inner: Box<dyn Session>,
+        begin_delay: Duration,
+    }
+
+    #[async_trait::async_trait]
+    impl Session for PgSession {
+        fn capabilities(&self) -> &Capabilities {
+            self.inner.capabilities()
+        }
+        fn server_version(&self) -> Option<&str> {
+            self.inner.server_version()
+        }
+        fn dialect(&self) -> Arc<dyn Dialect> {
+            Arc::new(PgRules)
+        }
+        fn metadata(&self) -> Arc<dyn Metadata> {
+            self.inner.metadata()
+        }
+        async fn execute(&mut self, s: Statement, o: ExecOptions) -> DriverResult<ResultStream> {
+            if s.text.starts_with("BEGIN READ ONLY") {
+                tokio::time::sleep(self.begin_delay).await;
+            }
+            self.inner.execute(s, o).await
+        }
+        fn cancel_handle(&self) -> Arc<dyn CancelHandle> {
+            self.inner.cancel_handle()
+        }
+        fn auto_commit(&self) -> bool {
+            self.inner.auto_commit()
+        }
+        fn in_transaction(&self) -> bool {
+            self.inner.in_transaction()
+        }
+        async fn set_auto_commit(&mut self, on: bool) -> DriverResult<()> {
+            self.inner.set_auto_commit(on).await
+        }
+        async fn begin(&mut self) -> DriverResult<()> {
+            self.inner.begin().await
+        }
+        async fn commit(&mut self) -> DriverResult<()> {
+            self.inner.commit().await
+        }
+        async fn rollback(&mut self) -> DriverResult<()> {
+            self.inner.rollback().await
+        }
+        fn is_read_only(&self) -> bool {
+            self.inner.is_read_only()
+        }
+        async fn set_read_only(&mut self, ro: bool) -> DriverResult<()> {
+            self.inner.set_read_only(ro).await
+        }
+        async fn ping(&mut self) -> DriverResult<()> {
+            self.inner.ping().await
+        }
+        async fn close(self: Box<Self>) -> DriverResult<()> {
+            self.inner.close().await
+        }
+    }
+}
+
+async fn idle(h: &ninesql_core::SessionHandle) {
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while h.is_leased() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the lease was not released"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
+#[test]
+fn export_read_only_transaction_cancel_and_open_transactions() {
+    let tmp = tempfile::tempdir().unwrap();
+    let driver = pglike::PgLike {
+        mock: mock_driver(),
+        begin_delay: Duration::from_millis(400),
+    };
+    let (manager, _) = manager(Arc::new(driver), tmp.path());
+    let transfer = TransferService::new(manager.clone(), &paths(&tmp.path().join("ninesql")));
+    let out = tempfile::tempdir().unwrap();
+    let csv = || ExportOptions::new(ExportFormat::Csv);
+    ui(async {
+        let types = ConnectionTypes::default();
+        let h = open_ok(&manager, mock_connection(ConnectionTypeId::dev()), &types).await;
+        // A plain export: its read-only transaction is opened and rolled back before Done.
+        let s = finish_export(transfer.export(
+            &h,
+            ExportRequest::statement("SELECT * FROM numbers(3)", out.path().join("a.csv"), csv()),
+        ))
+        .await
+        .unwrap();
+        assert!(s.warnings.is_empty());
+        idle(&h).await;
+        assert!(!h.transaction_state().in_transaction);
+
+        // R2: a cancel while the BEGIN runs stops the export and rolls the BEGIN back.
+        let job = transfer.export(
+            &h,
+            ExportRequest::statement("SELECT * FROM numbers(3)", out.path().join("b.csv"), csv()),
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        job.cancel();
+        assert!(matches!(
+            finish_export(job).await,
+            Err(TransferJobError::Cancelled)
+        ));
+        idle(&h).await;
+        assert!(!h.transaction_state().in_transaction);
+        assert!(!out.path().join("b.csv").exists());
+
+        // R3: a transaction already open: the export runs in it on dev, with a warning, and
+        // leaves it open.
+        h.begin().await.unwrap().unwrap();
+        let s = finish_export(transfer.export(
+            &h,
+            ExportRequest::statement("SELECT * FROM numbers(3)", out.path().join("c.csv"), csv()),
+        ))
+        .await
+        .unwrap();
+        assert_eq!(
+            s.warnings,
+            vec![ninesql_core::ExportWarning::TransactionAlreadyOpen]
+        );
+        idle(&h).await;
+        assert!(h.transaction_state().in_transaction);
+        h.rollback().await.unwrap().unwrap();
+
+        // ... and is refused on production.
+        let prod = open_ok(&manager, mock_connection(ConnectionTypeId::prod()), &types).await;
+        prod.begin().await.unwrap().unwrap();
+        let e = finish_export(transfer.export(
+            &prod,
+            ExportRequest::statement("SELECT * FROM numbers(3)", out.path().join("d.csv"), csv()),
+        ))
+        .await
+        .unwrap_err();
+        assert!(matches!(e, TransferJobError::PendingTransaction), "{e}");
+        assert!(e.to_string().contains("commit or roll back first"));
+        assert!(!out.path().join("d.csv").exists());
+    });
+}
+
+#[test]
+fn leases_wait_for_running_commands_and_block_metadata() {
+    use ninesql_core::driver_api::{ObjectKind, ObjectPath};
+    use ninesql_core::{MetadataConfig, MetadataError, MetadataService, NodeKey};
+    let tmp = tempfile::tempdir().unwrap();
+    let (manager, _) = manager(Arc::new(mock_driver()), tmp.path());
+    let transfer = TransferService::new(manager.clone(), &paths(&tmp.path().join("ninesql")));
+    let metadata = MetadataService::new(manager.clone(), MetadataConfig::default());
+    let out = tempfile::tempdir().unwrap();
+    ui(async {
+        let h = open_ok(
+            &manager,
+            mock_connection(ConnectionTypeId::dev()),
+            &ConnectionTypes::default(),
+        )
+        .await;
+        let connection = h.info().connection;
+        // R1: a statement the session task has taken (running, its result unread) keeps the
+        // session busy: the export is refused, never interleaved.
+        let running = h.execute(ninesql_core::ExecuteRequest::sql(
+            "SELECT * FROM slow_numbers(1000, 50)",
+        ));
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let e = finish_export(transfer.export(
+            &h,
+            ExportRequest::statement(
+                "SELECT * FROM numbers(3)",
+                out.path().join("x.csv"),
+                ExportOptions::new(ExportFormat::Csv),
+            ),
+        ))
+        .await
+        .unwrap_err();
+        assert!(matches!(e, TransferJobError::SessionBusy), "{e}");
+        drop(running);
+
+        // R6: while a transfer holds the session, metadata loads are refused.
+        let mut job = transfer.export(
+            &h,
+            ExportRequest::statement(
+                "SELECT * FROM slow_numbers(100000, 20)",
+                out.path().join("slow.csv"),
+                ExportOptions::new(ExportFormat::Csv),
+            ),
+        );
+        loop {
+            match job.next().await {
+                Some(ExportEvent::Started) => break,
+                Some(_) => {}
+                None => panic!("ended"),
+            }
+        }
+        let key = NodeKey::new(ObjectPath::root(), ObjectKind::Schema);
+        let r = metadata.children(connection, key.clone()).await;
+        assert!(matches!(r, Err(MetadataError::SessionLeased)), "{r:?}");
+        job.cancel();
+        let _ = finish_export(job).await;
+        idle(&h).await;
+        let r = metadata.children(connection, key).await;
+        assert!(!matches!(r, Err(MetadataError::SessionLeased)), "{r:?}");
+    });
+}

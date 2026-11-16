@@ -149,7 +149,7 @@ pub enum TransferJobError {
     #[error("this connection has no transactions: choose \"commit every N rows\"")]
     NoTransactions,
     /// A transaction is open on the session.
-    #[error("a transaction is open on this session: commit or roll back before importing")]
+    #[error("a transaction is open on this session: commit or roll back first")]
     PendingTransaction,
     /// A row could not be read or converted (and invalid rows are not skipped).
     #[error("invalid row: {0}")]
@@ -386,6 +386,19 @@ pub struct ExportSummary {
     pub incomplete: bool,
     /// Peak bytes of result batches held by the export at once (measured).
     pub peak_buffered_bytes: u64,
+    /// Warnings ([`ExportWarning`]).
+    pub warnings: Vec<ExportWarning>,
+}
+
+/// Something the user should know about a finished export.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum ExportWarning {
+    /// A transaction was already open on the session: the export ran inside it, without an
+    /// engine-side read-only transaction of its own.
+    TransactionAlreadyOpen,
+    /// The engine refused the read-only transaction: the export ran without it.
+    ReadOnlyTransactionFailed,
 }
 
 /// Event of an export. Exactly one of [`ExportEvent::Done`] or [`ExportEvent::Failed`] ends it.
@@ -1053,6 +1066,10 @@ impl ExportTask {
                 .ok_or(TransferJobError::SessionBusy)?,
             read_only_tx: false,
         });
+        // Right after the lease, with the session idle: an open transaction is seen here
+        // (review R1, R3), and the read-only transaction is opened before anything else runs.
+        let mut warnings = Vec::new();
+        self.begin_read_only(guard, &dialect, &mut warnings).await?;
 
         // The file: checked and created on the blocking pool.
         let service = self.service.clone();
@@ -1098,7 +1115,6 @@ impl ExportTask {
             )
         };
 
-        guard.read_only_tx = self.begin_read_only(&guard.lease, &dialect).await?;
         let budget = request.budget.with_max_bytes(u64::MAX).with_max_rows(None);
         let mut exec = guard.lease.execute(
             ExecuteRequest::sql(text)
@@ -1184,6 +1200,7 @@ impl ExportTask {
             result_sets_skipped: stats.result_sets_skipped,
             incomplete: stats.incomplete.is_some(),
             peak_buffered_bytes: gauge.peak.load(Ordering::SeqCst),
+            warnings,
         })
     }
 }
@@ -1204,22 +1221,37 @@ impl Drop for ExportLease {
 }
 
 impl ExportTask {
-    /// Opens an engine-side read-only transaction around the export when the session has none
-    /// open and is not read-only already (review L7): PostgreSQL family `BEGIN READ ONLY`,
-    /// MySQL family `START TRANSACTION READ ONLY`; SQLite and engines without transactions need
-    /// or allow none. `true` when one was opened. If it cannot be opened, the export fails on a
-    /// production or confirm-every-write connection and goes on without it otherwise.
+    /// Opens an engine-side read-only transaction around the export when the session is not
+    /// read-only already and the driver has transactions (review L7): PostgreSQL family
+    /// `BEGIN READ ONLY`, MySQL family `START TRANSACTION READ ONLY`; SQLite and engines without
+    /// transactions need or allow none.
+    ///
+    /// - A transaction already open: refused with [`TransferJobError::PendingTransaction`] on a
+    ///   production or confirm-every-write connection; elsewhere the export runs in it, with
+    ///   [`ExportWarning::TransactionAlreadyOpen`] (review R3).
+    /// - The `BEGIN` fails: the export fails on a production or confirm-every-write connection
+    ///   and runs without it elsewhere, with [`ExportWarning::ReadOnlyTransactionFailed`].
+    /// - A cancel while the `BEGIN` runs stops it and waits for its end (review R2).
+    ///
+    /// After any outcome, `guard.read_only_tx` follows the session's transaction state, so a
+    /// transaction the `BEGIN` did open is always rolled back.
     async fn begin_read_only(
         &self,
-        lease: &SessionLease,
+        guard: &mut ExportLease,
         dialect: &Arc<dyn ninesql_driver_api::Dialect>,
-    ) -> Result<bool, TransferJobError> {
+        warnings: &mut Vec<ExportWarning>,
+    ) -> Result<(), TransferJobError> {
         let info = self.session.info();
-        if info.read_only
-            || !info.capabilities.transactions.manual_commit
-            || self.session.transaction_state().in_transaction
-        {
-            return Ok(false);
+        let strict = info.policy.production || info.policy.confirm_every_write;
+        if info.read_only || !info.capabilities.transactions.manual_commit {
+            return Ok(());
+        }
+        if self.session.transaction_state().in_transaction {
+            if strict {
+                return Err(TransferJobError::PendingTransaction);
+            }
+            warnings.push(ExportWarning::TransactionAlreadyOpen);
+            return Ok(());
         }
         let rules = dialect.lexical_rules();
         let text = if rules.e_string_backslash {
@@ -1227,11 +1259,29 @@ impl ExportTask {
         } else if rules.hash_comments {
             "START TRANSACTION READ ONLY"
         } else {
-            return Ok(false);
+            return Ok(());
         };
-        let mut exec = lease.execute(ExecuteRequest::sql(text));
+        let mut exec = guard.lease.execute(ExecuteRequest::sql(text));
+        let mut cancelled = false;
         let outcome = loop {
-            match exec.next().await {
+            let event = if cancelled {
+                // Drain until the session reports the end of the cancelled `BEGIN`.
+                match tokio::time::timeout(Duration::from_secs(30), exec.next()).await {
+                    Ok(e) => e,
+                    Err(_) => break Err(TransferJobError::Cancelled),
+                }
+            } else {
+                tokio::select! {
+                    biased;
+                    () = self.cancel.cancelled() => {
+                        exec.cancel();
+                        cancelled = true;
+                        continue;
+                    }
+                    e = exec.next() => e,
+                }
+            };
+            match event {
                 Some(ExecEvent::Finished { .. }) => break Ok(()),
                 Some(ExecEvent::Failed(e)) => break Err(TransferJobError::from_core(e)),
                 Some(ExecEvent::NeedsConfirmation(_)) => {
@@ -1241,15 +1291,20 @@ impl ExportTask {
                 None => break Err(TransferJobError::Core(CoreError::SessionClosed)),
             }
         };
+        drop(exec);
+        // The state is recorded before the terminal event: it says whether a transaction is open.
+        guard.read_only_tx = self.session.transaction_state().in_transaction;
         match outcome {
-            Ok(()) => Ok(true),
-            Err(e) if info.policy.production || info.policy.confirm_every_write => Err(e),
+            _ if cancelled => Err(TransferJobError::Cancelled),
+            Ok(()) => Ok(()),
+            Err(e) if strict => Err(e),
             Err(e) => {
                 tracing::warn!(
                     kind = e.kind(),
                     "export runs without a read-only transaction"
                 );
-                Ok(false)
+                warnings.push(ExportWarning::ReadOnlyTransactionFailed);
+                Ok(())
             }
         }
     }
@@ -1313,6 +1368,23 @@ impl ImportCounters {
         self.issues_total += 1;
         if self.issues.len() < MAX_REPORTED_ISSUES {
             self.issues.push(issue);
+        }
+    }
+}
+
+/// The import's lease on its session and whether its transaction is open. Dropping it while
+/// the transaction is open (the import task dropped mid-way: runtime shutdown, a panic) queues
+/// a `ROLLBACK` before the lease is released, so nothing of a half import is ever committed by
+/// a later statement (review R4).
+struct ImportTx {
+    lease: SessionLease,
+    in_tx: bool,
+}
+
+impl Drop for ImportTx {
+    fn drop(&mut self) {
+        if self.in_tx {
+            drop(self.lease.rollback());
         }
     }
 }
@@ -1503,7 +1575,10 @@ impl ImportTask {
 
         let _ = self.events.try_send(ImportEvent::Started { file_bytes });
         let mut c = ImportCounters::default();
-        let mut in_tx = false;
+        let mut tx = ImportTx {
+            lease,
+            in_tx: false,
+        };
         let mut last_progress = Instant::now();
         let outcome: Result<(), TransferJobError> = async {
             loop {
@@ -1533,16 +1608,22 @@ impl ImportTask {
                 if batch.rows.is_empty() {
                     continue;
                 }
-                if transactional && !in_tx {
-                    tx_op(lease.begin()).await?;
-                    in_tx = true;
+                if transactional && !tx.in_tx {
+                    tx_op(tx.lease.begin()).await?;
+                    tx.in_tx = true;
                 }
                 let n = batch.rows.len();
                 let text = renderer.insert(&request.table, &columns, n)?;
                 let first_line = batch.lines.first().copied().unwrap_or(0);
                 let params: Vec<Param> = batch.rows.into_iter().flatten().collect();
                 if let Err(e) = self
-                    .insert(&lease, text, params, confirmed, request.statement_timeout)
+                    .insert(
+                        &tx.lease,
+                        text,
+                        params,
+                        confirmed,
+                        request.statement_timeout,
+                    )
                     .await
                 {
                     if !matches!(e, TransferJobError::Cancelled) {
@@ -1561,8 +1642,8 @@ impl ImportTask {
                 } else if let ImportTransaction::CommitEvery(every) = request.transaction
                     && c.since_commit >= every
                 {
-                    tx_op(lease.commit()).await?;
-                    in_tx = false;
+                    tx_op(tx.lease.commit()).await?;
+                    tx.in_tx = false;
                     c.commits += 1;
                     c.rows_committed = c.rows_inserted;
                     c.since_commit = 0;
@@ -1576,9 +1657,9 @@ impl ImportTask {
                     });
                 }
             }
-            if in_tx {
-                tx_op(lease.commit()).await?;
-                in_tx = false;
+            if tx.in_tx {
+                tx_op(tx.lease.commit()).await?;
+                tx.in_tx = false;
                 c.commits += 1;
                 c.rows_committed = c.rows_inserted;
             }
@@ -1590,10 +1671,11 @@ impl ImportTask {
         let (end, error) = match outcome {
             Ok(()) => (ImportEnd::Completed, None),
             Err(e) => {
-                if in_tx {
+                if tx.in_tx {
                     // A failed rollback leaves the transaction to the session (closing it rolls
                     // back); it is reported through the session's transaction state.
-                    if let Err(re) = tx_op(lease.rollback()).await {
+                    tx.in_tx = false;
+                    if let Err(re) = tx_op(tx.lease.rollback()).await {
                         tracing::warn!(kind = re.kind(), "rollback after a failed import failed");
                     }
                 }
@@ -1689,5 +1771,67 @@ async fn tx_op(
         Some(Ok(_)) => Ok(()),
         Some(Err(e)) => Err(TransferJobError::Core(e)),
         None => Err(TransferJobError::Core(CoreError::SessionClosed)),
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)] // Tests may panic (AGENTS.md).
+mod tests {
+    use std::sync::Arc;
+
+    use ninesql_driver_api::mock::{MOCK_ENGINE, MockDriver, full_capabilities};
+    use ninesql_secrets::SecretStores;
+
+    use super::*;
+    use crate::connection::{Auth, Connection, Endpoint, EngineId, TlsMode};
+    use crate::connection_type::{ConnectionTypeId, ConnectionTypes};
+    use crate::registry::DriverRegistry;
+    use crate::session::{KnownHostsFiles, ManagerConfig, OpenOutcome, OpenRequest};
+
+    /// R4: an import dropped mid-way (its task gone) still rolls its transaction back and
+    /// releases the session.
+    #[test]
+    fn import_guard_rolls_back_when_dropped() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut caps = full_capabilities();
+        caps.tls = [ninesql_driver_api::TlsMode::Disable].into_iter().collect();
+        let mut registry = DriverRegistry::new();
+        registry.register(Arc::new(MockDriver::new().with_capabilities(caps)));
+        let config = ManagerConfig::with_known_hosts(KnownHostsFiles {
+            own: dir.path().join("known_hosts"),
+            user: None,
+        });
+        let manager = SessionManager::new(config, registry, SecretStores::new()).unwrap();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let mut c = Connection::new(
+                "Mock",
+                EngineId::new(MOCK_ENGINE.as_str()).unwrap(),
+                Endpoint::Tcp {
+                    host: "mock.example.test".into(),
+                    port: Some(5000),
+                    database: None,
+                },
+                Auth::None,
+                ConnectionTypeId::dev(),
+            );
+            c.tls.mode = TlsMode::Disable;
+            let request = OpenRequest::new(c, &ConnectionTypes::default());
+            let Some(Ok(OpenOutcome::Opened(h))) = manager.open(request).await else {
+                panic!("not opened");
+            };
+            let lease = h.lease().unwrap();
+            tx_op(lease.begin()).await.unwrap();
+            assert!(h.transaction_state().in_transaction);
+            drop(ImportTx { lease, in_tx: true });
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while h.is_leased() || h.transaction_state().in_transaction {
+                assert!(Instant::now() < deadline, "not rolled back");
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        });
     }
 }

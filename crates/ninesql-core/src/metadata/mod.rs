@@ -10,6 +10,12 @@
 //!   the cache is cleared, requests in flight fail with [`MetadataError::SessionClosed`], and
 //!   [`MetadataEvent::Invalidated`] tells the UI; the next request binds another open session of
 //!   the connection, if any.
+//! - While a transfer (export or CSV import, `crate::transfer`) leases the bound session, every
+//!   request fails at once with [`MetadataError::SessionLeased`], and a load already running
+//!   stops before its next driver call: no metadata statement runs inside the transfer's
+//!   transaction. A driver call that had already started when the lease was taken finishes
+//!   first (the session serialises it before the transfer's first statement). The UI loads
+//!   again once the transfer ended.
 //! - Every call runs on the driver runtime (I6) and answers through a [`MetadataRequest`]
 //!   (await it on any executor, or poll it with [`MetadataRequest::try_take`]) and an event on
 //!   the [`MetadataEvents`] channel.
@@ -182,6 +188,10 @@ pub enum MetadataError {
     /// The connection has no open session.
     #[error("the connection is not open")]
     NoSession,
+    /// The session is held by a transfer (export or CSV import, whose transaction may be
+    /// open): no metadata call runs on it until the transfer ends; load again then.
+    #[error("an export or import is using this connection's session; try again when it ends")]
+    SessionLeased,
     /// The session closed before the answer.
     #[error("the session is closed")]
     SessionClosed,
@@ -211,6 +221,7 @@ impl MetadataError {
     pub fn kind(&self) -> &'static str {
         match self {
             Self::NoSession => "no-session",
+            Self::SessionLeased => "session-leased",
             Self::SessionClosed => "session-closed",
             Self::Unsupported(_) => "unsupported-kind",
             Self::DdlUnsupported(_) => "ddl-unsupported",
@@ -587,6 +598,15 @@ impl Inner {
         if stale {
             self.drop_connection(st, connection, InvalidationReason::SessionClosed);
         }
+        // A transfer holds the session (its transaction may be open): nothing runs on it
+        // meanwhile; the navigator says so and loads again once the transfer ended.
+        if st
+            .conns
+            .get(&connection)
+            .is_some_and(|cs| cs.session.is_leased())
+        {
+            return Err(MetadataError::SessionLeased);
+        }
         let vacant = match st.conns.entry(connection) {
             Entry::Occupied(o) => return Ok(o.into_mut()),
             Entry::Vacant(v) => v,
@@ -598,6 +618,9 @@ impl Inner {
                 .into_iter()
                 .find(|h| !h.is_closed())
                 .ok_or(MetadataError::NoSession)?;
+            if handle.is_leased() {
+                return Err(MetadataError::SessionLeased);
+            }
             let session = handle.id();
             let weak = Arc::downgrade(self);
             let watched = handle.clone();
@@ -745,6 +768,7 @@ impl Inner {
         let id = self.next_id();
         let session = cs.session.id();
         let work = Work {
+            session: cs.session.clone(),
             metadata: Arc::clone(&cs.metadata),
             limiter: Arc::clone(&cs.limiter),
             key: key.clone(),
@@ -859,6 +883,8 @@ impl Inner {
 
 /// One flight's work, run on the driver runtime.
 struct Work {
+    /// Checked before every driver call: no metadata call starts on a leased session.
+    session: crate::session::SessionHandle,
     metadata: Arc<dyn Metadata>,
     limiter: Arc<Semaphore>,
     key: FlightKey,
@@ -882,7 +908,16 @@ impl Work {
         }
     }
 
+    fn check_lease(&self) -> Result<(), MetadataError> {
+        if self.session.is_leased() {
+            Err(MetadataError::SessionLeased)
+        } else {
+            Ok(())
+        }
+    }
+
     async fn call(&self) -> FlightResult {
+        self.check_lease()?;
         match &self.key {
             FlightKey::Children(k) | FlightKey::More(k) => self.list(k).await,
             FlightKey::Ddl(path) => {
@@ -912,6 +947,7 @@ impl Work {
         let mut added = 0usize;
         let mut pages = 0u32;
         loop {
+            self.check_lease()?;
             let page = self
                 .metadata
                 .list(

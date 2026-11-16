@@ -77,8 +77,8 @@ pub use snippets::{Expansion, Placeholder, Snippet, SnippetError, SnippetStore, 
 pub use sql_format::{FormatOptions, KeywordCase, format_sql};
 pub use transfer::{
     CsvPreviewRequest, ExportEvent, ExportJob, ExportRequest, ExportSource, ExportSummary,
-    ImportConfirmation, ImportEnd, ImportEvent, ImportJob, ImportRequest, ImportSummary,
-    ImportToken, ImportTransaction, Job, TransferJobError, TransferService,
+    ExportWarning, ImportConfirmation, ImportEnd, ImportEvent, ImportJob, ImportRequest,
+    ImportSummary, ImportToken, ImportTransaction, Job, TransferJobError, TransferService,
 };
 pub use workspace::{
     ConnectionTypesFile, Connections, ConnectionsFile, LoadIssue, LoadedConnections, MarkerClear,
