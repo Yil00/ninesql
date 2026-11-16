@@ -87,6 +87,27 @@ fn csv_quotes_guards_formulas_and_keeps_null_distinct() {
         assert!(row.starts_with("-7,"), "{row:?}");
         assert!(out.contains(&format!("'{start}1+1")), "{out:?}");
     }
+    // Leading blanks and format characters do not hide a formula; full-width forms count.
+    for v in [
+        " =1+1",
+        "\u{200B}=1",
+        "\u{FEFF}@x",
+        "\u{FF1D}1+1",
+        "|cmd",
+        "\u{3000}\u{FF0B}1",
+    ] {
+        assert!(ninesql_transfer::export::needs_formula_guard(v), "{v:?}");
+    }
+    assert!(!ninesql_transfer::export::needs_formula_guard("a=1"));
+    // A NULL text the guard would flag, or holding the delimiter / quote, is refused.
+    for null in ["=x", "a,b", "\""] {
+        let mut o = ExportOptions::new(ExportFormat::Csv);
+        o.text.null_text = null.into();
+        assert!(o.validate().is_err(), "{null:?}");
+    }
+    let mut o = ExportOptions::new(ExportFormat::Csv);
+    o.text.decimal_separator = '"';
+    assert!(o.validate().is_err());
     // Guard off.
     let mut o = ExportOptions::new(ExportFormat::Csv);
     o.formula_guard = false;

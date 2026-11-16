@@ -18,7 +18,9 @@
 //! - **CSV / TSV:** a field is quoted when it holds the delimiter, the quote, a CR or a LF, and
 //!   an empty text is written `""` when the NULL text is empty, so `NULL` and `''` stay distinct.
 //!   With [`ExportOptions::formula_guard`] (on by default for CSV and TSV), a text cell or header
-//!   that starts with `=`, `+`, `-`, `@`, a tab or a CR is prefixed with `'`, so a spreadsheet
+//!   that starts with a tab or a CR, or whose first character after leading Unicode whitespace
+//!   and format characters is `=`, `+`, `-`, `@`, `|` or a full-width `＝ ＋ － ＠`
+//!   ([`needs_formula_guard`]), is prefixed with `'`, so a spreadsheet
 //!   opens it as text rather than running it as a formula ("CSV injection"). Numbers are never
 //!   prefixed (a negative number stays a number).
 //! - **JSON:** strings are escaped per RFC 8259, plus U+2028 / U+2029; keys of duplicate column
@@ -204,6 +206,23 @@ impl ExportOptions {
                     "the delimiter and the quote must differ and not be line breaks".into(),
                 ));
             }
+            let null = &self.text.null_text;
+            if null.contains([delimiter, self.quote]) {
+                return Err(TransferError::InvalidOption(
+                    "the NULL text cannot hold the delimiter or the quote".into(),
+                ));
+            }
+            if self.formula_guard && needs_formula_guard(null) {
+                return Err(TransferError::InvalidOption(
+                    "the NULL text would be read as a spreadsheet formula".into(),
+                ));
+            }
+            let sep = self.text.decimal_separator;
+            if sep == self.quote || bad(sep) {
+                return Err(TransferError::InvalidOption(
+                    "the decimal separator cannot be the quote or a line break".into(),
+                ));
+            }
         }
         if self.text.null_text.contains(['\r', '\n']) {
             return Err(TransferError::InvalidOption(
@@ -312,12 +331,28 @@ impl<W: Write> std::fmt::Debug for Exporter<W> {
 }
 
 /// Characters that make a spreadsheet read a cell as a formula.
-const FORMULA_STARTS: [char; 6] = ['=', '+', '-', '@', '\t', '\r'];
+const FORMULA_STARTS: [char; 9] = [
+    '=', '+', '-', '@', '|', '\u{FF1D}', '\u{FF0B}', '\u{FF0D}', '\u{FF20}',
+];
 
-/// `true` when `text` would be read as a formula by a spreadsheet.
+/// Unicode format characters (category Cf) a spreadsheet may skip before a formula.
+fn is_format_char(c: char) -> bool {
+    matches!(c,
+        '\u{00AD}' | '\u{061C}' | '\u{180E}' | '\u{200B}'..='\u{200F}' | '\u{202A}'..='\u{202E}'
+        | '\u{2060}'..='\u{2064}' | '\u{2066}'..='\u{206F}' | '\u{FEFF}' | '\u{FFF9}'..='\u{FFFB}')
+}
+
+/// `true` when `text` would be read as a formula by a spreadsheet: it starts with a tab or a
+/// CR, or its first character after leading Unicode whitespace and format characters is `=`,
+/// `+`, `-`, `@`, `|` or a full-width `＝ ＋ － ＠`.
 #[must_use]
 pub fn needs_formula_guard(text: &str) -> bool {
-    text.starts_with(FORMULA_STARTS)
+    if text.starts_with(['\t', '\r']) {
+        return true;
+    }
+    text.chars()
+        .find(|c| !c.is_whitespace() && !is_format_char(*c))
+        .is_some_and(|c| FORMULA_STARTS.contains(&c))
 }
 
 /// Appends `s` as a JSON string (RFC 8259, plus U+2028 / U+2029 escaped).

@@ -571,8 +571,11 @@ fn merge_guess(a: GuessedType, b: GuessedType) -> GuessedType {
 pub struct PreviewRow {
     /// 1-based line.
     pub line: u64,
-    /// The fields as read (before trimming and conversion).
+    /// The fields as read (before trimming and conversion), each cut at
+    /// [`MAX_PREVIEW_CELL_BYTES`].
     pub fields: Vec<String>,
+    /// At least one field was cut for the preview (the import reads it whole).
+    pub cut: bool,
 }
 
 impl std::fmt::Debug for PreviewRow {
@@ -580,6 +583,7 @@ impl std::fmt::Debug for PreviewRow {
         f.debug_struct("PreviewRow")
             .field("line", &self.line)
             .field("fields", &self.fields.len())
+            .field("cut", &self.cut)
             .finish()
     }
 }
@@ -588,7 +592,7 @@ impl std::fmt::Debug for PreviewRow {
 #[derive(Clone, Debug, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct CsvPreview {
-    /// Header names, when the format has a header.
+    /// Header names, when the format has a header (each cut at [`MAX_PREVIEW_CELL_BYTES`]).
     pub header: Option<Vec<String>>,
     /// The first rows.
     pub rows: Vec<PreviewRow>,
@@ -600,18 +604,39 @@ pub struct CsvPreview {
     pub mapping: ColumnMapping,
     /// The type each target column expects.
     pub target_types: Vec<TargetType>,
-    /// Issues found in the previewed rows, with the suggested mapping (at most one per row
-    /// per column).
+    /// Issues found in the previewed records, with the suggested mapping: at most
+    /// [`MAX_PREVIEW_ISSUES`] (one per record).
     pub issues: Vec<RowIssue>,
-    /// The file is shorter than the preview: every row was read.
+    /// All issues found in the previewed records.
+    pub issues_total: u64,
+    /// The file is shorter than the preview: every record was read.
     pub complete: bool,
 }
 
-/// Largest preview, in rows.
+/// Largest preview, in records (valid or not).
 pub const MAX_PREVIEW_ROWS: usize = 1000;
+/// Issues kept in a preview.
+pub const MAX_PREVIEW_ISSUES: usize = 1000;
+/// Bytes of a preview cell; longer cells are cut (on a character boundary).
+pub const MAX_PREVIEW_CELL_BYTES: usize = 4096;
+/// Bytes of preview cells kept in total; the preview stops there.
+pub const MAX_PREVIEW_BYTES: usize = 16 * 1024 * 1024;
 
-/// Reads the first `rows` rows (at most [`MAX_PREVIEW_ROWS`]) of `input` and checks them against
-/// `targets` with a mapping suggested by `mode`.
+fn cut_cell(mut s: String) -> (String, bool) {
+    if s.len() <= MAX_PREVIEW_CELL_BYTES {
+        return (s, false);
+    }
+    let mut end = MAX_PREVIEW_CELL_BYTES;
+    while !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    s.truncate(end);
+    (s, true)
+}
+
+/// Reads the first `rows` records (at most [`MAX_PREVIEW_ROWS`], invalid ones included) of
+/// `input` and checks them against `targets` with a mapping suggested by `mode`. Memory stays
+/// under [`MAX_PREVIEW_BYTES`] of cells plus one record.
 ///
 /// # Errors
 /// Fatal CSV errors ([`CsvReader::next_record`]), invalid options.
@@ -627,7 +652,12 @@ pub fn preview<R: BufRead>(
     let mut reader = CsvReader::new(input, format, limits)?;
     let header = if format.header {
         match reader.next_non_blank()? {
-            Some(Ok(r)) => Some(r.fields),
+            Some(Ok(r)) => Some(
+                r.fields
+                    .into_iter()
+                    .map(|f| cut_cell(f).0)
+                    .collect::<Vec<_>>(),
+            ),
             Some(Err(e)) => {
                 return Err(TransferError::Csv {
                     line: e.line,
@@ -639,39 +669,55 @@ pub fn preview<R: BufRead>(
     } else {
         None
     };
-    let mut out_rows = Vec::new();
-    let mut issues = Vec::new();
     let limit = rows.min(MAX_PREVIEW_ROWS);
-    let mut complete = true;
-    while out_rows.len() < limit {
-        match reader.next_non_blank()? {
-            None => break,
-            Some(Ok(r)) => out_rows.push(PreviewRow {
-                line: r.line,
-                fields: r.fields,
-            }),
-            Some(Err(e)) => issues.push(RowIssue {
-                line: e.line,
-                kind: IssueKind::Record(e.kind),
-            }),
+    let mut out_rows: Vec<PreviewRow> = Vec::new();
+    let mut issues = Vec::new();
+    let mut issues_total = 0u64;
+    let mut record_issue = |issue: RowIssue, issues: &mut Vec<RowIssue>| {
+        issues_total += 1;
+        if issues.len() < MAX_PREVIEW_ISSUES {
+            issues.push(issue);
         }
-    }
-    if out_rows.len() == limit && reader.next_non_blank()?.is_some() {
-        complete = false;
-    }
-    let field_count = header
-        .as_ref()
-        .map(Vec::len)
-        .or_else(|| out_rows.first().map(|r| r.fields.len()))
-        .unwrap_or(0);
-    let mapping = match (mode, &header) {
-        (MappingMode::ByName, Some(h)) => ColumnMapping::by_name(h, targets),
-        _ => ColumnMapping::by_position(field_count, targets),
     };
-    let mut guessed = vec![GuessedType::Empty; field_count];
-    for row in &out_rows {
+    let mut field_count = header.as_ref().map(Vec::len);
+    let mut mapping: Option<ColumnMapping> = None;
+    let mut guessed: Vec<GuessedType> = Vec::new();
+    let mut bytes = 0usize;
+    let mut records = 0usize;
+    let mut complete = true;
+    loop {
+        if records >= limit || bytes >= MAX_PREVIEW_BYTES {
+            complete = reader.next_non_blank()?.is_none();
+            break;
+        }
+        let Some(record) = reader.next_non_blank()? else {
+            break;
+        };
+        records += 1;
+        let record = match record {
+            Ok(r) => r,
+            Err(e) => {
+                record_issue(
+                    RowIssue {
+                        line: e.line,
+                        kind: IssueKind::Record(e.kind),
+                    },
+                    &mut issues,
+                );
+                continue;
+            }
+        };
+        let count = *field_count.get_or_insert(record.fields.len());
+        let mapping = mapping.get_or_insert_with(|| match (mode, &header) {
+            (MappingMode::ByName, Some(h)) => ColumnMapping::by_name(h, targets),
+            _ => ColumnMapping::by_position(count, targets),
+        });
+        if guessed.len() != count {
+            guessed.resize(count, GuessedType::Empty);
+        }
+        // Guess and check on the whole record, then keep a cut copy.
         for (i, g) in guessed.iter_mut().enumerate() {
-            if let Some(f) = row.fields.get(i) {
+            if let Some(f) = record.fields.get(i) {
                 let f = match values.trim {
                     Trim::None => f.as_str(),
                     Trim::Both => f.trim(),
@@ -683,14 +729,43 @@ pub fn preview<R: BufRead>(
             }
         }
         let mut sink = Vec::new();
-        convert_row(row.line, &row.fields, &mapping, targets, values, &mut sink);
-        if let Err(issue) = check_row(&sink, row.line, &mapping, targets) {
-            issues.push(issue);
+        convert_row(
+            record.line,
+            &record.fields,
+            mapping,
+            targets,
+            values,
+            &mut sink,
+        );
+        if let Err(issue) = check_row(&sink, record.line, mapping, targets) {
+            record_issue(issue, &mut issues);
         }
         if let Some(issue) = take_issue(&mut sink) {
-            issues.push(issue);
+            record_issue(issue, &mut issues);
         }
+        let mut cut = false;
+        let fields: Vec<String> = record
+            .fields
+            .into_iter()
+            .map(|f| {
+                let (f, c) = cut_cell(f);
+                cut |= c;
+                bytes += f.len() + 24;
+                f
+            })
+            .collect();
+        out_rows.push(PreviewRow {
+            line: record.line,
+            fields,
+            cut,
+        });
     }
+    let field_count = field_count.unwrap_or(0);
+    let mapping = mapping.unwrap_or_else(|| match (mode, &header) {
+        (MappingMode::ByName, Some(h)) => ColumnMapping::by_name(h, targets),
+        _ => ColumnMapping::by_position(field_count, targets),
+    });
+    guessed.resize(field_count, GuessedType::Empty);
     issues.sort_by_key(|i| i.line);
     Ok(CsvPreview {
         header,
@@ -700,6 +775,7 @@ pub fn preview<R: BufRead>(
         mapping,
         target_types: targets.iter().map(TargetColumn::target_type).collect(),
         issues,
+        issues_total,
         complete,
     })
 }
@@ -824,6 +900,7 @@ pub struct RowSource<R> {
     values: ValueOptions,
     header: Option<Vec<String>>,
     done: bool,
+    stop_at_first_issue: bool,
 }
 
 impl<R> std::fmt::Debug for RowSource<R> {
@@ -871,7 +948,16 @@ impl<R: BufRead> RowSource<R> {
             values,
             header,
             done: false,
+            stop_at_first_issue: false,
         })
+    }
+
+    /// Ends each batch right after its first issue (an import that stops on invalid rows
+    /// reads no further than needed).
+    #[must_use]
+    pub fn stopping_at_first_issue(mut self, stop: bool) -> Self {
+        self.stop_at_first_issue = stop;
+        self
     }
 
     /// The header, when the file has one.
@@ -904,7 +990,9 @@ impl<R: BufRead> RowSource<R> {
 
     /// The next batch of at most `max_rows` valid rows (and at most about `max_bytes` of
     /// parameters), or `None` at the end. Invalid rows are not in `rows`: they are reported in
-    /// `issues`.
+    /// `issues`, at most `max_rows` of them per batch (only one with
+    /// [`Self::stopping_at_first_issue`]), so a file of invalid records never grows a batch
+    /// without bound.
     ///
     /// # Errors
     /// Fatal CSV errors.
@@ -923,7 +1011,12 @@ impl<R: BufRead> RowSource<R> {
             bytes: 0,
         };
         let mut sink = Vec::with_capacity(1);
-        while batch.rows.len() < max_rows.max(1) && batch.bytes < max_bytes {
+        let max_rows = max_rows.max(1);
+        while batch.rows.len() < max_rows
+            && batch.issues.len() < max_rows
+            && batch.bytes < max_bytes
+            && !(self.stop_at_first_issue && !batch.issues.is_empty())
+        {
             match self.reader.next_non_blank()? {
                 None => {
                     self.done = true;
@@ -1127,6 +1220,56 @@ mod tests {
         // No value appears in any issue or Debug output.
         let debug = format!("{p:?}");
         assert!(!debug.contains("ann") && !debug.contains("two"));
+    }
+
+    #[test]
+    fn invalid_records_are_bounded_per_batch_and_in_the_preview() {
+        let mut csv = b"id,name,born\n".to_vec();
+        for _ in 0..50_000 {
+            csv.extend_from_slice(b"\xff\n");
+        }
+        let t = targets();
+        let mut src = RowSource::open(
+            &csv[..],
+            CsvFormat::default(),
+            CsvLimits::default(),
+            ValueOptions::default(),
+            t.clone(),
+            ColumnMapping::by_position(3, &t),
+        )
+        .unwrap();
+        let b = src.next_batch(100, usize::MAX).unwrap().unwrap();
+        assert_eq!((b.rows.len(), b.issues.len()), (0, 100));
+        let mut src = src.stopping_at_first_issue(true);
+        let b = src.next_batch(100, usize::MAX).unwrap().unwrap();
+        assert_eq!(b.issues.len(), 1);
+        let p = preview(
+            &csv[..],
+            CsvFormat::default(),
+            CsvLimits::default(),
+            &ValueOptions::default(),
+            &t,
+            MappingMode::ByPosition,
+            usize::MAX,
+        )
+        .unwrap();
+        assert!(p.rows.is_empty() && !p.complete);
+        assert_eq!(p.issues.len(), MAX_PREVIEW_ISSUES);
+        assert_eq!(p.issues_total, MAX_PREVIEW_ROWS as u64);
+        // Long cells are cut in the preview and checked whole.
+        let long = format!("id,name,born\n1,{},2000-01-01\n", "é".repeat(10_000));
+        let p = preview(
+            long.as_bytes(),
+            CsvFormat::default(),
+            CsvLimits::default(),
+            &ValueOptions::default(),
+            &t,
+            MappingMode::ByName,
+            10,
+        )
+        .unwrap();
+        assert!(p.rows[0].cut && p.rows[0].fields[1].len() <= MAX_PREVIEW_CELL_BYTES);
+        assert!(p.complete && p.issues.is_empty());
     }
 
     #[test]

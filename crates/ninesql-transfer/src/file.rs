@@ -8,10 +8,10 @@
 //! 2. creates a temporary file **in the same directory** with `O_CREAT | O_EXCL | O_NOFOLLOW |
 //!    O_CLOEXEC` and mode `0600` (named `.<name>.<random>.ninesql-part`);
 //! 3. [`OutputFile::commit`] flushes, `fsync`s and moves it into place, then `fsync`s the
-//!    directory. Without an overwrite confirmation the move is a hard link, which fails if the
-//!    target appeared meanwhile (no race replaces a file the user did not confirm); on a file
-//!    system without hard links it falls back to a check followed by `rename` (a narrow race,
-//!    documented). With a confirmation it is a `rename`, which replaces a symbolic link itself,
+//!    directory. Without an overwrite confirmation the move is `renameat2(RENAME_NOREPLACE)`,
+//!    which fails if the target appeared meanwhile (no race replaces a file the user did not
+//!    confirm); without it, a hard link (same guarantee); on a file system without hard links
+//!    either (`EPERM`, `EOPNOTSUPP`), a check followed by `rename` (a narrow race). With a confirmation it is a `rename`, which replaces a symbolic link itself,
 //!    never the file it points to;
 //! 4. on error, cancel or drop before `commit`, the temporary file is removed.
 //!
@@ -196,24 +196,7 @@ impl OutputFile {
         file.sync_all()?;
         drop(file);
         match self.overwrite {
-            Overwrite::Refuse => match fs::hard_link(&self.temp, &self.target) {
-                Ok(()) => {
-                    let _ = fs::remove_file(&self.temp);
-                }
-                Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
-                    return Err(TransferError::AlreadyExists(self.target.clone()));
-                }
-                Err(_) => {
-                    // No hard links on this file system (vfat, some FUSE mounts): check, then
-                    // rename. A file created in between would be replaced (narrow race).
-                    match fs::symlink_metadata(&self.target) {
-                        Ok(_) => return Err(TransferError::AlreadyExists(self.target.clone())),
-                        Err(e) if e.kind() == io::ErrorKind::NotFound => {}
-                        Err(e) => return Err(e.into()),
-                    }
-                    fs::rename(&self.temp, &self.target)?;
-                }
-            },
+            Overwrite::Refuse => self.move_no_replace()?,
             Overwrite::Confirmed => {
                 if let Ok(m) = fs::symlink_metadata(&self.target)
                     && m.is_dir()
@@ -228,6 +211,41 @@ impl OutputFile {
         {
             let _ = dir.sync_all();
         }
+        Ok(())
+    }
+
+    /// Moves the temporary file to the target without ever replacing an existing file:
+    /// `renameat2(RENAME_NOREPLACE)`; on a file system without it, a hard link then removal of
+    /// the temporary name; on a file system without hard links either, a check followed by a
+    /// rename (a narrow race, documented).
+    fn move_no_replace(&self) -> Result<(), TransferError> {
+        use rustix::fs::{CWD, RenameFlags, renameat_with};
+        use rustix::io::Errno;
+        match renameat_with(CWD, &self.temp, CWD, &self.target, RenameFlags::NOREPLACE) {
+            Ok(()) => return Ok(()),
+            Err(Errno::EXIST) => return Err(TransferError::AlreadyExists(self.target.clone())),
+            Err(Errno::INVAL | Errno::NOSYS | Errno::OPNOTSUPP) => {}
+            Err(e) => return Err(io::Error::from(e).into()),
+        }
+        match fs::hard_link(&self.temp, &self.target) {
+            Ok(()) => {
+                let _ = fs::remove_file(&self.temp);
+                return Ok(());
+            }
+            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
+                return Err(TransferError::AlreadyExists(self.target.clone()));
+            }
+            Err(e)
+                if e.kind() == io::ErrorKind::Unsupported
+                    || matches!(e.raw_os_error(), Some(libc::EPERM | libc::EOPNOTSUPP)) => {}
+            Err(e) => return Err(e.into()),
+        }
+        match fs::symlink_metadata(&self.target) {
+            Ok(_) => return Err(TransferError::AlreadyExists(self.target.clone())),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e.into()),
+        }
+        fs::rename(&self.temp, &self.target)?;
         Ok(())
     }
 

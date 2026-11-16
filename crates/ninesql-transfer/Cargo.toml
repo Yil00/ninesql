@@ -18,6 +18,9 @@ thiserror.workspace = true
 tracing.workspace = true
 # `O_NOFOLLOW` / `O_CLOEXEC` for the export file (constants only, no `unsafe`).
 libc.workspace = true
+# `renameat2(RENAME_NOREPLACE)` for the final move of the export file (already in the graph
+# through tempfile; only the `fs` feature is enabled here).
+rustix = { workspace = true, features = ["fs"] }
 
 [dev-dependencies]
 proptest.workspace = true

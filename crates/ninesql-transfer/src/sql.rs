@@ -135,7 +135,14 @@ impl SqlLiteralRenderer for DialectSql {
     fn literal(&self, value: &CellValue<'_>) -> Result<String, TransferError> {
         // P5-B integration point: typed literal rendering.
         let param = cell_to_param(value)?;
-        let text = self.dialect.format_literal(&param);
+        let text = match &param {
+            // PostgreSQL family: an `E'…'` string reads the same whatever
+            // `standard_conforming_strings` is when the file is run later.
+            Param::Text(t) | Param::Json(t) if self.dialect.lexical_rules().e_string_backslash => {
+                e_string(t)
+            }
+            _ => self.dialect.format_literal(&param),
+        };
         // `format_literal` quotes text; a control character stays inside the quotes. Refuse a
         // NUL, which several engines cannot read back from a script.
         if text.contains('\0') {
@@ -145,6 +152,21 @@ impl SqlLiteralRenderer for DialectSql {
         }
         Ok(text)
     }
+}
+
+/// `E'…'` with backslashes doubled and quotes doubled.
+fn e_string(text: &str) -> String {
+    let mut out = String::with_capacity(text.len() + 3);
+    out.push_str("E'");
+    for c in text.chars() {
+        match c {
+            '\\' => out.push_str("\\\\"),
+            '\'' => out.push_str("''"),
+            c => out.push(c),
+        }
+    }
+    out.push('\'');
+    out
 }
 
 impl InsertRenderer for DialectSql {
@@ -238,6 +260,18 @@ mod tests {
             "DATE '2024-01-31'"
         );
         assert!(sql.literal(&CellValue::Text("a\0b")).is_err());
+        // PostgreSQL rules: E-strings, the same under either standard_conforming_strings.
+        struct Pg;
+        impl Dialect for Pg {
+            fn lexical_rules(&self) -> ninesql_driver_api::LexicalRules {
+                ninesql_driver_api::LexicalRules::POSTGRES
+            }
+        }
+        let pg = DialectSql::new(Arc::new(Pg));
+        assert_eq!(
+            pg.literal(&CellValue::Text("a\\'; --")).unwrap(),
+            "E'a\\\\''; --'"
+        );
         assert!(sql.literal(&CellValue::Unsupported("List".into())).is_err());
     }
 }
