@@ -194,10 +194,22 @@ mod tests {
     }
 
     #[test]
-    fn the_shipped_drivers_offer_the_four_mvp_engines_in_order() {
+    fn the_shipped_drivers_offer_the_mvp_engines_first_then_the_wire_compatible_ones() {
         let offers = offers(&shipped());
         let names: Vec<_> = offers.iter().map(|o| o.name.as_str()).collect();
-        assert_eq!(names, ["PostgreSQL", "MySQL", "MariaDB", "SQLite"]);
+        assert_eq!(
+            names,
+            [
+                "PostgreSQL",
+                "MySQL",
+                "MariaDB",
+                "SQLite",
+                "QuestDB",
+                "TiDB",
+                "TimescaleDB",
+                "YugabyteDB"
+            ]
+        );
     }
 
     #[test]
