@@ -641,6 +641,10 @@ fn open_prompt_dialog(flow: Entity<ConnectFlow>, window: &mut Window, cx: &mut A
     });
 }
 
+/// Height of the statement box of the statement confirmation before it scrolls (about
+/// `STATEMENT_BOX_LINES` lines).
+pub const STATEMENT_BOX_MAX_HEIGHT: f32 = 320.;
+
 /// What runs when the user confirms (or declines) a statement.
 pub type ConfirmCallback = Rc<dyn Fn(&mut Window, &mut App)>;
 
@@ -713,10 +717,49 @@ pub fn open_statement_confirmation(
             )))
             .child(
                 div()
-                    .id("statement-text")
-                    .font_family(mono)
-                    .child(view.statement.clone()),
+                    .id("statement-size")
+                    .text_xs()
+                    .text_color(muted)
+                    .child(view.statement.size_text()),
             )
+            .child(
+                // Bounded (a large statement shows its head and tail) and scrollable, so the
+                // buttons stay in view whatever the statement's length.
+                v_flex()
+                    .id("statement-text")
+                    .max_h(px(STATEMENT_BOX_MAX_HEIGHT))
+                    .overflow_y_scroll()
+                    .border_1()
+                    .border_color(muted)
+                    .p_1()
+                    .font_family(mono.clone())
+                    .child(view.statement.head.clone())
+                    .when_some(view.statement.hidden_marker(), |el, marker| {
+                        el.child(
+                            div()
+                                .id("statement-hidden")
+                                .py_1()
+                                .italic()
+                                .text_color(warn)
+                                .child(marker),
+                        )
+                        .child(view.statement.tail.clone())
+                    }),
+            )
+            .when(view.statement.needs_last_line(), |el| {
+                // The end of the statement, where a destructive tail can hide, always in view.
+                el.child(
+                    div()
+                        .id("statement-last-line")
+                        .text_xs()
+                        .child(div().text_color(muted).child("Ends with:"))
+                        .child(
+                            div()
+                                .font_family(mono)
+                                .child(view.statement.last_line.clone()),
+                        ),
+                )
+            })
             .when(view.params > 0, |el| {
                 el.child(div().text_xs().text_color(muted).child(format!(
                     "{} bind parameters (values not shown).",

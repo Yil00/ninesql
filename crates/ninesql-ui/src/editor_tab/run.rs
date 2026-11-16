@@ -10,7 +10,7 @@ use std::cell::RefCell;
 use std::rc::Rc;
 
 use gpui_kit::base::async_util::Sender;
-use ninesql_core::driver_api::{DriverError, FetchBudget};
+use ninesql_core::driver_api::{DriverError, FetchBudget, Param};
 use ninesql_core::{CoreError, ErrorPosition, FetchMode, RunControl, RunRequest};
 use ninesql_editor::execution::{
     ErrorLocation, ExecutionItem, ExecutionRequest, ExecutionSink, RequestId,
@@ -103,6 +103,22 @@ impl ResultSource for RunSource {
             control.release(index);
         }
     }
+}
+
+/// Zeroizes the owned text and bytes of bind values, then empties the list (phase 3 review L3):
+/// the tab's copies of the values do not outlive its run. Best effort: copies made earlier (the
+/// core's, a reallocation) are not reached.
+pub fn wipe_params(params: &mut Vec<Param>) {
+    use zeroize::Zeroize as _;
+    for p in params.iter_mut() {
+        match p {
+            Param::Text(s) | Param::Decimal(s) | Param::Json(s) => s.zeroize(),
+            Param::Bytes(b) => b.zeroize(),
+            // Fixed-size values hold no heap buffer; a kind added later is dropped below.
+            _ => {}
+        }
+    }
+    params.clear();
 }
 
 /// Why an editor request cannot become a run (shown under the editor).
@@ -309,6 +325,17 @@ mod tests {
         );
         assert_eq!(locate_error(&r, Some(10), None), (1, None));
         assert_eq!(locate_error(&r, None, None), (usize::MAX, None));
+    }
+
+    #[test]
+    fn bind_values_are_wiped() {
+        let mut params = vec![
+            Param::Text("secret text".to_owned()),
+            Param::Bytes(vec![1, 2, 3]),
+            Param::Int(7),
+        ];
+        wipe_params(&mut params);
+        assert!(params.is_empty());
     }
 
     #[test]

@@ -27,8 +27,12 @@
 //!   (through the hub) and the state reported after each statement; commit and roll back are
 //!   offered only when the driver declares manual commit (I8).
 //! - **Cancel (F-SQL-05).** `CancelExecution` (editor) and the toolbar's button cancel the run;
-//!   the button says "Stop fetching" when the driver can only stop locally
-//!   (`CancelSupport::LocalOnly`).
+//!   the button says "Cancel" only when the driver declares a server-side cancel
+//!   (`CancelSupport::ServerSide`), "Stop fetching" otherwise (`LocalOnly`, or a kind added
+//!   later).
+//! - **Idle paused results (ADR-0024 §5).** `RunEvent::ResultClosedIdle` goes to the grid (its
+//!   result says it was closed, fetching is off for it) and to the toolbar, with a hint when the
+//!   session's transaction is still open.
 
 pub mod run;
 
@@ -83,6 +87,33 @@ pub fn setup_for(session: Option<&SessionHandle>) -> EditorSetup {
     }
 }
 
+/// The cancel button's label for a driver's [`CancelSupport`] (I8): "Cancel" only when the
+/// server stops the statement; "Stop fetching" otherwise, a support kind added later included
+/// (`CancelSupport` is non-exhaustive: an unknown kind never promises a server-side cancel).
+#[must_use]
+pub fn cancel_label_for(support: Option<CancelSupport>) -> &'static str {
+    match support {
+        Some(CancelSupport::ServerSide) | None => "Cancel",
+        Some(_) => "Stop fetching",
+    }
+}
+
+/// The toolbar message after the core closed a paused result left idle (ADR-0024 §5), with the
+/// open-transaction hint when the session still has one.
+#[must_use]
+pub fn idle_close_message(after: std::time::Duration, in_transaction: bool) -> String {
+    let mut text = format!(
+        "Result closed after {} idle: the rows already loaded are kept. Run the statement again to read more.",
+        ninesql_grid::view::idle_duration_text(after.as_secs())
+    );
+    if in_transaction {
+        text.push_str(
+            " The transaction is still open on this session: commit or roll back when you are done.",
+        );
+    }
+    text
+}
+
 /// A statement waiting for the user's confirmation.
 #[derive(Clone)]
 struct PendingConfirmation {
@@ -112,6 +143,17 @@ struct ActiveRun {
     /// Bumped at each core run: events of an older one are ignored.
     generation: u64,
     task: Option<Task<()>>,
+}
+
+impl Drop for ActiveRun {
+    /// The run's bind values (in the editor's request and in the core request kept for a
+    /// resume) are zeroized when the run ends, whichever way (phase 3 review L3).
+    fn drop(&mut self) {
+        for item in &mut self.request.items {
+            run::wipe_params(&mut item.params);
+        }
+        run::wipe_params(&mut self.template.params);
+    }
 }
 
 /// What the toolbar shows about the last action (errors of transaction commands, refusals).
@@ -311,10 +353,7 @@ impl SqlEditorTab {
     /// The cancel button's label (I8): what the driver can do.
     #[must_use]
     pub fn cancel_label(&self) -> &'static str {
-        match self.session().map(|s| s.info().capabilities.cancel) {
-            Some(CancelSupport::LocalOnly) => "Stop fetching",
-            _ => "Cancel",
-        }
+        cancel_label_for(self.session().map(|s| s.info().capabilities.cancel))
     }
 
     /// The session the current run started on (where it goes on after a confirmation).
@@ -543,6 +582,24 @@ impl SqlEditorTab {
                 window,
                 cx,
             ),
+            RunEvent::ResultClosedIdle { index, rows, after } => {
+                // The session's own state: a paused read may sit inside an open transaction.
+                let in_tx = self
+                    .session()
+                    .map(SessionHandle::transaction_state)
+                    .or(self.transaction)
+                    .is_some_and(|t| t.in_transaction);
+                self.say(idle_close_message(after, in_tx), in_tx, cx);
+                self.grid(
+                    ExecutionEvent::ResultClosedIdle {
+                        statement: n(index),
+                        rows,
+                        after,
+                    },
+                    window,
+                    cx,
+                );
+            }
             RunEvent::StatementClosed { index, .. } => self.grid(
                 ExecutionEvent::StatementClosed {
                     statement: n(index),
