@@ -5,6 +5,9 @@
 //! asks only for the visible rows and columns, and the delegate formats exactly those cells
 //! from the Arrow batches ([`ResultSetModel::cell`]). Nothing here awaits I/O (I6): rows come in
 //! through [`ResultsView::apply`] and requests go out through the [`ResultSource`].
+//!
+//! A tab's table state (`TableState`) is created when the tab is first shown, not when its
+//! result set arrives: a run of many result sets builds only the tables the user looks at.
 
 use std::ops::Range;
 use std::rc::Rc;
@@ -391,15 +394,42 @@ impl ResultsView {
         self.status.as_deref()
     }
 
-    /// Shows a pane.
-    pub fn set_active_pane(&mut self, pane: ActivePane, cx: &mut Context<Self>) {
-        if let ActivePane::Result(ix) = pane
-            && ix >= self.results.tabs().len()
-        {
-            return;
+    /// Shows a pane (and builds the table of a result tab shown for the first time).
+    pub fn set_active_pane(
+        &mut self,
+        pane: ActivePane,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let ActivePane::Result(ix) = pane {
+            if ix >= self.results.tabs().len() {
+                return;
+            }
+            self.ensure_table(ix, window, cx);
         }
         self.active = pane;
         cx.notify();
+    }
+
+    /// Builds the table of result tab `ix` if it is tabular and has none yet.
+    fn ensure_table(&mut self, ix: usize, window: &mut Window, cx: &mut Context<Self>) {
+        if self.table(ix).is_some() {
+            return;
+        }
+        let Some(ResultTab::Table(model)) = self.results.tabs().get(ix) else {
+            return;
+        };
+        let tab = self.new_table(ix, model.clone(), window, cx);
+        if self.tables.len() <= ix {
+            self.tables.resize_with(ix + 1, || None);
+        }
+        self.tables[ix] = Some(tab);
+    }
+
+    /// Result tabs whose table was built (tests: tables are built lazily).
+    #[must_use]
+    pub fn built_tables(&self) -> usize {
+        self.tables.iter().filter(|t| t.is_some()).count()
     }
 
     /// The table entity of result tab `ix`.
@@ -431,19 +461,13 @@ impl ResultsView {
             self.active = ActivePane::UpdateCounts;
             self.status = None;
         }
-        for ix in applied.new_tabs {
-            let tab = match &self.results.tabs()[ix] {
-                ResultTab::Table(model) => Some(self.new_table(ix, model.clone(), window, cx)),
-                ResultTab::Documents { .. } => None,
-            };
-            if self.tables.len() <= ix {
-                self.tables.resize_with(ix + 1, || None);
-            }
-            self.tables[ix] = tab;
-            // The first result set is shown as soon as it starts.
-            if !matches!(self.active, ActivePane::Result(_)) {
-                self.active = ActivePane::Result(ix);
-            }
+        // The first result set is shown as soon as it starts; the others get their table when
+        // first shown.
+        if let Some(&ix) = applied.new_tabs.first()
+            && !matches!(self.active, ActivePane::Result(_))
+        {
+            self.active = ActivePane::Result(ix);
+            self.ensure_table(ix, window, cx);
         }
         if let Some(ix) = applied.changed_tab
             && let Some(table) = self.table(ix)
@@ -605,7 +629,7 @@ impl ResultsView {
         } else {
             (pos + panes.len() - 1) % panes.len()
         };
-        self.set_active_pane(panes[next], cx);
+        self.set_active_pane(panes[next], window, cx);
         let handle = self.focus_handle(cx);
         window.focus(&handle, cx);
     }
@@ -650,6 +674,7 @@ impl ResultsView {
             FetchState::Complete => "all rows",
             FetchState::Truncated(_) | FetchState::GridBudgetReached => "truncated",
             FetchState::Closed => "closed",
+            FetchState::ClosedIdle { .. } => "closed after idle",
             FetchState::Stopped => "stopped",
         };
         Some(format!(
@@ -679,6 +704,11 @@ fn banner_for(m: &ResultSetModel, results: &ExecutionResults) -> Option<String> 
             "The result was closed before its end: {rows} rows loaded. Run the statement again \
              to see more."
         ),
+        FetchState::ClosedIdle { after_secs } => format!(
+            "Result closed after {} idle: the {rows} rows already loaded are kept. Run the \
+             statement again to read more.",
+            idle_duration_text(after_secs)
+        ),
         FetchState::Stopped => {
             format!("Stopped: the statement failed or was cancelled. {rows} rows loaded.")
         }
@@ -691,9 +721,23 @@ fn banner_for(m: &ResultSetModel, results: &ExecutionResults) -> Option<String> 
     Some(text)
 }
 
+/// `4 min` for 240 s, `45 s` under a minute.
+#[must_use]
+pub fn idle_duration_text(secs: u64) -> String {
+    if secs >= 60 {
+        format!("{} min", secs / 60)
+    } else {
+        format!("{secs} s")
+    }
+}
+
 impl Render for ResultsView {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        if let ActivePane::Result(ix) = self.active {
+            self.ensure_table(ix, window, cx);
+        }
         let theme = cx.theme().clone();
+        let limit_banner = self.results.limit_banner();
         let multi = self.results.multi_statement();
         let mut strip = h_flex()
             .id("result-tabs")
@@ -716,7 +760,9 @@ impl Render for ResultsView {
                 })
                 .when(!active, |d| d.text_color(theme.tab_foreground))
                 .child(label)
-                .on_click(cx.listener(move |this, _, _, cx| this.set_active_pane(pane, cx)))
+                .on_click(cx.listener(move |this, _, window, cx| {
+                    this.set_active_pane(pane, window, cx);
+                }))
         };
         for (ix, tab) in self.results.tabs().iter().enumerate() {
             let pane = ActivePane::Result(ix);
@@ -787,6 +833,18 @@ impl Render for ResultsView {
             .on_action(cx.listener(|this, _: &PreviousResultTab, window, cx| {
                 this.cycle(false, window, cx);
             }))
+            .when_some(limit_banner, |d, text| {
+                d.child(
+                    div()
+                        .id("results-limit-banner")
+                        .w_full()
+                        .px_2()
+                        .py_1()
+                        .bg(theme.warning)
+                        .text_color(theme.warning_foreground)
+                        .child(text),
+                )
+            })
             .child(strip)
             .child(div().flex_1().min_h_0().child(body))
     }

@@ -528,3 +528,68 @@ fn documents_tab_is_honest(cx: &mut TestAppContext) {
     vcx.simulate_keystrokes("ctrl-c");
     assert!(view.read_with(&vcx, |v, _| v.status().is_none()));
 }
+
+#[gpui::test]
+fn tables_are_built_when_first_shown_and_many_result_sets_stay_bounded(cx: &mut TestAppContext) {
+    let (view, recorder, mut vcx) = open(cx, small_budget());
+    let mut events = vec![
+        ExecutionEvent::Started,
+        ExecutionEvent::StatementStarted { statement: 0 },
+    ];
+    for i in 0..100_000u32 {
+        events.push(item(
+            0,
+            ResultItem::ResultSet(ResultSetHeader::tabular(i, schema())),
+        ));
+    }
+    events.push(ExecutionEvent::StatementFinished { statement: 0 });
+    send(&view, &mut vcx, events);
+    view.read_with(&vcx, |v, _| {
+        assert_eq!(v.results().tabs().len(), crate::execution::MAX_RESULT_TABS);
+        assert_eq!(v.built_tables(), 1, "only the shown tab has a table");
+        assert!(v.results().bytes() <= v.results().budget().max_bytes);
+        let banner = v.results().limit_banner().unwrap();
+        assert!(banner.starts_with("Results limit reached: 99000 more result sets were not kept"));
+    });
+    assert_eq!(recorder.releases.borrow().as_slice(), &[0]);
+    vcx.simulate_keystrokes("alt-right");
+    view.read_with(&vcx, |v, _| {
+        assert_eq!(v.active_pane(), ActivePane::Result(1));
+        assert_eq!(v.built_tables(), 2);
+        assert!(v.table(1).is_some());
+    });
+}
+
+#[gpui::test]
+fn an_idle_close_says_so_and_disables_fetching(cx: &mut TestAppContext) {
+    let (view, recorder, mut vcx) = open(cx, small_budget());
+    send(
+        &view,
+        &mut vcx,
+        vec![
+            ExecutionEvent::Started,
+            ExecutionEvent::StatementStarted { statement: 0 },
+            item(0, header()),
+            item(0, ResultItem::Rows(batch(0, 10))),
+            ExecutionEvent::ResultClosedIdle {
+                statement: 0,
+                rows: 10,
+                after: std::time::Duration::from_secs(240),
+            },
+            ExecutionEvent::StatementClosed { statement: 0 },
+            ExecutionEvent::Finished,
+        ],
+    );
+    view.read_with(&vcx, |v, _| {
+        assert_eq!(
+            v.banner(0).unwrap(),
+            "Result closed after 4 min idle: the 10 rows already loaded are kept. Run the \
+             statement again to read more."
+        );
+        assert!(v.status_line(0).unwrap().ends_with("closed after idle"));
+    });
+    // "Fetch next page" and "Fetch all" do nothing (I8).
+    vcx.simulate_keystrokes("alt-pagedown alt-end");
+    assert!(recorder.fetches.borrow().is_empty());
+    assert_eq!(super::idle_duration_text(45), "45 s");
+}
