@@ -3409,7 +3409,23 @@ fn set_path(slot: &mut Option<String>, value: &str) {
 
 /// Final TLS settings of a network connection, with the I5 report entries.
 fn resolve_tls(st: &mut ConnState) -> TlsConfig {
-    let mut mode = st.tls.handler_mode.or(st.tls.prop_mode);
+    // A TLS handler and a driver property (`sslMode`) that both set a mode: the stricter one
+    // is kept (fail closed). NineSQL's export writes both for MySQL-family `verify-full`, and
+    // which one DBeaver's driver applies depends on its version.
+    let mut mode = match (st.tls.handler_mode, st.tls.prop_mode) {
+        (Some(h), Some(p)) => {
+            if h != p {
+                st.issues.info(
+                    IssueKind::TlsConverted,
+                    None,
+                    "a TLS handler and a driver property set different TLS modes: the stricter \
+                     one is imported",
+                );
+            }
+            Some(h.max(p))
+        }
+        (h, p) => h.or(p),
+    };
     if mode.is_none() {
         mode = st.tls.implied_mode();
     }
