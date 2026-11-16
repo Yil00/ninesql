@@ -272,14 +272,27 @@ fn export_results_and_format_sql_from_the_editor(cx: &mut TestAppContext) {
 }
 
 #[test]
-fn table_parts_follow_the_nearest_schema() {
+fn table_parts_follow_the_core_naming() {
     use ninesql_core::driver_api::ObjectKind;
     use ninesql_core::driver_api::metadata::ObjectPath;
     let p = ObjectPath::root()
         .child(ObjectKind::Catalog, "app")
         .child(ObjectKind::Schema, "public")
         .child(ObjectKind::Table, "users");
-    assert_eq!(super::table_parts(&p), vec!["public", "users"]);
+    assert_eq!(super::table_parts(&p), vec!["app", "public", "users"]);
+    assert_eq!(
+        super::table_parts(&p),
+        ninesql_core::TableQuery::of_path(&p).table,
+        "the same object as editing"
+    );
+    let p = ObjectPath::root()
+        .child(ObjectKind::Schema, "main")
+        .child(ObjectKind::Table, "t");
+    assert_eq!(super::table_parts(&p), vec!["main", "t"]);
+    let p = ObjectPath::root()
+        .child(ObjectKind::Catalog, "shop")
+        .child(ObjectKind::Table, "t");
+    assert_eq!(super::table_parts(&p), vec!["shop", "t"]);
     let p = ObjectPath::root().child(ObjectKind::Table, "t");
     assert_eq!(super::table_parts(&p), vec!["t"]);
 }

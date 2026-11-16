@@ -21,26 +21,15 @@ pub mod import;
 #[cfg(test)]
 mod tests;
 
-use ninesql_core::driver_api::ObjectKind;
 use ninesql_core::driver_api::metadata::ObjectPath;
 use ninesql_core::{SessionHandle, TransferJobError};
 
-/// The table name parts a transfer request takes (`[schema, table]`, `[catalog, table]` or
-/// `[table]`): the nearest schema (else catalog) and the object's name, as "Generate SQL" does.
+/// The table name parts a transfer request takes: the core's naming (`[catalog, schema,
+/// table]` when both exist, else `[schema, table]`, `[catalog, table]` or `[table]`), so
+/// "Export table…" and "Import CSV…" target the same object as editing and "Open table data".
 #[must_use]
 pub fn table_parts(path: &ObjectPath) -> Vec<String> {
-    let Some((leaf, parents)) = path.0.split_last() else {
-        return Vec::new();
-    };
-    let container = parents
-        .iter()
-        .rev()
-        .find(|s| s.kind == ObjectKind::Schema)
-        .or_else(|| parents.iter().rev().find(|s| s.kind == ObjectKind::Catalog));
-    match container {
-        Some(c) => vec![c.name.clone(), leaf.name.clone()],
-        None => vec![leaf.name.clone()],
-    }
+    ninesql_core::edit::table_parts(path)
 }
 
 /// Why a transfer cannot start on `session` now, if so.
