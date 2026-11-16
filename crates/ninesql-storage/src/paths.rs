@@ -205,6 +205,12 @@ impl ProjectPaths {
         self.dir.join("navigator.json")
     }
 
+    /// `snippets.json`: SQL snippets of the project (P5-C, F-SQL-10).
+    #[must_use]
+    pub fn snippets_file(&self) -> PathBuf {
+        self.dir.join("snippets.json")
+    }
+
     /// `scripts/`.
     #[must_use]
     pub fn scripts_dir(&self) -> PathBuf {

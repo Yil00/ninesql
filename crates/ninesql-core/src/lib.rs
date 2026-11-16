@@ -22,6 +22,8 @@ pub mod registry;
 pub mod runtime;
 pub mod services;
 pub mod session;
+pub mod snippets;
+pub mod sql_format;
 pub mod transfer;
 pub mod workspace;
 
@@ -71,6 +73,8 @@ pub use session::{
     Reply, SecretsLockReason, SessionHandle, SessionId, SessionInfo, SessionManager,
     SessionWarning, TransactionEnd, TransactionState,
 };
+pub use snippets::{Expansion, Placeholder, Snippet, SnippetError, SnippetStore, expand};
+pub use sql_format::{FormatOptions, KeywordCase, format_sql};
 pub use transfer::{
     CsvPreviewRequest, ExportEvent, ExportJob, ExportRequest, ExportSource, ExportSummary,
     ImportConfirmation, ImportEnd, ImportEvent, ImportJob, ImportRequest, ImportSummary,
