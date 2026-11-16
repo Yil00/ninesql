@@ -199,6 +199,12 @@ impl ProjectPaths {
         self.dir.join("connection-types.json")
     }
 
+    /// `navigator.json`: navigator filters per connection (P4-B, F-NAV-04).
+    #[must_use]
+    pub fn navigator_file(&self) -> PathBuf {
+        self.dir.join("navigator.json")
+    }
+
     /// `scripts/`.
     #[must_use]
     pub fn scripts_dir(&self) -> PathBuf {
@@ -335,6 +341,10 @@ mod tests {
         assert_eq!(
             proj.project_file(),
             Path::new("/d/ninesql/workspace/General/project.json")
+        );
+        assert_eq!(
+            proj.navigator_file(),
+            Path::new("/d/ninesql/workspace/General/navigator.json")
         );
         assert_eq!(
             proj.scripts_dir(),

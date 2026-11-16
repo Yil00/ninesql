@@ -1677,6 +1677,7 @@ async fn open_session(
                 in_transaction: session.in_transaction(),
             }),
             dialect: session.dialect(),
+            metadata: session.metadata(),
             // One slot more than configured: the terminal event's reserved slot.
             result_queue: shared.config.result_queue.max(1) + 1,
         }),
@@ -2032,6 +2033,9 @@ struct HandleInner {
     tx_state: Mutex<TransactionState>,
     /// The session's dialect, kept in sync by the driver with the session's lexical modes.
     dialect: Arc<dyn ninesql_driver_api::Dialect>,
+    /// The session's metadata access ([`Session::metadata`]), used only by
+    /// [`crate::metadata::MetadataService`], which wraps every call in its timeout.
+    metadata: Arc<dyn ninesql_driver_api::Metadata>,
     result_queue: usize,
 }
 
@@ -2147,6 +2151,17 @@ impl SessionHandle {
     #[must_use]
     pub fn dialect(&self) -> Arc<dyn ninesql_driver_api::Dialect> {
         Arc::clone(&self.inner.dialect)
+    }
+
+    /// The session's metadata access, for the metadata service only: it applies its own
+    /// timeout, cancel and capability checks around every call (ADR-0004).
+    pub(crate) fn metadata(&self) -> Arc<dyn ninesql_driver_api::Metadata> {
+        Arc::clone(&self.inner.metadata)
+    }
+
+    /// Resolves once the session task ended (closed on request, lost or panicked).
+    pub(crate) async fn closed(&self) {
+        self.inner.commands.closed().await;
     }
 
     /// The last known transaction state (F-SQL-07), updated after every statement and
