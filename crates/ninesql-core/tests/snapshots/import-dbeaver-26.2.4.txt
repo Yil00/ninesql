@@ -35,6 +35,5 @@ connection pg-url-tls: Imported create engine=postgresql type=dev folder=["Team 
 connection roundtrip-marker: Imported create engine=postgresql type=dev folder=[] enabled=true reason=None read_only=None auto_commit=None schema=None marker=false init_sql=0 tls=VerifyFull ssh_hops=0 props=[] secrets=[]
   - Warning TlsConverted
 connection sqlite-local: Imported create engine=sqlite type=dev folder=[] enabled=true reason=None read_only=None auto_commit=None schema=None marker=false init_sql=0 tls=VerifyFull ssh_hops=0 props=[] secrets=[]
-connection timescale-metrics: ImportedDisabled create engine=timescaledb type=dev folder=["Team B"] enabled=false reason=Some(NoDriver) read_only=None auto_commit=None schema=None marker=false init_sql=0 tls=VerifyFull ssh_hops=0 props=[] secrets=["Auth:Password"]
-  - Warning Disabled
+connection timescale-metrics: Imported create engine=timescaledb type=dev folder=["Team B"] enabled=true reason=None read_only=None auto_commit=None schema=None marker=false init_sql=0 tls=VerifyFull ssh_hops=0 props=[] secrets=["Auth:Password"]
   - Warning TlsConverted
