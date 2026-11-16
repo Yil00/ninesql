@@ -8,6 +8,11 @@
 //! quoted with backticks (a backtick doubled), which no `sql_mode` changes, and a name holding
 //! NUL (which MySQL identifiers cannot) is refused.
 //!
+//! Precondition of this quoting: the connection character sets are UTF-8. The session checks
+//! it after connect and after every statement that may change it (`verify_session` closes the
+//! session otherwise), so the hexadecimal literals and backtick-quoted names built here are
+//! read as the UTF-8 bytes they are; do not relax that check without revisiting this module.
+//!
 //! Path shapes: `[Schema]`, `[Schema, Table | View | Routine | Event | Sequence]`, and below a
 //! table `Column`, `Constraint`, `ForeignKey`, `Index`, `Trigger`, `Partition` (columns also
 //! below a view).
@@ -598,10 +603,7 @@ impl Metadata for MyMetadata {
                             .await?,
                     );
                 }
-                if out.is_empty() {
-                    return Err(not_found());
-                }
-                Ok(out.join("\n\n"))
+                routine_script(out)
             }
             (
                 _,
@@ -615,6 +617,45 @@ impl Metadata for MyMetadata {
             _ => Err(DriverError::Unsupported(Feature::Ddl)),
         }
     }
+}
+
+/// The DDL of a routine name: one definition as the server returns it, or, when a function
+/// and a procedure share the name, both in one mysql-client script with `DELIMITER` markers
+/// (the routine bodies may hold `;`). At most [`MAX_DDL_BYTES`] in total (security review L2).
+fn routine_script(defs: Vec<String>) -> DriverResult<String> {
+    let out = match defs.len() {
+        0 => return Err(not_found()),
+        1 => defs.into_iter().next().unwrap_or_default(),
+        _ => {
+            let delimiter = ["$$", "//", ";;", "$$$$", "%%"]
+                .into_iter()
+                .find(|d| defs.iter().all(|x| !x.contains(d)))
+                .ok_or_else(|| DriverError::Query {
+                    code: None,
+                    message: "the routine definitions cannot be separated into one script".into(),
+                    position: None,
+                })?;
+            let mut out = format!("DELIMITER {delimiter}\n");
+            for d in &defs {
+                out.push_str(d);
+                out.push_str(delimiter);
+                out.push('\n');
+            }
+            out.push_str("DELIMITER ;\n");
+            out
+        }
+    };
+    if out.len() as u64 > MAX_DDL_BYTES {
+        return Err(DriverError::Query {
+            code: None,
+            message: format!(
+                "the definition is larger than {} KiB and was not loaded",
+                MAX_DDL_BYTES / 1024
+            ),
+            position: None,
+        });
+    }
+    Ok(out)
 }
 
 #[cfg(test)]
@@ -636,6 +677,16 @@ mod tests {
         );
         assert!(ordinal_clause("P", Some("1 OR 1")).is_err());
         assert_eq!(ordinal_clause("P", Some("7")).unwrap(), " AND P > 7");
+    }
+
+    #[test]
+    fn routines_sharing_a_name_form_one_script() {
+        assert!(routine_script(Vec::new()).is_err());
+        assert_eq!(routine_script(vec!["CREATE f".into()]).unwrap(), "CREATE f");
+        let s = routine_script(vec!["CREATE f $$".into(), "CREATE p".into()]).unwrap();
+        assert_eq!(s, "DELIMITER //\nCREATE f $$//\nCREATE p//\nDELIMITER ;\n");
+        let big = "x".repeat(600 * 1024);
+        assert!(routine_script(vec![big.clone(), big]).is_err());
     }
 
     #[test]

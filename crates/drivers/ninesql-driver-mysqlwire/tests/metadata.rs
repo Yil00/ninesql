@@ -537,6 +537,22 @@ async fn generated_ddl_round_trips() {
             let after = m.ddl(o).await.unwrap();
             assert_eq!(&after, before, "{e}: {o:?}");
         }
+        // The two routines sharing a name come back as one runnable script (L2).
+        assert!(same.starts_with("DELIMITER "), "{same}");
+        let items = admin.dialect().split_script(&same);
+        for item in &items {
+            if item.kind == ninesql_driver_api::ScriptItemKind::Statement {
+                exec(admin.as_mut(), item.text(&same))
+                    .await
+                    .unwrap_or_else(|err| panic!("{e}: {err}"));
+            }
+        }
+        assert_eq!(
+            m.ddl(&sch.child(ObjectKind::Routine, "ninesql_meta_same"))
+                .await
+                .unwrap(),
+            same
+        );
         s.close().await.unwrap();
         exec_all(admin.as_mut(), e, DROP).await;
         if *e == EngineId::MARIADB {
@@ -610,6 +626,60 @@ async fn large_listings_page() {
             exec(
                 admin.as_mut(),
                 &format!("DROP TABLE ninesql_meta_big_{i:03}"),
+            )
+            .await
+            .unwrap();
+        }
+        admin.close().await.unwrap();
+    }
+}
+
+/// Security review L3: a listing past the internal 32 MiB cap fails without closing the
+/// session; a smaller page works.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn oversized_listing_fails_without_closing_the_session() {
+    let _serial = SERIAL.lock().await;
+    for dev in devs() {
+        let e = &dev.engine;
+        let mut admin = connect(&dev, false).await;
+        let comment = "c".repeat(60_000);
+        for i in 0..600 {
+            exec(
+                admin.as_mut(),
+                &format!(
+                    "CREATE FUNCTION IF NOT EXISTS ninesql_meta_huge_{i:03}() RETURNS INT \
+                     DETERMINISTIC COMMENT '{comment}' RETURN 1"
+                ),
+            )
+            .await
+            .unwrap_or_else(|err| panic!("{e}: {err}"));
+        }
+        let s = connect(&dev, false).await;
+        let m = s.metadata();
+        let sch = ObjectPath::root().child(ObjectKind::Schema, &dev.database);
+        let page = PageRequest::first()
+            .with_limit(600)
+            .with_filter(Some("ninesql_meta_huge_".into()));
+        match m.list(&sch, ObjectKind::Routine, page).await {
+            Err(DriverError::Query { message, .. }) => assert!(message.contains("32 MiB")),
+            other => panic!("{e}: {:?}", other.map(|p| p.items.len())),
+        }
+        let small = m
+            .list(
+                &sch,
+                ObjectKind::Routine,
+                PageRequest::first()
+                    .with_limit(100)
+                    .with_filter(Some("ninesql_meta_huge_".into())),
+            )
+            .await
+            .unwrap();
+        assert_eq!(small.items.len(), 100);
+        s.close().await.unwrap();
+        for i in 0..600 {
+            exec(
+                admin.as_mut(),
+                &format!("DROP FUNCTION IF EXISTS ninesql_meta_huge_{i:03}"),
             )
             .await
             .unwrap();

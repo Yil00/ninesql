@@ -381,6 +381,13 @@ impl Actor {
         };
         self.sync_status();
         match r? {
+            Ok(rows) if rows.overflow => Err(DriverError::Query {
+                code: None,
+                message: "the listing is larger than the driver's 32 MiB limit; use a smaller \
+                          page or a filter"
+                    .into(),
+                position: None,
+            }),
             Ok(rows) if rows.cut && value_limit.is_some() => Err(DriverError::Query {
                 code: None,
                 message: format!(
