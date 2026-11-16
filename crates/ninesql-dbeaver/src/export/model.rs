@@ -190,6 +190,9 @@ pub struct ExportConnection {
     pub properties: BTreeMap<String, String>,
     /// Init statements.
     pub init_sql: Vec<String>,
+    /// `Connection::init_sql_needs_confirmation`: imported init SQL the user has not confirmed
+    /// yet. Such statements are not exported (reported).
+    pub init_sql_needs_confirmation: bool,
     /// Default schema.
     pub default_schema: Option<String>,
     /// Default catalog.

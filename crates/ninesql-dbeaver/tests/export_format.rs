@@ -168,6 +168,7 @@ fn everything() -> Vec<ExportConnection> {
             ("busy_timeout".to_owned(), "100".to_owned()),
         ]),
         init_sql: vec!["SELECT 1".to_owned()],
+        init_sql_needs_confirmation: false,
         default_schema: Some("app".to_owned()),
         default_catalog: Some("nine".to_owned()),
         auto_commit: Some(false),

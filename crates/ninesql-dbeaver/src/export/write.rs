@@ -16,13 +16,17 @@
 //!   DBeaver workspace or data directory, by this module's own check and by the caller's
 //!   (`ninesql-core`'s `DbeaverRoots`, which also knows the folders picked for imports).
 //!
-//! Residual risk: the directory is checked, then used by path. Someone who can replace a
-//! directory of the path between the check and the creation (another local process of the same
-//! user) could redirect the new file; it still never overwrites an existing file.
+//! After the link, the final name is checked to be the file this call wrote (same device and
+//! inode); otherwise the name just created is removed and the export fails.
+//!
+//! Residual risk: the directory is checked, then used by path (directory-relative `openat`
+//! calls would need a direct `rustix` dependency with its `fs` feature; not done). Someone who can
+//! replace a directory of the path between the check and the creation (another local process
+//! of the same user) could redirect the new file; it still never overwrites an existing file.
 
 use std::fs;
 use std::io::{self, Write};
-use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
+use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 
 use crate::detect::SearchRoots;
@@ -83,6 +87,13 @@ pub enum ExportWriteError {
         "{path} is inside a DBeaver workspace: NineSQL never writes there; choose another folder"
     )]
     InsideDbeaver {
+        /// Path concerned.
+        path: PathBuf,
+    },
+    /// A path changed while the export was written (another process swapped it): the export
+    /// is not written.
+    #[error("{path} changed while it was written: nothing was exported")]
+    Changed {
         /// Path concerned.
         path: PathBuf,
     },
@@ -206,10 +217,11 @@ fn create_new(path: &Path) -> io::Result<fs::File> {
         .open(path)
 }
 
-fn write_all_synced(path: &Path, bytes: &[u8]) -> io::Result<()> {
+fn write_all_synced(path: &Path, bytes: &[u8]) -> io::Result<fs::File> {
     let mut f = create_new(path)?;
     f.write_all(bytes)?;
-    f.sync_all()
+    f.sync_all()?;
+    Ok(f)
 }
 
 /// Writes `bytes` to the new file `dir/name` (see the module documentation).
@@ -227,16 +239,29 @@ fn write_new_file(
         h.finish()
     };
     let tmp = dir.join(format!(".{name}.ninesql-export-{nonce:016x}.tmp"));
-    if let Err(e) = write_all_synced(&tmp, bytes) {
-        if e.kind() != io::ErrorKind::AlreadyExists {
-            let _ = fs::remove_file(&tmp);
+    let tmp_file = match write_all_synced(&tmp, bytes) {
+        Ok(f) => f,
+        Err(e) => {
+            if e.kind() != io::ErrorKind::AlreadyExists {
+                let _ = fs::remove_file(&tmp);
+            }
+            return Err(io_err(&tmp, &e));
         }
-        return Err(io_err(&tmp, &e));
-    }
+    };
     let linked = fs::hard_link(&tmp, &target);
     let _ = fs::remove_file(&tmp);
     match linked {
-        Ok(()) => {}
+        Ok(()) => {
+            created.push(target.clone());
+            // The new name must be the file this call wrote (same device and inode): a
+            // temporary path swapped between the write and the link is detected, and the name
+            // just created is removed by the caller.
+            let ours = tmp_file.metadata().map_err(|e| io_err(&tmp, &e))?;
+            let linked = fs::symlink_metadata(&target).map_err(|e| io_err(&target, &e))?;
+            if (ours.dev(), ours.ino()) != (linked.dev(), linked.ino()) {
+                return Err(ExportWriteError::Changed { path: target });
+            }
+        }
         Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
             return Err(io_err(&target, &e));
         }
@@ -255,7 +280,6 @@ fn write_new_file(
             return Ok(target);
         }
     }
-    created.push(target.clone());
     sync_dir(dir);
     Ok(target)
 }
@@ -317,17 +341,19 @@ fn write_project(
 
 /// Most ancestors inspected for DBeaver markers.
 const MAX_ANCESTORS: usize = 64;
-/// Most entries of a `.dbeaver` directory listed; a larger one counts as a project.
-const MAX_DBEAVER_ENTRIES: usize = 4096;
 
-/// Whether `dir` (canonical) lies inside a DBeaver location: a `DBeaverData` component, a known
-/// install location, or an ancestor that is a DBeaver workspace (`.metadata/
-/// dbeaver-workspace.properties`) or project (a `.dbeaver` directory holding a DBeaver project
-/// file). The walk stops before `home`, its ancestors and `/` (a stray `~/.dbeaver` does not
+/// Whether `dir` (canonical) lies inside a DBeaver location: a `DBeaverData` component (any
+/// case), a known install location, or an ancestor that is a DBeaver workspace (`.metadata/
+/// dbeaver-workspace.properties`) or project (a non-empty `.dbeaver` directory, a `.project`
+/// with DBeaver's nature, or legacy `.dbeaver-data-sources*.xml` files). The walk stops before `home`, its ancestors and `/` (a stray `~/.dbeaver` does not
 /// block every export). **Fail closed**: a marker whose presence cannot be checked counts.
-/// The same rules as `ninesql-core`'s `DbeaverRoots`, which the caller also applies.
+/// Stricter than `ninesql-core`'s `DbeaverRoots`, which the caller also applies.
 pub(crate) fn inside_dbeaver(dir: &Path, home: Option<&Path>) -> bool {
-    if dir.components().any(|c| c.as_os_str() == "DBeaverData") {
+    if dir.components().any(|c| {
+        c.as_os_str()
+            .to_str()
+            .is_none_or(|s| s.eq_ignore_ascii_case("DBeaverData"))
+    }) {
         return true;
     }
     if let Some(home) = home {
@@ -353,12 +379,73 @@ pub(crate) fn inside_dbeaver(dir: &Path, home: Option<&Path>) -> bool {
         match fs::symlink_metadata(&dot) {
             Err(e) if e.kind() == io::ErrorKind::NotFound => {}
             Err(_) => return true,
-            Ok(m) if !m.is_dir() && !m.file_type().is_symlink() => {}
+            // A regular file named `.dbeaver` is not a project; a directory, a link to one or
+            // anything else is listed (fail closed when it cannot be).
+            Ok(m) if m.is_file() => {}
             Ok(_) => {
-                if dbeaver_dir_has_project_file(&dot) {
+                if dbeaver_dir_not_empty(&dot) {
                     return true;
                 }
             }
+        }
+        if project_file_is_dbeaver(&ancestor.join(".project")) || has_legacy_data_sources(ancestor)
+        {
+            return true;
+        }
+    }
+    false
+}
+
+/// Longest `.project` file read for the DBeaver nature.
+const MAX_PROJECT_FILE: u64 = 1024 * 1024;
+/// Most entries of an ancestor listed while looking for legacy `.dbeaver-data-sources*.xml`;
+/// a larger directory counts as a DBeaver project (fail closed).
+const MAX_ANCESTOR_ENTRIES: usize = 100_000;
+
+/// An Eclipse `.project` with DBeaver's nature (`org.jkiss.dbeaver.DBeaverNature`). Fail
+/// closed: a `.project` that exists but cannot be read, or is too large, counts.
+fn project_file_is_dbeaver(path: &Path) -> bool {
+    use std::io::Read;
+    match fs::symlink_metadata(path) {
+        Err(e)
+            if matches!(
+                e.kind(),
+                io::ErrorKind::NotFound | io::ErrorKind::NotADirectory
+            ) =>
+        {
+            false
+        }
+        Err(_) => true,
+        Ok(m) if m.len() > MAX_PROJECT_FILE => true,
+        Ok(_) => {
+            let mut text = String::new();
+            match fs::File::open(path)
+                .and_then(|f| f.take(MAX_PROJECT_FILE).read_to_string(&mut text))
+            {
+                Ok(_) => text.contains("org.jkiss.dbeaver.DBeaverNature"),
+                Err(_) => true,
+            }
+        }
+    }
+}
+
+/// Legacy DBeaver project files (`.dbeaver-data-sources*.xml`, before the `.dbeaver/`
+/// folder). Fail closed on a listing error or a very large directory.
+fn has_legacy_data_sources(dir: &Path) -> bool {
+    let Ok(entries) = fs::read_dir(dir) else {
+        return true;
+    };
+    for (i, entry) in entries.enumerate() {
+        if i >= MAX_ANCESTOR_ENTRIES {
+            return true;
+        }
+        let Ok(entry) = entry else {
+            return true;
+        };
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if name.starts_with(".dbeaver-data-sources") && name.ends_with(".xml") {
+            return true;
         }
     }
     false
@@ -377,27 +464,13 @@ fn marker_exists(path: &Path) -> Option<bool> {
     }
 }
 
-fn dbeaver_dir_has_project_file(dot: &Path) -> bool {
-    let Ok(entries) = fs::read_dir(dot) else {
-        return true;
-    };
-    for (i, entry) in entries.enumerate() {
-        if i >= MAX_DBEAVER_ENTRIES {
-            return true;
-        }
-        let Ok(entry) = entry else {
-            return true;
-        };
-        let name = entry.file_name();
-        let name = name.to_string_lossy();
-        if (name.starts_with("data-sources") && name.ends_with(".json"))
-            || name == "project-settings.json"
-            || name == "credentials-config.json"
-        {
-            return true;
-        }
+/// Any entry in a `.dbeaver` folder makes it a DBeaver project (fail closed: an unreadable
+/// folder counts too).
+fn dbeaver_dir_not_empty(dot: &Path) -> bool {
+    match fs::read_dir(dot) {
+        Ok(mut entries) => entries.next().is_some(),
+        Err(_) => true,
     }
-    false
 }
 
 #[cfg(test)]

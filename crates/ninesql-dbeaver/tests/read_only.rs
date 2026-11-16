@@ -200,13 +200,26 @@ fn sources_have_no_write_path() {
             .filter(|l| !l.trim_start().starts_with("//"))
             .collect::<Vec<_>>()
             .join("\n");
-        // The export writer creates new files (O_EXCL), links and removes its own temporary
-        // file: the only writing code of the crate.
+        // The export writer creates new files (O_EXCL) and folders, links and removes its own
+        // temporary file: the only writing code of the crate, with an explicit allowlist (no
+        // rename, copy, truncation, permission change, lock or symbolic link even there).
+        let allowed: &[&str] = if name == "export/write.rs" {
+            &[
+                "OpenOptions",
+                "create_dir",
+                "remove_file",
+                "remove_dir",
+                "hard_link",
+                "write_all",
+            ]
+        } else {
+            &[]
+        };
+        for f in forbidden.iter().filter(|f| !allowed.contains(f)) {
+            assert!(!code.contains(f), "{name} contains `{f}`");
+        }
         if name == "export/write.rs" {
             continue;
-        }
-        for f in forbidden {
-            assert!(!code.contains(f), "{name} contains `{f}`");
         }
         if name != "fsread.rs" {
             assert!(

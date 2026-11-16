@@ -50,6 +50,7 @@ fn base(name: &str, engine_id: &str) -> ExportConnection {
         folder: Vec::new(),
         properties: BTreeMap::new(),
         init_sql: Vec::new(),
+        init_sql_needs_confirmation: false,
         default_schema: None,
         default_catalog: None,
         auto_commit: None,
@@ -392,13 +393,13 @@ fn export_imports_back_equivalent() {
     // Custom type: its read-only default becomes the connection flag; TLS off stays explicit.
     let ts = by_name(&imp, "timescale");
     assert_eq!(ts.engine, engine("timescaledb"));
-    assert_eq!(ts.connection_type, "staging");
+    assert_eq!(ts.connection_type, "ninesql-staging");
     assert_eq!(ts.read_only, Some(true));
     assert_eq!(ts.tls.mode, mapping::TlsMode::Disable);
     let staging = imp
         .connection_types
         .iter()
-        .find(|t| t.id == "staging")
+        .find(|t| t.id == "ninesql-staging")
         .unwrap();
     assert_eq!(staging.name, "Staging \"QA\" ü");
     assert_eq!(
@@ -721,7 +722,7 @@ fn reimporting_a_fixture_export_keeps_the_mapped_fields() {
             assert_eq!(back.engine, c.engine, "{ctx}");
             assert_eq!(back.endpoint, c.endpoint, "{ctx}");
             assert_eq!(back.folder, c.folder, "{ctx}");
-            assert_eq!(back.connection_type, c.connection_type, "{ctx}");
+            assert_eq!(back.connection_type, nine_type(&c.connection_type), "{ctx}");
             assert_eq!(back.read_only, c.read_only, "{ctx}");
             assert_eq!(back.init_sql, c.init_sql, "{ctx}");
             assert_eq!(back.default_schema, c.default_schema, "{ctx}");
@@ -731,6 +732,15 @@ fn reimporting_a_fixture_export_keeps_the_mapped_fields() {
             assert_eq!(back.auth.username(), c.auth.username(), "{ctx}");
             assert!(back.secrets.is_empty(), "{ctx}");
         }
+    }
+}
+
+/// The type id NineSQL gets back: custom types carry the export's `ninesql-` prefix.
+fn nine_type(id: &str) -> String {
+    if matches!(id, "dev" | "test" | "prod") || id.starts_with("ninesql-") {
+        id.to_owned()
+    } else {
+        format!("ninesql-{id}")
     }
 }
 
@@ -815,6 +825,7 @@ fn from_imported(c: &ImportedConnection) -> ExportConnection {
         folder: c.folder.clone(),
         properties: c.properties.clone(),
         init_sql: c.init_sql.clone(),
+        init_sql_needs_confirmation: false,
         default_schema: c.default_schema.clone(),
         default_catalog: c.default_catalog.clone(),
         auto_commit: c.auto_commit,
@@ -885,7 +896,7 @@ fn connection() -> impl Strategy<Value = ExportConnection> {
                         host: "db.example.test".to_owned(),
                         port,
                         database: database
-                            .map(|d| d.trim().to_owned())
+                            .map(|d| d.replace(['?', '&', ';', '#', '%'], "").trim().to_owned())
                             .filter(|d| !d.is_empty()),
                     };
                     c.auth = match user {
@@ -949,7 +960,7 @@ proptest! {
             prop_assert_eq!(&back.description, &c.description);
             prop_assert_eq!(&back.engine, &c.engine);
             prop_assert_eq!(&back.folder, &c.folder);
-            prop_assert_eq!(&back.connection_type, &c.connection_type);
+            prop_assert_eq!(&back.connection_type, &nine_type(&c.connection_type));
             prop_assert_eq!(&back.default_schema, &c.default_schema);
             let ty = opts.connection_types.iter().find(|t| t.id == c.connection_type).unwrap();
             let effective_ro = c.read_only.unwrap_or(ty.read_only);

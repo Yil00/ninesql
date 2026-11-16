@@ -29,8 +29,9 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::hash::{BuildHasher, Hash, Hasher};
 use std::path::Path;
 
-use ninesql_driver_api::EngineId;
+use ninesql_driver_api::dialect::classify_with_rules;
 use ninesql_driver_api::hygiene::text_may_hold_credentials;
+use ninesql_driver_api::{EngineId, LexicalRules, StatementClass};
 use ninesql_storage::hygiene::{find_secret_like_keys, is_secret_like_entry, is_secret_like_key};
 use serde::ser::{Serialize, SerializeMap, SerializeSeq, Serializer};
 
@@ -89,6 +90,20 @@ pub fn export_connections(
             .ok_or("its connection type is not known, so its read-only default is not either")
             .and_then(|ty| export_one(conn, ty, &mut issues));
         let dbeaver_id = match result {
+            Ok(written)
+                if serde_json::to_value(written.json.as_ref())
+                    .map_or(true, |v| !find_secret_like_keys(&v).is_empty()) =>
+            {
+                // A user-chosen key (property, folder…) looks like it names a secret: this
+                // connection is skipped, the rest of the export goes on.
+                issues.push(
+                    Severity::Error,
+                    ExportIssueKind::Skipped,
+                    None,
+                    "not exported: one of its setting names looks like it holds a secret",
+                );
+                None
+            }
             Ok(mut written) => {
                 let id = unique_id(
                     written.driver,
@@ -133,7 +148,7 @@ pub fn export_connections(
     let mut out_types = Vec::new();
     for id in used_types {
         if let Some(ty) = types.get(id) {
-            out_types.push((id.to_owned(), connection_type_json(ty, &mut global)));
+            out_types.push((dbeaver_type_id(id), connection_type_json(ty, &mut global)));
         }
     }
     report.issues = global.0;
@@ -396,6 +411,13 @@ fn export_one(
     let read_only = conn.read_only.unwrap_or(ty.read_only);
     if read_only {
         c.push(("read-only".to_owned(), J::Bool(true)));
+        issues.warn(
+            ExportIssueKind::Approximated,
+            "read_only",
+            "DBeaver enforces read-only in its JDBC driver and its UI (`setReadOnly`, editors), \
+             not with an engine-side read-only transaction re-checked after every statement as \
+             NineSQL does: a statement can still write on some engines",
+        );
         if conn.read_only.is_none() {
             issues.info(
                 ExportIssueKind::Approximated,
@@ -421,11 +443,15 @@ fn export_one(
             if engine.file {
                 return Err("its engine uses a database file but the connection has a host");
             }
+            check_url_safe_host(host)?;
             cfg.push(("host".to_owned(), J::s(host)));
             if let Some(p) = port {
                 cfg.push(("port".to_owned(), J::s(p.to_string())));
             }
             if let Some(db) = database.as_deref().filter(|d| !d.is_empty()) {
+                if !url_safe_database(db) {
+                    return Err(URL_UNSAFE_DATABASE);
+                }
                 cfg.push(("database".to_owned(), J::s(db)));
             }
         }
@@ -440,11 +466,14 @@ fn export_one(
             if !path.is_absolute() {
                 return Err("the database file path is not absolute");
             }
+            if !url_safe_database(&p) {
+                return Err(URL_UNSAFE_DATABASE);
+            }
             cfg.push(("database".to_owned(), J::s(p)));
         }
     }
     cfg.push(("configurationType".to_owned(), J::s("MANUAL")));
-    cfg.push(("type".to_owned(), J::s(&ty.id)));
+    cfg.push(("type".to_owned(), J::s(dbeaver_type_id(&ty.id))));
 
     // Authentication: the user name only, never a secret.
     let username = match &conn.auth {
@@ -519,6 +548,11 @@ fn export_one(
 
     // Driver properties and TLS settings expressed as driver properties.
     let mut props = export_properties(engine.family, &conn.engine, &conn.properties, issues);
+    if read_only && matches!(engine.family, Family::Pg | Family::QuestDb) {
+        // pgjdbc: `setReadOnly(true)` also in auto-commit mode (its default, `transaction`,
+        // only applies it inside explicit transactions).
+        props.insert("readOnlyMode".to_owned(), "always".to_owned());
+    }
     let mut handlers: Vec<(String, J)> = Vec::new();
     if matches!(conn.endpoint, ExportEndpoint::Tcp { .. }) {
         export_tls(engine.family, &conn.tls, &mut props, &mut handlers, issues);
@@ -553,12 +587,37 @@ fn export_one(
     }
     let mut queries = Vec::new();
     let mut secret_queries = 0usize;
-    for q in conn.init_sql.iter().filter(|q| !q.trim().is_empty()) {
+    let mut writing_queries = 0usize;
+    let init_sql: &[String] =
+        if conn.init_sql_needs_confirmation && conn.init_sql.iter().any(|q| !q.trim().is_empty()) {
+            issues.warn(
+                ExportIssueKind::Dropped,
+                "init_sql",
+                "the init statements came from an import and are not confirmed yet: not exported \
+             (confirm them by opening the connection in NineSQL, then export again)",
+            );
+            &[]
+        } else {
+            &conn.init_sql
+        };
+    for q in init_sql.iter().filter(|q| !q.trim().is_empty()) {
         if text_may_hold_credentials(q) {
             secret_queries += 1;
+        } else if read_only && !read_only_safe(q, engine.family) {
+            writing_queries += 1;
         } else {
             queries.push(J::s(q));
         }
+    }
+    if writing_queries > 0 {
+        issues.warn(
+            ExportIssueKind::Dropped,
+            "init_sql",
+            format!(
+                "{writing_queries} init statement(s) of this read-only connection are not plain \
+                 reads (or touch the access mode) and are not exported"
+            ),
+        );
     }
     if secret_queries > 0 {
         issues.warn(
@@ -628,12 +687,102 @@ fn folder_path(folder: &[String], issues: &mut Issues) -> Option<String> {
 }
 
 // ---------------------------------------------------------------------------------------------
+// Values DBeaver pastes into a JDBC URL
+// ---------------------------------------------------------------------------------------------
+
+const URL_UNSAFE_DATABASE: &str = "the database name or file path contains `?`, `&`, `;`, `#` \
+     or `%`, which DBeaver would paste into the JDBC URL as parameters (they could override \
+     the TLS and read-only settings)";
+
+/// DBeaver builds the JDBC URL from a template (`jdbc:postgresql://{host}[:{port}]/{database}`)
+/// without escaping: a host or database holding URL syntax would add parameters that win over
+/// the TLS handler and read-only (pgjdbc and MariaDB Connector/J: URL parameters win).
+fn check_url_safe_host(host: &str) -> Result<(), &'static str> {
+    if host.contains(':') {
+        // An IPv6 address: whether DBeaver brackets it in the URL is not verified (L5).
+        return Err(
+            "IPv6 address hosts are not exported (DBeaver's URL bracketing is not \
+                    verified); use a host name",
+        );
+    }
+    if host
+        .chars()
+        .any(|c| c.is_whitespace() || c.is_control() || "?&;#/\\%".contains(c))
+    {
+        return Err(
+            "the host contains a character DBeaver would paste into the JDBC URL as \
+                    syntax (`? & ; # / \\ %` or whitespace)",
+        );
+    }
+    Ok(())
+}
+
+fn url_safe_database(db: &str) -> bool {
+    !db.chars().any(|c| c.is_control() || "?&;#%".contains(c))
+}
+
+/// Init statements kept on a read-only connection: plain reads (classifier `Read`) that do not
+/// touch the access mode (`SET … TRANSACTION … WRITE`, `read_only`, `query_only`).
+fn read_only_safe(sql: &str, family: Family) -> bool {
+    let rules = match family {
+        Family::Pg | Family::QuestDb => LexicalRules::POSTGRES,
+        Family::MySql | Family::MariaDb => LexicalRules::MYSQL,
+        Family::Sqlite => LexicalRules::SQLITE,
+        Family::Other => LexicalRules::ANSI,
+    };
+    if classify_with_rules(sql, rules) != StatementClass::Read {
+        return false;
+    }
+    let norm: String = sql
+        .chars()
+        .filter(char::is_ascii_alphanumeric)
+        .map(|c| c.to_ascii_lowercase())
+        .collect();
+    !(norm.contains("readonly")
+        || norm.contains("queryonly")
+        || (norm.contains("transaction") && norm.contains("write")))
+}
+
+/// DBeaver id of a connection type: built-ins keep theirs, custom types get a `ninesql-` prefix
+/// so that they do not collide with a type the user already has in DBeaver (DBeaver keeps an
+/// existing type of the same id). At most 64 bytes, so NineSQL imports it back unchanged.
+fn dbeaver_type_id(id: &str) -> String {
+    const PREFIX: &str = "ninesql-";
+    if matches!(id, "dev" | "test" | "prod") || id.starts_with(PREFIX) {
+        return id.to_owned();
+    }
+    let mut base = id.to_owned();
+    let max = 64 - PREFIX.len();
+    while base.len() > max {
+        base.pop();
+    }
+    format!("{PREFIX}{base}")
+}
+
+// ---------------------------------------------------------------------------------------------
 // Connection types
 // ---------------------------------------------------------------------------------------------
 
 fn connection_type_json(ty: &ExportConnectionType, issues: &mut Issues) -> J {
     let field = format!("connection_types.{}", ty.id);
     let production = ty.is_production();
+    if !matches!(ty.id.as_str(), "dev" | "test" | "prod") {
+        issues.warn(
+            ExportIssueKind::Approximated,
+            &field,
+            format!(
+                "written as the DBeaver type `{}`; if the DBeaver workspace already has a type \
+                 of that id, DBeaver keeps its own settings, not these",
+                dbeaver_type_id(&ty.id)
+            ),
+        );
+    } else {
+        issues.info(
+            ExportIssueKind::NotVerified,
+            &field,
+            "a DBeaver built-in type: DBeaver may keep its own settings for it (not verified)",
+        );
+    }
     let confirm_execute = ty.confirm_every_write;
     let confirm_change = ty.confirm_destructive || ty.confirm_every_write || production;
     if production && ty.id != "prod" {
@@ -730,7 +879,29 @@ fn export_properties(
     let mut out = BTreeMap::new();
     let mut options: Vec<String> = Vec::new();
     let mut variables: Vec<String> = Vec::new();
+    let mut redacted = 0usize;
     for (raw_key, value) in properties {
+        // A key that looks like a secret, or holds non-printable characters, is never echoed.
+        if is_secret_like_key(raw_key)
+            || raw_key.chars().any(|c| c.is_control() || c.is_whitespace())
+        {
+            redacted += 1;
+            let field = format!("properties.<redacted #{redacted}>");
+            if is_secret_like_key(raw_key) {
+                issues.warn(
+                    ExportIssueKind::LooksLikeSecret,
+                    &field,
+                    "the key looks like it names a secret: not exported",
+                );
+            } else {
+                issues.warn(
+                    ExportIssueKind::Dropped,
+                    &field,
+                    "the key has whitespace or control characters: not exported",
+                );
+            }
+            continue;
+        }
         let field = format!("properties.{raw_key}");
         // NineSQL property names are matched ignoring ASCII case, as the drivers do.
         let canonical = |list: &[&'static str]| {
@@ -855,6 +1026,26 @@ fn handler(kind: &str, save_password: bool, extra: Vec<(String, J)>, props: Vec<
     J::Obj(h)
 }
 
+/// Properties of DBeaver's `mysql_ssl` handler (TLS required).
+fn mysql_handler_props(
+    verify: bool,
+    ca: Option<String>,
+    cert: Option<(String, String)>,
+) -> Vec<(String, J)> {
+    let mut p = vec![
+        ("ssl.require".to_owned(), J::Bool(true)),
+        ("ssl.verify.server".to_owned(), J::Bool(verify)),
+    ];
+    if let Some(ca) = ca {
+        p.push(("ssl.ca.cert".to_owned(), J::s(ca)));
+    }
+    if let Some((c, k)) = cert {
+        p.push(("ssl.client.cert".to_owned(), J::s(c)));
+        p.push(("ssl.client.key".to_owned(), J::s(k)));
+    }
+    p
+}
+
 /// TLS settings in the form NineSQL's importer reads back to the same mode (never weaker).
 fn export_tls(
     family: Family,
@@ -935,56 +1126,50 @@ fn export_tls(
                 }
                 TlsMode::VerifyFull => {
                     // DBeaver's `mysql_ssl` handler verifies the chain, not the host name
-                    // (Connector/J `VERIFY_CA`): the mode goes in `sslMode`, without the
-                    // handler, so that it is not weakened.
+                    // (Connector/J `VERIFY_CA`), so the host name check goes in the `sslMode`
+                    // driver property. The handler is written too, so that DBeaver never sees
+                    // a connection without TLS settings (it may then add `useSSL=false`) and a
+                    // driver that ignores `sslMode` still verifies the chain: the worst case is
+                    // `verify-ca`, never plaintext. NineSQL's importer keeps the stricter of
+                    // the two (`verify-full`).
                     let value = if mariadb {
                         "verify-full"
                     } else {
                         "VERIFY_IDENTITY"
                     };
                     props.insert("sslMode".to_owned(), value.to_owned());
-                    match (mariadb, ca_text) {
-                        (true, Some(ca)) => {
-                            props.insert("serverSslCert".to_owned(), ca);
-                        }
-                        (false, Some(_)) => issues.warn(
-                            ExportIssueKind::Dropped,
-                            "tls.ca_file",
-                            "MySQL Connector/J takes a CA as a Java keystore, not a PEM file, \
-                             and DBeaver's TLS handler does not verify host names: the CA file \
-                             is not exported (set it in DBeaver's SSL tab, which turns host \
-                             name verification off)",
+                    if mariadb && let Some(ca) = &ca_text {
+                        props.insert("serverSslCert".to_owned(), ca.clone());
+                    }
+                    handlers.push((
+                        "mysql_ssl".to_owned(),
+                        handler(
+                            "CONFIG",
+                            false,
+                            vec![],
+                            mysql_handler_props(true, ca_text, cert_paths),
                         ),
-                        (_, None) => {}
-                    }
-                    if cert_paths.is_some() {
-                        issues.warn(
-                            ExportIssueKind::Dropped,
-                            "tls.client_certificate",
-                            "a client certificate needs DBeaver's TLS handler, which does not \
-                             verify host names: not exported (set it in DBeaver's SSL tab)",
-                        );
-                    }
-                    issues.info(
-                        ExportIssueKind::NotVerified,
+                    ));
+                    issues.warn(
+                        ExportIssueKind::Approximated,
                         "tls.mode",
-                        "`verify-full` written as the driver property `sslMode`, which \
-                         DBeaver's bundled driver version must support (not verified)",
+                        if mariadb {
+                            "`verify-full` needs MariaDB Connector/J 3.0 or later in DBeaver \
+                             (`sslMode=verify-full`); an older driver ignores `sslMode` and \
+                             only applies DBeaver's TLS handler, which does not verify the \
+                             host name (`verify-ca`)"
+                        } else {
+                            "`verify-full` needs MySQL Connector/J 8.0.13 or later in DBeaver \
+                             (`sslMode=VERIFY_IDENTITY`); an older driver ignores `sslMode` \
+                             and only applies DBeaver's TLS handler, which does not verify the \
+                             host name (`verify-ca`). How DBeaver merges its handler settings \
+                             with this property is not verified"
+                        },
                     );
                 }
                 TlsMode::Require | TlsMode::VerifyCa => {
                     let verify = tls.mode == TlsMode::VerifyCa;
-                    let mut p = vec![
-                        ("ssl.require".to_owned(), J::Bool(true)),
-                        ("ssl.verify.server".to_owned(), J::Bool(verify)),
-                    ];
-                    if let Some(ca) = ca_text {
-                        p.push(("ssl.ca.cert".to_owned(), J::s(ca)));
-                    }
-                    if let Some((c, k)) = cert_paths {
-                        p.push(("ssl.client.cert".to_owned(), J::s(c)));
-                        p.push(("ssl.client.key".to_owned(), J::s(k)));
-                    }
+                    let p = mysql_handler_props(verify, ca_text, cert_paths);
                     handlers.push(("mysql_ssl".to_owned(), handler("CONFIG", false, vec![], p)));
                 }
             }
@@ -1108,8 +1293,16 @@ fn ssh_handler(ssh: &ExportSshTunnel, issues: &mut Issues) -> Result<J, &'static
             ExportIssueKind::NotVerified,
             "ssh.jump_hosts",
             "jump hosts are written as `jumpServer<i>.*` properties, taken from DBeaver's \
-             source (no fixture); DBeaver before 24.3 reads only the first one",
+             source (no fixture)",
         );
+        if ssh.jump_hosts.len() > 1 {
+            issues.warn(
+                ExportIssueKind::Approximated,
+                "ssh.jump_hosts",
+                "route change in DBeaver before 24.3: it reads only the first jump host and \
+                 would connect through a shorter route than NineSQL; use DBeaver 24.3 or later",
+            );
+        }
     }
     if ssh.jump_hosts.iter().any(|h| hop_asks(&h.auth)) && !hop_asks(&server.auth) {
         issues.info(
@@ -1119,6 +1312,12 @@ fn ssh_handler(ssh: &ExportSshTunnel, issues: &mut Issues) -> Result<J, &'static
              the SSH server's setting",
         );
     }
+    issues.warn(
+        ExportIssueKind::Dropped,
+        "ssh.host_key_policy",
+        "DBeaver applies its own SSH host key checks, not NineSQL's known_hosts and per-hop \
+         policies: check the fingerprint DBeaver shows on the first connection",
+    );
     issues.info(
         ExportIssueKind::NotVerified,
         "ssh.username",
