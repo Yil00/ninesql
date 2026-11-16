@@ -286,7 +286,7 @@ impl Render for FindObjectDialog {
                 let selected = s.selected;
                 Checkbox::new(("find-scope", ix))
                     .checked(selected)
-                    .label(s.name.clone())
+                    .label(super::display_name(&s.name))
                     .on_click(cx.listener(move |this, _, _, cx| this.set_scope(id, !selected, cx)))
             }));
         let hits = self
@@ -297,7 +297,7 @@ impl Render for FindObjectDialog {
         let rows = hits.iter().enumerate().map(|(ix, hit)| {
             let kind = hit.kind().map_or("object", kind_singular);
             let path = display_path(&hit.path);
-            let connection = self.scope_name(hit.connection).to_owned();
+            let connection = super::display_name(self.scope_name(hit.connection));
             h_flex()
                 .id(("find-hit", ix))
                 .w_full()

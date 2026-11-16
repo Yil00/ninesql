@@ -851,8 +851,8 @@ pub fn row_label(
     connection_name: &dyn Fn(ConnectionId) -> String,
 ) -> String {
     match &row.kind {
-        RowKind::Folder { name, .. } => format!("{name}/"),
-        RowKind::Connection { id, .. } => connection_name(*id),
+        RowKind::Folder { name, .. } => format!("{}/", super::display_name(name)),
+        RowKind::Connection { id, .. } => super::display_name(&connection_name(*id)),
         RowKind::NotConnected(_) => "Not connected".to_owned(),
         RowKind::NoKinds(_) => "No objects are listed for this engine".to_owned(),
         RowKind::Group { group, .. } => super::kind_plural(group.key.kind).to_owned(),

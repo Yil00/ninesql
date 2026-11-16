@@ -36,8 +36,16 @@ fn small_pages() -> MetadataConfig {
 
 /// A window on the mock driver with one connection, connected.
 fn connected(cx: &mut TestAppContext, metadata: MetadataConfig) -> Fixture {
+    connected_with(cx, metadata, false)
+}
+
+/// [`connected`], on a read-only connection when `read_only`.
+fn connected_with(cx: &mut TestAppContext, metadata: MetadataConfig, read_only: bool) -> Fixture {
     let tmp = tempfile::tempdir().unwrap_or_else(|e| panic!("{e}"));
-    let c = mock_connection("Live", ConnectionTypeId::dev(), Auth::None);
+    let mut c = mock_connection("Live", ConnectionTypeId::dev(), Auth::None);
+    if read_only {
+        c.read_only = Some(true);
+    }
     let id = c.id;
     let hub = mock_hub_with_metadata(cx, tmp.path(), vec![c], metadata);
     let (ws, mut vcx) = open_live(cx);
@@ -520,6 +528,13 @@ fn generate_sql_opens_quoted_templates_that_never_run(cx: &mut TestAppContext) {
     f.ws.update_in(&mut f.vcx, |ws, window, cx| {
         ws.generate(id, path_of("t000"), Template::Update, window, cx);
     });
+    let ws = f.ws.clone();
+    wait_until(&mut f.vcx, |vcx| {
+        ws.read_with(vcx, |ws, cx| {
+            ws.active_title(cx)
+                .is_some_and(|t| t.as_ref() == "UPDATE t000")
+        })
+    });
     let tab = f.ws.read_with(&f.vcx, |ws, _| ws.active_editor().cloned());
     let text = tab.map(|t| t.read_with(&f.vcx, |t, cx| t.editor().read(cx).text(cx)));
     assert_eq!(
@@ -610,4 +625,123 @@ fn navigator_actions_are_bound_and_in_the_palette(_cx: &mut TestAppContext) {
         assert!(!spec.default_keys.is_empty(), "{name}");
         assert_eq!(spec.category, "Navigator");
     }
+}
+
+fn tab_count(f: &Fixture) -> usize {
+    f.ws.read_with(&f.vcx, |ws, cx| ws.tab_titles(cx).len())
+}
+
+fn active_text(f: &Fixture) -> Option<String> {
+    let tab = f.ws.read_with(&f.vcx, |ws, _| ws.active_editor().cloned());
+    tab.map(|t| t.read_with(&f.vcx, |t, cx| t.editor().read(cx).text(cx)))
+}
+
+/// Review M3: a filtered column list never yields a key condition, and says so.
+#[gpui::test]
+fn filtered_columns_give_no_key_condition(cx: &mut TestAppContext) {
+    let mut f = connected(cx, MetadataConfig::default());
+    let metadata = metadata_of(&f);
+    let id = f.id;
+    let filters = ninesql_core::ConnectionFilters::new()
+        .with(
+            ObjectKind::Column,
+            ninesql_core::KindFilter::new(Vec::<String>::new(), vec!["id"], false)
+                .unwrap_or_else(|e| panic!("{e}")),
+        )
+        .unwrap_or_else(|e| panic!("{e}"));
+    let reply = metadata.set_filters(id, filters);
+    let mut reply = Some(reply);
+    wait_until(&mut f.vcx, |_| {
+        matches!(
+            reply.as_mut().map(|r| r.try_take()),
+            Some(ninesql_core::Next::Ready(_))
+        )
+    });
+    reply.take();
+    f.ws.update_in(&mut f.vcx, |ws, window, cx| {
+        ws.generate(id, path_of("t000"), Template::Delete, window, cx);
+    });
+    let ws = f.ws.clone();
+    wait_until(&mut f.vcx, |vcx| {
+        ws.read_with(vcx, |ws, cx| {
+            ws.active_title(cx)
+                .is_some_and(|t| t.as_ref() == "DELETE t000")
+        })
+    });
+    assert_eq!(
+        active_text(&f).as_deref(),
+        Some(
+            format!(
+                "{}\nDELETE FROM \"public\".\"t000\"\nWHERE <condition>;\n",
+                super::generate::KEY_UNKNOWN
+            )
+            .as_str()
+        )
+    );
+    f.ws.update_in(&mut f.vcx, |ws, window, cx| {
+        ws.generate(id, path_of("t000"), Template::Select, window, cx);
+    });
+    let ws = f.ws.clone();
+    wait_until(&mut f.vcx, |vcx| {
+        ws.read_with(vcx, |ws, cx| {
+            ws.active_title(cx)
+                .is_some_and(|t| t.as_ref() == "SELECT t000")
+        })
+    });
+    let text = active_text(&f).unwrap_or_default();
+    assert!(
+        text.starts_with(super::generate::COLUMNS_INCOMPLETE),
+        "{text}"
+    );
+    assert!(!text.contains("\"id\""), "{text}");
+}
+
+/// Review M2: a name the editor would change gets no template.
+#[gpui::test]
+fn names_the_editor_would_change_get_no_template(cx: &mut TestAppContext) {
+    let mut f = connected(cx, MetadataConfig::default());
+    let id = f.id;
+    let before = tab_count(&f);
+    for name in ["orders\u{1}", "orders\r", "a\u{2028}b"] {
+        f.ws.update_in(&mut f.vcx, |ws, window, cx| {
+            ws.generate(id, path_of(name), Template::Select, window, cx);
+        });
+        f.vcx.run_until_parked();
+        assert_eq!(tab_count(&f), before, "{name:?}");
+    }
+}
+
+/// Review L4: no write template on a read-only session.
+#[gpui::test]
+fn read_only_sessions_offer_select_only(cx: &mut TestAppContext) {
+    let mut f = connected_with(cx, MetadataConfig::default(), true);
+    let id = f.id;
+    let read_only = f.hub.read_with(&f.vcx, |h, _| {
+        h.sessions(id).first().is_some_and(|s| s.info().read_only)
+    });
+    assert!(read_only, "the mock opened a read-only session");
+    let before = tab_count(&f);
+    for which in [Template::Insert, Template::Update, Template::Delete] {
+        f.ws.update_in(&mut f.vcx, |ws, window, cx| {
+            ws.generate(id, path_of("t000"), which, window, cx);
+        });
+        f.vcx.run_until_parked();
+        assert_eq!(tab_count(&f), before, "{which:?}");
+    }
+    f.ws.update_in(&mut f.vcx, |ws, window, cx| {
+        ws.generate(id, path_of("t000"), Template::Select, window, cx);
+    });
+    let ws = f.ws.clone();
+    wait_until(&mut f.vcx, |vcx| {
+        ws.read_with(vcx, |ws, cx| {
+            ws.active_title(cx)
+                .is_some_and(|t| t.as_ref() == "SELECT t000")
+        })
+    });
+    f.ws.update_in(&mut f.vcx, |ws, window, cx| {
+        ws.open_object_editor(id, path_of("t000"), None, window, cx);
+    });
+    let editor =
+        f.ws.read_with(&f.vcx, |ws, _| ws.active_object_editor().cloned());
+    assert!(editor.is_some_and(|e| e.read_with(&f.vcx, |e, cx| e.read_only(cx))));
 }

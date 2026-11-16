@@ -22,7 +22,7 @@ use gpui_kit::component::{ActiveTheme as _, Sizable as _, h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 use ninesql_core::driver_api::ObjectKind;
-use ninesql_core::driver_api::metadata::{ObjectDetails, ObjectInfo, ObjectPath};
+use ninesql_core::driver_api::metadata::{ConstraintKind, ObjectDetails, ObjectInfo, ObjectPath};
 use ninesql_core::{
     ConnectionId, InvalidationReason, InvalidationScope, MetadataEvent, MetadataService,
     NodeChildren, NodeKey, ObjectDdl,
@@ -200,6 +200,25 @@ impl ObjectEditor {
             .is_some_and(|k| service.supports_ddl(self.connection, k));
     }
 
+    /// Whether the open session of the connection is read-only (write templates are not
+    /// offered then, I8).
+    #[must_use]
+    pub fn read_only(&self, cx: &App) -> bool {
+        self.hub
+            .read(cx)
+            .sessions(self.connection)
+            .first()
+            .is_some_and(|s| s.info().read_only)
+    }
+
+    /// Bidirectional controls in the loaded DDL (flagged like in the SQL editor).
+    #[must_use]
+    pub fn ddl_bidi_controls(&self) -> Vec<ninesql_editor::hygiene::BidiControl> {
+        self.ddl_text()
+            .map(ninesql_editor::hygiene::find_bidi_controls)
+            .unwrap_or_default()
+    }
+
     /// Tab title (the object's name).
     #[must_use]
     pub fn title(&self) -> &SharedString {
@@ -334,7 +353,7 @@ impl ObjectEditor {
                             );
                         }
                     }
-                    Err(err) => e.info_error = Some(err.to_string()),
+                    Err(err) => e.info_error = Some(super::display_message(&err.to_string())),
                 }
                 cx.notify();
             });
@@ -366,7 +385,7 @@ impl ObjectEditor {
                 section.loading = false;
                 match result {
                     Ok(c) => section.children = Some(c),
-                    Err(err) => section.error = Some(err.to_string()),
+                    Err(err) => section.error = Some(super::display_message(&err.to_string())),
                 }
                 cx.notify();
             });
@@ -392,7 +411,7 @@ impl ObjectEditor {
             let _ = this.update_in(cx, |e, window, cx| {
                 match result {
                     Ok(d) => e.show_ddl(d, window, cx),
-                    Err(err) => e.ddl = DdlState::Failed(err.to_string()),
+                    Err(err) => e.ddl = DdlState::Failed(super::display_message(&err.to_string())),
                 }
                 cx.notify();
             });
@@ -506,7 +525,7 @@ impl ObjectEditor {
             .hub
             .read(cx)
             .connection(self.connection)
-            .map(|c| c.name.clone())
+            .map(|c| display_name(&c.name))
         {
             props.push(("Connection".into(), name));
         }
@@ -676,6 +695,7 @@ impl ObjectEditor {
         match &self.ddl {
             DdlState::Loaded(_) => v_flex()
                 .size_full()
+                .children(ddl_bidi_banner(&self.ddl_bidi_controls(), cx))
                 .child(
                     div()
                         .flex_1()
@@ -704,8 +724,106 @@ fn is_under(path: &ObjectPath, prefix: &ObjectPath) -> bool {
     path.0.len() >= prefix.0.len() && path.0[..prefix.0.len()] == prefix.0[..]
 }
 
+/// The warning shown over DDL with bidirectional controls, as in the SQL editor (P4-B review
+/// L2).
+#[must_use]
+pub fn ddl_bidi_text(controls: &[ninesql_editor::hygiene::BidiControl]) -> Option<String> {
+    let first = controls.first()?;
+    Some(format!(
+        "{} bidirectional control character(s) in this DDL (first: {}): the text may read differently from what it defines.",
+        controls.len(),
+        first.label()
+    ))
+}
+
+fn ddl_bidi_banner(
+    controls: &[ninesql_editor::hygiene::BidiControl],
+    cx: &App,
+) -> Option<AnyElement> {
+    let text = ddl_bidi_text(controls)?;
+    let theme = cx.theme();
+    Some(
+        div()
+            .id("ddl-bidi")
+            .px_2()
+            .py_1()
+            .bg(theme.warning)
+            .text_color(theme.warning_foreground)
+            .child(text)
+            .into_any_element(),
+    )
+}
+
 fn yes_no(b: bool) -> &'static str {
     if b { "yes" } else { "no" }
+}
+
+/// The "Details" cell of a constraint, foreign key or index (P4-A details): kind and columns,
+/// referenced table and columns, uniqueness, method and predicate. Names are shown with
+/// [`display_name`].
+#[must_use]
+pub fn detail_text(details: &ObjectDetails) -> String {
+    let list = |cols: &[String]| {
+        format!(
+            "({})",
+            cols.iter()
+                .map(|c| display_name(c))
+                .collect::<Vec<_>>()
+                .join(", ")
+        )
+    };
+    match details {
+        ObjectDetails::Constraint(c) => {
+            let kind = match c.kind {
+                ConstraintKind::PrimaryKey => "primary key",
+                ConstraintKind::Unique => "unique",
+                ConstraintKind::Check => "check",
+                ConstraintKind::Exclusion => "exclusion",
+                _ => "constraint",
+            };
+            let mut out = kind.to_owned();
+            if !c.columns.is_empty() {
+                out.push(' ');
+                out.push_str(&list(&c.columns));
+            }
+            if c.kind == ConstraintKind::Check
+                && let Some(d) = &c.definition
+            {
+                out.push_str(": ");
+                out.push_str(&display_name(d));
+            }
+            out
+        }
+        ObjectDetails::ForeignKey(fk) => {
+            let mut out = format!(
+                "{} → {}",
+                list(&fk.columns),
+                display_path(&fk.referenced_table)
+            );
+            if !fk.referenced_columns.is_empty() {
+                out.push(' ');
+                out.push_str(&list(&fk.referenced_columns));
+            }
+            out
+        }
+        ObjectDetails::Index(ix) => {
+            let mut parts = Vec::new();
+            if ix.primary {
+                parts.push("primary".to_owned());
+            } else if ix.unique {
+                parts.push("unique".to_owned());
+            }
+            parts.push(list(&ix.columns));
+            if let Some(m) = &ix.method {
+                parts.push(display_name(m));
+            }
+            if let Some(p) = &ix.predicate {
+                parts.push(format!("WHERE {}", display_name(p)));
+            }
+            parts.join(" · ")
+        }
+        _ => String::new(),
+    }
 }
 
 fn columns_header(kind: ObjectKind, muted: Hsla) -> AnyElement {
@@ -721,7 +839,7 @@ fn columns_header(kind: ObjectKind, muted: Hsla) -> AnyElement {
             ("Comment", 220.),
         ]
     } else {
-        &[("Name", 260.), ("Comment", 360.)]
+        &[("Name", 220.), ("Details", 380.), ("Comment", 220.)]
     };
     h_flex()
         .px_3()
@@ -765,8 +883,9 @@ fn list_row(kind: ObjectKind, ix: usize, item: &ObjectInfo, muted: Hsla) -> AnyE
             .child(cell(220., comment).text_color(muted))
             .into_any_element()
     } else {
-        row.child(cell(260., display_name(item.name())))
-            .child(cell(360., comment).text_color(muted))
+        row.child(cell(220., display_name(item.name())))
+            .child(cell(380., detail_text(&item.details)))
+            .child(cell(220., comment).text_color(muted))
             .into_any_element()
     }
 }
@@ -795,9 +914,10 @@ impl Render for ObjectEditor {
                 }
             }));
         let kind = self.path.kind();
+        let read_only = self.read_only(cx);
         let templates: Vec<Template> = Template::ALL
             .into_iter()
-            .filter(|t| kind.is_some_and(|k| t.applies_to(k)))
+            .filter(|t| kind.is_some_and(|k| t.offered(k, read_only)))
             .collect();
         let toolbar = h_flex()
             .px_3()
@@ -859,5 +979,54 @@ impl Render for ObjectEditor {
             .child(toolbar)
             .child(bar)
             .child(div().flex_1().min_h_0().child(body))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{ddl_bidi_text, detail_text};
+    use ninesql_core::driver_api::ObjectKind;
+    use ninesql_core::driver_api::metadata::{
+        ConstraintInfo, ConstraintKind, ForeignKeyInfo, IndexInfo, ObjectDetails, ObjectPath,
+    };
+
+    #[test]
+    fn details_show_keys_references_and_indexes() {
+        let mut pk = ConstraintInfo::new(ConstraintKind::PrimaryKey);
+        pk.columns = vec!["tenant_id".into(), "id".into()];
+        assert_eq!(
+            detail_text(&ObjectDetails::Constraint(pk)),
+            "primary key (tenant_id, id)"
+        );
+        let target = ObjectPath::root()
+            .child(ObjectKind::Schema, "public")
+            .child(ObjectKind::Table, "customers");
+        let mut fk = ForeignKeyInfo::new(target);
+        fk.columns = vec!["customer_id".into()];
+        fk.referenced_columns = vec!["id\u{202e}".into()];
+        assert_eq!(
+            detail_text(&ObjectDetails::ForeignKey(fk)),
+            "(customer_id) → public.customers (id\u{FFFD})"
+        );
+        let mut ix = IndexInfo::default();
+        ix.columns = vec!["lower(email)".into()];
+        ix.unique = true;
+        ix.method = Some("btree".into());
+        assert_eq!(
+            detail_text(&ObjectDetails::Index(ix)),
+            "unique · (lower(email)) · btree"
+        );
+    }
+
+    #[test]
+    fn ddl_with_bidi_controls_is_flagged() {
+        let controls =
+            ninesql_editor::hygiene::find_bidi_controls("CREATE TABLE \"a\u{202e}b\" ()");
+        let text = ddl_bidi_text(&controls).unwrap_or_default();
+        assert!(
+            text.starts_with("1 bidirectional control character(s) in this DDL"),
+            "{text}"
+        );
+        assert!(ddl_bidi_text(&[]).is_none());
     }
 }

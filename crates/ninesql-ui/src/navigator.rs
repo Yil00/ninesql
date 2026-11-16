@@ -453,7 +453,11 @@ impl Navigator {
         self.loads.remove(&(connection, key.clone()));
         match result {
             Ok(children) => self.tree.loaded(connection, &key, children),
-            Err(e) => self.tree.failed(connection, &key, &e.to_string()),
+            Err(e) => self.tree.failed(
+                connection,
+                &key,
+                &crate::browse::display_message(&e.to_string()),
+            ),
         }
         self.rebuild(cx);
         self.advance_reveal(cx);
@@ -757,7 +761,11 @@ impl Navigator {
             RowKind::Folder { name, expanded, .. } => h_flex()
                 .gap_1()
                 .child(chevron(*expanded, true))
-                .child(div().text_color(muted).child(name.clone()))
+                .child(
+                    div()
+                        .text_color(muted)
+                        .child(crate::browse::display_name(name)),
+                )
                 .into_any_element(),
             RowKind::Connection { id, expanded } => h_flex()
                 .gap_1()
@@ -893,6 +901,12 @@ impl Navigator {
             let mut menu = menu.action_context(focus.clone());
             if let Some((connection, path)) = &object {
                 let kind = path.kind();
+                let read_only = connection.is_some_and(|c| {
+                    hub.read(cx)
+                        .sessions(c)
+                        .first()
+                        .is_some_and(|s| s.info().read_only)
+                });
                 if kind.is_some_and(is_table_like) {
                     menu = menu.menu("Open object editor", Box::new(OpenObjectEditor));
                     menu = menu.separator();
@@ -905,7 +919,7 @@ impl Navigator {
                         (Template::Update, Box::new(GenerateUpdateSql)),
                         (Template::Delete, Box::new(GenerateDeleteSql)),
                     ] {
-                        if kind.is_some_and(|k| t.applies_to(k)) {
+                        if kind.is_some_and(|k| t.offered(k, read_only)) {
                             menu = menu.menu(format!("Generate SQL: {}", t.label()), action);
                         }
                     }
@@ -945,7 +959,7 @@ impl Navigator {
         h_flex()
             .gap_2()
             .child(div().w(px(4.)).h(px(16.)).rounded_sm().bg(b.color))
-            .child(c.name.clone())
+            .child(crate::browse::display_name(&c.name))
             .when(open, |el| {
                 el.child(
                     div()
