@@ -785,3 +785,120 @@ proptest! {
         assert_lazy_equals_full(&MyDialect::mysql(), &s);
     }
 }
+
+/// Security review H1 (P4-C): no dialect variant of the family (MySQL, MariaDB, TiDB, every
+/// `sql_mode` the lexer follows) panics on arbitrary Unicode, multibyte characters right after
+/// comment markers included (`SELECT 1 -- é` used to panic in the TiDB dialect).
+mod never_panics {
+    use ninesql_driver_api::{Dialect, ScriptState, StatementClass, TextPosition, position_at};
+    use ninesql_driver_mysqlwire::MyDialect;
+    use proptest::prelude::*;
+
+    fn variants() -> Vec<MyDialect> {
+        let mut out = Vec::new();
+        for mode in [
+            "",
+            "ANSI_QUOTES",
+            "NO_BACKSLASH_ESCAPES",
+            "ANSI_QUOTES,NO_BACKSLASH_ESCAPES",
+        ] {
+            for d in [MyDialect::mysql(), MyDialect::mariadb(), MyDialect::tidb()] {
+                out.push(d.with_sql_mode(mode));
+            }
+        }
+        out
+    }
+
+    const PIECES: &[&str] = &[
+        "/*",
+        "*/",
+        "/*T!",
+        "/*t!",
+        "/*!",
+        "/*M!",
+        "--",
+        "-- ",
+        "#",
+        " ",
+        "\n",
+        "é",
+        "€",
+        "日本",
+        "😀",
+        "'",
+        "\"",
+        "`",
+        "\\",
+        ";",
+        "(",
+        ")",
+        "DELIMITER $$\n",
+        "$$",
+        "SELECT",
+        "BEGIN",
+        "END",
+        "GET_LOCK",
+        "NEXT VALUE FOR",
+        "@x",
+        "X'",
+    ];
+
+    fn exercise(d: &dyn Dialect, text: &str) {
+        let _ = d.classify(text);
+        let _ = d.split_statements(text);
+        let items = d.split_script(text);
+        for state in [
+            ScriptState::default(),
+            ScriptState::with_delimiter(Some("$$".into())),
+        ] {
+            let _ = d.split_script_ahead(text, TextPosition::START, &state);
+            for item in &items {
+                let _ = d.split_script_ahead(text, item.end, &state);
+                let _ = d.classify(item.text(text));
+            }
+            for (offset, _) in text.char_indices().step_by(7) {
+                let _ = d.split_script_ahead(text, position_at(text, offset), &state);
+            }
+        }
+    }
+
+    #[test]
+    fn reported_cases() {
+        for text in [
+            "SELECT 1 -- é",
+            "/*€",
+            "*/€",
+            "SELECT 1 /*é",
+            "/*T",
+            "/*T!€ */",
+            "-- 😀",
+        ] {
+            for d in variants() {
+                exercise(&d, text);
+            }
+        }
+        assert_eq!(
+            MyDialect::tidb().classify("SELECT 1 -- é"),
+            StatementClass::Read
+        );
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(256))]
+
+        #[test]
+        fn arbitrary_unicode(text in "\\PC*") {
+            for d in variants() {
+                exercise(&d, &text);
+            }
+        }
+
+        #[test]
+        fn markers_and_multibyte(parts in proptest::collection::vec(proptest::sample::select(PIECES), 0..40)) {
+            let text = parts.concat();
+            for d in variants() {
+                exercise(&d, &text);
+            }
+        }
+    }
+}
