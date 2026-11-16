@@ -22,6 +22,9 @@ pub mod registry;
 pub mod runtime;
 pub mod services;
 pub mod session;
+pub mod snippets;
+pub mod sql_format;
+pub mod transfer;
 pub mod workspace;
 
 pub use connect::{FlaggedInitStatement, SecretPrompt};
@@ -34,8 +37,9 @@ pub use connection_type::{Color, ConnectionType, ConnectionTypeId, ConnectionTyp
 pub use dbeaver_roots::{DbeaverRoots, FileCheck};
 pub use error::{ConnectionError, CoreError, WorkspaceError};
 pub use execution::{
-    ErrorPosition, ExecutionService, FetchMode, MAX_PAUSED_RESULT_IDLE, MIN_PAUSED_RESULT_IDLE,
-    Run, RunControl, RunEnd, RunEvent, RunKind, RunRequest, RunSummary, TimeoutChoice,
+    ErrorPosition, ExecutionService, FetchMode, FirstError, MAX_PAUSED_RESULT_IDLE,
+    MAX_STATEMENT_OUTCOMES, MIN_PAUSED_RESULT_IDLE, Run, RunControl, RunEnd, RunEvent, RunKind,
+    RunRequest, RunSummary, StatementOutcome, StatementStatus, TimeoutChoice,
     paused_result_idle_limit,
 };
 pub use history::{History, HistoryError, Recorded, StatementRecord};
@@ -69,6 +73,13 @@ pub use session::{
     Reply, SecretsLockReason, SessionHandle, SessionId, SessionInfo, SessionManager,
     SessionWarning, TransactionEnd, TransactionState,
 };
+pub use snippets::{Expansion, Placeholder, Snippet, SnippetError, SnippetStore, expand};
+pub use sql_format::{FormatOptions, KeywordCase, format_sql};
+pub use transfer::{
+    CsvPreviewRequest, ExportEvent, ExportJob, ExportRequest, ExportSource, ExportSummary,
+    ExportWarning, ImportConfirmation, ImportEnd, ImportEvent, ImportJob, ImportRequest,
+    ImportSummary, ImportToken, ImportTransaction, Job, TransferJobError, TransferService,
+};
 pub use workspace::{
     ConnectionTypesFile, Connections, ConnectionsFile, LoadIssue, LoadedConnections, MarkerClear,
     ProjectFile, ProjectId, Workspace,
@@ -80,4 +91,3 @@ pub use ninesql_driver_api as driver_api;
 pub use ninesql_secrets as secrets;
 pub use ninesql_ssh as ssh;
 pub use ninesql_storage as storage;
-pub use ninesql_transfer as transfer;

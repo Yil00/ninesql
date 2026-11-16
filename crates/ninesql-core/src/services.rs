@@ -65,6 +65,7 @@ use crate::registry::DriverRegistry;
 use crate::session::{
     CoreEvent, CoreEvents, EventSink, ManagerConfig, Reply, SecretsLockReason, SessionManager,
 };
+use crate::transfer::TransferService;
 use crate::workspace::Workspace;
 
 /// Default idle time after which the vault locks itself.
@@ -193,6 +194,7 @@ struct Inner {
     timer: Mutex<Option<JoinHandle<()>>>,
     execution: ExecutionService,
     metadata: MetadataService,
+    transfer: TransferService,
     navigator_issues: Vec<String>,
     history_error: Option<String>,
     preference_issues: Vec<PreferenceIssue>,
@@ -432,6 +434,9 @@ impl CoreServices {
             }
         };
 
+        // 9. Transfer service (P5-C).
+        let transfer = TransferService::new(manager.clone(), &paths);
+
         Ok(Self {
             inner: Arc::new(Inner {
                 workspace,
@@ -448,6 +453,7 @@ impl CoreServices {
                 timer: Mutex::new(Some(timer)),
                 execution,
                 metadata,
+                transfer,
                 navigator_issues,
                 history_error,
                 preference_issues,
@@ -607,6 +613,12 @@ impl CoreServices {
     #[must_use]
     pub fn execution(&self) -> &ExecutionService {
         &self.inner.execution
+    }
+
+    /// The transfer service: export rows to files, preview and import CSV files (P5-C).
+    #[must_use]
+    pub fn transfer(&self) -> &TransferService {
+        &self.inner.transfer
     }
 
     /// The metadata service (P4-B): navigator nodes, DDL, filters, search and completion

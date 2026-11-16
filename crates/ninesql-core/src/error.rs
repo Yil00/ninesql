@@ -159,6 +159,9 @@ pub enum CoreError {
     /// The session is closed or its task ended.
     #[error("the session is closed")]
     SessionClosed,
+    /// A transfer (CSV import) holds the session: other statements wait until it ends.
+    #[error("an import is using this session; wait for it to end or cancel it")]
+    SessionLeased,
     /// The request would end an open transaction implicitly (switching auto-commit on): commit
     /// or roll back first.
     #[error("a transaction is open: commit or roll back first")]
@@ -198,6 +201,7 @@ impl CoreError {
             Self::StillCancelling => "still-cancelling",
             Self::InvalidConfirmation => "invalid-confirmation",
             Self::SessionClosed => "session-closed",
+            Self::SessionLeased => "session-leased",
             Self::PendingTransaction => "pending-transaction",
             Self::InvalidRequest(_) => "invalid-request",
             Self::Runtime(_) => "runtime",

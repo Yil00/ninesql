@@ -2484,3 +2484,50 @@ fn a_refusal_after_a_directive_only_window_is_reported() {
     });
     manager.shutdown(Duration::from_secs(5));
 }
+
+#[test]
+fn run_summary_lists_each_statement_and_the_first_error() {
+    use ninesql_core::StatementStatus::{Failed, Succeeded};
+    let tmp = tempfile::tempdir().unwrap();
+    let (manager, _) = manager(Arc::new(mock_driver()), tmp.path());
+    let types = ConnectionTypes::default();
+    let exec = service(&manager, None);
+    ui(async {
+        let h = open_ok(&manager, mock_connection(ConnectionTypeId::dev()), &types).await;
+        let script =
+            "SELECT * FROM numbers(3);\nSELECT error();\nINSERT INTO t VALUES (1);\nSELECT error()";
+        let (_, s) = collect_run(exec.run(
+            &h,
+            RunRequest::script(script).with_on_error(OnError::Continue),
+        ))
+        .await;
+        assert_eq!(s.end, RunEnd::Completed);
+        let outcomes: Vec<_> = s
+            .outcomes
+            .iter()
+            .map(|o| (o.index, o.status, o.rows, o.update_count))
+            .collect();
+        assert_eq!(
+            outcomes,
+            vec![
+                (0, Succeeded, 3, None),
+                (1, Failed, 0, None),
+                (2, Succeeded, 0, Some(1)),
+                (3, Failed, 0, None),
+            ]
+        );
+        assert_eq!(s.outcomes_dropped, 0);
+        let span = s.outcomes[1].span.clone().unwrap();
+        assert_eq!(&script[span], "SELECT error()");
+        let first = s.first_error.clone().unwrap();
+        assert_eq!(first.index, 1);
+        assert!(!first.message.is_empty() && !first.kind.is_empty());
+        // Stop on error: the summary ends at the failed statement.
+        let (_, s) =
+            collect_run(exec.run(&h, RunRequest::script(script).with_on_error(OnError::Stop)))
+                .await;
+        assert_eq!(s.end, RunEnd::Failed { index: 1 });
+        assert_eq!(s.outcomes.len(), 2);
+        assert_eq!(s.first_error.map(|e| e.index), Some(1));
+    });
+}

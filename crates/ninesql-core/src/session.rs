@@ -1680,6 +1680,8 @@ async fn open_session(
             metadata: session.metadata(),
             // One slot more than configured: the terminal event's reserved slot.
             result_queue: shared.config.result_queue.max(1) + 1,
+            leased: Mutex::new(false),
+            pending: std::sync::atomic::AtomicUsize::new(0),
         }),
     };
     lock(&shared.sessions).insert(id, handle.clone());
@@ -2037,6 +2039,42 @@ struct HandleInner {
     /// [`crate::metadata::MetadataService`], which wraps every call in its timeout.
     metadata: Arc<dyn ninesql_driver_api::Metadata>,
     result_queue: usize,
+    /// Held by a [`SessionLease`] (a CSV import): statements and transaction commands from
+    /// anyone else are refused with [`CoreError::SessionLeased`] meanwhile.
+    leased: Mutex<bool>,
+    /// Commands sent and not yet fully handled by the session task (queued or running): raised
+    /// before each send, lowered by the task once the command is done. A lease is granted only
+    /// at zero, so a command the task already took but has not finished is never missed.
+    pending: std::sync::atomic::AtomicUsize,
+}
+
+/// Exclusive use of a session by one transfer ([`SessionHandle::lease`]); released on drop.
+pub(crate) struct SessionLease {
+    handle: SessionHandle,
+}
+
+impl SessionLease {
+    pub(crate) fn execute(&self, request: ExecuteRequest) -> Execution {
+        self.handle.send_execute(request)
+    }
+
+    pub(crate) fn begin(&self) -> Reply<Result<TransactionState, CoreError>> {
+        self.handle.send_transaction(TxOp::Begin)
+    }
+
+    pub(crate) fn commit(&self) -> Reply<Result<TransactionState, CoreError>> {
+        self.handle.send_transaction(TxOp::Commit)
+    }
+
+    pub(crate) fn rollback(&self) -> Reply<Result<TransactionState, CoreError>> {
+        self.handle.send_transaction(TxOp::Rollback)
+    }
+}
+
+impl Drop for SessionLease {
+    fn drop(&mut self) {
+        *lock(&self.handle.inner.leased) = false;
+    }
 }
 
 /// A handle to an open session. Cheap to clone; every method returns at once.
@@ -2077,7 +2115,17 @@ impl SessionHandle {
     /// session queues a few. Never blocks: a full queue or a closed session yields an execution
     /// that fails at once.
     #[must_use]
+    ///
+    /// Fails with [`CoreError::SessionLeased`] while a transfer holds the session.
     pub fn execute(&self, request: ExecuteRequest) -> Execution {
+        let leased = lock(&self.inner.leased);
+        if *leased {
+            return Execution::failed(CoreError::SessionLeased);
+        }
+        self.send_execute(request)
+    }
+
+    fn send_execute(&self, request: ExecuteRequest) -> Execution {
         let (events_tx, events) = mpsc::channel(self.inner.result_queue);
         let cancel = CancelToken::new();
         let command = Command::Execute {
@@ -2085,7 +2133,12 @@ impl SessionHandle {
             events: events_tx,
             cancel: cancel.clone(),
         };
-        match self.inner.commands.try_send(command) {
+        self.inner.pending.fetch_add(1, Ordering::SeqCst);
+        let sent = self.inner.commands.try_send(command);
+        if sent.is_err() {
+            self.inner.pending.fetch_sub(1, Ordering::SeqCst);
+        }
+        match sent {
             Ok(()) => Execution { events, cancel },
             Err(mpsc::error::TrySendError::Full(_)) => {
                 Execution::failed(CoreError::Driver(DriverError::Busy))
@@ -2104,12 +2157,48 @@ impl SessionHandle {
     }
 
     fn transaction(&self, op: TxOp) -> Reply<Result<TransactionState, CoreError>> {
+        let leased = lock(&self.inner.leased);
+        if *leased && !matches!(op, TxOp::Ping) {
+            return Reply::ready(Err(CoreError::SessionLeased));
+        }
+        self.send_transaction(op)
+    }
+
+    /// Takes the session for one transfer: `None` when it is already leased or not idle (a
+    /// statement running or queued). Until the lease is dropped, every other statement and
+    /// transaction command on the session fails with [`CoreError::SessionLeased`] (the
+    /// keep-alive ping and `close` still work).
+    pub(crate) fn lease(&self) -> Option<SessionLease> {
+        let mut leased = lock(&self.inner.leased);
+        // Sends happen under the `leased` lock (or by the lease holder), so no command can be
+        // raised between this check and the lease being set.
+        let idle = self.inner.pending.load(Ordering::SeqCst) == 0;
+        if *leased || !idle || self.is_closed() {
+            return None;
+        }
+        *leased = true;
+        Some(SessionLease {
+            handle: self.clone(),
+        })
+    }
+
+    /// `true` while a transfer holds the session ([`CoreError::SessionLeased`]).
+    #[must_use]
+    pub fn is_leased(&self) -> bool {
+        *lock(&self.inner.leased)
+    }
+
+    fn send_transaction(&self, op: TxOp) -> Reply<Result<TransactionState, CoreError>> {
         let (tx, reply) = Reply::channel();
-        match self
+        self.inner.pending.fetch_add(1, Ordering::SeqCst);
+        let sent = self
             .inner
             .commands
-            .try_send(Command::Transaction { op, reply: tx })
-        {
+            .try_send(Command::Transaction { op, reply: tx });
+        if sent.is_err() {
+            self.inner.pending.fetch_sub(1, Ordering::SeqCst);
+        }
+        match sent {
             Ok(()) => reply,
             Err(mpsc::error::TrySendError::Full(_)) => {
                 Reply::ready(Err(CoreError::Driver(DriverError::Busy)))
@@ -2369,6 +2458,7 @@ impl SessionTask {
                     };
                     let flow = self.handle_command(command).await;
                     self.update_transaction_state();
+                    self.handle.inner.pending.fetch_sub(1, Ordering::SeqCst);
                     last_activity = tokio::time::Instant::now();
                     match flow {
                         Flow::Continue => {}
@@ -2392,6 +2482,7 @@ impl SessionTask {
         // Pending commands fail with `SessionClosed` once the receiver is dropped.
         commands.close();
         while let Ok(command) = commands.try_recv() {
+            self.handle.inner.pending.fetch_sub(1, Ordering::SeqCst);
             match command {
                 Command::Execute { events, .. } => {
                     let _ = events.try_send(ExecEvent::Failed(CoreError::SessionClosed));
@@ -2474,41 +2565,47 @@ impl SessionTask {
                 drop(out);
                 flow
             }
-            Command::Transaction { op, reply } => {
-                let Some(session) = self.session.as_mut() else {
-                    let _ = reply.send(Err(CoreError::SessionClosed));
-                    return Flow::Continue;
-                };
-                if matches!(op, TxOp::SetAutoCommit(true))
-                    && !session.auto_commit()
-                    && session.in_transaction()
-                {
-                    // Switching auto-commit on would end the open transaction one way or the
-                    // other, depending on the engine: the user commits or rolls back first.
-                    let _ = reply.send(Err(CoreError::PendingTransaction));
-                    return Flow::Continue;
-                }
-                let result = match op {
-                    TxOp::Begin => session.begin().await,
-                    TxOp::Commit => session.commit().await,
-                    TxOp::Rollback => session.rollback().await,
-                    TxOp::SetAutoCommit(on) => session.set_auto_commit(on).await,
-                    TxOp::Ping => session.ping().await,
-                };
-                let flow = match &result {
-                    Err(e) if e.is_fatal() => Flow::Lost(e.clone()),
-                    _ => Flow::Continue,
-                };
-                let state = TransactionState {
-                    auto_commit: session.auto_commit(),
-                    in_transaction: session.in_transaction(),
-                };
-                // Recorded before the answer, so `transaction_state()` agrees with it.
-                self.update_transaction_state();
-                let _ = reply.send(result.map(|()| state).map_err(CoreError::from));
-                flow
-            }
+            Command::Transaction { op, reply } => self.transaction_command(op, reply).await,
         }
+    }
+
+    async fn transaction_command(
+        &mut self,
+        op: TxOp,
+        reply: oneshot::Sender<Result<TransactionState, CoreError>>,
+    ) -> Flow {
+        let Some(session) = self.session.as_mut() else {
+            let _ = reply.send(Err(CoreError::SessionClosed));
+            return Flow::Continue;
+        };
+        if matches!(op, TxOp::SetAutoCommit(true))
+            && !session.auto_commit()
+            && session.in_transaction()
+        {
+            // Switching auto-commit on would end the open transaction one way or the
+            // other, depending on the engine: the user commits or rolls back first.
+            let _ = reply.send(Err(CoreError::PendingTransaction));
+            return Flow::Continue;
+        }
+        let result = match op {
+            TxOp::Begin => session.begin().await,
+            TxOp::Commit => session.commit().await,
+            TxOp::Rollback => session.rollback().await,
+            TxOp::SetAutoCommit(on) => session.set_auto_commit(on).await,
+            TxOp::Ping => session.ping().await,
+        };
+        let flow = match &result {
+            Err(e) if e.is_fatal() => Flow::Lost(e.clone()),
+            _ => Flow::Continue,
+        };
+        let state = TransactionState {
+            auto_commit: session.auto_commit(),
+            in_transaction: session.in_transaction(),
+        };
+        // Recorded before the answer, so `transaction_state()` agrees with it.
+        self.update_transaction_state();
+        let _ = reply.send(result.map(|()| state).map_err(CoreError::from));
+        flow
     }
 
     async fn execute(

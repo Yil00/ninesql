@@ -4765,6 +4765,15 @@ dependencies = [
 [[package]]
 name = "ninesql-transfer"
 version = "0.0.0"
+dependencies = [
+ "libc",
+ "ninesql-driver-api",
+ "proptest",
+ "rustix",
+ "tempfile",
+ "thiserror 2.0.21",
+ "tracing",
+]
 
 [[package]]
 name = "ninesql-ui"
