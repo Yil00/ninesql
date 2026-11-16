@@ -15,6 +15,7 @@ use ninesql_core::{FilterHistoryEntry, SaveConfirmation, SavePlan};
 
 use super::{ConfirmationGuard, SqlEditorTab};
 use crate::connections::visuals::{ConnectionBadges, hsla};
+use crate::script_view::{ScriptRows, script_view};
 
 impl SqlEditorTab {
     /// The color of the save confirmation (the session's type, production's when the core says
@@ -40,28 +41,20 @@ impl SqlEditorTab {
     }
 }
 
-/// Height of the script boxes.
-const SCRIPT_BOX_MAX_HEIGHT: f32 = 320.;
 /// Generation the save confirmation's guard reports (never a run's).
 pub(super) const SAVE_CONFIRMATION_GENERATION: u64 = u64::MAX;
 
-fn script_box(id: &'static str, script: &str, cx: &App) -> Stateful<Div> {
-    let mono = cx.theme().mono_font_family.clone();
-    let muted = cx.theme().muted_foreground;
-    v_flex()
-        .id(id)
-        .max_h(px(SCRIPT_BOX_MAX_HEIGHT))
-        .overflow_y_scroll()
-        .border_1()
-        .border_color(muted)
-        .p_1()
-        .font_family(mono)
-        .text_xs()
-        .children(
-            script
-                .lines()
-                .map(|l| div().child(crate::browse::display_message(l))),
-        )
+/// The unchecked columns as shown: each name through [`crate::browse::display_name`].
+#[must_use]
+pub fn unchecked_columns_text(columns: &[String]) -> String {
+    format!(
+        "Concurrent changes to these columns are not detected: {}",
+        columns
+            .iter()
+            .map(|c| crate::browse::display_name(c))
+            .collect::<Vec<_>>()
+            .join(", ")
+    )
 }
 
 fn counts_text(deletes: usize, updates: usize, inserts: usize) -> String {
@@ -81,6 +74,7 @@ pub fn open_save_confirmation(
     cx: &mut App,
 ) {
     let decided = Rc::new(std::cell::Cell::new(false));
+    let script = Rc::new(ScriptRows::new(&confirmation.script));
     let c = Rc::new(confirmation);
     window.open_dialog(cx, move |dialog, _window, cx| {
         let _guard = &guard;
@@ -125,7 +119,7 @@ pub fn open_save_confirmation(
                     .px_1()
                     .bg(color)
                     .text_color(crate::connections::visuals::text_on(color))
-                    .child(c.connection_name.clone()),
+                    .child(crate::browse::display_name(&c.connection_name)),
             )
             .child(div().child(format!(
                 "Save {} changes to {}{}? They run in one transaction.",
@@ -144,12 +138,13 @@ pub fn open_save_confirmation(
                     .child(counts_text(c.deletes, c.updates, c.inserts)),
             )
             .when(!c.unchecked_columns.is_empty(), |d| {
-                d.child(div().text_color(warn).child(format!(
-                    "Concurrent changes to these columns are not detected: {}",
-                    c.unchecked_columns.join(", ")
-                )))
+                d.child(
+                    div()
+                        .text_color(warn)
+                        .child(unchecked_columns_text(&c.unchecked_columns)),
+                )
             })
-            .child(script_box("save-script", &c.script, cx));
+            .child(script_view("save-script", script.clone(), cx));
         dialog
             .title("Confirm save")
             .w(px(720.))
@@ -161,6 +156,7 @@ pub fn open_save_confirmation(
 /// The DML preview ("Preview changes"): the statements the save would run, with "Save
 /// changes" (which still asks on a production connection) and "Close".
 pub fn open_preview(tab: Entity<SqlEditorTab>, plan: SavePlan, window: &mut Window, cx: &mut App) {
+    let script = Rc::new(ScriptRows::new(&plan.script));
     let plan = Rc::new(plan);
     window.open_dialog(cx, move |dialog, _window, cx| {
         let warn = cx.theme().warning;
@@ -189,12 +185,13 @@ pub fn open_preview(tab: Entity<SqlEditorTab>, plan: SavePlan, window: &mut Wind
                     .text_sm()
                     .child(counts_text(plan.deletes, plan.updates, plan.inserts))
                     .when(!plan.unchecked_columns.is_empty(), |d| {
-                        d.child(div().text_color(warn).child(format!(
-                            "Concurrent changes to these columns are not detected: {}",
-                            plan.unchecked_columns.join(", ")
-                        )))
+                        d.child(
+                            div()
+                                .text_color(warn)
+                                .child(unchecked_columns_text(&plan.unchecked_columns)),
+                        )
                     })
-                    .child(script_box("preview-script", &plan.script, cx)),
+                    .child(script_view("preview-script", script.clone(), cx)),
             )
             .footer(h_flex().gap_2().justify_end().child(close).child(save))
     });
@@ -463,24 +460,41 @@ pub fn open_filter_dialog(
 /// shown only as "value").
 #[must_use]
 pub fn history_label(e: &FilterHistoryEntry) -> String {
-    let mut parts: Vec<String> = e
-        .filters
+    filter_label(&e.filters, e.raw_where.as_deref(), &e.order_by)
+}
+
+/// [`history_label`] from its parts: column names through [`crate::browse::display_name`].
+#[must_use]
+pub fn filter_label(
+    filters: &[ninesql_core::ColumnFilter],
+    raw_where: Option<&str>,
+    order_by: &[ninesql_core::SortKey],
+) -> String {
+    let mut parts: Vec<String> = filters
         .iter()
         .map(|f| {
             if f.op.takes_value() {
-                format!("{} {} …", f.column, f.op.as_str())
+                format!(
+                    "{} {} …",
+                    crate::browse::display_name(&f.column),
+                    f.op.as_str()
+                )
             } else {
-                format!("{} {}", f.column, f.op.as_str())
+                format!(
+                    "{} {}",
+                    crate::browse::display_name(&f.column),
+                    f.op.as_str()
+                )
             }
         })
         .collect();
-    if let Some(raw) = &e.raw_where {
+    if let Some(raw) = raw_where {
         parts.push(crate::browse::display_message(raw));
     }
-    for k in &e.order_by {
+    for k in order_by {
         parts.push(format!(
             "order by {} {}",
-            k.column,
+            crate::browse::display_name(&k.column),
             match k.direction {
                 ninesql_core::SortDirection::Ascending => "asc",
                 ninesql_core::SortDirection::Descending => "desc",

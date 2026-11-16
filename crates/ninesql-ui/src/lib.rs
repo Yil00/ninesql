@@ -29,6 +29,7 @@ pub mod layout;
 pub mod navigator;
 pub mod palette;
 pub mod persist;
+pub mod script_view;
 pub mod services;
 pub mod settings;
 pub mod snippets;

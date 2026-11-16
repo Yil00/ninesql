@@ -78,11 +78,34 @@ impl TableSource {
         }
     }
 
-    /// The table's display name (`schema.table`).
+    /// The table's display name (`schema.table`), each part through
+    /// [`crate::browse::display_name`] (tab title and toolbar).
     #[must_use]
     pub fn label(&self) -> String {
-        table_parts(&self.path).join(".")
+        display_parts(&table_parts(&self.path))
     }
+}
+
+/// Names joined with `sep` for a label, each through [`crate::browse::display_name`] (invisible
+/// characters marked, length capped).
+fn display_joined(names: &[String], sep: &str) -> String {
+    names
+        .iter()
+        .map(|n| crate::browse::display_name(n))
+        .collect::<Vec<_>>()
+        .join(sep)
+}
+
+/// Table parts as a label (`schema.table`).
+#[must_use]
+pub fn display_parts(parts: &[String]) -> String {
+    display_joined(parts, ".")
+}
+
+/// Column names as a label (`a, b`).
+#[must_use]
+pub fn display_columns(columns: &[String]) -> String {
+    display_joined(columns, ", ")
 }
 
 /// The pending changes of the tab's editable result.
@@ -667,6 +690,11 @@ impl SqlEditorTab {
 
     /// "Revert row changes": the selected rows' edits and deletions are dropped.
     pub fn revert_selected_rows(&mut self, cx: &mut Context<Self>) {
+        // Not while a save, its confirmation, a run or a lease holds the pending changes: the
+        // confirmed script must stay the one shown.
+        if let Some(why) = self.table_action_problem() {
+            return self.say(why, true, cx);
+        }
         let Some(ix) = self.editing().map(|e| e.tab) else {
             return self.say(
                 "Nothing to revert: the result is not being edited.",
@@ -1248,8 +1276,8 @@ impl SqlEditorTab {
                         Ok(query) => out.push(FkTarget {
                             label: format!(
                                 "{} ({})",
-                                table_parts(table).join("."),
-                                fk.columns.join(", ")
+                                display_parts(&table_parts(table)),
+                                display_columns(&fk.columns)
                             ),
                             path: table.clone(),
                             query,
@@ -1313,9 +1341,9 @@ impl SqlEditorTab {
                     Ok(query) => out.push(FkTarget {
                         label: format!(
                             "{} → {} ({})",
-                            crate::browse::display_message(name),
-                            table_parts(&fk.referenced_table).join("."),
-                            fk.columns.join(", ")
+                            crate::browse::display_name(name),
+                            display_parts(&table_parts(&fk.referenced_table)),
+                            display_columns(&fk.columns)
                         ),
                         path: fk.referenced_table.clone(),
                         query,

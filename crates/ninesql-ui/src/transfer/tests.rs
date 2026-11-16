@@ -217,9 +217,16 @@ fn import_previews_maps_and_confirms_on_production(cx: &mut TestAppContext) {
     });
     assert_eq!(lines[0], ("Connection".into(), "Live (production)".into()));
     assert_eq!(lines[2], ("Columns".into(), "id, label".into()));
+    assert_eq!(lines.len(), 4, "{lines:?}");
+    assert_eq!(lines[3].0, "File");
+    // The statement is shown whole in the script view, never cut.
+    let script = dialog
+        .read_with(&l.vcx, |d, _| d.confirmation_script())
+        .expect("statement shown");
     assert!(
-        lines[3].1.starts_with("INSERT INTO \"people\""),
-        "{lines:?}"
+        script.shown_text().starts_with("INSERT INTO \"people\""),
+        "{}",
+        script.shown_text()
     );
     // Cancel goes back to the preview; nothing ran.
     dialog.update(&mut l.vcx, |d, cx| d.decline(cx));
