@@ -33,8 +33,8 @@ pub use connection_type::{Color, ConnectionType, ConnectionTypeId, ConnectionTyp
 pub use dbeaver_roots::{DbeaverRoots, FileCheck};
 pub use error::{ConnectionError, CoreError, WorkspaceError};
 pub use execution::{
-    ErrorPosition, ExecutionService, FetchMode, Run, RunControl, RunEnd, RunEvent, RunKind,
-    RunRequest, RunSummary, TimeoutChoice,
+    ErrorPosition, ExecutionService, FetchMode, MAX_PAUSED_RESULT_IDLE, Run, RunControl, RunEnd,
+    RunEvent, RunKind, RunRequest, RunSummary, TimeoutChoice, paused_result_idle_limit,
 };
 pub use history::{History, HistoryError, Recorded, StatementRecord};
 pub use import::{

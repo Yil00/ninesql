@@ -570,6 +570,12 @@ impl Session for FlakySession {
             // Two pages of rows, then an engine error (not a cancel).
             return Ok(ResultStream::from_items(broken_stream_items(), &o));
         }
+        if s.text.starts_with("INSERT INTO slow_write") {
+            // A write that streams rows slowly (an `INSERT … RETURNING`): 6 batches, 150 ms
+            // apart, for a statement the dialect classifies as a write.
+            let rows = Statement::new("SELECT * FROM slow_numbers(60, 150)", s.language);
+            return self.inner.execute(rows, o).await;
+        }
         self.inner.execute(s, o).await
     }
     fn cancel_handle(&self) -> Arc<dyn CancelHandle> {
@@ -1385,6 +1391,260 @@ fn coalesced_fetches_and_close_with_commit_behind_a_paused_result() {
         assert!(!h.transaction_state().in_transaction);
     });
     manager.shutdown(Duration::from_secs(5));
+}
+
+// ---------------------------------------------------------------------------------------------
+// Idle paused results (phase 3 review M1)
+
+/// A service whose paused results are closed after `idle` with no fetch. Set in memory: the
+/// saved preference cannot go below 30 s.
+fn service_with_idle(manager: &SessionManager, idle: Duration) -> ExecutionService {
+    let mut prefs = Preferences::default();
+    prefs.execution.paused_result_idle = idle;
+    ExecutionService::new(manager.clone(), None, prefs)
+}
+
+/// Review M1: a read paused with no fetch past the idle limit is released by its run
+/// (`ResultClosedIdle`, then `StatementClosed`), the session is free for the next statement and
+/// the open transaction is still open (never rolled back by the core).
+#[test]
+fn an_idle_paused_read_is_closed_and_the_session_stays_usable() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mock = mock_driver();
+    let stats = mock.stats();
+    let (manager, _) = manager(Arc::new(mock), tmp.path());
+    let types = ConnectionTypes::default();
+    let idle = Duration::from_millis(300);
+    let exec = service_with_idle(&manager, idle);
+    let budget = FetchBudget::default().with_batch_rows(50);
+    ui(async {
+        let mut dev = mock_connection(ConnectionTypeId::dev());
+        dev.auto_commit = Some(false);
+        let h = open_ok(&manager, dev, &types).await;
+        // An open transaction (a confirmed write waiting for commit).
+        let (_, s) =
+            collect_run(exec.run(&h, RunRequest::statement("INSERT INTO t VALUES (1)"))).await;
+        assert!(s.transaction.in_transaction);
+
+        let mut run = exec.run(
+            &h,
+            RunRequest::statement("SELECT * FROM numbers(100000)")
+                .with_budget(budget)
+                .with_paging(100),
+        );
+        let mut n = 0;
+        until(&mut run, &mut n, |e| matches!(e, RunEvent::PageEnd { .. })).await;
+        let paused_at = std::time::Instant::now();
+        // While it waits, the session is busy.
+        let busy =
+            tokio::time::timeout(Duration::from_secs(2), h.close_with(TransactionEnd::Commit))
+                .await
+                .expect("close_with hung");
+        assert!(matches!(busy, Err(CoreError::Driver(DriverError::Busy))));
+        // No fetch: the run closes it after the idle limit, the event first.
+        let e = until(&mut run, &mut n, |e| {
+            matches!(
+                e,
+                RunEvent::ResultClosedIdle { .. } | RunEvent::StatementClosed { .. }
+            )
+        })
+        .await;
+        let RunEvent::ResultClosedIdle { index, rows, after } = e else {
+            panic!("StatementClosed came before ResultClosedIdle: {e:?}");
+        };
+        assert_eq!((index, rows), (0, 100));
+        assert!(after >= idle, "{after:?}");
+        assert!(paused_at.elapsed() >= idle);
+        let e = run.next().await.unwrap();
+        assert!(
+            matches!(
+                e,
+                RunEvent::StatementClosed {
+                    index: 0,
+                    rows: 100
+                }
+            ),
+            "{e:?}"
+        );
+        let Some(RunEvent::Done(summary)) = run.next().await else {
+            panic!("no Done");
+        };
+        assert_eq!(summary.end, RunEnd::Completed);
+        assert_eq!(summary.succeeded, 1);
+        assert_eq!(n, 100, "rows already delivered are kept, nothing more");
+        assert!(stats.rows_generated() < 100_000, "closed, not drained");
+        assert!(
+            summary.transaction.in_transaction,
+            "the open transaction is not rolled back"
+        );
+
+        // The session is alive and free: the next statement runs, the transaction is intact.
+        assert!(!h.is_closed());
+        assert!(h.transaction_state().in_transaction);
+        let (_, s) =
+            collect_run(exec.run(&h, RunRequest::statement("SELECT * FROM numbers(3)"))).await;
+        assert_eq!(s.end, RunEnd::Completed);
+        assert!(s.transaction.in_transaction);
+        h.close_with(TransactionEnd::Rollback).await.unwrap();
+    });
+    manager.shutdown(Duration::from_secs(5));
+}
+
+/// Review M1: every fetch restarts the idle clock; only a result left paused past the limit is
+/// closed.
+#[test]
+fn fetches_restart_the_idle_clock() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (manager, _) = manager(Arc::new(mock_driver()), tmp.path());
+    let types = ConnectionTypes::default();
+    let idle = Duration::from_millis(600);
+    let exec = service_with_idle(&manager, idle);
+    ui(async {
+        let h = open_ok(&manager, mock_connection(ConnectionTypeId::dev()), &types).await;
+        let mut run = exec.run(
+            &h,
+            RunRequest::statement("SELECT * FROM numbers(100000)")
+                .with_budget(FetchBudget::default().with_batch_rows(10))
+                .with_paging(10),
+        );
+        let mut n = 0;
+        until(&mut run, &mut n, |e| matches!(e, RunEvent::PageEnd { .. })).await;
+        let started = std::time::Instant::now();
+        // Paused in total much longer than the limit, but never that long in one go.
+        for _ in 0..6 {
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            run.fetch(0, FetchMode::Page(10));
+            let e = until(&mut run, &mut n, |e| {
+                matches!(
+                    e,
+                    RunEvent::PageEnd { .. }
+                        | RunEvent::ResultClosedIdle { .. }
+                        | RunEvent::StatementClosed { .. }
+                )
+            })
+            .await;
+            assert!(matches!(e, RunEvent::PageEnd { index: 0, .. }), "{e:?}");
+        }
+        assert!(started.elapsed() > idle);
+        assert_eq!(n, 70);
+        // Left alone now: closed.
+        let e = until(&mut run, &mut n, |e| {
+            matches!(e, RunEvent::ResultClosedIdle { .. })
+        })
+        .await;
+        assert!(matches!(e, RunEvent::ResultClosedIdle { rows: 70, .. }));
+        let e = until(&mut run, &mut n, |e| matches!(e, RunEvent::Done(_))).await;
+        assert!(matches!(
+            e,
+            RunEvent::Done(RunSummary {
+                end: RunEnd::Completed,
+                ..
+            })
+        ));
+        // A release by the grid is not reported as idle.
+        let mut run = exec.run(
+            &h,
+            RunRequest::statement("SELECT * FROM numbers(100000)")
+                .with_budget(FetchBudget::default().with_batch_rows(10))
+                .with_paging(10),
+        );
+        until(&mut run, &mut n, |e| matches!(e, RunEvent::PageEnd { .. })).await;
+        run.release(0);
+        let (events, summary) = collect_run(run).await;
+        assert_eq!(summary.end, RunEnd::Completed);
+        assert!(
+            !events
+                .iter()
+                .any(|e| matches!(e, RunEvent::ResultClosedIdle { .. })),
+            "{events:?}"
+        );
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, RunEvent::StatementClosed { index: 0, .. }))
+        );
+    });
+    manager.shutdown(Duration::from_secs(5));
+}
+
+/// Review M1: a non-read is never paused, so never closed after idle, even when it streams for
+/// longer than the limit and the UI reads its events slowly.
+#[test]
+fn a_non_read_is_never_closed_after_idle() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (manager, _) = manager(Arc::new(Flaky::new(mock_driver())), tmp.path());
+    let types = ConnectionTypes::default();
+    let exec = service_with_idle(&manager, Duration::from_millis(100));
+    ui(async {
+        let h = open_ok(&manager, mock_connection(ConnectionTypeId::dev()), &types).await;
+        let run = exec.run(
+            &h,
+            RunRequest::statement("INSERT INTO slow_write VALUES (1)")
+                .with_budget(FetchBudget::default().with_batch_rows(10))
+                .with_paging(10),
+        );
+        // The UI does not read for a while: back-pressure, not a pause.
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        let (events, summary) = collect_run(run).await;
+        assert_eq!(summary.end, RunEnd::Completed, "{events:?}");
+        assert!(
+            !events.iter().any(|e| matches!(
+                e,
+                RunEvent::ResultClosedIdle { .. }
+                    | RunEvent::StatementClosed { .. }
+                    | RunEvent::PageEnd { .. }
+            )),
+            "{events:?}"
+        );
+        assert!(events.iter().any(|e| matches!(
+            e,
+            RunEvent::StatementFinished {
+                index: 0,
+                rows: 60,
+                ..
+            }
+        )));
+        assert_eq!(rows(&events, 0), 60);
+    });
+    manager.shutdown(Duration::from_secs(5));
+}
+
+#[test]
+fn the_idle_limit_stays_below_the_drivers_limits() {
+    use ninesql_core::{MAX_PAUSED_RESULT_IDLE, paused_result_idle_limit};
+    let d = Duration::from_secs;
+    assert_eq!(MAX_PAUSED_RESULT_IDLE, d(280));
+    // Below the shipped drivers' own limits, with a margin for the release to reach the server.
+    for driver_limit in [
+        ninesql_driver_pgwire::IDLE_CURSOR_TIMEOUT,
+        ninesql_driver_mysqlwire::PAUSED_RESULT_TIMEOUT,
+    ] {
+        assert!(MAX_PAUSED_RESULT_IDLE + d(20) <= driver_limit);
+    }
+    assert_eq!(
+        Preferences::default().execution.paused_result_idle,
+        d(240),
+        "default"
+    );
+    assert_eq!(paused_result_idle_limit(d(240), None), d(240));
+    assert_eq!(paused_result_idle_limit(d(10_000), None), d(280), "capped");
+    assert_eq!(
+        paused_result_idle_limit(d(240), Some(d(60))),
+        d(60),
+        "lower driver limit"
+    );
+    assert_eq!(paused_result_idle_limit(d(100), Some(d(600))), d(100));
+    // The saved preference cannot reach the drivers' 300 s.
+    let mut p = Preferences::default();
+    assert!(
+        PreferenceChange::PausedResultIdle(d(300))
+            .apply(&mut p)
+            .is_err()
+    );
+    PreferenceChange::PausedResultIdle(d(30))
+        .apply(&mut p)
+        .unwrap();
+    assert_eq!(p.execution.paused_result_idle, d(30));
 }
 
 // ---------------------------------------------------------------------------------------------
