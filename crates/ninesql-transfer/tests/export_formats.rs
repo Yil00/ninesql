@@ -1,6 +1,6 @@
 //! Export formats: escaping per format (no injection into the output), options, and a one-million
 //! row export through the export file in bounded memory (ROADMAP phase 5 exit criterion).
-#![allow(clippy::unwrap_used, clippy::expect_used)] // Tests may panic (AGENTS.md).
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::print_stderr)] // Tests may panic (AGENTS.md).
 
 use std::sync::Arc;
 
@@ -66,7 +66,10 @@ fn csv_quotes_guards_formulas_and_keeps_null_distinct() {
         vec![Some(1), None, Some(3), Some(4)],
         vec![Some(NASTY), Some(""), None, Some("a,b\nc")],
     );
-    let out = export(ExportOptions::new(ExportFormat::Csv), &[b.clone()]);
+    let out = export(
+        ExportOptions::new(ExportFormat::Csv),
+        std::slice::from_ref(&b),
+    );
     assert_eq!(
         out,
         "id,name,ok,price\n\
@@ -121,7 +124,10 @@ fn json_array_and_lines_escape() {
         vec![Some(1), None],
         vec![Some("q\"\\\n\u{1}\u{2028}</script>"), None],
     );
-    let out = export(ExportOptions::new(ExportFormat::JsonArray), &[b.clone()]);
+    let out = export(
+        ExportOptions::new(ExportFormat::JsonArray),
+        std::slice::from_ref(&b),
+    );
     assert_eq!(
         out,
         "[\n  {\"id\": 1, \"name\": \"q\\\"\\\\\\n\\u0001\\u2028</script>\", \"ok\": true, \"price\": -1.5},\n  {\"id\": null, \"name\": null, \"ok\": true, \"price\": -1.5}\n]\n"
@@ -175,7 +181,7 @@ fn sql_insert_statements() {
         vec![Some(1), None],
         vec![Some("it's'); DROP TABLE t; --"), None],
     );
-    let out = export(o.clone(), &[b.clone()]);
+    let out = export(o.clone(), std::slice::from_ref(&b));
     assert_eq!(
         out,
         "INSERT INTO \"s\".\"t\" (\"id\", \"name\", \"ok\", \"price\") VALUES (1, 'it''s''); DROP TABLE t; --', TRUE, -1.5);\n\

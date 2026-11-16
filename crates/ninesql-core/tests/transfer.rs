@@ -2,7 +2,7 @@
 //! read-only exports only, file safety (existing file, symbolic link, DBeaver workspace,
 //! NineSQL storage), cancel cleanup, and the CSV import (batches, transactions, invalid rows,
 //! read-only refusal, production confirmation).
-#![allow(clippy::unwrap_used, clippy::expect_used)] // Tests may panic (AGENTS.md).
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::print_stderr)] // Tests may panic (AGENTS.md).
 
 mod support;
 

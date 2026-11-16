@@ -380,6 +380,7 @@ pub fn expand(snippet: &Snippet, values: &HashMap<String, String>) -> Expansion 
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)] // Tests may panic (AGENTS.md).
 mod tests {
     use super::*;
 

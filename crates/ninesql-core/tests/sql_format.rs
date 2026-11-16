@@ -30,9 +30,12 @@ fn dialects() -> Vec<(String, Arc<dyn Dialect>)> {
     out
 }
 
+/// Tokens and comments of one script item.
+type Signature = (Vec<(CodeTokenKind, String)>, Vec<String>);
+
 /// Per item of the dialect's script split (what the driver runs): the statement tokens and
 /// comments, or the text of a directive; then the text between items.
-fn signature(d: &dyn Dialect, text: &str) -> Vec<(Vec<(CodeTokenKind, String)>, Vec<String>)> {
+fn signature(d: &dyn Dialect, text: &str) -> Vec<Signature> {
     let mut out = Vec::new();
     let mut at = 0;
     for item in d.split_script(text) {
@@ -55,7 +58,7 @@ fn signature(d: &dyn Dialect, text: &str) -> Vec<(Vec<(CodeTokenKind, String)>, 
 }
 
 /// Tokens (words upper-cased) and the non-blank text between them (comments), in order.
-fn statement_signature(d: &dyn Dialect, text: &str) -> (Vec<(CodeTokenKind, String)>, Vec<String>) {
+fn statement_signature(d: &dyn Dialect, text: &str) -> Signature {
     let tokens = code_tokens(text, d.lexical_rules());
     let mut toks = Vec::new();
     let mut gaps = Vec::new();

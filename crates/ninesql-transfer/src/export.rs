@@ -471,7 +471,7 @@ impl<W: Write> Exporter<W> {
             },
             ResultItem::Rows(batch) if self.state == State::Writing => self.write_batch(batch),
             ResultItem::Truncated(t) => {
-                self.incomplete = Some(t.clone());
+                self.incomplete = Some(*t);
                 Ok(())
             }
             _ => Ok(()),

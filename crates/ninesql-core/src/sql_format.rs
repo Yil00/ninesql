@@ -271,10 +271,10 @@ fn format_statement(text: &str, rules: LexicalRules, options: &FormatOptions) ->
                     if let Some(s) = in_select.last_mut() {
                         *s = true;
                     }
-                } else if CLAUSES.contains(&w.as_str()) {
-                    if let Some(s) = in_select.last_mut() {
-                        *s = false;
-                    }
+                } else if CLAUSES.contains(&w.as_str())
+                    && let Some(s) = in_select.last_mut()
+                {
+                    *s = false;
                 }
                 let after_dot = i > 0 && tokens[i - 1].text(text) == ".";
                 if !after_dot && is_cased_keyword(word) {

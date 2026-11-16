@@ -370,7 +370,7 @@ pub struct ExportSummary {
 #[derive(Debug)]
 #[non_exhaustive]
 pub enum ExportEvent {
-    /// The statement was sent and the file created.
+    /// The statement was sent (the file is being created next to the target).
     Started,
     /// Progress (dropped when the UI reads slowly).
     Progress {
