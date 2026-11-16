@@ -23,6 +23,10 @@
 //!   after `Truncated`); [`ExecutionEvent::StatementClosed`] when the service dropped the stream
 //!   before its end (the next statement of a script needed the session, the tab was closed…):
 //!   rows not fetched by then are not reachable without running the statement again.
+//! - **Idle close**: [`ExecutionEvent::ResultClosedIdle`] when the service closed a paused
+//!   result itself after it waited too long with no fetch (ADR-0024 §5); the
+//!   `StatementClosed` of that statement follows. The rows loaded are kept; the grid offers no
+//!   more fetches for that result (I8).
 //! - [`ResultSource::release`] tells the service the grid will take no more rows of that
 //!   statement (the grid's memory budget is reached): it drops the stream, which releases the
 //!   server cursor, and answers with `StatementClosed`.
@@ -30,6 +34,7 @@
 //!   value. Notice messages are display-only: the grid never logs them.
 
 use std::fmt;
+use std::time::Duration;
 
 use ninesql_core::driver_api::ResultItem;
 
@@ -95,6 +100,17 @@ pub enum ExecutionEvent {
         /// Statement number.
         statement: u32,
     },
+    /// The service closed the statement's paused result because it waited longer than the idle
+    /// limit with no fetch; [`ExecutionEvent::StatementClosed`] follows. The rows loaded are
+    /// kept.
+    ResultClosedIdle {
+        /// Statement number.
+        statement: u32,
+        /// Rows the service had delivered.
+        rows: u64,
+        /// How long the result had been paused.
+        after: Duration,
+    },
     /// The statement failed. The message is user-presentable and carries no secret or value.
     StatementFailed {
         /// Statement number.
@@ -117,6 +133,11 @@ impl fmt::Debug for ExecutionEvent {
             Self::Item { statement, item } => write!(f, "Item({statement}, {item:?})"),
             Self::StatementFinished { statement } => write!(f, "StatementFinished({statement})"),
             Self::StatementClosed { statement } => write!(f, "StatementClosed({statement})"),
+            Self::ResultClosedIdle {
+                statement,
+                rows,
+                after,
+            } => write!(f, "ResultClosedIdle({statement}, {rows}, {after:?})"),
             Self::StatementFailed { statement, .. } => write!(f, "StatementFailed({statement})"),
             Self::Cancelled => f.write_str("Cancelled"),
             Self::Finished => f.write_str("Finished"),

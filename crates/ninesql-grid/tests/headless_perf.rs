@@ -8,7 +8,8 @@ use std::time::{Duration, Instant};
 
 use ninesql_core::driver_api::arrow_array::{Int64Array, RecordBatch, StringArray};
 use ninesql_core::driver_api::arrow_schema::{DataType, Field, Schema, SchemaRef};
-use ninesql_core::driver_api::{ResultItem, ResultSetHeader};
+use ninesql_core::driver_api::{ResultItem, ResultSetHeader, ResultSetKind};
+use ninesql_grid::execution::header_bytes;
 use ninesql_grid::model::batch_bytes;
 use ninesql_grid::{
     ColumnOrder, CopyFormat, CopyOptions, DisplayOptions, ExecutionEvent, ExecutionResults,
@@ -70,7 +71,11 @@ fn a_million_rows_window_copy_and_memory() {
     let (results, release) = ingest(unbounded, &batches);
     let ingest_time = t.elapsed();
     assert_eq!(release, None);
-    assert_eq!(results.bytes(), total);
+    // Plus the result set's header (its fixed overhead and schema).
+    assert_eq!(
+        results.bytes(),
+        total + header_bytes(&ResultSetKind::Tabular(schema()))
+    );
     assert!(
         ingest_time < Duration::from_secs(10),
         "ingest {ingest_time:?}"

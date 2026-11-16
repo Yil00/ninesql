@@ -14,6 +14,7 @@
 //! keep_alive_secs = 0             # 0 = off, else 10..=86400
 //! auto_reconnect = true           # the UI offers / starts a reconnect when a session is lost
 //! reconnect_attempts = 3          # 1..=20
+//! paused_result_idle_secs = 240   # 30..=280: a paused result is closed after this long idle
 //!
 //! [execution.connection_timeouts] # per-connection default timeout, by connection id
 //! "6f1c…" = 30
@@ -43,6 +44,14 @@
 //! - **One writer at a time in the process.** [`save_changes`] holds a process-wide lock; the UI
 //!   writer of `settings.toml` (appearance, key bindings) should take
 //!   [`settings_write_lock`] too, so the two never interleave a read-modify-write.
+//! - **A paused result is closed before the drivers give up on it.** `paused_result_idle_secs`
+//!   stays below 300 s, the time after which pgwire (`IDLE_CURSOR_TIMEOUT`, enforced by the
+//!   server's `idle_in_transaction_session_timeout`) and mysqlwire (the server's
+//!   `net_write_timeout`) end a session whose result is left waiting, which on mysqlwire in
+//!   manual commit also rolls back the user's open transaction (phase 3 review M1). The 20 s
+//!   margin covers the release reaching the server. A value set directly in memory is still
+//!   capped at [`PAUSED_RESULT_IDLE_SECS_RANGE`]'s maximum when a run uses it
+//!   ([`crate::paused_result_idle_limit`]).
 //! - No secret is ever stored here (I1); connection ids are not secrets.
 
 use std::collections::BTreeMap;
@@ -80,6 +89,11 @@ pub const QUERY_TIMEOUT_SECS_RANGE: (u64, u64) = (1, 7 * 24 * 60 * 60);
 pub const KEEP_ALIVE_SECS_RANGE: (u64, u64) = (10, 24 * 60 * 60);
 /// Valid range of `reconnect_attempts`.
 pub const RECONNECT_ATTEMPTS_RANGE: (u32, u32) = (1, 20);
+/// Valid range of `paused_result_idle_secs`: the upper bound stays below the 300 s after which
+/// the drivers end a session whose paused result is left waiting (see the module's rules).
+pub const PAUSED_RESULT_IDLE_SECS_RANGE: (u64, u64) = (30, 280);
+/// Default of `paused_result_idle_secs`.
+pub const DEFAULT_PAUSED_RESULT_IDLE_SECS: u64 = 240;
 /// Valid range of `max_entries_per_connection`.
 pub const HISTORY_ENTRIES_RANGE: (u32, u32) = (0, 1_000_000);
 /// Valid range of a non-zero `max_age_days`.
@@ -129,6 +143,10 @@ pub struct ExecutionPreferences {
     pub reconnect_attempts: u32,
     /// Per-connection default timeouts, overriding [`Self::default_timeout`].
     pub connection_timeouts: BTreeMap<ConnectionId, Duration>,
+    /// A paused paged result ([`crate::RunRequest::with_paging`]) with no fetch for longer
+    /// than this is closed by its run ([`crate::RunEvent::ResultClosedIdle`]). Saved and
+    /// loaded within [`PAUSED_RESULT_IDLE_SECS_RANGE`]; capped at its maximum when used.
+    pub paused_result_idle: Duration,
 }
 
 impl Default for ExecutionPreferences {
@@ -143,6 +161,7 @@ impl Default for ExecutionPreferences {
             auto_reconnect: true,
             reconnect_attempts: 3,
             connection_timeouts: BTreeMap::new(),
+            paused_result_idle: Duration::from_secs(DEFAULT_PAUSED_RESULT_IDLE_SECS),
         }
     }
 }
@@ -314,6 +333,9 @@ pub enum PreferenceChange {
     ReconnectAttempts(u32),
     /// `execution.connection_timeouts."<id>"`; `None` removes the override.
     ConnectionTimeout(ConnectionId, Option<Duration>),
+    /// `execution.paused_result_idle_secs` (whole seconds, within
+    /// [`PAUSED_RESULT_IDLE_SECS_RANGE`]).
+    PausedResultIdle(Duration),
     /// `history.enabled`.
     HistoryEnabled(bool),
     /// `history.max_entries_per_connection`.
@@ -367,6 +389,7 @@ impl PreferenceChange {
             Self::AutoReconnect(_) => "execution.auto_reconnect",
             Self::ReconnectAttempts(_) => "execution.reconnect_attempts",
             Self::ConnectionTimeout(..) => "execution.connection_timeouts",
+            Self::PausedResultIdle(_) => "execution.paused_result_idle_secs",
             Self::HistoryEnabled(_) => "history.enabled",
             Self::HistoryMaxEntries(_) => "history.max_entries_per_connection",
             Self::HistoryMaxAgeDays(_) => "history.max_age_days",
@@ -429,6 +452,10 @@ impl PreferenceChange {
                     e.connection_timeouts.remove(&id);
                 }
             },
+            Self::PausedResultIdle(d) => {
+                check_range(key, whole_seconds(key, d)?, PAUSED_RESULT_IDLE_SECS_RANGE)?;
+                e.paused_result_idle = d;
+            }
             Self::HistoryEnabled(on) => prefs.history.enabled = on,
             Self::HistoryMaxEntries(n) => {
                 prefs.history.max_entries_per_connection =
@@ -463,6 +490,7 @@ impl PreferenceChange {
             Self::MaxValueBytes(b) => (section, key.into(), int(b / KIB)),
             Self::OnError(o) => (section, key.into(), Some(Value::from(o.as_str()))),
             Self::KeepAlive(k) => (section, key.into(), int(k.map_or(0, |d| d.as_secs()))),
+            Self::PausedResultIdle(d) => (section, key.into(), int(d.as_secs())),
             Self::AutoReconnect(b)
             | Self::HistoryEnabled(b)
             | Self::CloseWithOpenTransaction(b) => (section, key.into(), Some(Value::from(*b))),
@@ -596,6 +624,13 @@ impl Preferences {
             }
             if let Some(n) = r.int("reconnect_attempts", RECONNECT_ATTEMPTS_RANGE, false) {
                 e.reconnect_attempts = n;
+            }
+            if let Some(s) = r.int(
+                "paused_result_idle_secs",
+                PAUSED_RESULT_IDLE_SECS_RANGE,
+                false,
+            ) {
+                e.paused_result_idle = Duration::from_secs(s);
             }
             match table.get("connection_timeouts") {
                 None => {}
@@ -796,6 +831,7 @@ mod tests {
         assert_eq!(p.execution.default_timeout, None, "ADR-0004: no timeout");
         assert_eq!(p.execution.fetch_size, 200);
         assert_eq!(p.execution.budget(), FetchBudget::default());
+        assert_eq!(p.execution.paused_result_idle, Duration::from_secs(240));
         assert_eq!(p.history.retention(), Retention::default(), "ADR-0008 §6");
         assert!(p.confirmations.asks_on_close(false));
         let (parsed, issues) = Preferences::parse("");
@@ -820,6 +856,7 @@ on_error = "continue"
 keep_alive_secs = 120
 auto_reconnect = false
 reconnect_attempts = 5
+paused_result_idle_secs = 60
 unknown = 1
 [execution.connection_timeouts]
 "{id}" = 5
@@ -843,6 +880,7 @@ close_with_open_transaction = false
         assert_eq!(e.keep_alive, Some(Duration::from_secs(120)));
         assert!(!e.auto_reconnect);
         assert_eq!(e.reconnect_attempts, 5);
+        assert_eq!(e.paused_result_idle, Duration::from_secs(60));
         assert_eq!(e.timeout_for(id), Some(Duration::from_secs(5)));
         assert_eq!(
             e.timeout_for(ConnectionId::new_random()),
@@ -860,10 +898,17 @@ close_with_open_transaction = false
         );
 
         let (p, issues) = Preferences::parse(
-            "[execution]\nfetch_size = 0\nkeep_alive_secs = 3\non_error = 'maybe'\nauto_reconnect = 'yes'\nresult_memory_mib = 'big secret'\n[history]\nmax_age_days = -1",
+            "[execution]\nfetch_size = 0\nkeep_alive_secs = 3\non_error = 'maybe'\nauto_reconnect = 'yes'\nresult_memory_mib = 'big secret'\npaused_result_idle_secs = 300\n[history]\nmax_age_days = -1",
         );
         assert_eq!(p, Preferences::default());
-        assert_eq!(issues.len(), 6, "{issues:?}");
+        assert_eq!(issues.len(), 7, "{issues:?}");
+        // At or above the drivers' 300 s, or 0, is refused: the default stays.
+        for bad in ["0", "29", "281", "300", "-1"] {
+            let (p, issues) =
+                Preferences::parse(&format!("[execution]\npaused_result_idle_secs = {bad}"));
+            assert_eq!(p, Preferences::default(), "{bad}");
+            assert_eq!(issues.len(), 1, "{bad}");
+        }
         assert!(
             issues.iter().all(|i| !i.message().contains("big secret")),
             "string values are never echoed"
@@ -889,6 +934,10 @@ close_with_open_transaction = false
             PreferenceChange::ReconnectAttempts(0),
             PreferenceChange::HistoryMaxAgeDays(Some(0)),
             PreferenceChange::ConnectionTimeout(ConnectionId::new_random(), Some(Duration::ZERO)),
+            PreferenceChange::PausedResultIdle(Duration::from_secs(29)),
+            PreferenceChange::PausedResultIdle(Duration::from_secs(281)),
+            PreferenceChange::PausedResultIdle(Duration::from_secs(300)),
+            PreferenceChange::PausedResultIdle(Duration::from_millis(60_500)),
         ] {
             assert!(
                 matches!(bad.apply(&mut p), Err(PreferencesError::Invalid { .. })),
@@ -910,6 +959,7 @@ close_with_open_transaction = false
                 PreferenceChange::ConnectionTimeout(id, Some(Duration::from_secs(9))),
                 PreferenceChange::HistoryMaxAgeDays(None),
                 PreferenceChange::CloseWithOpenTransaction(false),
+                PreferenceChange::PausedResultIdle(Duration::from_secs(120)),
             ],
         )
         .unwrap();
@@ -923,6 +973,8 @@ close_with_open_transaction = false
         assert_eq!(p.execution.timeout_for(id), Some(Duration::from_secs(9)));
         assert_eq!(p.history.max_age_days, None);
         assert!(!p.confirmations.close_with_open_transaction);
+        assert_eq!(p.execution.paused_result_idle, Duration::from_secs(120));
+        assert!(out.contains("paused_result_idle_secs = 120"));
         let out = apply_changes(&out, &[PreferenceChange::ConnectionTimeout(id, None)]).unwrap();
         assert_eq!(
             Preferences::parse(&out).0.execution.timeout_for(id),

@@ -576,3 +576,113 @@ fn a_confirmation_that_vanishes_ends_the_run(cx: &mut TestAppContext) {
     let editor = tab.read_with(&vcx, |t, _| t.editor().clone());
     assert!(editor.read_with(&vcx, |e, _| e.running().is_none()));
 }
+
+#[test]
+fn the_cancel_label_promises_a_server_cancel_only_when_declared() {
+    use ninesql_core::driver_api::CancelSupport;
+    assert_eq!(
+        super::cancel_label_for(Some(CancelSupport::ServerSide)),
+        "Cancel"
+    );
+    assert_eq!(
+        super::cancel_label_for(Some(CancelSupport::LocalOnly)),
+        "Stop fetching"
+    );
+    assert_eq!(super::cancel_label_for(None), "Cancel");
+}
+
+#[gpui::test]
+fn a_result_closed_after_idle_keeps_its_rows_and_hints_at_the_open_transaction(
+    cx: &mut TestAppContext,
+) {
+    use ninesql_core::RunEvent;
+    use ninesql_grid::FetchState;
+    use std::time::Duration;
+
+    let tmp = tempfile::tempdir().unwrap_or_else(|e| panic!("{e}"));
+    let live = mock_connection("Live", ConnectionTypeId::dev(), Auth::None);
+    let (_ws, _hub, tab, mut vcx) = connected_with(cx, vec![live], tmp.path());
+    run(&tab, "BEGIN", ExecutionKind::Statement, &mut vcx);
+    wait_until(&mut vcx, |vcx| !tab.read_with(vcx, |t, _| t.is_running()));
+    assert!(in_transaction(&tab, &vcx));
+
+    // A paged read pauses after its first page.
+    run(
+        &tab,
+        "SELECT * FROM numbers(1000000)",
+        ExecutionKind::Statement,
+        &mut vcx,
+    );
+    wait_until(&mut vcx, |vcx| {
+        tab.read_with(vcx, |t, cx| {
+            t.results()
+                .read(cx)
+                .results()
+                .tabs()
+                .first()
+                .is_some_and(|r| match r {
+                    ResultTab::Table(m) => m.borrow().state() == FetchState::Idle,
+                    ResultTab::Documents { .. } => false,
+                })
+        })
+    });
+    let loaded = rows(&tab, &vcx)[0];
+    // What the core sends when the paused result waited past the idle limit.
+    tab.update_in(&mut vcx, |t, window, cx| {
+        let generation = t.generation;
+        t.on_run_event(
+            generation,
+            RunEvent::ResultClosedIdle {
+                index: 0,
+                rows: loaded as u64,
+                after: Duration::from_secs(240),
+            },
+            window,
+            cx,
+        );
+        t.on_run_event(
+            generation,
+            RunEvent::StatementClosed {
+                index: 0,
+                rows: loaded as u64,
+            },
+            window,
+            cx,
+        );
+    });
+    vcx.run_until_parked();
+    assert_eq!(
+        message(&tab, &vcx),
+        "Result closed after 4 min idle: the rows already loaded are kept. Run the statement \
+         again to read more. The transaction is still open on this session: commit or roll back \
+         when you are done."
+    );
+    let results = tab.read_with(&vcx, |t, _| t.results().clone());
+    results.read_with(&vcx, |r, _| {
+        let Some(ResultTab::Table(m)) = r.results().tabs().first() else {
+            panic!("a table");
+        };
+        assert_eq!(
+            m.borrow().state(),
+            FetchState::ClosedIdle { after_secs: 240 }
+        );
+        assert_eq!(m.borrow().row_count(), loaded, "rows kept");
+        assert!(
+            r.banner(0)
+                .is_some_and(|b| b.starts_with("Result closed after 4 min idle"))
+        );
+    });
+    // Fetching is off for that result (I8).
+    results.update(&mut vcx, |r, cx| r.fetch(0, true, cx));
+    results.read_with(&vcx, |r, _| {
+        let Some(ResultTab::Table(m)) = r.results().tabs().first() else {
+            panic!("a table");
+        };
+        assert!(!m.borrow().state().is_fetching());
+    });
+    // Without a transaction, no hint.
+    assert!(!super::idle_close_message(Duration::from_secs(240), false).contains("transaction"));
+
+    tab.update_in(&mut vcx, |t, window, cx| t.cancel_run(window, cx));
+    wait_until(&mut vcx, |vcx| !tab.read_with(vcx, |t, _| t.is_running()));
+}

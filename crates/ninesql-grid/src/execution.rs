@@ -15,6 +15,15 @@
 //!   [`FetchState::GridBudgetReached`] (the "Truncated: memory budget reached" banner) and the
 //!   stream is released ([`ResultSource::release`](crate::ResultSource::release)) so the server
 //!   cursor goes away.
+//! - **Everything kept is charged**, not only rows: each result-set header costs
+//!   [`RESULT_SET_OVERHEAD_BYTES`] plus its schema ([`schema_bytes`]), each update count
+//!   `UPDATE_COUNT_BYTES`, each notice its text plus `NOTICE_OVERHEAD_BYTES`. So a run of many
+//!   empty result sets or update counts stays under the same budget as one of many rows.
+//! - **At most [`MAX_RESULT_TABS`] result tabs** per execution. A result set past the cap or
+//!   past the budget is not kept: it is counted, its stream released, and the
+//!   [`ExecutionResults::limit_banner`] says so. An update count past the budget is counted, not
+//!   kept (a write's stream is never released: the core only releases reads).
+//! - The bytes held are a running total ([`ExecutionResults::bytes`]), not a walk over the tabs.
 //! - Nothing else grows with the result: cells are formatted only when drawn or copied (no text
 //!   cache), copy is bounded ([`crate::copy::MAX_COPY_BYTES`]), notices are bounded
 //!   ([`GridBudget::max_notices`]), document result sets are counted, not kept, until the
@@ -24,9 +33,10 @@
 //!   budget.
 
 use std::cell::RefCell;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::rc::Rc;
 
+use ninesql_core::driver_api::arrow_schema::{Field, Schema};
 use ninesql_core::driver_api::result::{NOTICE_OVERHEAD_BYTES, UPDATE_COUNT_BYTES};
 use ninesql_core::driver_api::{
     FetchBudget, NoticeSeverity, ResultItem, ResultSetKind, Truncation, TruncationReason,
@@ -34,6 +44,68 @@ use ninesql_core::driver_api::{
 
 use crate::model::{FetchState, ResultSetModel, batch_bytes};
 use crate::source::{ExecutionEvent, FetchMode, FetchRequest};
+
+/// Most result tabs one execution keeps (I6). Later result sets are counted, not kept, and
+/// their streams released.
+pub const MAX_RESULT_TABS: usize = 1000;
+
+/// Fixed bytes charged per result-set header: the tab, its model, its column list and, once
+/// the tab is shown, its table state. The schema is charged on top ([`schema_bytes`]).
+pub const RESULT_SET_OVERHEAD_BYTES: u64 = 1024;
+
+/// Bytes charged per column besides its name and metadata (the field, its column description,
+/// its type label).
+pub const COLUMN_OVERHEAD_BYTES: u64 = 128;
+
+/// The bytes a result-set schema is charged: per column [`COLUMN_OVERHEAD_BYTES`], its name
+/// twice (the schema and the column description each hold it) and its metadata, plus the
+/// schema's metadata. Nested fields are counted the same way.
+#[must_use]
+pub fn schema_bytes(schema: &Schema) -> u64 {
+    fn field_bytes(field: &Field) -> u64 {
+        use ninesql_core::driver_api::arrow_schema::DataType;
+        let own = COLUMN_OVERHEAD_BYTES
+            + 2 * field.name().len() as u64
+            + field
+                .metadata()
+                .iter()
+                .map(|(k, v)| (k.len() + v.len()) as u64)
+                .sum::<u64>();
+        let children: u64 = match field.data_type() {
+            DataType::Struct(fields) => fields.iter().map(|f| field_bytes(f)).sum(),
+            DataType::List(f)
+            | DataType::LargeList(f)
+            | DataType::FixedSizeList(f, _)
+            | DataType::Map(f, _) => field_bytes(f),
+            _ => 0,
+        };
+        own.saturating_add(children)
+    }
+    schema
+        .fields()
+        .iter()
+        .map(|f| field_bytes(f))
+        .fold(0u64, u64::saturating_add)
+        .saturating_add(
+            schema
+                .metadata()
+                .iter()
+                .map(|(k, v)| (k.len() + v.len()) as u64)
+                .sum::<u64>(),
+        )
+}
+
+/// The bytes a result-set header is charged: [`RESULT_SET_OVERHEAD_BYTES`] plus the schema of
+/// a tabular result.
+#[must_use]
+pub fn header_bytes(kind: &ResultSetKind) -> u64 {
+    match kind {
+        ResultSetKind::Tabular(schema) => {
+            RESULT_SET_OVERHEAD_BYTES.saturating_add(schema_bytes(schema))
+        }
+        _ => RESULT_SET_OVERHEAD_BYTES,
+    }
+}
 
 /// A result set shared between the execution model and the table that draws it.
 pub type SharedResult = Rc<RefCell<ResultSetModel>>;
@@ -222,7 +294,17 @@ pub struct ExecutionResults {
     update_counts: Vec<UpdateCountEntry>,
     notices: Vec<NoticeEntry>,
     notices_dropped: u64,
-    notice_bytes: u64,
+    /// Running total of the bytes held: headers, kept batches, update counts, notices.
+    bytes: u64,
+    /// Result sets not kept because [`MAX_RESULT_TABS`] was reached.
+    result_sets_over_cap: u64,
+    /// Result sets not kept because the byte budget was reached.
+    result_sets_over_budget: u64,
+    /// Update counts not kept because the byte budget was reached.
+    update_counts_dropped: u64,
+    /// Statements whose current result set was not kept (their later items are ignored, their
+    /// stream was asked to be released once).
+    dropped_current: BTreeSet<u32>,
     /// Truncation reported where no tabular result was current (notices, documents).
     other_truncations: Vec<(u32, Truncation)>,
     state: ExecutionState,
@@ -240,7 +322,11 @@ impl ExecutionResults {
             update_counts: Vec::new(),
             notices: Vec::new(),
             notices_dropped: 0,
-            notice_bytes: 0,
+            bytes: 0,
+            result_sets_over_cap: 0,
+            result_sets_over_budget: 0,
+            update_counts_dropped: 0,
+            dropped_current: BTreeSet::new(),
             other_truncations: Vec::new(),
             state: ExecutionState::Idle,
         }
@@ -308,18 +394,57 @@ impl ExecutionResults {
         self.statements.len() > 1
     }
 
-    /// Bytes held: kept batches plus notices.
+    /// Bytes held: result-set headers, kept batches, update counts and notices (a running
+    /// total, O(1)).
     #[must_use]
     pub fn bytes(&self) -> u64 {
-        self.notice_bytes
-            + self
-                .tabs
-                .iter()
-                .map(|t| match t {
-                    ResultTab::Table(m) => m.borrow().bytes(),
-                    ResultTab::Documents { .. } => 0,
-                })
-                .sum::<u64>()
+        self.bytes
+    }
+
+    /// Result sets not kept: past [`MAX_RESULT_TABS`] or past the byte budget.
+    #[must_use]
+    pub fn result_sets_dropped(&self) -> u64 {
+        self.result_sets_over_cap + self.result_sets_over_budget
+    }
+
+    /// Update counts not kept (byte budget reached).
+    #[must_use]
+    pub fn update_counts_dropped(&self) -> u64 {
+        self.update_counts_dropped
+    }
+
+    /// The execution-wide banner when results were not kept (tab cap or budget), else `None`.
+    #[must_use]
+    pub fn limit_banner(&self) -> Option<String> {
+        let mut parts = Vec::new();
+        if self.result_sets_over_cap > 0 {
+            parts.push(format!(
+                "{} more result sets were not kept (a run keeps at most {MAX_RESULT_TABS} result \
+                 tabs)",
+                self.result_sets_over_cap
+            ));
+        }
+        if self.result_sets_over_budget > 0 {
+            parts.push(format!(
+                "{} more result sets were not kept (memory budget reached: {} of {})",
+                self.result_sets_over_budget,
+                format_bytes(self.bytes),
+                format_bytes(self.budget.max_bytes)
+            ));
+        }
+        if self.update_counts_dropped > 0 {
+            parts.push(format!(
+                "{} update counts were not kept (memory budget reached)",
+                self.update_counts_dropped
+            ));
+        }
+        (!parts.is_empty()).then(|| {
+            format!(
+                "Results limit reached: {}. Run fewer statements, or narrow the query, to see the \
+                 rest.",
+                parts.join("; ")
+            )
+        })
     }
 
     /// Applies one event.
@@ -348,6 +473,21 @@ impl ExecutionResults {
             ExecutionEvent::StatementClosed { statement } => {
                 self.end_statement(statement, StatementStatus::Closed, FetchState::Closed);
                 applied.changed_tab = self.current.get(&statement).copied();
+            }
+            ExecutionEvent::ResultClosedIdle {
+                statement, after, ..
+            } => {
+                // The paused result ends here; the `StatementClosed` that follows keeps this
+                // more precise state (a final state is never replaced).
+                if let Some(&ix) = self.current.get(&statement) {
+                    self.finish_tab(
+                        ix,
+                        FetchState::ClosedIdle {
+                            after_secs: after.as_secs(),
+                        },
+                    );
+                    applied.changed_tab = Some(ix);
+                }
             }
             ExecutionEvent::StatementFailed { statement, message } => {
                 self.end_statement(
@@ -388,6 +528,27 @@ impl ExecutionResults {
                 if let Some(&prev) = self.current.get(&statement) {
                     self.finish_tab(prev, FetchState::Complete);
                 }
+                let cost = header_bytes(&header.kind);
+                let refused = if self.tabs.len() >= MAX_RESULT_TABS {
+                    self.result_sets_over_cap += 1;
+                    true
+                } else if self.bytes.saturating_add(cost) > self.budget.max_bytes {
+                    self.result_sets_over_budget += 1;
+                    true
+                } else {
+                    false
+                };
+                if refused {
+                    // Not kept: its rows are ignored and its stream released (once).
+                    self.current.remove(&statement);
+                    if self.dropped_current.insert(statement) {
+                        tracing::debug!(statement, "result set not kept; stream released");
+                        applied.release = Some(statement);
+                    }
+                    return;
+                }
+                self.dropped_current.remove(&statement);
+                self.bytes += cost;
                 let tab = match header.kind {
                     ResultSetKind::Tabular(schema) => ResultTab::Table(Rc::new(RefCell::new(
                         ResultSetModel::new(statement, header.index, schema, self.budget.page_rows),
@@ -417,7 +578,7 @@ impl ExecutionResults {
                 if model.borrow().state().is_final() {
                     return;
                 }
-                if self.bytes().saturating_add(size) > self.budget.max_bytes {
+                if self.bytes.saturating_add(size) > self.budget.max_bytes {
                     model.borrow_mut().finish(FetchState::GridBudgetReached);
                     tracing::debug!(statement, "grid memory budget reached; stream released");
                     applied.release = Some(statement);
@@ -435,9 +596,12 @@ impl ExecutionResults {
                         ),
                     );
                     applied.release = Some(statement);
-                } else if !had_rows && model.borrow().row_count() > 0 {
-                    // Timing mark for the local measurement protocol (no value, no text).
-                    tracing::debug!(statement, "first rows");
+                } else {
+                    self.bytes += size;
+                    if !had_rows && model.borrow().row_count() > 0 {
+                        // Timing mark for the local measurement protocol (no value, no text).
+                        tracing::debug!(statement, "first rows");
+                    }
                 }
             }
             ResultItem::Documents(docs) => {
@@ -449,20 +613,24 @@ impl ExecutionResults {
                 }
             }
             ResultItem::UpdateCount(count) => {
-                self.notice_bytes += UPDATE_COUNT_BYTES;
-                self.update_counts
-                    .push(UpdateCountEntry { statement, count });
+                if self.bytes.saturating_add(UPDATE_COUNT_BYTES) > self.budget.max_bytes {
+                    self.update_counts_dropped += 1;
+                } else {
+                    self.bytes += UPDATE_COUNT_BYTES;
+                    self.update_counts
+                        .push(UpdateCountEntry { statement, count });
+                }
             }
             ResultItem::Notice(n) => {
                 let size = NOTICE_OVERHEAD_BYTES
                     + n.message.len() as u64
                     + n.code.as_ref().map_or(0, |c| c.len() as u64);
                 if self.notices.len() >= self.budget.max_notices
-                    || self.bytes().saturating_add(size) > self.budget.max_bytes
+                    || self.bytes.saturating_add(size) > self.budget.max_bytes
                 {
                     self.notices_dropped += 1;
                 } else {
-                    self.notice_bytes += size;
+                    self.bytes += size;
                     self.notices.push(NoticeEntry {
                         statement,
                         severity: n.severity,
@@ -471,6 +639,8 @@ impl ExecutionResults {
                     });
                 }
             }
+            // The end of a result set that was not kept.
+            ResultItem::Truncated(_) if self.dropped_current.contains(&statement) => {}
             ResultItem::Truncated(t) => match self.current.get(&statement).copied() {
                 Some(ix) => {
                     applied.changed_tab = Some(ix);
@@ -664,8 +834,9 @@ mod tests {
     #[test]
     fn grid_budget_across_statements_releases_the_stream() {
         let one = batch_bytes(&batch(0, 100));
+        let headers = 2 * header_bytes(&ResultSetKind::Tabular(schema()));
         let budget = GridBudget {
-            max_bytes: one * 3 + one / 2,
+            max_bytes: one * 3 + one / 2 + headers,
             page_rows: 100,
             max_notices: 10,
         };
@@ -767,6 +938,162 @@ mod tests {
             ResultItem::Truncated(Truncation::new(TruncationReason::MaxRows, 0, 10)),
         ));
         assert_eq!(r.other_truncations().len(), 1);
+    }
+
+    /// What `bytes()` must equal: a walk over everything kept.
+    fn recount(r: &ExecutionResults) -> u64 {
+        let tabs: u64 = r
+            .tabs()
+            .iter()
+            .map(|t| match t {
+                ResultTab::Table(m) => {
+                    let m = m.borrow();
+                    header_bytes(&ResultSetKind::Tabular(m.schema().clone())) + m.bytes()
+                }
+                ResultTab::Documents { .. } => RESULT_SET_OVERHEAD_BYTES,
+            })
+            .sum();
+        let notices: u64 = r
+            .notices()
+            .iter()
+            .map(|n| {
+                NOTICE_OVERHEAD_BYTES
+                    + n.message.len() as u64
+                    + n.code.as_ref().map_or(0, |c| c.len() as u64)
+            })
+            .sum();
+        tabs + notices + UPDATE_COUNT_BYTES * r.update_counts().len() as u64
+    }
+
+    #[test]
+    fn many_empty_result_sets_stay_bounded_and_show_the_banner() {
+        let mut r = ExecutionResults::new(GridBudget::default());
+        r.apply(ExecutionEvent::Started);
+        r.apply(ExecutionEvent::StatementStarted { statement: 0 });
+        let mut releases = Vec::new();
+        for i in 0..100_000u32 {
+            if let Some(s) = r.apply(item(0, header(i))).release {
+                releases.push(s);
+            }
+            // Rows and the truncation of a result set not kept are ignored.
+            r.apply(item(0, ResultItem::Rows(batch(0, 0))));
+        }
+        r.apply(ExecutionEvent::StatementFinished { statement: 0 });
+        assert_eq!(r.tabs().len(), MAX_RESULT_TABS);
+        assert_eq!(r.result_sets_dropped(), 100_000 - MAX_RESULT_TABS as u64);
+        assert_eq!(releases, vec![0], "the stream is released once");
+        assert!(r.bytes() <= r.budget().max_bytes);
+        assert_eq!(r.bytes(), recount(&r));
+        let banner = r.limit_banner().unwrap();
+        assert!(banner.starts_with("Results limit reached: 99000 more result sets were not kept"));
+        assert!(banner.contains("at most 1000 result tabs"));
+
+        // The same under a small budget: headers alone reach it.
+        let cost = header_bytes(&ResultSetKind::Tabular(schema()));
+        let budget = GridBudget {
+            max_bytes: cost * 10,
+            ..GridBudget::default()
+        };
+        let mut r = ExecutionResults::new(budget);
+        r.apply(ExecutionEvent::Started);
+        let mut releases = 0;
+        for s in 0..100_000u32 {
+            r.apply(ExecutionEvent::StatementStarted { statement: s });
+            if r.apply(item(s, header(0))).release.is_some() {
+                releases += 1;
+            }
+            r.apply(item(
+                s,
+                ResultItem::Truncated(Truncation::new(TruncationReason::MaxRows, 0, 0)),
+            ));
+            r.apply(ExecutionEvent::StatementClosed { statement: s });
+        }
+        assert_eq!(r.tabs().len(), 10);
+        assert_eq!(releases, 100_000 - 10);
+        assert!(r.other_truncations().is_empty());
+        assert!(r.bytes() <= budget.max_bytes);
+        assert!(r.limit_banner().unwrap().contains("memory budget reached"));
+    }
+
+    #[test]
+    fn update_counts_are_charged() {
+        let budget = GridBudget {
+            max_bytes: UPDATE_COUNT_BYTES * 3,
+            ..GridBudget::default()
+        };
+        let mut r = ExecutionResults::new(budget);
+        r.apply(ExecutionEvent::Started);
+        for s in 0..10 {
+            assert_eq!(
+                r.apply(item(s, ResultItem::UpdateCount(Some(1)))).release,
+                None,
+                "a write is never released"
+            );
+        }
+        assert_eq!(r.update_counts().len(), 3);
+        assert_eq!(r.update_counts_dropped(), 7);
+        assert_eq!(r.bytes(), UPDATE_COUNT_BYTES * 3);
+        assert_eq!(
+            r.limit_banner().unwrap(),
+            "Results limit reached: 7 update counts were not kept (memory budget reached). Run \
+             fewer statements, or narrow the query, to see the rest."
+        );
+        r.apply(ExecutionEvent::Started);
+        assert_eq!(r.bytes(), 0);
+        assert!(r.limit_banner().is_none());
+    }
+
+    #[test]
+    fn the_running_total_matches_what_is_kept() {
+        let mut r = ExecutionResults::new(GridBudget::default());
+        r.apply(ExecutionEvent::Started);
+        r.apply(item(0, header(0)));
+        assert_eq!(r.bytes(), header_bytes(&ResultSetKind::Tabular(schema())));
+        r.apply(item(0, ResultItem::Rows(batch(0, 10))));
+        r.apply(item(0, ResultItem::Rows(batch(10, 0))));
+        r.apply(item(0, header(1)));
+        r.apply(item(0, ResultItem::Rows(batch(0, 3))));
+        r.apply(item(1, ResultItem::UpdateCount(None)));
+        r.apply(item(
+            1,
+            ResultItem::Notice(Notice::new(NoticeSeverity::Info, "hello").with_code("00000")),
+        ));
+        r.apply(item(
+            2,
+            ResultItem::ResultSet(ResultSetHeader::documents(0)),
+        ));
+        r.apply(item(2, ResultItem::Documents(vec![Document::new(vec![])])));
+        assert_eq!(r.bytes(), recount(&r));
+        assert!(r.limit_banner().is_none());
+    }
+
+    #[test]
+    fn an_idle_close_keeps_the_rows_and_stops_fetching() {
+        let budget = GridBudget {
+            page_rows: 10,
+            ..GridBudget::default()
+        };
+        let mut r = ExecutionResults::new(budget);
+        r.apply(ExecutionEvent::Started);
+        r.apply(item(0, header(0)));
+        r.apply(item(0, ResultItem::Rows(batch(0, 10))));
+        assert_eq!(table(&r, 0).borrow().state(), FetchState::Idle);
+        let applied = r.apply(ExecutionEvent::ResultClosedIdle {
+            statement: 0,
+            rows: 10,
+            after: std::time::Duration::from_secs(240),
+        });
+        assert_eq!(applied.changed_tab, Some(0));
+        r.apply(ExecutionEvent::StatementClosed { statement: 0 });
+        r.apply(ExecutionEvent::Finished);
+        assert_eq!(
+            table(&r, 0).borrow().state(),
+            FetchState::ClosedIdle { after_secs: 240 }
+        );
+        assert_eq!(table(&r, 0).borrow().row_count(), 10);
+        assert_eq!(r.request_fetch(0, false), None);
+        assert_eq!(r.request_fetch(0, true), None);
+        assert_eq!(r.statements()[&0], StatementStatus::Closed);
     }
 
     #[test]

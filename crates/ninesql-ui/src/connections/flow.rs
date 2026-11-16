@@ -8,11 +8,125 @@
 //! They are plain data built from the core's values, so they are tested without a window, and
 //! they never hold a secret, a parameter value or a result value.
 
+use gpui_kit::SharedString;
 use ninesql_core::driver_api::{
     SecurityWarning as ApiWarning, StatementClass, TlsMode, TunnelInfo,
 };
 use ninesql_core::ssh::{SshSecurityWarning, SshWarningKind, UnknownHostKey};
 use ninesql_core::{ConfirmReason, ConfirmationRequest, SecretPrompt, SessionWarning};
+
+/// Statements up to this size are shown whole in the confirmation; larger ones show their head
+/// and their tail (the UI thread never lays out a multi-megabyte statement).
+pub const STATEMENT_PREVIEW_MAX_BYTES: usize = 64 * 1024;
+/// Bytes of the head, and of the tail, shown of a statement over
+/// [`STATEMENT_PREVIEW_MAX_BYTES`].
+pub const STATEMENT_PREVIEW_PART_BYTES: usize = 24 * 1024;
+/// Characters of the last line shown under the statement box.
+pub const STATEMENT_LAST_LINE_CHARS: usize = 200;
+
+/// A statement as the confirmation shows it (ADR-0007 §3, phase 3 review L1): bounded, and its
+/// end always visible, since a destructive tail can hide after a long harmless head.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StatementPreview {
+    /// The whole statement, or its first [`STATEMENT_PREVIEW_PART_BYTES`].
+    pub head: SharedString,
+    /// Bytes between the head and the tail that are not shown (0: the whole statement is in
+    /// `head`).
+    pub hidden_bytes: usize,
+    /// The last [`STATEMENT_PREVIEW_PART_BYTES`] when bytes are hidden, else empty.
+    pub tail: SharedString,
+    /// Lines of the whole statement.
+    pub lines: usize,
+    /// Bytes of the whole statement.
+    pub bytes: usize,
+    /// End of the last non-blank line (at most [`STATEMENT_LAST_LINE_CHARS`] characters,
+    /// `…` in front when cut), shown under the box whatever its scroll position.
+    pub last_line: SharedString,
+}
+
+fn floor_boundary(s: &str, mut i: usize) -> usize {
+    i = i.min(s.len());
+    while !s.is_char_boundary(i) {
+        i -= 1;
+    }
+    i
+}
+
+fn ceil_boundary(s: &str, mut i: usize) -> usize {
+    i = i.min(s.len());
+    while !s.is_char_boundary(i) {
+        i += 1;
+    }
+    i
+}
+
+impl StatementPreview {
+    /// The preview of `text`.
+    #[must_use]
+    pub fn of(text: &str) -> Self {
+        let bytes = text.len();
+        let lines = text.bytes().filter(|b| *b == b'\n').count() + 1;
+        let (head, hidden_bytes, tail) = if bytes > STATEMENT_PREVIEW_MAX_BYTES {
+            let head_end = floor_boundary(text, STATEMENT_PREVIEW_PART_BYTES);
+            let tail_start = ceil_boundary(text, bytes - STATEMENT_PREVIEW_PART_BYTES);
+            (
+                &text[..head_end],
+                tail_start - head_end,
+                &text[tail_start..],
+            )
+        } else {
+            (text, 0, "")
+        };
+        let last = text
+            .trim_end()
+            .rsplit('\n')
+            .next()
+            .unwrap_or_default()
+            .trim_start();
+        let count = last.chars().count();
+        let last_line = if count > STATEMENT_LAST_LINE_CHARS {
+            let skip = last
+                .char_indices()
+                .nth(count - STATEMENT_LAST_LINE_CHARS)
+                .map_or(0, |(i, _)| i);
+            format!("…{}", &last[skip..])
+        } else {
+            last.to_owned()
+        };
+        Self {
+            head: SharedString::from(head.to_owned()),
+            hidden_bytes,
+            tail: SharedString::from(tail.to_owned()),
+            lines,
+            bytes,
+            last_line: SharedString::from(last_line),
+        }
+    }
+
+    /// `… 1048576 bytes not shown …`, between the head and the tail of a large statement.
+    #[must_use]
+    pub fn hidden_marker(&self) -> Option<String> {
+        (self.hidden_bytes > 0).then(|| format!("… {} bytes not shown …", self.hidden_bytes))
+    }
+
+    /// `12 lines · 340 bytes`.
+    #[must_use]
+    pub fn size_text(&self) -> String {
+        let lines = if self.lines == 1 { "line" } else { "lines" };
+        let bytes = if self.bytes == 1 { "byte" } else { "bytes" };
+        format!("{} {lines} · {} {bytes}", self.lines, self.bytes)
+    }
+
+    /// Whether the end of the statement may be out of sight in the box (long or cut), so the
+    /// last line is repeated under it.
+    #[must_use]
+    pub fn needs_last_line(&self) -> bool {
+        self.hidden_bytes > 0 || self.lines > STATEMENT_BOX_LINES || self.bytes > 2000
+    }
+}
+
+/// Lines the statement box shows before it scrolls (its maximum height).
+pub const STATEMENT_BOX_LINES: usize = 16;
 
 /// What a `NeedsSecrets` prompt shows: one masked field per label.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -188,8 +302,9 @@ pub struct StatementConfirmView {
     pub connection_name: String,
     /// Typed production.
     pub production: bool,
-    /// The statement exactly as it will run.
-    pub statement: String,
+    /// The statement exactly as it will run, bounded for display: the whole text up to
+    /// [`STATEMENT_PREVIEW_MAX_BYTES`], its head and its tail beyond.
+    pub statement: StatementPreview,
     /// `destructive: this connection type confirms…`.
     pub reason: String,
     /// Number of bind parameters.
@@ -206,7 +321,7 @@ impl StatementConfirmView {
         Self {
             connection_name: r.connection_name.clone(),
             production: r.production,
-            statement: r.statement.clone(),
+            statement: StatementPreview::of(&r.statement),
             reason: format!("{}: {}", class_text(r.class), reason_text(r.reason)),
             params: r.params,
             bidi_controls,
@@ -309,6 +424,48 @@ mod tests {
             key_blob: b"blob".to_vec(),
             other_key_types: other,
         }
+    }
+
+    #[test]
+    fn a_short_statement_is_shown_whole() {
+        let p = StatementPreview::of("DELETE FROM t");
+        assert_eq!(p.head.as_ref(), "DELETE FROM t");
+        assert_eq!(p.hidden_marker(), None);
+        assert!(p.tail.is_empty());
+        assert_eq!(p.size_text(), "1 line · 13 bytes");
+        assert!(!p.needs_last_line());
+        let p = StatementPreview::of("SELECT 1\nFROM t\n\n");
+        assert_eq!(p.lines, 4);
+        assert_eq!(p.last_line.as_ref(), "FROM t");
+    }
+
+    #[test]
+    fn a_huge_statement_shows_its_head_its_tail_and_what_is_hidden() {
+        // A long harmless head (with multi-byte characters around the cut points) and a
+        // destructive tail.
+        let mut text = String::from("SELECT 'é");
+        while text.len() < 3 * 1024 * 1024 {
+            text.push_str("ééé harmless text, ");
+        }
+        text.push_str("';\nDELETE FROM accounts");
+        let p = StatementPreview::of(&text);
+        assert!(p.head.len() <= STATEMENT_PREVIEW_PART_BYTES);
+        assert!(p.tail.len() <= STATEMENT_PREVIEW_PART_BYTES + 1);
+        assert!(
+            p.tail.ends_with("DELETE FROM accounts"),
+            "the end is visible"
+        );
+        assert_eq!(p.head.len() + p.hidden_bytes + p.tail.len(), text.len());
+        let marker = p.hidden_marker().unwrap();
+        assert_eq!(marker, format!("… {} bytes not shown …", p.hidden_bytes));
+        assert_eq!(p.size_text(), format!("2 lines · {} bytes", text.len()));
+        assert!(p.needs_last_line());
+        assert_eq!(p.last_line.as_ref(), "DELETE FROM accounts");
+        // One huge line: its end is still repeated under the box.
+        let one = format!("{}DROP TABLE t", "x".repeat(100_000));
+        let p = StatementPreview::of(&one);
+        assert!(p.last_line.starts_with('…') && p.last_line.ends_with("DROP TABLE t"));
+        assert_eq!(p.last_line.chars().count(), STATEMENT_LAST_LINE_CHARS + 1);
     }
 
     #[test]

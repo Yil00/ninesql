@@ -42,6 +42,16 @@
 //!   [`RunControl::release`] (closed early: [`RunEvent::StatementClosed`]). The grid's result
 //!   source maps `fetch` / `release` onto a [`RunControl`]; the core does not depend on the
 //!   grid crate.
+//! - **Idle paused results (phase 3 review M1).** A paused result holds the session, a server
+//!   cursor and often a transaction snapshot, and the drivers end a session whose result has
+//!   waited too long (pgwire `IDLE_CURSOR_TIMEOUT`, mysqlwire `net_write_timeout`, both 300 s);
+//!   on mysqlwire in manual commit that rolls back the user's open transaction. So a run
+//!   releases a result paused with no [`RunControl::fetch`] for longer than
+//!   [`crate::ExecutionPreferences::paused_result_idle`] (default 240 s, always below 300 s)
+//!   itself, through the same path as [`RunControl::release`]: reads only, a server-side close
+//!   or cancel of the read, never of anything else. [`RunEvent::ResultClosedIdle`] comes just
+//!   before the [`RunEvent::StatementClosed`]; the rows already delivered are kept and the
+//!   session is free (its transaction, if any, still open) for the next statement.
 //! - **Back-pressure.** Events go through a small bounded channel: a UI that reads slowly slows
 //!   the fetch down (on top of the result's own budget). After a cancel, result items still
 //!   queued are dropped; the statement end and `Done` still arrive.
@@ -244,7 +254,9 @@ impl RunRequest {
     /// [`RunEvent::PageEnd`] and a pause until [`RunControl::fetch`] or
     /// [`RunControl::release`]. A paused result keeps its stream open, so the session is busy
     /// (other statements and transaction commands wait) until the result is fetched to its end
-    /// or released. In a script, every statement but the last is released after its first page
+    /// or released, or until it has waited longer than the idle limit with no fetch
+    /// ([`RunEvent::ResultClosedIdle`], [`crate::ExecutionPreferences::paused_result_idle`]).
+    /// In a script, every statement but the last is released after its first page
     /// ([`RunEvent::StatementClosed`]) so that the next one can run; the last one stays open.
     /// **Only statements the dialect classifies as reads are paged or released**: a release is
     /// a server-side cancel, which would roll back a write (`DELETE … RETURNING`, `CALL`), so
@@ -402,9 +414,24 @@ pub enum RunEvent {
         /// Rows / documents delivered so far by this statement.
         rows: u64,
     },
-    /// Statement `index`'s stream was closed early: released ([`RunControl::release`]), or a
-    /// script moved on to the next statement after its first page. Its result keeps the rows
-    /// delivered. Counted as succeeded.
+    /// Statement `index`'s paused result waited longer than the idle limit with no
+    /// [`RunControl::fetch`] ([`crate::ExecutionPreferences::paused_result_idle`]), so the run
+    /// released it before the driver's own limit could end the session. Sent just before the
+    /// [`RunEvent::StatementClosed`] of that statement (only when the engine confirmed the
+    /// close). The rows already delivered are kept; the session stays open and usable, and an
+    /// open transaction stays open. Only reads pause, so only reads are closed this way.
+    ResultClosedIdle {
+        /// Statement index.
+        index: usize,
+        /// Rows / documents delivered before it was closed.
+        rows: u64,
+        /// How long it had been paused when the run released it.
+        after: Duration,
+    },
+    /// Statement `index`'s stream was closed early: released ([`RunControl::release`]), closed
+    /// after the idle limit ([`RunEvent::ResultClosedIdle`] comes first), or a script moved on
+    /// to the next statement after its first page. Its result keeps the rows delivered.
+    /// Counted as succeeded.
     StatementClosed {
         /// Statement index.
         index: usize,
@@ -477,6 +504,24 @@ pub enum FetchMode {
     /// Everything left, up to the end of the result or its budget (never unbounded: the
     /// budget ends the result with `Truncated`).
     All,
+}
+
+/// Longest idle limit of a paused result, whatever the preferences hold: below the 300 s after
+/// which the drivers end a session whose result is left waiting (pgwire `IDLE_CURSOR_TIMEOUT`,
+/// mysqlwire `net_write_timeout`), with a margin for the release to reach the server.
+pub const MAX_PAUSED_RESULT_IDLE: Duration =
+    Duration::from_secs(crate::preferences::PAUSED_RESULT_IDLE_SECS_RANGE.1);
+
+/// The idle limit of a paused result: the preference, capped at [`MAX_PAUSED_RESULT_IDLE`], and
+/// the driver's own limit when it declares a lower one (`driver`). The driver API does not
+/// declare such a limit yet, so callers pass `None` until it does.
+#[must_use]
+pub fn paused_result_idle_limit(preference: Duration, driver: Option<Duration>) -> Duration {
+    let limit = preference.min(MAX_PAUSED_RESULT_IDLE);
+    match driver {
+        Some(d) => limit.min(d),
+        None => limit,
+    }
 }
 
 /// Release requests kept until the run reads them.
@@ -775,6 +820,7 @@ impl ExecutionService {
             control: Arc::clone(&control),
             started: Instant::now(),
             progress: Progress::default(),
+            idle_limit: paused_result_idle_limit(prefs.execution.paused_result_idle, None),
         };
         // The session's own dialect: drivers keep its lexical rules in sync with the session's
         // modes (`standard_conforming_strings`, `NO_BACKSLASH_ESCAPES`).
@@ -790,6 +836,14 @@ impl ExecutionService {
             },
             cancel,
         }
+    }
+}
+
+/// Completes at `deadline` (never when `None`; the caller guards the branch).
+async fn sleep_until_opt(deadline: Option<tokio::time::Instant>) {
+    match deadline {
+        Some(d) => tokio::time::sleep_until(d).await,
+        None => std::future::pending().await,
     }
 }
 
@@ -1155,6 +1209,8 @@ struct RunJob {
     started: Instant,
     /// Where the run is, for the terminal event of a run task that dies (see `Drop`).
     progress: Progress,
+    /// A paused result waiting longer than this with no fetch is released (review M1).
+    idle_limit: Duration,
 }
 
 /// How far a run went: the item being handled and the statement counts so far.
@@ -1495,6 +1551,11 @@ impl RunJob {
         let mut delivered: u64 = 0;
         let mut allowed: Option<u64> = None;
         let mut page_end_sent = false;
+        // When the result paused (no fetch since), and how long it had been paused when the run
+        // released it after the idle limit (review M1).
+        let mut paused_since: Option<tokio::time::Instant> = None;
+        let mut idle_closed: Option<Duration> = None;
+        let idle_limit = self.idle_limit;
         let connection = self.session.info().connection;
         let policy = self.session.info().policy;
         let history = self.history.clone();
@@ -1526,6 +1587,9 @@ impl RunJob {
         };
         loop {
             let paused = !cancel_sent && !releasing && allowed.is_some_and(|a| delivered >= a);
+            if !paused {
+                paused_since = None;
+            }
             if paused && !page_end_sent {
                 page_end_sent = true;
                 if forwarding {
@@ -1545,6 +1609,13 @@ impl RunJob {
                     continue;
                 }
             }
+            // The idle clock starts once the page end was handed to the UI (or given up on) and
+            // the result is still paused; a fetch that brings more rows stops it.
+            let idle_deadline = if paused && is_read {
+                Some(*paused_since.get_or_insert_with(tokio::time::Instant::now) + idle_limit)
+            } else {
+                None
+            };
             let event = tokio::select! {
                 biased;
                 () = self.cancel.cancelled(), if !cancel_sent => {
@@ -1568,6 +1639,17 @@ impl RunJob {
                         }
                         page_end_sent = false;
                     }
+                    continue;
+                }
+                // Paused with no fetch for too long: released as `release` would (reads only),
+                // before the driver's own limit ends the session (review M1).
+                () = sleep_until_opt(idle_deadline), if idle_deadline.is_some() => {
+                    if let Some(since) = paused_since {
+                        idle_closed = Some(since.elapsed());
+                    }
+                    tracing::debug!(index, "paused result idle past its limit; releasing it");
+                    execution.cancel();
+                    releasing = true;
                     continue;
                 }
                 e = execution.next(), if !paused => e,
@@ -1677,6 +1759,15 @@ impl RunJob {
                         // real engine error that arrived meanwhile is reported as a failure.
                         _ if releasing && cancel_error => {
                             record(EntryStatus::Succeeded, Some(delivered), update_count, None);
+                            if let Some(after) = idle_closed {
+                                self.out
+                                    .send_end(RunEvent::ResultClosedIdle {
+                                        index,
+                                        rows: delivered,
+                                        after,
+                                    })
+                                    .await;
+                            }
                             self.out
                                 .send_end(RunEvent::StatementClosed {
                                     index,

@@ -76,6 +76,13 @@ pub enum FetchState {
     GridBudgetReached,
     /// The stream was dropped before its end; rows not loaded are unreachable.
     Closed,
+    /// The execution service closed the result after it waited this many seconds with no
+    /// fetch (`[execution] paused_result_idle_secs`, ADR-0024 §5): the rows loaded are kept,
+    /// no more can be fetched.
+    ClosedIdle {
+        /// Seconds the result had been paused.
+        after_secs: u64,
+    },
     /// The statement failed or was cancelled after this result started.
     Stopped,
 }
