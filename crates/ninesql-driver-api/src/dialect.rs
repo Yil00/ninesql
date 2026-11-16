@@ -1541,7 +1541,7 @@ const SIDE_EFFECT_FUNCTIONS: &[&str] = &[
     "PG_ROTATE_LOGFILE",
     "PG_PROMOTE",
     "PG_SWITCH_WAL",
-    "PG_FILE_WRITE",
+    "PG_SWITCH_XLOG",
     "PG_START_BACKUP",
     "PG_STOP_BACKUP",
     "PG_DROP_REPLICATION_SLOT",
@@ -1553,11 +1553,19 @@ const SIDE_EFFECT_FUNCTIONS: &[&str] = &[
     "PG_IMPORT_SYSTEM_COLLATIONS",
     "PG_STAT_STATEMENTS_RESET",
     "PG_NOTIFY",
+    // Assign a transaction id to a read-only transaction (P5 security review L6).
+    "TXID_CURRENT",
+    "PG_CURRENT_XACT_ID",
+    // Index maintenance callable from a `SELECT` (P5 security review L6).
+    "BRIN_SUMMARIZE_NEW_VALUES",
+    "BRIN_SUMMARIZE_RANGE",
+    "BRIN_DESUMMARIZE_RANGE",
+    "GIN_CLEAN_PENDING_LIST",
     // Server file access, the counterparts of MySQL's `LOAD_FILE` (P5 security review L5).
     "PG_READ_FILE",
     "PG_READ_BINARY_FILE",
-    "PG_LS_DIR",
     "PG_STAT_FILE",
+    "PG_LOGDIR_LS",
     "LO_IMPORT",
     "LO_EXPORT",
     "LO_UNLINK",
@@ -1575,7 +1583,10 @@ const SIDE_EFFECT_FUNCTIONS: &[&str] = &[
 /// statistics resets, backups, WAL replay control, `dblink*`, `pg_create_*` (restore points,
 /// replication slots), `pg_copy_*_replication_slot`, advisory locks and unlocks
 /// (`pg_advisory_*`, `pg_try_advisory_*`: a session lock outlives the statement) and
-/// `pg_sleep*` (holds the session and its locks; P5 security review L5). A few read-only
+/// `pg_sleep*` (holds the session and its locks; P5 security review L5), server directory
+/// listings `pg_ls_*` (`pg_ls_dir`, `pg_ls_waldir`, `pg_ls_logdir`…) and adminpack's
+/// `pg_file_*` (`pg_file_write`, `pg_file_unlink`, `pg_file_rename`, `pg_file_sync`; P5
+/// security review L6), and the pre-10 `pg_xlog_replay_*`. A few read-only
 /// members (`pg_replication_origin_oid`…) are over-classified, which only asks for
 /// confirmation.
 const SIDE_EFFECT_PREFIXES: &[&str] = &[
@@ -1589,6 +1600,9 @@ const SIDE_EFFECT_PREFIXES: &[&str] = &[
     "PG_BACKUP_",
     "PG_WAL_REPLAY_",
     "PG_REPLICATION_ORIGIN_",
+    "PG_XLOG_REPLAY_",
+    "PG_LS_",
+    "PG_FILE_",
 ];
 
 fn is_side_effect_function(upper: &str) -> bool {

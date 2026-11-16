@@ -412,6 +412,126 @@ SELECT "pg_stat_file"('postgresql.conf')
 expect: all=Read
 SELECT pg_read_file, t.pg_ls_dir, pg_stat_file FROM t
 
+## pg_ls_waldir (P5 security review L6)
+expect: pg=Unknown
+SELECT * FROM pg_ls_waldir()
+
+## pg_ls_logdir qualified
+expect: pg=Unknown
+SELECT pg_catalog.pg_ls_logdir()
+
+## pg_ls_tmpdir quoted and qualified
+expect: pg=Unknown
+SELECT "pg_catalog"."pg_ls_tmpdir"()
+
+## pg_ls_archive_statusdir
+expect: pg=Unknown
+SELECT name FROM pg_ls_archive_statusdir()
+
+## pg_file_unlink (adminpack)
+expect: pg=Unknown
+SELECT pg_file_unlink('x.log')
+
+## pg_file_rename qualified
+expect: pg=Unknown
+SELECT public.pg_file_rename('a', 'b')
+
+## pg_file_write quoted
+expect: pg=Unknown
+SELECT "pg_file_write"('x', 'data', false)
+
+## pg_file_sync
+expect: pg=Unknown
+SELECT pg_file_sync('x')
+
+## pg_logdir_ls
+expect: pg=Unknown
+SELECT * FROM pg_logdir_ls() AS a(f timestamp, n text)
+
+## brin_summarize_new_values
+expect: pg=Unknown
+SELECT brin_summarize_new_values('t_brin_idx')
+
+## brin_summarize_range qualified
+expect: pg=Unknown
+SELECT pg_catalog.brin_summarize_range('t_brin_idx', 0)
+
+## brin_desummarize_range quoted
+expect: pg=Unknown
+SELECT "brin_desummarize_range"('t_brin_idx', 0)
+
+## gin_clean_pending_list
+expect: pg=Unknown
+SELECT gin_clean_pending_list('t_gin_idx'::regclass)
+
+## txid_current assigns a transaction id
+expect: pg=Unknown
+SELECT txid_current()
+
+## pg_current_xact_id qualified
+expect: pg=Unknown
+SELECT pg_catalog.pg_current_xact_id()
+
+## pg_create_restore_point
+expect: pg=Unknown
+SELECT pg_create_restore_point('r1')
+
+## pg_switch_wal quoted
+expect: pg=Unknown
+SELECT "pg_switch_wal"()
+
+## pg_switch_xlog (before PostgreSQL 10)
+expect: pg=Unknown
+SELECT pg_switch_xlog()
+
+## pg_xlog_replay_pause (before PostgreSQL 10)
+expect: pg=Unknown
+SELECT pg_xlog_replay_pause()
+
+## pg_promote qualified
+expect: pg=Unknown
+SELECT pg_catalog.pg_promote(true, 60)
+
+## pg_create_logical_replication_slot
+expect: pg=Unknown
+SELECT * FROM pg_create_logical_replication_slot('s', 'pgoutput')
+
+## pg_create_physical_replication_slot quoted
+expect: pg=Unknown
+SELECT "pg_create_physical_replication_slot"('s')
+
+## pg_drop_replication_slot
+expect: pg=Unknown
+SELECT pg_drop_replication_slot('s')
+
+## pg_replication_origin_create
+expect: pg=Unknown
+SELECT pg_replication_origin_create('o')
+
+## pg_replication_origin_session_setup qualified
+expect: pg=Unknown
+SELECT pg_catalog.pg_replication_origin_session_setup('o')
+
+## pg_logical_emit_message
+expect: pg=Unknown
+SELECT pg_logical_emit_message(true, 'p', 'm')
+
+## nextval qualified
+expect: pg=Unknown
+SELECT pg_catalog.nextval('s')
+
+## setval in a where clause
+expect: pg=Unknown
+SELECT 1 WHERE setval('s', 1) > 0
+
+## columns named like the L6 functions are reads
+expect: all=Read
+SELECT pg_ls_waldir, t.pg_file_unlink, brin_summarize_range, t.gin_clean_pending_list, txid_current, t.pg_ls_logdir FROM t
+
+## qualified columns named like WAL and replication functions are reads
+expect: all=Read
+SELECT t.pg_switch_wal, t.pg_promote, t.pg_create_restore_point, t.nextval FROM t WHERE t.pg_file_write = 1
+
 ## dblink qualified
 expect: pg=Unknown
 SELECT * FROM public.dblink('dbname=x', 'SELECT 1') AS r(a int)
