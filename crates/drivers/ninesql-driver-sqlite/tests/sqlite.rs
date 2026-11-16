@@ -1693,3 +1693,54 @@ async fn metadata_lists_keys_indexes_triggers_and_ddl_round_trips() {
     );
     assert!(s.is_read_only());
 }
+
+/// Security review L4: foreign keys past the internal row cap continue on the next page.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn foreign_keys_past_the_row_cap_page() {
+    let dir = tempfile::tempdir().unwrap();
+    let src = dir.path().join("fks.db");
+    {
+        let c = rusqlite::Connection::open(&src).unwrap();
+        // Two-column keys: 10 050 rows, so the cap cuts a key in half.
+        let fks = ", FOREIGN KEY (a, b) REFERENCES parent (x, y)".repeat(5025);
+        c.execute_batch(&format!(
+            "CREATE TABLE parent (x INTEGER, y INTEGER, PRIMARY KEY (x, y)); \
+             CREATE TABLE child (a INTEGER, b INTEGER{fks})"
+        ))
+        .unwrap();
+    }
+    let s = connect(ro_params(&src)).await;
+    let m = s.metadata();
+    let child = ObjectPath::root()
+        .child(ObjectKind::Schema, "main")
+        .child(ObjectKind::Table, "child");
+    let mut seen = std::collections::BTreeSet::new();
+    let mut cursor = None;
+    let mut pages = 0;
+    loop {
+        let p = m
+            .list(
+                &child,
+                ObjectKind::ForeignKey,
+                PageRequest::first().with_limit(10_000).with_cursor(cursor),
+            )
+            .await
+            .unwrap();
+        pages += 1;
+        for i in &p.items {
+            assert!(seen.insert(i.name().to_owned()), "{} twice", i.name());
+            match &i.details {
+                ninesql_driver_api::ObjectDetails::ForeignKey(f) => {
+                    assert_eq!(f.columns, vec!["a", "b"], "{} is partial", i.name());
+                }
+                other => panic!("{other:?}"),
+            }
+        }
+        match p.next_cursor {
+            Some(c) => cursor = Some(c),
+            None => break,
+        }
+    }
+    assert_eq!(seen.len(), 5025);
+    assert!(pages >= 2);
+}

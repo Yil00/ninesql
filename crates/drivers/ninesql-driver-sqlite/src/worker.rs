@@ -1588,6 +1588,13 @@ impl Worker {
                         }
                     }
                 }
+                // At the row cap the last key may be partial: drop it and continue from the
+                // last complete one on the next page (security review L4).
+                let capped = rows.len() >= 10_001;
+                if capped {
+                    keys.pop();
+                }
+                let last_complete = keys.last().map(|(n, _, _)| n.clone());
                 // The filter matches the name or the referenced table, as a literal substring.
                 keys.retain(|(n, f, _)| {
                     pattern.as_ref().is_none_or(|p| {
@@ -1597,7 +1604,13 @@ impl Worker {
                                 .is_some_and(|t| t.name.to_lowercase().contains(p))
                     })
                 });
-                more = keys.len() > limit;
+                more = keys.len() > limit || (capped && last_complete.is_some());
+                // Every key left fits the page: continue after the last one read.
+                let tail = if keys.len() <= limit && capped {
+                    last_complete
+                } else {
+                    None
+                };
                 for (name, mut f, implicit) in keys.into_iter().take(limit) {
                     if implicit {
                         // `REFERENCES t` without columns: the referenced table's primary key.
@@ -1621,6 +1634,9 @@ impl Worker {
                         comment: None,
                         details: ObjectDetails::ForeignKey(f),
                     });
+                }
+                if tail.is_some() {
+                    next = tail;
                 }
             }
             _ => {
