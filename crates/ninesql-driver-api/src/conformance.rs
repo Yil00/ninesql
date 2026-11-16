@@ -721,9 +721,13 @@ pub const CREDENTIAL_STATEMENT_SAMPLES: &[&str] = &[
 /// The value every [`CREDENTIAL_STATEMENT_SAMPLES`] statement holds.
 pub const LOG_HYGIENE_SECRET: &str = "hunter2-log-probe";
 
-/// Records the fields of every event, on the thread it is installed on.
+/// Records the fields of every event it receives while `active` is set (a process-wide
+/// capture stays installed after a check, so it records only during one).
 #[derive(Clone, Default)]
-struct LogCapture(std::sync::Arc<std::sync::Mutex<Vec<String>>>);
+struct LogCapture {
+    lines: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+    active: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
 
 struct LogFields<'a>(&'a mut String);
 
@@ -743,9 +747,12 @@ impl tracing::Subscriber for LogCapture {
     fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
     fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
     fn event(&self, event: &tracing::Event<'_>) {
+        if !self.active.load(std::sync::atomic::Ordering::SeqCst) {
+            return;
+        }
         let mut line = String::new();
         event.record(&mut LogFields(&mut line));
-        self.0
+        self.lines
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .push(line);
@@ -759,19 +766,43 @@ impl tracing::Subscriber for LogCapture {
 /// as both, and asserts that the log shows the harmless ones (so logging was on) but neither
 /// the credential statements nor [`LOG_HYGIENE_SECRET`] (I1, `text_may_hold_credentials`).
 ///
-/// Events are captured on the calling thread only, so call it from a current-thread runtime
-/// (`#[tokio::test(flavor = "current_thread")]`): every task the driver spawns then runs on
-/// that thread and its events are captured too.
+/// Events are captured by a process-wide subscriber installed on first use, so events from
+/// every thread are seen (a thread-local subscriber missed events whose callsite interest
+/// another test thread had cached). If another global subscriber is already installed, the
+/// capture falls back to the calling thread: call it from a current-thread runtime
+/// (`#[tokio::test(flavor = "current_thread")]`) so every task the driver spawns runs there.
 ///
 /// # Panics
 /// When a credential statement is logged, or when no statement is (logging was not on).
 pub async fn assert_credential_statements_not_logged(driver: &dyn Driver, params: ConnectParams) {
-    let capture = LogCapture::default();
-    let _guard = tracing::subscriber::set_default(capture.clone());
-    // Other tests of the same binary may have hit the drivers' `trace!` callsites with no
-    // subscriber in scope, caching "never interested": recompute the interest now that this
-    // thread has one, so the capture sees every event.
+    static GLOBAL: std::sync::OnceLock<Option<LogCapture>> = std::sync::OnceLock::new();
+    let global = GLOBAL.get_or_init(|| {
+        let capture = LogCapture::default();
+        tracing::subscriber::set_global_default(capture.clone())
+            .ok()
+            .map(|()| capture)
+    });
+    let (capture, _guard) = match global {
+        Some(capture) => {
+            capture
+                .lines
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clear();
+            (capture.clone(), None)
+        }
+        None => {
+            let capture = LogCapture::default();
+            let guard = tracing::subscriber::set_default(capture.clone());
+            (capture, Some(guard))
+        }
+    };
+    // Recompute every callsite's interest now that a capture is installed, so a callsite
+    // cached as "never interested" before it was installed is seen again.
     tracing::callsite::rebuild_interest_cache();
+    capture
+        .active
+        .store(true, std::sync::atomic::Ordering::SeqCst);
     let mut p = params;
     p.log_statements = true;
     p.production = false;
@@ -794,8 +825,11 @@ pub async fn assert_credential_statements_not_logged(driver: &dyn Driver, params
         panic!("harmless statement failed: {e}");
     }
     let _ = session.close().await;
+    capture
+        .active
+        .store(false, std::sync::atomic::Ordering::SeqCst);
     let all = capture
-        .0
+        .lines
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .join("\n");
