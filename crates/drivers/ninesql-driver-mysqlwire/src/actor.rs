@@ -59,18 +59,29 @@ pub(crate) struct Shared {
     pub(crate) status: AtomicU16,
     /// The session is read-only (the engine-side setting must stay on).
     pub(crate) read_only: AtomicBool,
-    /// `transaction_read_only`, or `tx_read_only` on older servers.
-    pub(crate) ro_var: &'static str,
+    /// The expression read back for the access mode: `@@SESSION.transaction_read_only`
+    /// (`tx_read_only` on older servers), or on TiDB, which has no session read-only mode, the
+    /// instance's read-only variables ([`TIDB_READ_ONLY_EXPR`]).
+    pub(crate) ro_expr: &'static str,
+    /// TiDB: the read-only mode is the instance's, never set by the driver (P4-C).
+    pub(crate) tidb: bool,
 }
 
+/// TiDB's access mode: `1` when the instance refuses writes from every user
+/// (`tidb_super_read_only`, or `tidb_restricted_read_only`, which implies it). Both are
+/// GLOBAL-only; `GREATEST` is a built-in function, which no stored function can shadow.
+pub(crate) const TIDB_READ_ONLY_EXPR: &str =
+    "GREATEST(@@GLOBAL.tidb_super_read_only, @@GLOBAL.tidb_restricted_read_only)";
+
 impl Shared {
-    pub(crate) fn new(status: u16, ro_var: &'static str) -> Self {
+    pub(crate) fn new(status: u16, ro_expr: &'static str, tidb: bool) -> Self {
         Self {
             closed: AtomicBool::new(false),
             close_reason: Mutex::new(None),
             status: AtomicU16::new(status),
             read_only: AtomicBool::new(false),
-            ro_var,
+            ro_expr,
+            tidb,
         }
     }
 
@@ -152,7 +163,8 @@ pub(crate) fn statement_error(e: &MyError, cancelled: bool) -> DriverError {
         return DriverError::Closed(e.display());
     }
     match e.code {
-        1792 => DriverError::ReadOnly(e.display()),
+        // 1836: TiDB "Running in read-only mode" (`tidb_super_read_only`).
+        1792 | 1836 => DriverError::ReadOnly(e.display()),
         // Interrupted (KILL QUERY), MySQL max_execution_time, MariaDB max_statement_time.
         1317 | 3024 | 1969 if cancelled => DriverError::Cancelled,
         _ if e.state == "25006" => DriverError::ReadOnly(e.display()),
@@ -417,9 +429,8 @@ impl Actor {
         }
         let sql = format!(
             "SELECT @@SESSION.sql_mode, @@SESSION.character_set_client, \
-             @@SESSION.character_set_connection, @@SESSION.character_set_results, \
-             @@SESSION.{}",
-            self.shared.ro_var
+             @@SESSION.character_set_connection, @@SESSION.character_set_results, {}",
+            self.shared.ro_expr
         );
         let mut rows = self.internal(&sql).await;
         // A late `KILL QUERY` can interrupt the read-back itself: try once more.
@@ -458,7 +469,8 @@ impl Actor {
                     .into(),
             ));
         }
-        if read_only {
+        if read_only && !self.shared.tidb {
+            // (TiDB: no session mode to re-assert; the instance's mode was read back above.)
             // `SET TRANSACTION … READ WRITE` (no SESSION) only changes the *next* transaction
             // and leaves `transaction_read_only` at 1, so the read-back cannot see it.
             // Re-asserting the session characteristic resets that pending one-shot mode, on

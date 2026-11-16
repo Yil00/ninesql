@@ -69,6 +69,10 @@ pub struct MyDialect {
     modes: Arc<Modes>,
     /// `EXPLAIN ANALYZE` is offered (MySQL ≥ 8.0.18; MariaDB spells it `ANALYZE`).
     explain_analyze: bool,
+    /// TiDB (P4-C): `EXPLAIN FORMAT = 'tidb_json'`, and TiDB's executable comments
+    /// `/*T![feature] … */`, which the shared lexer reads as plain comments, make a statement
+    /// `Unknown`.
+    tidb: bool,
 }
 
 impl MyDialect {
@@ -78,6 +82,17 @@ impl MyDialect {
         Self {
             modes: Arc::default(),
             explain_analyze: true,
+            tidb: false,
+        }
+    }
+
+    /// The TiDB dialect (MySQL's, with TiDB's explain formats and executable comments).
+    #[must_use]
+    pub fn tidb() -> Self {
+        Self {
+            modes: Arc::default(),
+            explain_analyze: true,
+            tidb: true,
         }
     }
 
@@ -87,6 +102,7 @@ impl MyDialect {
         Self {
             modes: Arc::default(),
             explain_analyze: false,
+            tidb: false,
         }
     }
 
@@ -100,13 +116,15 @@ impl MyDialect {
         Self {
             modes: Arc::new(modes),
             explain_analyze: self.explain_analyze,
+            tidb: self.tidb,
         }
     }
 
-    pub(crate) fn tracking(modes: Arc<Modes>, explain_analyze: bool) -> Self {
+    pub(crate) fn tracking(modes: Arc<Modes>, explain_analyze: bool, tidb: bool) -> Self {
         Self {
             modes,
             explain_analyze,
+            tidb,
         }
     }
 
@@ -181,7 +199,20 @@ impl Dialect for MyDialect {
     }
 
     fn classify(&self, text: &str) -> StatementClass {
-        classify_with_rules(&self.normalized(text), self.lexical_rules())
+        let class = classify_with_rules(&self.normalized(text), self.lexical_rules());
+        // TiDB runs the content of `/*T! … */` (feature-gated executable comments) that the
+        // shared lexer skips as a comment: never classify such a text below `Unknown`.
+        if self.tidb
+            && scan(text, self.scan_rules()).iter().any(|seg| {
+                seg.kind == Seg::Comment
+                    && text
+                        .get(seg.start..)
+                        .is_some_and(|t| t.len() >= 4 && t[..4].eq_ignore_ascii_case("/*t!"))
+            })
+        {
+            return class.max(StatementClass::Unknown);
+        }
+        class
     }
 
     fn split_script(&self, script: &str) -> Vec<ScriptItem> {
@@ -255,6 +286,7 @@ impl Dialect for MyDialect {
         let q = query.trim().trim_end_matches(';');
         Some(match format {
             ExplainFormat::Text => format!("EXPLAIN {q}"),
+            ExplainFormat::Json if self.tidb => format!("EXPLAIN FORMAT = 'tidb_json' {q}"),
             ExplainFormat::Json => format!("EXPLAIN FORMAT=JSON {q}"),
             ExplainFormat::Analyze if self.explain_analyze => format!("EXPLAIN ANALYZE {q}"),
             _ => return None,
@@ -1076,7 +1108,7 @@ mod tests {
         let modes = Arc::new(Modes::default());
         modes.set_sql_mode("ANSI_QUOTES,NO_BACKSLASH_ESCAPES");
         conformance::assert_dialect_quoting_roundtrip(
-            &MyDialect::tracking(modes, true),
+            &MyDialect::tracking(modes, true, false),
             conformance::ALIAS_TEMPLATE,
             conformance::IDENTIFIER_SAMPLES,
         );
@@ -1085,7 +1117,7 @@ mod tests {
     #[test]
     fn sql_mode_drives_the_lexer() {
         let modes = Arc::new(Modes::default());
-        let d = MyDialect::tracking(Arc::clone(&modes), true);
+        let d = MyDialect::tracking(Arc::clone(&modes), true, false);
         // Default mode: `\'` escapes the quote, one statement holding a string.
         let sql = r"SELECT 'a\'; DELETE FROM t; -- '";
         assert_eq!(d.split_statements(sql).len(), 1);
@@ -1206,7 +1238,7 @@ mod tests {
         fn rewrite_keeps_length(text in "\\PC{0,80}") {
             let modes = Arc::new(Modes::default());
             modes.set_sql_mode("ANSI_QUOTES");
-            let d = MyDialect::tracking(modes, true);
+            let d = MyDialect::tracking(modes, true, false);
             let n = d.normalized(&text);
             prop_assert_eq!(n.len(), text.len());
             for s in d.split_statements(&text) {

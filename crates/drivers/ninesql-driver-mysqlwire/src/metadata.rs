@@ -45,12 +45,15 @@ pub struct MyMetadata {
     pub(crate) link: Link,
     pub(crate) control: Arc<Control>,
     pub(crate) mariadb: bool,
+    /// TiDB (P4-C): sequences; no triggers, stored routines or events.
+    pub(crate) tidb: bool,
 }
 
 impl std::fmt::Debug for MyMetadata {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("MyMetadata")
             .field("mariadb", &self.mariadb)
+            .field("tidb", &self.tidb)
             .finish_non_exhaustive()
     }
 }
@@ -193,12 +196,21 @@ impl Metadata for MyMetadata {
             None => vec![ObjectKind::Schema],
             Some(ObjectKind::Schema) => {
                 let mut k = vec![ObjectKind::Table, ObjectKind::View];
-                if self.mariadb {
+                if self.mariadb || self.tidb {
                     k.push(ObjectKind::Sequence);
                 }
-                k.extend([ObjectKind::Routine, ObjectKind::Event]);
+                if !self.tidb {
+                    k.extend([ObjectKind::Routine, ObjectKind::Event]);
+                }
                 k
             }
+            Some(ObjectKind::Table) if self.tidb => vec![
+                ObjectKind::Column,
+                ObjectKind::Constraint,
+                ObjectKind::ForeignKey,
+                ObjectKind::Index,
+                ObjectKind::Partition,
+            ],
             Some(ObjectKind::Table) => vec![
                 ObjectKind::Column,
                 ObjectKind::Constraint,
@@ -565,7 +577,7 @@ impl Metadata for MyMetadata {
                 self.show_create(&format!("SHOW CREATE VIEW {schema}.{name}"), 1)
                     .await
             }
-            (2, ObjectKind::Sequence) if self.mariadb => {
+            (2, ObjectKind::Sequence) if self.mariadb || self.tidb => {
                 self.show_create(&format!("SHOW CREATE SEQUENCE {schema}.{name}"), 1)
                     .await
             }

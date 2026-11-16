@@ -1,8 +1,8 @@
-//! `ninesql-driver-mysqlwire`: the MySQL wire protocol family (ADR-0003). Serves MySQL and
-//! MariaDB; TiDB will be added with its own capability overrides once its integration tests
-//! prove them (I8).
+//! `ninesql-driver-mysqlwire`: the MySQL wire protocol family (ADR-0003). Serves MySQL,
+//! MariaDB and TiDB, each with its own engine id and capabilities (I8); the server must be the
+//! declared engine.
 //!
-//! ROADMAP: P1-B. The client/server protocol is implemented in the driver on top of tokio and
+//! ROADMAP: P1-B, P4-C (TiDB). The client/server protocol is implemented in the driver on top of tokio and
 //! rustls with the `ring` provider: no OpenSSL, no C library, no protocol crate (ADR-0002,
 //! ADR-0011, docs/03-tech-stack.md).
 //!
@@ -23,7 +23,9 @@
 //!   returns (`retains_secret_after_connect = false`).
 //! - **Read-only** (I3): `SET SESSION TRANSACTION READ ONLY` before init statements, verified
 //!   by a read-back; after every statement `transaction_read_only` is read back and the session
-//!   is closed if it was lifted.
+//!   is closed if it was lifted. TiDB has no session read-only mode: a read-only session needs
+//!   a read-only TiDB instance (`tidb_super_read_only` / `tidb_restricted_read_only`), read
+//!   back the same way, and is refused otherwise.
 //! - **Execute**: text protocol, one statement per call, parameters inlined as inert literals
 //!   (hexadecimal, digits, fixed date formats); results streamed as Arrow batches, values cut
 //!   to the budget while they are read.
@@ -128,10 +130,10 @@ fn prop_kind(var: &str) -> PropKind {
     }
 }
 
-/// `max_execution_time` is MySQL only, `max_statement_time` MariaDB only.
+/// `max_execution_time` is MySQL and TiDB only, `max_statement_time` MariaDB only.
 fn prop_engine_ok(var: &str, engine: &EngineId) -> bool {
     match var {
-        "max_execution_time" => *engine == EngineId::MYSQL,
+        "max_execution_time" => *engine == EngineId::MYSQL || *engine == EngineId::TIDB,
         "max_statement_time" => *engine == EngineId::MARIADB,
         _ => true,
     }
@@ -143,7 +145,7 @@ pub struct MySqlWireDriver {
     _private: (),
 }
 
-const ENGINES: &[EngineId] = &[EngineId::MYSQL, EngineId::MARIADB];
+const ENGINES: &[EngineId] = &[EngineId::MYSQL, EngineId::MARIADB, EngineId::TIDB];
 
 impl MySqlWireDriver {
     #[allow(clippy::too_many_lines)]
@@ -252,7 +254,7 @@ impl MySqlWireDriver {
         // The password is not needed any more (`retains_secret_after_connect = false`).
         drop(password);
         let (main, mut control_conn) = outcome?;
-        let ro_var = match check_server(&engine, &main.server_version) {
+        let ro_expr = match check_server(&engine, &main.server_version) {
             Ok(v) => v,
             Err(e) => {
                 let mut main = main;
@@ -262,7 +264,7 @@ impl MySqlWireDriver {
             }
         };
         let version = display_version(&main.server_version).to_owned();
-        let shared = Arc::new(Shared::new(main.status, ro_var));
+        let shared = Arc::new(Shared::new(main.status, ro_expr, engine == EngineId::TIDB));
         let modes = Arc::new(Modes::default());
         control_conn.status = 0;
         let control = Control::new(control_conn);
@@ -283,7 +285,8 @@ impl MySqlWireDriver {
             capabilities: capabilities_for(&engine, Some(&version)),
             dialect: Arc::new(MyDialect::tracking(
                 Arc::clone(&modes),
-                engine == EngineId::MYSQL,
+                engine != EngineId::MARIADB,
+                engine == EngineId::TIDB,
             )),
             control: Arc::clone(&control),
             log_statements,
@@ -317,7 +320,7 @@ impl MySqlWireDriver {
                 .cloned()
                 .flatten()
                 .ok_or_else(|| DriverError::Connect("the server sent no version".into()))?;
-            if check_server(&engine, &server_version)? != ro_var {
+            if check_server(&engine, &server_version)? != ro_expr {
                 return Err(DriverError::Connect(
                     "the server version changed between the handshake and the session".into(),
                 ));
@@ -412,8 +415,11 @@ impl MySqlWireDriver {
     }
 }
 
-/// Capabilities of MySQL or MariaDB through this driver (mirrored in docs/08).
+/// Capabilities of MySQL, MariaDB or TiDB through this driver (mirrored in docs/08).
 fn capabilities_for(engine: &EngineId, server_version: Option<&str>) -> Capabilities {
+    if *engine == EngineId::TIDB {
+        return tidb_capabilities(server_version);
+    }
     let mut c = Capabilities::minimal(engine.clone());
     c.server_version = server_version.map(str::to_owned);
     let mut metadata = MetadataCapabilities::default();
@@ -504,6 +510,54 @@ fn capabilities_for(engine: &EngineId, server_version: Option<&str>) -> Capabili
     c
 }
 
+/// TiDB (P4-C, mirrored in docs/08): MySQL's protocol and `information_schema` without
+/// triggers, stored routines or events, with sequences; only `READ COMMITTED` and
+/// `REPEATABLE READ`; no session read-only mode (see `MySession::apply_tidb_read_only`); TLS
+/// not declared until the dev service has a test CA (I8).
+fn tidb_capabilities(server_version: Option<&str>) -> Capabilities {
+    let mut c = capabilities_for(&EngineId::MYSQL, server_version);
+    c.engine = EngineId::TIDB;
+    let mut metadata = MetadataCapabilities::default();
+    metadata.kinds = BTreeSet::from([
+        ObjectKind::Schema,
+        ObjectKind::Table,
+        ObjectKind::View,
+        ObjectKind::Column,
+        ObjectKind::Constraint,
+        ObjectKind::ForeignKey,
+        ObjectKind::Index,
+        ObjectKind::Partition,
+        ObjectKind::Sequence,
+    ]);
+    metadata.ddl = BTreeSet::from([
+        ObjectKind::Schema,
+        ObjectKind::Table,
+        ObjectKind::View,
+        ObjectKind::Sequence,
+    ]);
+    c.metadata = metadata;
+    let mut tx = TransactionCapabilities::default();
+    tx.manual_commit = true;
+    tx.savepoints = true;
+    // TiDB refuses SERIALIZABLE and READ UNCOMMITTED (error 8048).
+    tx.isolation_levels = BTreeSet::from([
+        IsolationLevel::ReadCommitted,
+        IsolationLevel::RepeatableRead,
+    ]);
+    c.transactions = tx;
+    // The instance's read-only variables; a privileged user can lift them with `SET GLOBAL`
+    // (refused client-side as an access-mode change, and read back after every statement).
+    c.read_only = ReadOnlyMechanism::ServerSetting { liftable: true };
+    // No stored procedures, so no `CALL` with several result sets.
+    c.multiple_result_sets = false;
+    c.tls = BTreeSet::from([TlsMode::Disable]);
+    let mut accepted = c.connect.accepted_properties.clone().unwrap_or_default();
+    accepted.retain(|k| k != "max_statement_time");
+    accepted.insert("max_execution_time".to_owned());
+    c.connect.accepted_properties = Some(accepted);
+    c
+}
+
 fn normalize(key: &str) -> String {
     key.chars()
         .filter(char::is_ascii_alphanumeric)
@@ -528,10 +582,10 @@ fn accepted_properties(
                 "property `{}` is not supported by the {engine} driver; accepted: time_zone, \
                  lock_wait_timeout, innodb_lock_wait_timeout, group_concat_max_len, {}",
                 echo_property_key(key),
-                if *engine == EngineId::MYSQL {
-                    "max_execution_time"
-                } else {
+                if *engine == EngineId::MARIADB {
                     "max_statement_time"
+                } else {
+                    "max_execution_time"
                 }
             )));
         };
@@ -586,19 +640,30 @@ fn display_version(v: &str) -> &str {
 }
 
 /// Checks that the server is the engine the connection was declared for (capabilities differ),
-/// and returns the name of the access-mode variable.
+/// and returns the expression read back for the access mode.
 fn check_server(engine: &EngineId, version: &str) -> DriverResult<&'static str> {
     let is_mariadb = version.contains("MariaDB");
-    if version.contains("TiDB") {
-        return Err(DriverError::Connect(
-            "this server is TiDB, which the mysqlwire driver does not serve yet".into(),
-        ));
-    }
-    if is_mariadb != (*engine == EngineId::MARIADB) {
+    let is_tidb = version.contains("TiDB");
+    let server = if is_tidb {
+        EngineId::TIDB
+    } else if is_mariadb {
+        EngineId::MARIADB
+    } else {
+        EngineId::MYSQL
+    };
+    if server != *engine {
+        let shown: String = display_version(version)
+            .chars()
+            .filter(|c| !c.is_control())
+            .take(120)
+            .collect();
         return Err(DriverError::Connect(format!(
-            "this server reports version {}, which is not {engine}; choose the matching engine",
-            display_version(version)
+            "this server reports version {shown}, which is not {engine}; choose the matching \
+             engine"
         )));
+    }
+    if is_tidb {
+        return Ok(actor::TIDB_READ_ONLY_EXPR);
     }
     let (major, minor) = version_of(version);
     let modern = if is_mariadb {
@@ -607,9 +672,9 @@ fn check_server(engine: &EngineId, version: &str) -> DriverResult<&'static str> 
         (major, minor) >= (8, 0)
     };
     Ok(if modern {
-        "transaction_read_only"
+        "@@SESSION.transaction_read_only"
     } else {
-        "tx_read_only"
+        "@@SESSION.tx_read_only"
     })
 }
 
@@ -636,6 +701,8 @@ impl Driver for MySqlWireDriver {
         Self::check_engine(engine)?;
         Ok(Arc::new(if *engine == EngineId::MYSQL {
             MyDialect::mysql()
+        } else if *engine == EngineId::TIDB {
+            MyDialect::tidb()
         } else {
             MyDialect::mariadb()
         }))
@@ -684,9 +751,28 @@ mod tests {
                 .explain
                 .contains(&ExplainFormat::Analyze)
         );
-        assert!(d.capabilities(&EngineId::TIDB, None).is_err());
+        let tidb = d.capabilities(&EngineId::TIDB, None).unwrap();
+        assert_eq!(
+            tidb.read_only,
+            ReadOnlyMechanism::ServerSetting { liftable: true }
+        );
+        assert!(!tidb.metadata.kinds.contains(&ObjectKind::Trigger));
+        assert!(tidb.metadata.kinds.contains(&ObjectKind::Sequence));
+        assert!(!tidb.multiple_result_sets);
+        assert_eq!(tidb.tls, BTreeSet::from([TlsMode::Disable]));
+        assert!(
+            !tidb
+                .transactions
+                .isolation_levels
+                .contains(&IsolationLevel::Serializable)
+        );
+        assert!(tidb.connect.accepts_property("max_execution_time"));
+        assert!(!tidb.connect.accepts_property("max_statement_time"));
         assert!(d.dialect(&EngineId::POSTGRESQL).is_err());
-        assert_eq!(d.engines(), &[EngineId::MYSQL, EngineId::MARIADB]);
+        assert_eq!(
+            d.engines(),
+            &[EngineId::MYSQL, EngineId::MARIADB, EngineId::TIDB]
+        );
     }
 
     #[test]
@@ -723,19 +809,29 @@ mod tests {
     fn server_checks() {
         assert_eq!(
             check_server(&EngineId::MYSQL, "8.4.13").unwrap(),
-            "transaction_read_only"
+            "@@SESSION.transaction_read_only"
         );
         assert_eq!(
             check_server(&EngineId::MARIADB, "5.5.5-11.8.9-MariaDB-ubu2404").unwrap(),
-            "transaction_read_only"
+            "@@SESSION.transaction_read_only"
         );
         assert_eq!(
             check_server(&EngineId::MARIADB, "5.5.5-10.11.6-MariaDB").unwrap(),
-            "tx_read_only"
+            "@@SESSION.tx_read_only"
         );
         assert!(check_server(&EngineId::MYSQL, "5.5.5-11.8.9-MariaDB").is_err());
         assert!(check_server(&EngineId::MARIADB, "8.4.13").is_err());
         assert!(check_server(&EngineId::MYSQL, "8.0.11-TiDB-v8.5.0").is_err());
+        assert!(check_server(&EngineId::MARIADB, "8.0.11-TiDB-v8.5.0").is_err());
+        assert!(check_server(&EngineId::TIDB, "8.4.13").is_err());
+        assert_eq!(
+            check_server(&EngineId::TIDB, "8.0.11-TiDB-v8.5.8").unwrap(),
+            actor::TIDB_READ_ONLY_EXPR
+        );
+        let msg = check_server(&EngineId::TIDB, "8.4\u{1b}[2J")
+            .unwrap_err()
+            .to_string();
+        assert!(!msg.chars().any(char::is_control), "{msg:?}");
         assert_eq!(display_version("5.5.5-11.8.9-MariaDB"), "11.8.9-MariaDB");
         assert!(is_loopback_host("localhost") && is_loopback_host("::1"));
         assert!(!is_loopback_host("db.example.test"));
@@ -773,11 +869,16 @@ mod tests {
             Err(DriverError::InvalidParams(_))
         ));
         let mut p = base();
-        p.engine = EngineId::TIDB;
+        p.engine = EngineId::POSTGRESQL;
         assert!(matches!(
             d.connect(p).await,
             Err(DriverError::InvalidParams(_))
         ));
+        // TiDB: no TLS declared yet, so a TLS mode is refused before any traffic.
+        let mut p = base();
+        p.engine = EngineId::TIDB;
+        p.tls.mode = TlsMode::VerifyFull;
+        assert!(d.connect(p).await.is_err());
         let mut p = base();
         p.database = Some("a\0b".into());
         assert!(matches!(
