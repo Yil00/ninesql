@@ -115,6 +115,25 @@ pub fn check_target(target: &Path, overwrite: Overwrite) -> Result<(), TransferE
     }
 }
 
+/// Opens an input file (a CSV to import) for reading with `O_NOFOLLOW | O_NONBLOCK |
+/// O_CLOEXEC` and checks with `fstat` that what was opened is a regular file: read through the
+/// returned handle, never by path again. `O_NONBLOCK` keeps a FIFO swapped in at the last moment
+/// from blocking the open; it does not change reads of a regular file.
+///
+/// # Errors
+/// I/O errors; [`TransferError::NotARegularFile`].
+pub fn open_input(path: &Path) -> Result<(File, fs::Metadata), TransferError> {
+    let file = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC)
+        .open(path)?;
+    let meta = file.metadata()?;
+    if !meta.is_file() {
+        return Err(TransferError::NotARegularFile(path.to_path_buf()));
+    }
+    Ok((file, meta))
+}
+
 impl OutputFile {
     /// Creates the temporary file next to `target` (see the [module documentation](self)).
     ///

@@ -13,7 +13,8 @@
 //! A snippet is a workspace file, so it must never hold a password: a body holding a URI with
 //! credentials (`postgresql://u:pw@h`) is refused, and so is a body that holds a credential word
 //! (`PASSWORD`, `IDENTIFIED`, `SECRET`, `TOKEN`… the history rule,
-//! [`ninesql_driver_api::text_may_hold_credentials`]) together with a string literal. Use a
+//! [`ninesql_driver_api::text_may_hold_credentials`]) together with a literal typed in the body
+//! (`'…'`, `"…"`, `$$…$$` or `$tag$…$tag$`, placeholders left out). Use a
 //! placeholder for the credential instead: `CREATE USER ${user} IDENTIFIED BY ${password}`.
 
 use std::collections::HashMap;
@@ -150,13 +151,28 @@ fn validate(s: &Snippet) -> Result<(), SnippetError> {
     if s.body.trim().is_empty() || s.body.len() > MAX_SNIPPET_BODY {
         return Err(SnippetError::InvalidBody);
     }
-    let literal = s.body.contains('\'') || s.body.contains('"');
+    // The text as it would be inserted with every placeholder left empty: a literal there is
+    // typed in the snippet itself, not supplied at expansion.
+    let fixed = expand(s, &HashMap::new()).text;
+    let literal = fixed.contains('\'') || fixed.contains('"') || has_dollar_quote(&fixed);
     if ninesql_driver_api::hygiene::has_uri_credentials(&s.body)
-        || (literal && ninesql_driver_api::text_may_hold_credentials(&s.body))
+        || (literal && ninesql_driver_api::text_may_hold_credentials(&fixed))
     {
         return Err(SnippetError::HoldsCredential);
     }
     Ok(())
+}
+
+/// `true` when `text` holds a dollar-quote opener (`$$` or `$tag$`, PostgreSQL family).
+fn has_dollar_quote(text: &str) -> bool {
+    let bytes = text.as_bytes();
+    bytes.iter().enumerate().any(|(i, &b)| {
+        b == b'$'
+            && bytes[i + 1..]
+                .iter()
+                .position(|c| !(c.is_ascii_alphanumeric() || *c == b'_'))
+                .is_some_and(|n| bytes[i + 1 + n] == b'$')
+    })
 }
 
 /// The snippets of one project.
@@ -451,6 +467,19 @@ mod tests {
             store.upsert(Snippet::new("u", "CREATE USER x IDENTIFIED BY 'hunter2'")),
             Err(SnippetError::HoldsCredential)
         ));
+        for body in [
+            "ALTER ROLE x PASSWORD $$hunter2$$",
+            "ALTER ROLE x PASSWORD $$$$hunter2$$$$",
+            "ALTER ROLE x PASSWORD $p$hunter2$p$",
+        ] {
+            assert!(
+                matches!(
+                    store.upsert(Snippet::new("d", body)),
+                    Err(SnippetError::HoldsCredential)
+                ),
+                "{body}"
+            );
+        }
         assert!(matches!(
             store.upsert(Snippet::new("l", "SELECT dblink('postgresql://u:pw@h/db')")),
             Err(SnippetError::HoldsCredential)

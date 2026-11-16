@@ -569,3 +569,123 @@ fn csv_import_refusals_and_production_confirmation() {
         assert_eq!((s.statements, s.rows_inserted), (4, 10));
     });
 }
+
+#[test]
+fn review_fixes_lease_file_identity_key_and_protected_aliases() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (manager, _) = manager(Arc::new(mock_driver()), tmp.path());
+    let ninesql = paths(&tmp.path().join("ninesql"));
+    std::fs::create_dir_all(ninesql.data_dir()).unwrap();
+    let transfer = TransferService::new(manager.clone(), &ninesql);
+    let data = tempfile::tempdir().unwrap();
+    let out = tempfile::tempdir().unwrap();
+    ui(async {
+        let types = ConnectionTypes::default();
+        let h = open_ok(&manager, mock_connection(ConnectionTypeId::dev()), &types).await;
+        // L9: while an export holds the session, other statements are refused.
+        let mut job = transfer.export(
+            &h,
+            ExportRequest::statement(
+                "SELECT * FROM slow_numbers(100000, 20)",
+                out.path().join("slow.csv"),
+                ExportOptions::new(ExportFormat::Csv),
+            ),
+        );
+        loop {
+            match job.next().await {
+                Some(ExportEvent::Started) => break,
+                Some(_) => {}
+                None => panic!("ended"),
+            }
+        }
+        assert!(h.is_leased());
+        match terminal(&run(&h, "SELECT * FROM numbers(1)").await) {
+            ninesql_core::ExecEvent::Failed(ninesql_core::CoreError::SessionLeased) => {}
+            other => panic!("{other:?}"),
+        }
+        assert!(matches!(
+            h.commit().await,
+            Some(Err(ninesql_core::CoreError::SessionLeased))
+        ));
+        // A second transfer on the same session is refused.
+        let file = write_csv(data.path(), 10, None);
+        let mapping = ColumnMapping::by_position(3, &targets());
+        match finish_import(transfer.import_csv(
+            &h,
+            ImportRequest::new(&file, vec!["t".into()], targets(), mapping.clone()),
+        ))
+        .await
+        {
+            ImportOutcome::Refused(TransferJobError::SessionBusy) => {}
+            _ => panic!("a leased session refuses another transfer"),
+        }
+        job.cancel();
+        assert!(matches!(
+            finish_export(job).await,
+            Err(TransferJobError::Cancelled)
+        ));
+        assert!(!h.is_leased());
+        assert!(matches!(
+            terminal(&run(&h, "SELECT * FROM numbers(1)").await),
+            ninesql_core::ExecEvent::Finished { .. }
+        ));
+
+        // L1 / L2: the token is bound to the file's identity and the import's options.
+        let prod = open_ok(&manager, mock_connection(ConnectionTypeId::prod()), &types).await;
+        let request = ImportRequest::new(&file, vec!["t".into()], targets(), mapping.clone());
+        let token = |o: ImportOutcome| match o {
+            ImportOutcome::Confirm(c) => c.token,
+            _ => panic!("needs confirmation"),
+        };
+        let t = token(finish_import(transfer.import_csv(&prod, request.clone())).await);
+        let changed = request
+            .clone()
+            .with_transaction(ImportTransaction::CommitEvery(5))
+            .confirmed(t);
+        assert!(matches!(
+            finish_import(transfer.import_csv(&prod, changed)).await,
+            ImportOutcome::Refused(TransferJobError::InvalidConfirmation)
+        ));
+        let t = token(finish_import(transfer.import_csv(&prod, request.clone())).await);
+        // The file is replaced after the confirmation.
+        std::fs::write(&file, "id,label,born\n1,x,2000-01-01\n").unwrap();
+        assert!(matches!(
+            finish_import(transfer.import_csv(&prod, request.clone().confirmed(t))).await,
+            ImportOutcome::Refused(TransferJobError::InvalidConfirmation)
+        ));
+
+        // M1: an all-invalid file stops at its first issue.
+        let mut bad = Vec::from(&b"id,label,born\n"[..]);
+        for _ in 0..100_000 {
+            bad.extend_from_slice(b"\xff\n");
+        }
+        let bad_file = data.path().join("bad.csv");
+        std::fs::write(&bad_file, bad).unwrap();
+        let s = done(
+            finish_import(transfer.import_csv(
+                &h,
+                ImportRequest::new(&bad_file, vec!["t".into()], targets(), mapping.clone()),
+            ))
+            .await,
+        );
+        assert_eq!(s.end, ImportEnd::Failed);
+        assert_eq!((s.rows_read, s.issues_total), (1, 1));
+        let p = transfer
+            .preview_csv(CsvPreviewRequest::new(&bad_file, targets()))
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(p.rows.is_empty() && !p.complete && p.issues_total == 100);
+
+        // L4: a symbolic link to NineSQL's storage is refused like the storage itself.
+        let alias = out.path().join("alias");
+        std::os::unix::fs::symlink(ninesql.data_dir(), &alias).unwrap();
+        let e = transfer
+            .check_export_path(
+                &alias.join("x.csv"),
+                ninesql_core::transfer::Overwrite::Refuse,
+            )
+            .unwrap_err();
+        assert!(matches!(e, TransferError::ForbiddenLocation { .. }));
+    });
+}

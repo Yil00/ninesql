@@ -9,7 +9,9 @@
 //!   1. the **case of keywords**, and only for words that are reserved in every supported
 //!      dialect (MySQL's reserved list, the strictest one: a reserved word is never an unquoted
 //!      table name or alias, which MySQL compares case-sensitively on Linux), never a word right
-//!      after a `.` (MySQL accepts a reserved word as a qualified name part);
+//!      after a `.` (MySQL accepts a reserved word as a qualified name part), and, with SQLite's
+//!      lexical rules, never a word SQLite accepts as an unquoted name (`key`, `left`, `desc`…:
+//!      SQLite keeps a column's case as created and shows it in result headers);
 //!   2. **whitespace between tokens**: a gap made only of ASCII whitespace may become a single space
 //!      or a line break with indentation; an empty gap stays empty, except right after a comma
 //!      where a line break is always safe. A gap holding a comment is copied unchanged, so is
@@ -176,8 +178,18 @@ fn upper(word: &str) -> String {
     word.to_ascii_uppercase()
 }
 
-fn is_cased_keyword(word: &str) -> bool {
-    CASED_KEYWORDS.binary_search(&upper(word).as_str()).is_ok()
+/// Words of [`CASED_KEYWORDS`] that SQLite accepts as unquoted names (its parser's fallback
+/// identifiers and join keywords; `TRUE` / `FALSE` are names there too). SQLite keeps the case a
+/// column was created with and shows it in result headers, so their case is left alone.
+const SQLITE_NAMES: &[&str] = &[
+    "ASC", "BY", "CROSS", "DESC", "FALSE", "INNER", "KEY", "LEFT", "LIKE", "NATURAL", "OUTER",
+    "RIGHT", "TRUE", "WITH",
+];
+
+fn is_cased_keyword(word: &str, rules: LexicalRules) -> bool {
+    let w = upper(word);
+    CASED_KEYWORDS.binary_search(&w.as_str()).is_ok()
+        && !(rules == LexicalRules::SQLITE && SQLITE_NAMES.contains(&w.as_str()))
 }
 
 /// Formats `text` with `dialect`'s lexical rules and splitter (see the [module
@@ -277,7 +289,13 @@ fn format_statement(text: &str, rules: LexicalRules, options: &FormatOptions) ->
                     *s = false;
                 }
                 let after_dot = i > 0 && tokens[i - 1].text(text) == ".";
-                if !after_dot && is_cased_keyword(word) {
+                // `BY` right after `GROUP` / `ORDER` / `PARTITION` is a keyword in every dialect.
+                let clause_by = w == "BY"
+                    && i > 0
+                    && ["GROUP", "ORDER", "PARTITION"]
+                        .iter()
+                        .any(|k| tokens[i - 1].is_word(text, k));
+                if !after_dot && (clause_by || is_cased_keyword(word, rules)) {
                     match options.keyword_case {
                         KeywordCase::Upper => out.push_str(&word.to_ascii_uppercase()),
                         KeywordCase::Lower => out.push_str(&word.to_ascii_lowercase()),

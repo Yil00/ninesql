@@ -239,3 +239,18 @@ proptest! {
         }
     }
 }
+
+#[test]
+fn sqlite_names_that_are_keywords_elsewhere_keep_their_case() {
+    let d = ninesql_driver_sqlite::SqliteDriver::new();
+    let sqlite = d.dialect(&d.engines()[0]).unwrap();
+    let out = format_sql(
+        sqlite.as_ref(),
+        "create table t (key text, left int, desc text); select key, left from t order by desc",
+        &FormatOptions::default(),
+    );
+    assert_eq!(
+        out,
+        "CREATE TABLE t (key text, left int, desc text); SELECT key,\n  left\nFROM t\nORDER BY desc"
+    );
+}

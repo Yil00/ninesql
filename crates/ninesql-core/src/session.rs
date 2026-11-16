@@ -1680,6 +1680,7 @@ async fn open_session(
             metadata: session.metadata(),
             // One slot more than configured: the terminal event's reserved slot.
             result_queue: shared.config.result_queue.max(1) + 1,
+            leased: Mutex::new(false),
         }),
     };
     lock(&shared.sessions).insert(id, handle.clone());
@@ -2037,6 +2038,38 @@ struct HandleInner {
     /// [`crate::metadata::MetadataService`], which wraps every call in its timeout.
     metadata: Arc<dyn ninesql_driver_api::Metadata>,
     result_queue: usize,
+    /// Held by a [`SessionLease`] (a CSV import): statements and transaction commands from
+    /// anyone else are refused with [`CoreError::SessionLeased`] meanwhile.
+    leased: Mutex<bool>,
+}
+
+/// Exclusive use of a session by one transfer ([`SessionHandle::lease`]); released on drop.
+pub(crate) struct SessionLease {
+    handle: SessionHandle,
+}
+
+impl SessionLease {
+    pub(crate) fn execute(&self, request: ExecuteRequest) -> Execution {
+        self.handle.send_execute(request)
+    }
+
+    pub(crate) fn begin(&self) -> Reply<Result<TransactionState, CoreError>> {
+        self.handle.send_transaction(TxOp::Begin)
+    }
+
+    pub(crate) fn commit(&self) -> Reply<Result<TransactionState, CoreError>> {
+        self.handle.send_transaction(TxOp::Commit)
+    }
+
+    pub(crate) fn rollback(&self) -> Reply<Result<TransactionState, CoreError>> {
+        self.handle.send_transaction(TxOp::Rollback)
+    }
+}
+
+impl Drop for SessionLease {
+    fn drop(&mut self) {
+        *lock(&self.handle.inner.leased) = false;
+    }
 }
 
 /// A handle to an open session. Cheap to clone; every method returns at once.
@@ -2077,7 +2110,17 @@ impl SessionHandle {
     /// session queues a few. Never blocks: a full queue or a closed session yields an execution
     /// that fails at once.
     #[must_use]
+    ///
+    /// Fails with [`CoreError::SessionLeased`] while a transfer holds the session.
     pub fn execute(&self, request: ExecuteRequest) -> Execution {
+        let leased = lock(&self.inner.leased);
+        if *leased {
+            return Execution::failed(CoreError::SessionLeased);
+        }
+        self.send_execute(request)
+    }
+
+    fn send_execute(&self, request: ExecuteRequest) -> Execution {
         let (events_tx, events) = mpsc::channel(self.inner.result_queue);
         let cancel = CancelToken::new();
         let command = Command::Execute {
@@ -2104,6 +2147,37 @@ impl SessionHandle {
     }
 
     fn transaction(&self, op: TxOp) -> Reply<Result<TransactionState, CoreError>> {
+        let leased = lock(&self.inner.leased);
+        if *leased && !matches!(op, TxOp::Ping) {
+            return Reply::ready(Err(CoreError::SessionLeased));
+        }
+        self.send_transaction(op)
+    }
+
+    /// Takes the session for one transfer: `None` when it is already leased or not idle (a
+    /// statement running or queued). Until the lease is dropped, every other statement and
+    /// transaction command on the session fails with [`CoreError::SessionLeased`] (the
+    /// keep-alive ping and `close` still work).
+    pub(crate) fn lease(&self) -> Option<SessionLease> {
+        let mut leased = lock(&self.inner.leased);
+        let idle = lock(&self.inner.current).is_none()
+            && self.inner.commands.capacity() == self.inner.commands.max_capacity();
+        if *leased || !idle || self.is_closed() {
+            return None;
+        }
+        *leased = true;
+        Some(SessionLease {
+            handle: self.clone(),
+        })
+    }
+
+    /// `true` while a transfer holds the session ([`CoreError::SessionLeased`]).
+    #[must_use]
+    pub fn is_leased(&self) -> bool {
+        *lock(&self.inner.leased)
+    }
+
+    fn send_transaction(&self, op: TxOp) -> Reply<Result<TransactionState, CoreError>> {
         let (tx, reply) = Reply::channel();
         match self
             .inner

@@ -19,8 +19,19 @@
 //! - **Reads only.** The statement (or `SELECT * FROM <table>`, quoted by the session's
 //!   dialect) is classified with the session's dialect and must be a
 //!   [`StatementClass::Read`]: an export runs the statement again, so a write is never run by an
-//!   export ([`TransferJobError::NotARead`]). It goes through [`SessionHandle::execute`], so the
-//!   session's read-only mode and safety rules still apply.
+//!   export ([`TransferJobError::NotARead`]). When the session has no open transaction and is not
+//!   read-only already, the export runs inside an engine-side read-only transaction (PostgreSQL
+//!   family `BEGIN READ ONLY`, MySQL family `START TRANSACTION READ ONLY`, rolled back at the end;
+//!   SQLite and engines without transactions: none), so a function with side effects that the
+//!   classifier reads as a read is refused by the engine. If it cannot be opened, the export
+//!   fails on production and confirm-every-write connections and goes on without it elsewhere.
+//!   The statements go through the session task, so the session's read-only mode and safety
+//!   rules still apply.
+//! - **Exclusive session.** An export and an import lease their session for their whole run:
+//!   meanwhile every other statement or transaction command on it fails with
+//!   [`CoreError::SessionLeased`], and a session that is running or queuing a statement (a
+//!   paused grid result included) refuses the transfer with [`TransferJobError::SessionBusy`].
+//!   The UI may still prefer a dedicated session so the editor stays usable.
 //! - **Memory.** The result is fetched in batches under the request's [`FetchBudget`] with no
 //!   overall byte or row limit (the rows are written, not kept), and each batch goes to a writer
 //!   on the blocking pool through a queue of [`WRITER_QUEUE`] batches; the exporter keeps one row
@@ -82,7 +93,9 @@ use uuid::Uuid;
 use crate::dbeaver_roots::DbeaverRoots;
 // The formats, options, CSV and mapping types, so the UI needs only `ninesql_core::transfer`.
 use crate::error::CoreError;
-use crate::session::{ExecEvent, ExecuteRequest, Next, Reply, SessionHandle, SessionManager};
+use crate::session::{
+    ExecEvent, ExecuteRequest, Next, Reply, SessionHandle, SessionLease, SessionManager,
+};
 pub use ninesql_transfer::*;
 
 /// Batches queued between the session and the export writer.
@@ -95,6 +108,11 @@ pub const MAX_PARAMS_PER_INSERT: usize = 30_000;
 pub const MAX_INSERT_BYTES: usize = 4 * 1024 * 1024;
 /// Issues kept in an import summary.
 pub const MAX_REPORTED_ISSUES: usize = 100;
+/// Why NineSQL's own directories are refused.
+const NINESQL_STORAGE: &str =
+    "the folder is part of NineSQL's own storage (workspace, secret vault, history)";
+/// Why `~/.ssh` is refused.
+const SSH_DIR: &str = "the folder holds SSH keys and settings";
 /// Events buffered per job before progress events are dropped.
 const EVENT_QUEUE: usize = 16;
 /// Lifetime of an import confirmation.
@@ -136,6 +154,9 @@ pub enum TransferJobError {
     /// A row could not be read or converted (and invalid rows are not skipped).
     #[error("invalid row: {0}")]
     InvalidRow(String),
+    /// The session runs or queues other work, or another transfer holds it.
+    #[error("the session is busy: wait for its statement to end, or use another session")]
+    SessionBusy,
     /// The confirmation does not match the import or expired.
     #[error("the confirmation does not match this import, or expired; confirm it again")]
     InvalidConfirmation,
@@ -161,6 +182,7 @@ impl TransferJobError {
             Self::NoTransactions => "no-transactions",
             Self::PendingTransaction => "pending-transaction",
             Self::InvalidRow(_) => "invalid-row",
+            Self::SessionBusy => "session-busy",
             Self::InvalidConfirmation => "invalid-confirmation",
             Self::UnexpectedConfirmation => "unexpected-confirmation",
         }
@@ -646,8 +668,32 @@ impl CsvPreviewRequest {
 struct ImportKey {
     session: crate::session::SessionId,
     file: PathBuf,
+    /// Identity of the opened file: a different file, or the same one changed, does not match.
+    file_id: FileId,
     table: Vec<String>,
     columns: Vec<String>,
+    /// Source field → target column pairs, in insert order.
+    mapping: Vec<(usize, usize)>,
+    transaction: ImportTransaction,
+    skip_invalid_rows: bool,
+}
+
+/// `(device, inode, length, modification time)` of an opened import file (`fstat`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct FileId {
+    dev: u64,
+    ino: u64,
+    len: u64,
+    mtime: i64,
+    mtime_nsec: i64,
+}
+
+/// An import file opened once (`O_NOFOLLOW | O_NONBLOCK`), checked with `fstat`; the reader
+/// uses this handle, never the path again.
+struct ImportFile {
+    file: fs::File,
+    path: PathBuf,
+    id: FileId,
 }
 
 struct PendingImport {
@@ -661,7 +707,8 @@ struct PendingImport {
 pub struct TransferService {
     manager: SessionManager,
     roots: DbeaverRoots,
-    protected: Arc<Vec<PathBuf>>,
+    /// NineSQL's own directories and `~/.ssh`, resolved at every check.
+    protected: Arc<Vec<(PathBuf, &'static str)>>,
     pending: Arc<Mutex<Vec<PendingImport>>>,
 }
 
@@ -676,10 +723,14 @@ impl TransferService {
     /// the manager's DBeaver roots.
     #[must_use]
     pub fn new(manager: SessionManager, paths: &Paths) -> Self {
-        let protected = [paths.config_dir(), paths.data_dir(), paths.state_dir()]
-            .iter()
-            .map(|p| fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf()))
-            .collect();
+        let mut protected: Vec<(PathBuf, &'static str)> =
+            [paths.config_dir(), paths.data_dir(), paths.state_dir()]
+                .iter()
+                .map(|p| (p.to_path_buf(), NINESQL_STORAGE))
+                .collect();
+        if let Some(home) = std::env::var_os("HOME").filter(|h| !h.is_empty()) {
+            protected.push((PathBuf::from(home).join(".ssh"), SSH_DIR));
+        }
         Self {
             roots: manager.dbeaver_roots().clone(),
             manager,
@@ -688,13 +739,35 @@ impl TransferService {
         }
     }
 
-    fn protected_reason(&self, path: &Path) -> Option<&'static str> {
-        self.protected
+    /// Why `dir` (a resolved directory) or one of its ancestors is refused: it is, or lies
+    /// inside, NineSQL's own storage or `~/.ssh`. Compared by `(device, inode)` of `dir` and of
+    /// each ancestor against the protected directories as they are now, and by resolved path
+    /// prefix (bind mounts and later renames are both covered).
+    fn protected_reason(&self, dir: &Path) -> Option<&'static str> {
+        use std::os::unix::fs::MetadataExt;
+        let ids: Vec<((u64, u64), &'static str, PathBuf)> = self
+            .protected
             .iter()
-            .any(|dir| path.starts_with(dir))
-            .then_some(
-                "the folder is part of NineSQL's own storage (workspace, secret vault, history)",
-            )
+            .filter_map(|(p, reason)| {
+                let canonical = fs::canonicalize(p).ok()?;
+                let m = fs::metadata(&canonical).ok()?;
+                Some(((m.dev(), m.ino()), *reason, canonical))
+            })
+            .collect();
+        for (_, reason, canonical) in &ids {
+            if dir.starts_with(canonical) {
+                return Some(reason);
+            }
+        }
+        for ancestor in dir.ancestors() {
+            if let Ok(m) = fs::metadata(ancestor)
+                && let Some((_, reason, _)) =
+                    ids.iter().find(|(id, _, _)| *id == (m.dev(), m.ino()))
+            {
+                return Some(reason);
+            }
+        }
+        None
     }
 
     /// Checks an export target and returns it with its directory resolved: absolute, an existing
@@ -730,7 +803,7 @@ impl TransferService {
                     .into(),
             });
         }
-        if let Some(reason) = self.protected_reason(&target) {
+        if let Some(reason) = self.protected_reason(&parent) {
             return Err(TransferError::ForbiddenLocation {
                 reason: reason.into(),
             });
@@ -739,28 +812,40 @@ impl TransferService {
         Ok(target)
     }
 
-    fn check_import_file(
+    fn open_import_file(
         &self,
         path: &Path,
         limits: &CsvLimits,
-    ) -> Result<(PathBuf, u64), TransferError> {
+    ) -> Result<ImportFile, TransferError> {
+        use std::os::unix::fs::MetadataExt;
         let canonical = fs::canonicalize(path)
             .map_err(|_| TransferError::InvalidPath("the file does not exist".into()))?;
-        if let Some(reason) = self.protected_reason(&canonical) {
+        if let Some(reason) = canonical.parent().and_then(|d| self.protected_reason(d)) {
             return Err(TransferError::ForbiddenLocation {
                 reason: reason.into(),
             });
         }
-        let meta = fs::metadata(&canonical)?;
-        if !meta.is_file() {
+        // Not opened at all unless it is a regular file (a FIFO or a device has side effects).
+        if !fs::metadata(&canonical)?.is_file() {
             return Err(TransferError::NotARegularFile(canonical));
         }
+        let (file, meta) = ninesql_transfer::file::open_input(&canonical)?;
         if meta.len() > limits.max_file_bytes {
             return Err(TransferError::FileTooLarge {
                 limit: limits.max_file_bytes,
             });
         }
-        Ok((canonical, meta.len()))
+        Ok(ImportFile {
+            file,
+            path: canonical,
+            id: FileId {
+                dev: meta.dev(),
+                ino: meta.ino(),
+                len: meta.len(),
+                mtime: meta.mtime(),
+                mtime_nsec: meta.mtime_nsec(),
+            },
+        })
     }
 
     /// Exports rows to a file (see the [module documentation](self#export)).
@@ -788,11 +873,10 @@ impl TransferService {
         let service = self.clone();
         self.manager.runtime().handle().spawn_blocking(move || {
             let result = service
-                .check_import_file(&request.path, &request.limits)
-                .and_then(|(path, _)| {
-                    let file = fs::File::open(path)?;
+                .open_import_file(&request.path, &request.limits)
+                .and_then(|opened| {
                     ninesql_transfer::import::preview(
-                        BufReader::new(file),
+                        BufReader::new(opened.file),
                         request.format,
                         request.limits,
                         &request.values,
@@ -943,6 +1027,14 @@ impl ExportTask {
                 Arc::new(DialectSql::new(Arc::clone(&dialect))) as Arc<dyn SqlLiteralRenderer>
             });
 
+        // The session is the export's alone until it ends (review L9).
+        let mut guard = ExportLease {
+            lease: acquire_lease(&self.session)
+                .await
+                .ok_or(TransferJobError::SessionBusy)?,
+            read_only_tx: false,
+        };
+
         // The file: checked and created on the blocking pool.
         let service = self.service.clone();
         let path = request.path.clone();
@@ -987,8 +1079,9 @@ impl ExportTask {
             )
         };
 
+        guard.read_only_tx = self.begin_read_only(&guard.lease, &dialect).await?;
         let budget = request.budget.with_max_bytes(u64::MAX).with_max_rows(None);
-        let mut exec = self.session.execute(
+        let mut exec = guard.lease.execute(
             ExecuteRequest::sql(text)
                 .with_params(params)
                 .with_budget(budget)
@@ -1073,6 +1166,92 @@ impl ExportTask {
             incomplete: stats.incomplete.is_some(),
             peak_buffered_bytes: gauge.peak.load(Ordering::SeqCst),
         })
+    }
+}
+
+/// The export's lease on its session; dropping it ends the read-only transaction the export
+/// opened (the `ROLLBACK` is queued before the lease is released, so it runs first).
+struct ExportLease {
+    lease: SessionLease,
+    read_only_tx: bool,
+}
+
+impl Drop for ExportLease {
+    fn drop(&mut self) {
+        if self.read_only_tx {
+            drop(self.lease.rollback());
+        }
+    }
+}
+
+impl ExportTask {
+    /// Opens an engine-side read-only transaction around the export when the session has none
+    /// open and is not read-only already (review L7): PostgreSQL family `BEGIN READ ONLY`,
+    /// MySQL family `START TRANSACTION READ ONLY`; SQLite and engines without transactions need
+    /// or allow none. `true` when one was opened. If it cannot be opened, the export fails on a
+    /// production or confirm-every-write connection and goes on without it otherwise.
+    async fn begin_read_only(
+        &self,
+        lease: &SessionLease,
+        dialect: &Arc<dyn ninesql_driver_api::Dialect>,
+    ) -> Result<bool, TransferJobError> {
+        let info = self.session.info();
+        if info.read_only
+            || !info.capabilities.transactions.manual_commit
+            || self.session.transaction_state().in_transaction
+        {
+            return Ok(false);
+        }
+        let rules = dialect.lexical_rules();
+        let text = if rules.e_string_backslash {
+            "BEGIN READ ONLY"
+        } else if rules.hash_comments {
+            "START TRANSACTION READ ONLY"
+        } else {
+            return Ok(false);
+        };
+        let mut exec = lease.execute(ExecuteRequest::sql(text));
+        let outcome = loop {
+            match exec.next().await {
+                Some(ExecEvent::Finished { .. }) => break Ok(()),
+                Some(ExecEvent::Failed(e)) => break Err(TransferJobError::from_core(e)),
+                Some(ExecEvent::NeedsConfirmation(_)) => {
+                    break Err(TransferJobError::UnexpectedConfirmation);
+                }
+                Some(_) => {}
+                None => break Err(TransferJobError::Core(CoreError::SessionClosed)),
+            }
+        };
+        match outcome {
+            Ok(()) => Ok(true),
+            Err(e) if info.policy.production || info.policy.confirm_every_write => Err(e),
+            Err(e) => {
+                tracing::warn!(
+                    kind = e.kind(),
+                    "export runs without a read-only transaction"
+                );
+                Ok(false)
+            }
+        }
+    }
+}
+
+/// How long a transfer waits for its session to finish what it is doing (the end of the
+/// previous statement is reported a moment before the session task is idle again).
+const LEASE_WAIT: Duration = Duration::from_secs(2);
+
+/// Leases `session`, waiting up to [`LEASE_WAIT`] for it to become idle; `None` when another
+/// transfer holds it or it stays busy (a running or paused statement).
+async fn acquire_lease(session: &SessionHandle) -> Option<SessionLease> {
+    let deadline = Instant::now() + LEASE_WAIT;
+    loop {
+        if let Some(lease) = session.lease() {
+            return Some(lease);
+        }
+        if session.is_leased() || session.is_closed() || Instant::now() >= deadline {
+            return None;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
     }
 }
 
@@ -1182,12 +1361,12 @@ impl ImportTask {
         let service = self.service.clone();
         let path = request.path.clone();
         let limits = request.limits;
-        let (file, file_bytes) =
-            match spawn_blocking(move || service.check_import_file(&path, &limits)).await {
-                Ok(Ok(v)) => v,
-                Ok(Err(e)) => return ImportEvent::Failed(e.into()),
-                Err(e) => return ImportEvent::Failed(e),
-            };
+        let opened = match spawn_blocking(move || service.open_import_file(&path, &limits)).await {
+            Ok(Ok(v)) => v,
+            Ok(Err(e)) => return ImportEvent::Failed(e.into()),
+            Err(e) => return ImportEvent::Failed(e),
+        };
+        let (file, file_bytes, file_id) = (opened.path.clone(), opened.id.len, opened.id);
         let columns: Vec<String> = request
             .mapping
             .columns
@@ -1205,8 +1384,17 @@ impl ImportTask {
             let key = ImportKey {
                 session: info.id,
                 file: file.clone(),
+                file_id,
                 table: request.table.clone(),
                 columns: columns.clone(),
+                mapping: request
+                    .mapping
+                    .columns
+                    .iter()
+                    .map(|c| (c.source, c.target))
+                    .collect(),
+                transaction: request.transaction,
+                skip_invalid_rows: request.skip_invalid_rows,
             };
             match request.confirmation {
                 None => {
@@ -1234,31 +1422,38 @@ impl ImportTask {
             false
         };
 
-        // The reader: one statement's worth of rows at a time, on the blocking pool.
+        // The session is the import's alone until it ends (review L9).
+        let Some(lease) = acquire_lease(&self.session).await else {
+            return ImportEvent::Failed(TransferJobError::SessionBusy);
+        };
+        if self.session.transaction_state().in_transaction {
+            return ImportEvent::Failed(TransferJobError::PendingTransaction);
+        }
+
+        // The reader: one statement's worth of rows at a time, on the blocking pool, from the
+        // handle opened above (never the path again).
         let rows_per_insert = self.rows_per_insert();
         let (rtx, mut rrx) = mpsc::channel::<ReaderMsg>(1);
         {
             let (format, limits, values) = (request.format, request.limits, request.values.clone());
             let (targets, mapping) = (request.targets.clone(), request.mapping.clone());
-            let file = file.clone();
+            let handle = opened.file;
+            let stop_first = !request.skip_invalid_rows;
             let cancel = self.cancel.clone();
             self.service
                 .manager
                 .runtime()
                 .handle()
                 .spawn_blocking(move || {
-                    let opened = fs::File::open(&file)
-                        .map_err(TransferError::from)
-                        .and_then(|f| {
-                            RowSource::open(
-                                BufReader::new(f),
-                                format,
-                                limits,
-                                values,
-                                targets,
-                                mapping,
-                            )
-                        });
+                    let opened = RowSource::open(
+                        BufReader::new(handle),
+                        format,
+                        limits,
+                        values,
+                        targets,
+                        mapping,
+                    )
+                    .map(|s| s.stopping_at_first_issue(stop_first));
                     let mut source = match opened {
                         Ok(s) => s,
                         Err(e) => {
@@ -1320,7 +1515,7 @@ impl ImportTask {
                     continue;
                 }
                 if transactional && !in_tx {
-                    tx_op(self.session.begin()).await?;
+                    tx_op(lease.begin()).await?;
                     in_tx = true;
                 }
                 let n = batch.rows.len();
@@ -1328,7 +1523,7 @@ impl ImportTask {
                 let first_line = batch.lines.first().copied().unwrap_or(0);
                 let params: Vec<Param> = batch.rows.into_iter().flatten().collect();
                 if let Err(e) = self
-                    .insert(text, params, confirmed, request.statement_timeout)
+                    .insert(&lease, text, params, confirmed, request.statement_timeout)
                     .await
                 {
                     if !matches!(e, TransferJobError::Cancelled) {
@@ -1347,7 +1542,7 @@ impl ImportTask {
                 } else if let ImportTransaction::CommitEvery(every) = request.transaction
                     && c.since_commit >= every
                 {
-                    tx_op(self.session.commit()).await?;
+                    tx_op(lease.commit()).await?;
                     in_tx = false;
                     c.commits += 1;
                     c.rows_committed = c.rows_inserted;
@@ -1363,7 +1558,7 @@ impl ImportTask {
                 }
             }
             if in_tx {
-                tx_op(self.session.commit()).await?;
+                tx_op(lease.commit()).await?;
                 in_tx = false;
                 c.commits += 1;
                 c.rows_committed = c.rows_inserted;
@@ -1379,7 +1574,7 @@ impl ImportTask {
                 if in_tx {
                     // A failed rollback leaves the transaction to the session (closing it rolls
                     // back); it is reported through the session's transaction state.
-                    if let Err(re) = tx_op(self.session.rollback()).await {
+                    if let Err(re) = tx_op(lease.rollback()).await {
                         tracing::warn!(kind = re.kind(), "rollback after a failed import failed");
                     }
                 }
@@ -1412,6 +1607,7 @@ impl ImportTask {
     /// statement when the import was confirmed.
     async fn insert(
         &self,
+        lease: &SessionLease,
         text: String,
         params: Vec<Param>,
         confirmed: bool,
@@ -1424,7 +1620,7 @@ impl ImportTask {
         let mut current = request.clone();
         loop {
             attempt += 1;
-            match self.run_statement(current).await? {
+            match self.run_statement(lease, current).await? {
                 None => return Ok(()),
                 Some(confirmation) => {
                     let expected = confirmation.statement == request.text
@@ -1443,9 +1639,10 @@ impl ImportTask {
     /// asks for a confirmation.
     async fn run_statement(
         &self,
+        lease: &SessionLease,
         request: ExecuteRequest,
     ) -> Result<Option<crate::session::ConfirmationRequest>, TransferJobError> {
-        let mut exec = self.session.execute(request);
+        let mut exec = lease.execute(request);
         loop {
             let event = tokio::select! {
                 biased;
