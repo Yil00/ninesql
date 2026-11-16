@@ -1517,7 +1517,7 @@ impl Worker {
                 } else {
                     let schema = self.schema_ident(&schema_name)?;
                     let sql = format!(
-                        "SELECT name, sql FROM {schema}.sqlite_schema \
+                        "SELECT name, substr(sql, 1, 2048) FROM {schema}.sqlite_schema \
                          WHERE type = 'trigger' AND tbl_name = ?1 \
                          AND (?2 IS NULL OR name LIKE ?2 ESCAPE '!') AND (?3 IS NULL OR name > ?3) \
                          ORDER BY name LIMIT ?4"
@@ -1526,7 +1526,8 @@ impl Worker {
                         &sql,
                         &[&table, &filter, &cursor, &fetch],
                         limit + 1,
-                        MAX_DDL_BYTES,
+                        // The trigger's header is at the start of its text.
+                        NAME_BYTES,
                     )?;
                     more = rows.len() > limit;
                     for row in rows.iter().take(limit) {
