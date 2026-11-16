@@ -291,8 +291,16 @@ fn timescale_internal_calls(text: &str, rules: LexicalRules) -> StatementClass {
     }
 }
 
-/// QuestDB functions with side effects callable from a `SELECT`.
-const QUESTDB_SIDE_EFFECT_FUNCTIONS: &[&str] = &["reload_config", "cancel_query"];
+/// QuestDB functions with side effects callable from a `SELECT` (all present on QuestDB 10.2):
+/// configuration reload, query cancel, the query-cache flush, and the dumps written to the
+/// server log.
+const QUESTDB_SIDE_EFFECT_FUNCTIONS: &[&str] = &[
+    "reload_config",
+    "cancel_query",
+    "flush_query_cache",
+    "dump_memory_usage",
+    "dump_thread_stacks",
+];
 
 /// `Unknown` when `text` calls one of `functions` (a word or quoted name right before `(`,
 /// schema-qualified or not), `Read` otherwise.
