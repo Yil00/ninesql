@@ -24,10 +24,17 @@ use crate::actions::{
     SplitRight, TestConnection, ToggleNavigator, WORKSPACE_CONTEXT,
 };
 use crate::actions::{
+    ClearTableFilter, DeleteRows, DiscardChanges, DuplicateRow, EditCell, ExportToDbeaver,
+    FilterTableBySelectedValue, FilterTableRows, InsertRow, OpenReferencedRows,
+    OpenReferencingRows, OpenTableData, PreviewChanges, RefreshTableData, RevertRowChanges,
+    SaveChanges, SetCellNull, SortTableAscending, SortTableDescending,
+};
+use crate::actions::{
     ConfigureNavigatorFilters, CopyObjectDdl, FindObject, GenerateDeleteSql, GenerateInsertSql,
     GenerateSelectSql, GenerateUpdateSql, LoadMoreObjects, OpenObjectEditor, RefreshNavigatorNode,
     ShowObjectDdl,
 };
+use crate::actions::{ExportResults, ExportTable, FormatSql, ImportCsv, InsertSnippet};
 use crate::appearance;
 use crate::browse::generate::{KeySource, Template, TemplateInput, names_survive_editor, template};
 use crate::browse::object_editor::{ObjectEditor, ObjectEditorEvent};
@@ -1214,6 +1221,26 @@ impl Workspace {
             self.show_selected_ddl(window, cx);
         } else if any.is::<CopyObjectDdl>() {
             self.copy_object_ddl(window, cx);
+        } else if any.is::<FormatSql>() {
+            self.format_sql(window, cx);
+        } else if any.is::<InsertSnippet>() {
+            self.insert_snippet(window, cx);
+        } else if any.is::<ExportResults>() {
+            self.export_results(window, cx);
+        } else if any.is::<ExportTable>() {
+            self.export_table(window, cx);
+        } else if any.is::<ImportCsv>() {
+            self.import_csv(window, cx);
+        } else if any.is::<OpenTableData>() {
+            self.open_table_data(window, cx);
+        } else if any.is::<ExportToDbeaver>() {
+            self.export_to_dbeaver(window, cx);
+        } else if any.is::<OpenReferencedRows>() {
+            self.open_foreign_key_rows(false, window, cx);
+        } else if any.is::<OpenReferencingRows>() {
+            self.open_foreign_key_rows(true, window, cx);
+        } else if self.table_action(any, window, cx) {
+            // Handled by the active editor's table.
         } else if any.is::<CloseWindow>() {
             window.remove_window();
         } else {
@@ -2040,6 +2067,422 @@ impl Workspace {
                 ws.open_sql_tab(format!("DDL {name}"), connection, text, window, cx);
             },
         );
+    }
+
+    /// "Format SQL" in the active SQL editor.
+    pub fn format_sql(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(tab) = self.active_editor().cloned() else {
+            return Self::notify("Open a SQL editor first.", window, cx);
+        };
+        tab.update(cx, |t, cx| t.format_sql(window, cx));
+    }
+
+    /// "Insert snippet": reads the project's snippets off the UI thread, then the picker.
+    pub fn insert_snippet(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(tab) = self.active_editor().cloned() else {
+            return Self::notify("Open a SQL editor first.", window, cx);
+        };
+        let Some(paths) = self.hub.read(cx).project_paths() else {
+            return Self::notify(
+                "No project is open: snippets are kept per project.",
+                window,
+                cx,
+            );
+        };
+        let engine = tab
+            .read(cx)
+            .session()
+            .map(|s| s.info().capabilities.engine.as_str().to_owned());
+        let loaded = cx.background_spawn(async move { ninesql_core::SnippetStore::load(&paths) });
+        cx.spawn_in(window, async move |_, cx| {
+            let result = loaded.await;
+            let _ = cx.update(|window, cx| match result {
+                Ok((store, _dropped)) => {
+                    let list: Vec<ninesql_core::Snippet> =
+                        store.list(engine.as_deref()).into_iter().cloned().collect();
+                    let tab = tab.clone();
+                    let on_pick: crate::snippets::OnPick = Rc::new(move |snippet, window, cx| {
+                        let tab = tab.clone();
+                        let on_expand: crate::snippets::OnExpand =
+                            Rc::new(move |expansion, window, cx| {
+                                tab.update(cx, |t, cx| {
+                                    t.insert_snippet_text(
+                                        &expansion.text,
+                                        expansion.cursor,
+                                        window,
+                                        cx,
+                                    );
+                                });
+                            });
+                        crate::snippets::open_placeholder_prompt(snippet, on_expand, window, cx);
+                    });
+                    crate::snippets::open_snippet_picker(list, on_pick, window, cx);
+                }
+                Err(e) => Self::notify(
+                    format!(
+                        "The snippets could not be read: {}",
+                        crate::browse::display_message(&e.to_string())
+                    ),
+                    window,
+                    cx,
+                ),
+            });
+        })
+        .detach();
+    }
+
+    /// "Export results…": the active result's statement, run again into a file.
+    pub fn export_results(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(tab) = self.active_editor().cloned() else {
+            return Self::notify("Open a SQL editor and run a query first.", window, cx);
+        };
+        let (session, text) = {
+            let t = tab.read(cx);
+            (t.session().cloned(), t.export_statement(cx))
+        };
+        let Some(session) = session else {
+            return Self::notify("The editor has no open connection.", window, cx);
+        };
+        let text = match text {
+            Ok(t) => t,
+            Err(why) => return Self::notify(why, window, cx),
+        };
+        let Some(transfer) = self.hub.read(cx).transfer() else {
+            return Self::notify("The driver runtime is not running.", window, cx);
+        };
+        if let Some(why) = crate::transfer::session_problem(&session, false) {
+            return Self::notify(why, window, cx);
+        }
+        crate::transfer::export::open_export_dialog(
+            session,
+            transfer,
+            crate::transfer::export::ExportTarget::Statement { text },
+            window,
+            cx,
+        );
+    }
+
+    /// The open session and the transfer service for a navigator table, or a notification.
+    fn transfer_target(
+        &self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Option<(
+        ConnectionId,
+        ObjectPath,
+        ninesql_core::SessionHandle,
+        ninesql_core::TransferService,
+    )> {
+        let Some((connection, path, _)) = self.target_object(cx) else {
+            Self::notify("Select a table in the navigator first.", window, cx);
+            return None;
+        };
+        if !path.kind().is_some_and(is_table_like) {
+            Self::notify("Select a table or a view in the navigator.", window, cx);
+            return None;
+        }
+        let hub = self.hub.read(cx);
+        let Some(session) = hub.sessions(connection).first().cloned() else {
+            Self::notify("Connect first.", window, cx);
+            return None;
+        };
+        let Some(transfer) = hub.transfer() else {
+            Self::notify("The driver runtime is not running.", window, cx);
+            return None;
+        };
+        Some((connection, path, session, transfer))
+    }
+
+    /// "Export table…" on the navigator's table.
+    pub fn export_table(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some((_, path, session, transfer)) = self.transfer_target(window, cx) else {
+            return;
+        };
+        if let Some(why) = crate::transfer::session_problem(&session, false) {
+            return Self::notify(why, window, cx);
+        }
+        let parts = crate::transfer::table_parts(&path);
+        crate::transfer::export::open_export_dialog(
+            session,
+            transfer,
+            crate::transfer::export::ExportTarget::Table { parts },
+            window,
+            cx,
+        );
+    }
+
+    /// "Import CSV…" into the navigator's table: its columns are read from the metadata cache
+    /// (loaded when needed), then the dialog opens.
+    pub fn import_csv(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some((connection, path, session, transfer)) = self.transfer_target(window, cx) else {
+            return;
+        };
+        if path.kind() != Some(ObjectKind::Table) {
+            return Self::notify("Rows can be imported into a table only.", window, cx);
+        }
+        if let Some(why) = crate::transfer::session_problem(&session, true) {
+            return Self::notify(why, window, cx);
+        }
+        let Some(service) = self.hub.read(cx).metadata() else {
+            return;
+        };
+        let columns = service.children(connection, NodeKey::new(path.clone(), ObjectKind::Column));
+        cx.spawn_in(window, async move |_, cx| {
+            let columns = columns.await;
+            let _ = cx.update(|window, cx| {
+                let targets = match columns {
+                    Ok(node) if node.complete && node.hidden_by_filter == 0 => {
+                        crate::transfer::import::targets_from(&node.items)
+                    }
+                    Ok(_) => {
+                        return Self::notify(
+                            "The table's columns are not all listed (a navigator filter hides some, or the list is incomplete): the import needs every column.",
+                            window,
+                            cx,
+                        );
+                    }
+                    Err(e) => {
+                        return Self::notify(
+                            format!(
+                                "The table's columns could not be read: {}",
+                                crate::browse::display_message(&e.to_string())
+                            ),
+                            window,
+                            cx,
+                        );
+                    }
+                };
+                crate::transfer::import::open_import_dialog(
+                    session,
+                    transfer,
+                    crate::transfer::table_parts(&path),
+                    targets,
+                    window,
+                    cx,
+                );
+            });
+        })
+        .detach();
+    }
+
+    /// "Open table data": the selected table's rows in a new tab, editable when its key allows.
+    pub fn open_table_data(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some((connection, path, _)) = self.target_object(cx) else {
+            return Self::notify("Select a table in the navigator first.", window, cx);
+        };
+        if !path.kind().is_some_and(is_table_like) {
+            return Self::notify("Select a table or a view in the navigator.", window, cx);
+        }
+        let Some(session) = self.hub.read(cx).sessions(connection).first().cloned() else {
+            return Self::notify("Connect first.", window, cx);
+        };
+        self.active_connection = Some(connection);
+        self.open_table_tab(
+            session,
+            crate::editor_tab::table::TableSource::of_path(path),
+            window,
+            cx,
+        );
+    }
+
+    /// Opens a new tab on `session` showing `source`.
+    pub fn open_table_tab(
+        &mut self,
+        session: ninesql_core::SessionHandle,
+        source: crate::editor_tab::table::TableSource,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> TabId {
+        let id = self.layout.allocate_tab();
+        let hub = self.hub.clone();
+        let title = source.label();
+        let editor = cx.new(|cx| SqlEditorTab::new(title, hub, Some(session), window, cx));
+        self.tabs.insert(id, editor.clone());
+        self.layout.open_tab(id);
+        self.after_change(window, cx);
+        editor.update(cx, |t, cx| t.open_table(source, window, cx));
+        id
+    }
+
+    /// The editing, sort and filter actions of the active editor's table.
+    fn table_action(
+        &mut self,
+        any: &dyn std::any::Any,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let known = any.is::<EditCell>()
+            || any.is::<SetCellNull>()
+            || any.is::<InsertRow>()
+            || any.is::<DuplicateRow>()
+            || any.is::<DeleteRows>()
+            || any.is::<RevertRowChanges>()
+            || any.is::<DiscardChanges>()
+            || any.is::<PreviewChanges>()
+            || any.is::<SaveChanges>()
+            || any.is::<FilterTableRows>()
+            || any.is::<FilterTableBySelectedValue>()
+            || any.is::<SortTableAscending>()
+            || any.is::<SortTableDescending>()
+            || any.is::<ClearTableFilter>()
+            || any.is::<RefreshTableData>();
+        if !known {
+            return false;
+        }
+        let Some(tab) = self.active_editor().cloned() else {
+            Self::notify("Open a table first (Open table data).", window, cx);
+            return true;
+        };
+        if any.is::<EditCell>() {
+            if let Some((row, col, name, text)) = tab.update(cx, |t, cx| t.cell_to_edit(cx)) {
+                crate::editor_tab::edit_dialogs::open_cell_editor(
+                    tab, row, col, name, text, window, cx,
+                );
+            }
+        } else if any.is::<SetCellNull>() {
+            tab.update(cx, |t, cx| t.set_focused_null(cx));
+        } else if any.is::<InsertRow>() {
+            let columns = tab.read(cx).insert_columns(cx);
+            if columns.is_empty() {
+                let why = tab
+                    .read(cx)
+                    .read_only_reason()
+                    .unwrap_or("No column of the result can be set.")
+                    .to_owned();
+                Self::notify(why, window, cx);
+            } else {
+                crate::editor_tab::edit_dialogs::open_insert_row(tab, columns, window, cx);
+            }
+        } else if any.is::<DuplicateRow>() {
+            tab.update(cx, |t, cx| t.duplicate_focused_row(cx));
+        } else if any.is::<DeleteRows>() {
+            tab.update(cx, |t, cx| t.delete_selected_rows(cx));
+        } else if any.is::<RevertRowChanges>() {
+            tab.update(cx, |t, cx| t.revert_selected_rows(cx));
+        } else if any.is::<DiscardChanges>() {
+            tab.update(cx, |t, cx| t.discard_changes(cx));
+        } else if any.is::<PreviewChanges>() {
+            if let Ok(plan) = tab.update(cx, |t, cx| t.plan_changes(cx)) {
+                crate::editor_tab::edit_dialogs::open_preview(tab, plan, window, cx);
+            }
+        } else if any.is::<SaveChanges>() {
+            tab.update(cx, |t, cx| t.save_changes(window, cx));
+        } else if any.is::<FilterTableRows>() {
+            let (has_source, current) = {
+                let t = tab.read(cx);
+                let s = t.table_state().source.as_ref();
+                (s.is_some(), s.and_then(|s| s.query.raw_where.clone()))
+            };
+            if !has_source {
+                Self::notify(
+                    "Server-side filters apply to a table opened from the navigator (Open table data).",
+                    window,
+                    cx,
+                );
+            } else {
+                let history = tab.update(cx, |t, cx| t.filter_history(cx));
+                crate::editor_tab::edit_dialogs::open_filter_dialog(
+                    tab, current, history, window, cx,
+                );
+            }
+        } else if any.is::<FilterTableBySelectedValue>() {
+            tab.update(cx, |t, cx| t.filter_server_by_value(window, cx));
+        } else if any.is::<SortTableAscending>() {
+            tab.update(cx, |t, cx| t.sort_server(false, window, cx));
+        } else if any.is::<SortTableDescending>() {
+            tab.update(cx, |t, cx| t.sort_server(true, window, cx));
+        } else if any.is::<ClearTableFilter>() {
+            tab.update(cx, |t, cx| t.clear_server_filter(window, cx));
+        } else if any.is::<RefreshTableData>() {
+            tab.update(cx, |t, cx| {
+                t.run_source(window, cx);
+            });
+        }
+        true
+    }
+
+    /// "Open referenced rows" / "Open referencing rows": the focused row's foreign-key targets,
+    /// one opened at once or picked from a list, each in a new tab.
+    pub fn open_foreign_key_rows(
+        &mut self,
+        referencing: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(tab) = self.active_editor().cloned() else {
+            return Self::notify("Open a table first (Open table data).", window, cx);
+        };
+        let Some(session) = tab.read(cx).table_session() else {
+            return Self::notify("The editor has no open connection.", window, cx);
+        };
+        let targets = tab.update(cx, |t, cx| t.foreign_key_targets(referencing, cx));
+        let this = cx.entity().downgrade();
+        cx.spawn_in(window, async move |_, cx| {
+            let result = targets.await;
+            let _ = cx.update(|window, cx| match result {
+                Ok(mut list) if list.len() == 1 => {
+                    let target = list.remove(0);
+                    let _ = this.update(cx, |ws, cx| {
+                        ws.open_fk_target(session.clone(), target, window, cx);
+                    });
+                }
+                Ok(list) => {
+                    let on_pick: crate::editor_tab::edit_dialogs::OnTarget = {
+                        let this = this.clone();
+                        let session = session.clone();
+                        std::rc::Rc::new(move |target, window, cx| {
+                            let _ = this.update(cx, |ws, cx| {
+                                ws.open_fk_target(session.clone(), target, window, cx);
+                            });
+                        })
+                    };
+                    crate::editor_tab::edit_dialogs::open_fk_picker(
+                        if referencing {
+                            "Open referencing rows"
+                        } else {
+                            "Open referenced rows"
+                        },
+                        list,
+                        on_pick,
+                        window,
+                        cx,
+                    );
+                }
+                Err(why) => Self::notify(why, window, cx),
+            });
+        })
+        .detach();
+    }
+
+    /// Opens a foreign-key target in a new tab (editable again: a table query of the core).
+    pub fn open_fk_target(
+        &mut self,
+        session: ninesql_core::SessionHandle,
+        target: crate::editor_tab::table::FkTarget,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> TabId {
+        let mut source = crate::editor_tab::table::TableSource::of_path(target.path);
+        source.initial = Some(target.query);
+        self.open_table_tab(session, source, window, cx)
+    }
+
+    /// "Export connections to DBeaver…".
+    pub fn export_to_dbeaver(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let hub = self.hub.read(cx);
+        let Some(core) = hub.core().cloned() else {
+            return Self::notify(
+                "The application core is not running: nothing can be exported.",
+                window,
+                cx,
+            );
+        };
+        let connections: Vec<(ConnectionId, String)> = hub
+            .connections()
+            .iter()
+            .map(|c| (c.id, c.name.clone()))
+            .collect();
+        crate::dbeaver_export::open_dbeaver_export(Some(core), connections, window, cx);
     }
 
     /// "Copy DDL": the active object editor's DDL, else the selected object's.

@@ -21,6 +21,7 @@ pub mod app;
 pub mod appearance;
 pub mod browse;
 pub mod connections;
+pub mod dbeaver_export;
 pub mod editor_tab;
 pub mod import;
 pub mod keymap;
@@ -30,6 +31,8 @@ pub mod palette;
 pub mod persist;
 pub mod services;
 pub mod settings;
+pub mod snippets;
+pub mod transfer;
 pub mod workspace;
 
 #[cfg(test)]

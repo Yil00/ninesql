@@ -381,3 +381,79 @@ fn loaded_scripts_are_sanitized(cx: &mut TestAppContext) {
     assert_eq!(removed, 2);
     assert_eq!(text(&view, vcx), "a\nb");
 }
+
+#[gpui::test]
+fn transform_formats_the_selection_or_the_document(cx: &mut TestAppContext) {
+    let (view, _, vcx) = open(cx);
+    set_text(&view, vcx, "select 1; select 2", 0);
+    let changed = view.update_in(vcx, |v, window, cx| {
+        v.transform_selection_or_all(str::to_uppercase, window, cx)
+    });
+    assert!(changed);
+    assert_eq!(text(&view, vcx), "SELECT 1; SELECT 2");
+    // Only the selection when there is one; the output is sanitized.
+    view.update_in(vcx, |v, _, cx| {
+        v.editor()
+            .update(cx, |s, cx| s.set_selected_range(0..8, cx));
+    });
+    view.update_in(vcx, |v, window, cx| {
+        v.transform_selection_or_all(|_| "select\u{0}1".to_owned(), window, cx)
+    });
+    assert_eq!(text(&view, vcx), "select1; SELECT 2");
+    let unchanged = view.update_in(vcx, |v, window, cx| {
+        v.transform_selection_or_all(str::to_owned, window, cx)
+    });
+    assert!(!unchanged);
+}
+
+#[gpui::test]
+fn insert_text_places_the_caret(cx: &mut TestAppContext) {
+    let (view, _, vcx) = open(cx);
+    set_text(&view, vcx, "-- x\n", 5);
+    view.update_in(vcx, |v, window, cx| {
+        v.insert_text("SELECT * FROM t WHERE ", Some(7), window, cx);
+    });
+    assert_eq!(text(&view, vcx), "-- x\nSELECT * FROM t WHERE ");
+    assert_eq!(selected(&view, vcx), 12..12);
+}
+
+#[gpui::test]
+fn built_statements_are_shown_and_sent_with_their_values(cx: &mut TestAppContext) {
+    let (view, sink, vcx) = open(cx);
+    let text = "SELECT * FROM \"t\" WHERE \"id\" = $1";
+    let id = view.update_in(vcx, |v, window, cx| {
+        v.submit_built(
+            text,
+            vec![ninesql_core::driver_api::Param::Int(7)],
+            window,
+            cx,
+        )
+    });
+    assert!(id.is_ok());
+    assert_eq!(text_of(&view, vcx), text);
+    {
+        let requests = sink.requests.borrow();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].items[0].text, text);
+        assert_eq!(requests[0].items[0].params.len(), 1);
+    }
+    // Refused while it runs, and for text the editor would change.
+    let again = view.update_in(vcx, |v, window, cx| {
+        v.submit_built(text, Vec::new(), window, cx)
+    });
+    assert!(again.is_err());
+    view.update_in(vcx, |v, _, cx| {
+        if let Ok(id) = id {
+            v.finish_run(id, cx);
+        }
+    });
+    let hidden = view.update_in(vcx, |v, window, cx| {
+        v.submit_built("SELECT 1 WHERE a = '\u{7}x'", Vec::new(), window, cx)
+    });
+    assert!(hidden.is_err());
+    assert_eq!(sink.requests.borrow().len(), 1);
+}
+
+fn text_of(view: &Entity<SqlEditor>, vcx: &mut VisualTestContext) -> String {
+    text(view, vcx)
+}

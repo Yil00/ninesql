@@ -217,6 +217,22 @@ pub struct ExecutionItem {
 }
 
 impl ExecutionItem {
+    /// One statement built by the application rather than typed (a filtered table query of
+    /// the core, P5-A): `text` is sent as is (its placeholders are already the dialect's) with
+    /// `params`, and spans the whole document from offset 0.
+    #[must_use]
+    pub fn built_statement(text: String, params: Vec<Param>) -> Self {
+        Self {
+            kind: ItemKind::Statement,
+            span: 0..text.len(),
+            start: TextPosition::default(),
+            original: text.clone(),
+            text,
+            params,
+            rewrites: Vec::new(),
+        }
+    }
+
     /// Maps a byte offset in [`text`](Self::text) back to one in
     /// [`original`](Self::original): inside a rewritten placeholder, its start.
     #[must_use]

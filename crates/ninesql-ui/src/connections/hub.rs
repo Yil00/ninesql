@@ -53,6 +53,8 @@ pub struct HubConfig {
     /// Limits of the metadata service built when there is no core (tests); the core's own
     /// service is used otherwise.
     pub metadata: ninesql_core::MetadataConfig,
+    /// The transfer service used when there is no core (tests); the core's otherwise.
+    pub transfer: Option<ninesql_core::TransferService>,
 }
 
 impl HubConfig {
@@ -71,6 +73,7 @@ impl HubConfig {
             core: None,
             problems: Vec::new(),
             metadata: ninesql_core::MetadataConfig::default(),
+            transfer: None,
         }
     }
 
@@ -242,6 +245,8 @@ pub struct ConnectionHub {
     detected: Option<Vec<DetectedDbeaver>>,
     local_execution: Option<ninesql_core::ExecutionService>,
     local_metadata: Option<ninesql_core::MetadataService>,
+    local_transfer: Option<ninesql_core::TransferService>,
+    local_edit: Option<ninesql_core::EditService>,
     metadata_config: ninesql_core::MetadataConfig,
     _events: Option<Task<()>>,
     _metadata_events: Option<Task<()>>,
@@ -271,6 +276,8 @@ impl ConnectionHub {
             detected: None,
             local_execution: None,
             local_metadata: None,
+            local_transfer: config.transfer,
+            local_edit: None,
             metadata_config: config.metadata,
             _events: None,
             _metadata_events: None,
@@ -474,6 +481,39 @@ impl ConnectionHub {
             Some(core) => Some(core.metadata().clone()),
             None => self.local_metadata.clone(),
         }
+    }
+
+    /// The transfer service (P5-C): the core's, or the one given to a hub assembled without a
+    /// core (tests). `None` when the core did not start.
+    #[must_use]
+    pub fn transfer(&self) -> Option<ninesql_core::TransferService> {
+        match &self.core {
+            Some(core) => Some(core.transfer().clone()),
+            None => self.local_transfer.clone(),
+        }
+    }
+
+    /// The edit service (P5-A core): row editing, filtered table queries, foreign-key
+    /// navigation and the filter history. The core's, or one over the session manager, the
+    /// local metadata and execution services when the hub was assembled without a core (tests).
+    #[must_use]
+    pub fn edit(&mut self) -> Option<ninesql_core::EditService> {
+        if let Some(core) = &self.core {
+            return Some(core.edit().clone());
+        }
+        if self.local_edit.is_none() {
+            let manager = self.manager.clone()?;
+            let metadata = self.metadata()?;
+            let execution = self.execution()?;
+            self.local_edit = Some(ninesql_core::EditService::new(manager, metadata, execution));
+        }
+        self.local_edit.clone()
+    }
+
+    /// The open project's directories (snippets), when a project is open.
+    #[must_use]
+    pub fn project_paths(&self) -> Option<ninesql_core::storage::ProjectPaths> {
+        self.workspace.as_ref().map(|w| w.project_paths().clone())
     }
 
     /// The preferences in effect (`[execution]`, `[history]`, `[confirmations]` of

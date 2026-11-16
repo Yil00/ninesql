@@ -152,6 +152,29 @@ pub(crate) fn mock_hub_with_metadata(
     init(cx, config)
 }
 
+/// [`mock_hub`] with a transfer service over the same session manager (P5-C), NineSQL's own
+/// storage under `dir/ninesql`.
+pub(crate) fn mock_hub_with_transfer(
+    cx: &mut TestAppContext,
+    dir: &std::path::Path,
+    connections: Vec<Connection>,
+) -> Entity<ConnectionHub> {
+    let manager = mock_manager(dir);
+    let root = dir.join("ninesql");
+    let paths = ninesql_core::storage::Paths::new(&ninesql_core::storage::XdgDirs {
+        config_home: root.join("config"),
+        data_home: root.join("data"),
+        state_home: root.join("state"),
+    });
+    let mut config = HubConfig::empty();
+    config.registry = manager.registry().clone();
+    config.transfer = Some(ninesql_core::TransferService::new(manager.clone(), &paths));
+    config.manager = Some(manager);
+    config.connections =
+        ninesql_core::Connections::from_vec(connections).unwrap_or_else(|e| panic!("{e}"));
+    init(cx, config)
+}
+
 fn shipped_hub(cx: &mut TestAppContext) -> Entity<ConnectionHub> {
     let mut config = HubConfig::empty();
     config.registry = shipped();
@@ -927,7 +950,7 @@ fn wait_reply<T>(mut reply: ninesql_core::Reply<T>) -> T {
 
 /// A real `CoreServices` on the mock driver under `base` (no Secret Service, no desktop lock
 /// watcher, so new secrets go to the vault), installed as the hub.
-fn core_hub(
+pub(crate) fn core_hub(
     cx: &mut TestAppContext,
     base: &std::path::Path,
 ) -> (Entity<ConnectionHub>, ninesql_core::CoreServices) {
@@ -951,7 +974,7 @@ fn create_test_vault(core: &ninesql_core::CoreServices) {
 }
 
 /// Awaits a hub task that runs on the driver runtime, with parking allowed.
-fn await_task<T: 'static>(vcx: &mut VisualTestContext, task: gpui::Task<T>) -> T {
+pub(crate) fn await_task<T: 'static>(vcx: &mut VisualTestContext, task: gpui::Task<T>) -> T {
     let done = std::rc::Rc::new(std::cell::RefCell::new(None));
     let slot = done.clone();
     vcx.foreground_executor()

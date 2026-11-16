@@ -160,6 +160,70 @@ impl SqlEditor {
         fixes.len()
     }
 
+    /// Replaces the selection with `f(selected text)`, or the whole document with `f(text)`
+    /// when nothing is selected ("Format SQL"). The result is sanitized like typed text and
+    /// goes through the input's undo history. Returns `false` when `f` changed nothing.
+    pub fn transform_selection_or_all(
+        &mut self,
+        f: impl FnOnce(&str) -> String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let (text, selection) = {
+            let s = self.editor.read(cx);
+            (s.value().to_string(), s.selected_range())
+        };
+        let range = if selection.is_empty() {
+            0..text.len()
+        } else {
+            selection
+        };
+        let Some(source) = text.get(range.clone()) else {
+            return false;
+        };
+        let out = f(source);
+        if out == source {
+            return false;
+        }
+        let clean = hygiene::apply_fixes(&out, &hygiene::fixes(&out));
+        let end = range.start + clean.len();
+        self.editor.update(cx, |s, cx| {
+            s.set_selected_range(range.clone(), cx);
+            s.replace(clean.clone(), window, cx);
+            s.set_selected_range(range.start..end, cx);
+        });
+        let full = self.text(cx);
+        self.refresh_bidi(&full, cx);
+        cx.notify();
+        true
+    }
+
+    /// Inserts `text` in place of the selection (a snippet expansion), sanitized like typed
+    /// text, and puts the caret at byte `cursor` of the inserted text (its end without one).
+    pub fn insert_text(
+        &mut self,
+        text: &str,
+        cursor: Option<usize>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let fixes = hygiene::fixes(text);
+        let clean = hygiene::apply_fixes(text, &fixes);
+        // A sanitized text may be shorter: keep the caret inside it.
+        let caret = cursor
+            .filter(|_| fixes.is_empty())
+            .unwrap_or(clean.len())
+            .min(clean.len());
+        let start = self.editor.read(cx).selected_range().start;
+        self.editor.update(cx, |s, cx| {
+            s.replace(clean.clone(), window, cx);
+            s.set_selected_range(start + caret..start + caret, cx);
+        });
+        let full = self.text(cx);
+        self.refresh_bidi(&full, cx);
+        cx.notify();
+    }
+
     /// Replaces the setup (the editor's connection changed): splitting, parameter style,
     /// completion keywords, quoting and metadata follow the new dialect. The text is kept.
     pub fn set_setup(&mut self, setup: EditorSetup, cx: &mut Context<Self>) {
@@ -546,6 +610,61 @@ impl SqlEditor {
         self.error = None;
         self.refresh_diagnostics(cx);
         sink.submit(request);
+    }
+
+    /// Replaces the document with `text` and submits it as one statement with `params` (a
+    /// query the application built, such as the core's filtered table query, P5-A): the user
+    /// sees exactly what runs. Refused (`Err` with the reason) while a run is going on, without
+    /// a sink, or when the text holds characters the editor would strip or change (it would no
+    /// longer be what runs). Returns the request id.
+    ///
+    /// # Errors
+    /// The reason, shown by the caller.
+    pub fn submit_built(
+        &mut self,
+        text: &str,
+        params: Vec<ninesql_core::driver_api::Param>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Result<RequestId, String> {
+        if self.running.is_some() {
+            return Err("A run is already going on in this editor: cancel it first.".to_owned());
+        }
+        let Some(sink) = self.sink.clone() else {
+            return Err("No connection: choose one for this editor first".to_owned());
+        };
+        if !hygiene::fixes(text).is_empty() {
+            return Err(
+                "The query holds control or invisible characters the editor would change: remove them from the filter."
+                    .to_owned(),
+            );
+        }
+        self.set_text(text, window, cx);
+        let id = RequestId(self.next_request);
+        self.next_request += 1;
+        let item = crate::execution::ExecutionItem::built_statement(text.to_owned(), params);
+        let mut kept_item = item.clone();
+        kept_item.params.clear();
+        let request = ExecutionRequest {
+            id,
+            kind: ExecutionKind::Statement,
+            connection: self.connection,
+            items: vec![item],
+            range_text: text.to_owned(),
+            bidi_controls: self.bidi.len(),
+        };
+        // Keep the mapping for error positions, not the values (I1).
+        self.last_request = Some(ExecutionRequest {
+            items: vec![kept_item],
+            range_text: request.range_text.clone(),
+            ..request.clone()
+        });
+        self.running = Some(id);
+        self.error = None;
+        self.refresh_diagnostics(cx);
+        sink.submit(request);
+        cx.notify();
+        Ok(id)
     }
 
     /// The core reports an error for an item of a run. Answers to an older run are ignored.

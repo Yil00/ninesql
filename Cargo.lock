@@ -4696,6 +4696,7 @@ dependencies = [
 name = "ninesql-grid"
 version = "0.0.0"
 dependencies = [
+ "arrow-data",
  "gpui-kit",
  "gpui-pre",
  "ninesql-core",
