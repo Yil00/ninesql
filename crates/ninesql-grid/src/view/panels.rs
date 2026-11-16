@@ -213,7 +213,8 @@ impl ResultsView {
             cx.notify();
             return false;
         };
-        self.update_delegate(cx, |d| {
+        let mut dropped = false;
+        let done = self.update_delegate(cx, |d| {
             d.update_rows(|rows, m| {
                 rows.set_sort(
                     Some(SortKey {
@@ -222,8 +223,15 @@ impl ResultsView {
                     }),
                     m,
                 );
+                dropped = rows.sort_dropped();
             });
-        })
+        });
+        if dropped {
+            self.status = Some(crate::rows::sort_dropped_text().into());
+            cx.notify();
+            return false;
+        }
+        done
     }
 
     /// Adds a client-side filter on the active result.

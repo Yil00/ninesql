@@ -212,10 +212,17 @@ pub trait ServerSortFilter {
     fn request(&self, statement: u32, spec: SortFilterSpec);
 }
 
+/// Most loaded rows sorted on the client. Above it the sort is refused (or dropped when rows
+/// arrive past it), and the label says to sort on the server: a sort on the UI thread must stay
+/// short (I6).
+pub const MAX_CLIENT_SORT_ROWS: usize = 200_000;
+
 /// A permutation of the loaded rows: client-side sort and filters.
 #[derive(Debug, Clone, Default)]
 pub struct RowView {
     sort: Option<SortKey>,
+    /// The sort was removed because the loaded rows exceed [`MAX_CLIENT_SORT_ROWS`].
+    sort_dropped: bool,
     filters: Vec<ClientFilter>,
     /// Model rows in display order; `None` when no sort or filter is active.
     map: Option<Vec<usize>>,
@@ -248,10 +255,18 @@ impl RowView {
         &self.filters
     }
 
-    /// Sets the sort (and rebuilds).
+    /// Sets the sort (and rebuilds). Over [`MAX_CLIENT_SORT_ROWS`] loaded rows the sort is not
+    /// applied and [`Self::sort_dropped`] says so.
     pub fn set_sort(&mut self, sort: Option<SortKey>, model: &ResultSetModel) {
         self.sort = sort;
+        self.sort_dropped = false;
         self.rebuild(model);
+    }
+
+    /// Whether the sort was refused or removed because too many rows are loaded.
+    #[must_use]
+    pub fn sort_dropped(&self) -> bool {
+        self.sort_dropped
     }
 
     /// Adds a filter (and rebuilds). A filter with no column and another operator than
@@ -276,6 +291,7 @@ impl RowView {
     /// Removes the sort and the filters.
     pub fn clear(&mut self) {
         self.sort = None;
+        self.sort_dropped = false;
         self.filters.clear();
         self.map = None;
         self.built_from = 0;
@@ -287,9 +303,15 @@ impl RowView {
         self.is_active() && self.built_from != model.row_count()
     }
 
-    /// Rebuilds the permutation from the loaded rows (when active).
+    /// Rebuilds the permutation from the loaded rows (when active). The sort keys are read
+    /// once per row (no per-comparison allocation); over [`MAX_CLIENT_SORT_ROWS`] rows the sort
+    /// is dropped.
     pub fn rebuild(&mut self, model: &ResultSetModel) {
         self.built_from = model.row_count();
+        if self.sort.is_some() && model.row_count() > MAX_CLIENT_SORT_ROWS {
+            self.sort = None;
+            self.sort_dropped = true;
+        }
         if !self.is_active() {
             self.map = None;
             return;
@@ -301,15 +323,24 @@ impl RowView {
             && key.column < model.columns().len()
         {
             let values = column_values(model.batches(), key.column);
+            // The text form of numbers and booleans is only compared against another type:
+            // built only when the column mixes types.
+            let mut kinds = values
+                .iter()
+                .filter(|v| !matches!(v, CellValue::Null))
+                .map(std::mem::discriminant);
+            let first = kinds.next();
+            let mixed = kinds.any(|k| Some(k) != first);
+            let keys: Vec<SortValue<'_>> = values.iter().map(|v| SortValue::of(v, mixed)).collect();
             rows.sort_by(|&a, &b| {
-                let (va, vb) = (&values[a], &values[b]);
-                match (va, vb) {
-                    (CellValue::Null, CellValue::Null) => Ordering::Equal,
+                let (ka, kb) = (&keys[a], &keys[b]);
+                match (ka.is_null(), kb.is_null()) {
+                    (true, true) => Ordering::Equal,
                     // NULL last in both directions.
-                    (CellValue::Null, _) => Ordering::Greater,
-                    (_, CellValue::Null) => Ordering::Less,
+                    (true, false) => Ordering::Greater,
+                    (false, true) => Ordering::Less,
                     _ => {
-                        let o = compare(va, vb);
+                        let o = ka.compare(kb);
                         match key.direction {
                             SortDirection::Ascending => o,
                             SortDirection::Descending => o.reverse(),
@@ -346,8 +377,9 @@ impl RowView {
     /// loaded rows are.
     #[must_use]
     pub fn label(&self, model: &ResultSetModel) -> Option<String> {
+        let dropped = self.sort_dropped.then(sort_dropped_text);
         if !self.is_active() {
-            return None;
+            return dropped;
         }
         let name = |c: usize| {
             model.columns().get(c).map_or_else(
@@ -372,12 +404,73 @@ impl RowView {
                 parts.push(format!("{col} {}", f.op.label()));
             }
         }
-        Some(format!(
+        let text = format!(
             "Loaded rows only: {} · {} of {} loaded rows shown",
             parts.join(" · "),
             self.len(model.row_count()),
             model.row_count()
-        ))
+        );
+        Some(match dropped {
+            Some(d) => format!("{d} {text}"),
+            None => text,
+        })
+    }
+}
+
+/// Why the client-side sort is not applied.
+#[must_use]
+pub fn sort_dropped_text() -> String {
+    format!(
+        "Not sorted: more than {MAX_CLIENT_SORT_ROWS} rows are loaded, over the client-side \
+         sort limit. Sort on the server (\"Order by\") instead."
+    )
+}
+
+/// A row's sort key, read once: the value, its number form and its text form for the mixed
+/// comparisons [`compare`] makes.
+struct SortValue<'a> {
+    value: &'a CellValue<'a>,
+    number: Option<f64>,
+    text: std::borrow::Cow<'a, str>,
+}
+
+impl<'a> SortValue<'a> {
+    fn of(value: &'a CellValue<'a>, mixed: bool) -> Self {
+        let number = if value.is_number() {
+            as_f64(value)
+        } else {
+            None
+        };
+        let text = match value {
+            CellValue::Text(s) => std::borrow::Cow::Borrowed(*s),
+            CellValue::Decimal(s) | CellValue::Duration(s) | CellValue::Unsupported(s) => {
+                std::borrow::Cow::Borrowed(s.as_str())
+            }
+            other if mixed => std::borrow::Cow::Owned(text_of(other)),
+            _ => std::borrow::Cow::Borrowed(""),
+        };
+        Self {
+            value,
+            number,
+            text,
+        }
+    }
+
+    fn is_null(&self) -> bool {
+        matches!(self.value, CellValue::Null)
+    }
+
+    /// The same order as [`compare`], without allocating.
+    fn compare(&self, other: &Self) -> Ordering {
+        if let Some(o) = compare_typed(self.value, other.value) {
+            return o;
+        }
+        if self.value.is_number() && other.value.is_number() {
+            if let (Some(x), Some(y)) = (self.number, other.number) {
+                return x.total_cmp(&y);
+            }
+        }
+        self.text.cmp(&other.text)
     }
 }
 
@@ -405,8 +498,21 @@ fn as_f64(v: &CellValue<'_>) -> Option<f64> {
 /// Type-aware comparison of two non-NULL values.
 #[must_use]
 pub fn compare(a: &CellValue<'_>, b: &CellValue<'_>) -> Ordering {
+    if let Some(o) = compare_typed(a, b) {
+        return o;
+    }
+    if a.is_number() && b.is_number() {
+        if let (Some(x), Some(y)) = (as_f64(a), as_f64(b)) {
+            return x.total_cmp(&y);
+        }
+    }
+    text_of(a).cmp(&text_of(b))
+}
+
+/// The comparison of two values of the same type, `None` for the mixed ones.
+fn compare_typed(a: &CellValue<'_>, b: &CellValue<'_>) -> Option<Ordering> {
     use CellValue as V;
-    match (a, b) {
+    Some(match (a, b) {
         (V::Int(x), V::Int(y)) => x.cmp(y),
         (V::UInt(x), V::UInt(y)) => x.cmp(y),
         (V::Bool(x), V::Bool(y)) => x.cmp(y),
@@ -435,12 +541,8 @@ pub fn compare(a: &CellValue<'_>, b: &CellValue<'_>) -> Ordering {
                 ..
             },
         ) => (s1, n1).cmp(&(s2, n2)),
-        _ if a.is_number() && b.is_number() => match (as_f64(a), as_f64(b)) {
-            (Some(x), Some(y)) => x.total_cmp(&y),
-            _ => text_of(a).cmp(&text_of(b)),
-        },
-        _ => text_of(a).cmp(&text_of(b)),
-    }
+        _ => return None,
+    })
 }
 
 fn text_of(v: &CellValue<'_>) -> String {
@@ -667,6 +769,61 @@ mod tests {
         );
         assert_eq!(v.model_row(0), Some(19));
         assert_eq!(v.model_row(19), Some(0));
+    }
+
+    #[test]
+    fn precomputed_keys_order_like_compare() {
+        let values = [
+            CellValue::Int(3),
+            CellValue::UInt(2),
+            CellValue::Float(2.5),
+            CellValue::Decimal("2.25".into()),
+            CellValue::Decimal("x".into()),
+            CellValue::Text("10"),
+            CellValue::Bool(true),
+            CellValue::Int(-1),
+        ];
+        for a in &values {
+            for b in &values {
+                let (ka, kb) = (SortValue::of(a, true), SortValue::of(b, true));
+                assert_eq!(ka.compare(&kb), compare(a, b), "{a:?} vs {b:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn sort_over_the_row_limit_is_dropped_and_said() {
+        let m = model(vec![batch(0, MAX_CLIENT_SORT_ROWS + 1)]);
+        let mut v = RowView::new();
+        v.set_sort(
+            Some(SortKey {
+                column: 0,
+                direction: SortDirection::Descending,
+            }),
+            &m,
+        );
+        assert!(v.sort_dropped());
+        assert!(v.sort().is_none());
+        assert_eq!(v.model_row(0), Some(0), "not sorted");
+        let label = v.label(&m).unwrap();
+        assert!(label.contains("Sort on the server"), "{label}");
+        // A sort set under the limit is dropped when rows arrive past it.
+        let small = model(vec![batch(0, 10)]);
+        let mut v = RowView::new();
+        v.set_sort(
+            Some(SortKey {
+                column: 0,
+                direction: SortDirection::Descending,
+            }),
+            &small,
+        );
+        assert!(!v.sort_dropped());
+        assert!(v.is_stale(&m));
+        v.rebuild(&m);
+        assert!(v.sort_dropped());
+        v.clear();
+        assert!(!v.sort_dropped());
+        assert!(v.label(&m).is_none());
     }
 
     #[test]
