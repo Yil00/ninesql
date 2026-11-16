@@ -246,13 +246,39 @@ async fn scenario(
         .unwrap()
         .unwrap_or_else(|e| panic!("{engine}: {e}"));
     assert_eq!(table.key.columns, vec!["id"], "{engine}");
-    let select = format!("SELECT id, label FROM {} ORDER BY id", n.parent);
-    let before = query(h, &select, vec![]).await;
+    // The grid's query of the table: built by the core, so its result can be edited.
+    let open_table = edit
+        .table_query(
+            h,
+            &TableQuery::of_path(&parent_path)
+                .with_columns(vec!["id".into(), "label".into()])
+                .order(SortKey::new("id", SortDirection::Ascending)),
+        )
+        .unwrap();
+    let source = open_table.source().clone();
+    let select = open_table.text.clone();
+    let before = built(h, open_table.clone()).await;
     let b = &before[0];
     assert_eq!(b.num_rows(), 3);
+    // A statement typed by the user has no source of its own; paired with the table query's
+    // source, a result whose columns differ from what that query selected is refused (here an
+    // alias pointing `id` at another column).
+    let aliased = query(
+        h,
+        &format!("SELECT label AS id FROM {} ORDER BY id", n.parent),
+        vec![],
+    )
+    .await;
+    let star = edit
+        .table_query(h, &TableQuery::of_path(&parent_path))
+        .unwrap();
+    assert!(
+        PendingEdits::new(table.clone(), star.source(), &aliased[0].schema()).is_err(),
+        "{engine}: an aliased result was accepted"
+    );
 
     // Edits: a label with quotes and comment markers, a NULL set, a delete, an insert.
-    let mut p = PendingEdits::new(table.clone(), &b.schema()).unwrap();
+    let mut p = PendingEdits::new(table.clone(), &source, &b.schema()).unwrap();
     let tricky = "it's \"x\"; -- /* \\ */";
     p.set_value(0, b, 0, 1, p.parse_input(1, tricky).unwrap())
         .unwrap();
@@ -296,7 +322,7 @@ async fn scenario(
     // A stale edit (the row changed since it was read) fails its row-count check, and the
     // whole save rolls back, the fresh edit before it included.
     let fresh = query(h, &select, vec![]).await;
-    let mut p = PendingEdits::new(table.clone(), &fresh[0].schema()).unwrap();
+    let mut p = PendingEdits::new(table.clone(), &source, &fresh[0].schema()).unwrap();
     p.set_value(1, &fresh[0], 1, 1, Param::Text("fresh".into()))
         .unwrap();
     p.set_value(5, b, 0, 1, Param::Text("stale".into()))
@@ -419,8 +445,16 @@ async fn scenario(
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
     let script = std::fs::read_to_string(&out).unwrap();
+    if engine == "postgresql" {
+        // The literals read the same in either lexical mode (security review H1 of P5-B): the
+        // file is replayed with backslash escapes on.
+        exec_ok(h, "SET standard_conforming_strings = off").await;
+    }
     for span in h.dialect().split_statements(&script) {
         exec_ok(h, &script[span.start..span.end]).await;
+    }
+    if engine == "postgresql" {
+        exec_ok(h, "SET standard_conforming_strings = on").await;
     }
     let copied = query(
         h,
@@ -438,8 +472,14 @@ async fn scenario(
     // Manual-commit mode: the save runs inside the session's transaction around a savepoint.
     // A failed save undoes only itself; a good one stays uncommitted until the user commits.
     h.set_auto_commit(false).await.unwrap().unwrap();
+    // Earlier uncommitted work of the session, which a failed save must not discard.
+    exec_ok(
+        h,
+        &format!("UPDATE {} SET label = 'pending' WHERE id = 4", n.parent),
+    )
+    .await;
     let rows = query(h, &select, vec![]).await;
-    let mut good = PendingEdits::new(table.clone(), &rows[0].schema()).unwrap();
+    let mut good = PendingEdits::new(table.clone(), &source, &rows[0].schema()).unwrap();
     good.set_value(1, &rows[0], 1, 1, Param::Text("manual".into()))
         .unwrap();
     let mut bad = good.clone();
@@ -458,6 +498,11 @@ async fn scenario(
         Some("was null"),
         "{engine}"
     );
+    assert_eq!(
+        label(h, &n.parent, 4).await.as_deref(),
+        Some("pending"),
+        "{engine}: the earlier uncommitted work was lost"
+    );
     let SaveEvent::Done(s) = end(edit.save(h, &good, SaveOptions::default())).await else {
         panic!("{engine}: not saved in manual-commit mode");
     };
@@ -466,6 +511,11 @@ async fn scenario(
     assert_eq!(label(h, &n.parent, 2).await.as_deref(), Some("manual"));
     h.commit().await.unwrap().unwrap();
     h.set_auto_commit(true).await.unwrap().unwrap();
+    assert_eq!(
+        label(h, &n.parent, 4).await.as_deref(),
+        Some("pending"),
+        "{engine}"
+    );
     assert_eq!(
         label(h, &n.parent, 2).await.as_deref(),
         Some("manual"),

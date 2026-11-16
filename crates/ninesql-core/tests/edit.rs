@@ -8,11 +8,14 @@ mod support;
 use std::sync::Arc;
 use std::time::Duration;
 
+use ninesql_core::driver_api::AnsiDialect;
 use ninesql_core::driver_api::arrow_array::RecordBatch;
 use ninesql_core::driver_api::mock::MOCK_ENGINE;
 use ninesql_core::driver_api::{
     ColumnInfo, IndexInfo, ObjectDetails, ObjectInfo, ObjectKind, ObjectPath, Param, ResultItem,
+    TableInfo,
 };
+use ninesql_core::edit::{MAX_CHANGES_PER_SAVE, QuerySource, TableQuery, build_table_query};
 use ninesql_core::{
     ConnectionType, ConnectionTypeId, ConnectionTypes, EditError, EditService, EditableTable,
     ExecEvent, ExecutionService, MetadataConfig, MetadataService, NotEditable, PendingEdits,
@@ -49,10 +52,12 @@ fn table() -> EditableTable {
         comment: None,
         details: ObjectDetails::Index(pk),
     };
+    let mut info = TableInfo::default();
+    info.transactional = Some(true);
     EditableTable::from_metadata(
         &MOCK_ENGINE,
         path(),
-        None,
+        Some(&info),
         &[col("id", 1, "bigint"), col("label", 2, "text")],
         true,
         &[idx],
@@ -79,9 +84,17 @@ async fn rows(h: &SessionHandle) -> RecordBatch {
         .unwrap()
 }
 
+/// The source of the navigator's "open table" query of `t000` (`SELECT *`).
+fn source() -> QuerySource {
+    build_table_query(&AnsiDialect, &TableQuery::of_path(&path()))
+        .unwrap()
+        .source()
+        .clone()
+}
+
 async fn edits(h: &SessionHandle) -> (PendingEdits, RecordBatch) {
     let b = rows(h).await;
-    let mut p = PendingEdits::new(table(), &b.schema()).unwrap();
+    let mut p = PendingEdits::new(table(), &source(), &b.schema()).unwrap();
     p.set_value(0, &b, 0, 1, Param::Text("renamed".into()))
         .unwrap();
     p.delete_row(2, &b, 2).unwrap();
@@ -127,7 +140,7 @@ fn dev_save_runs_in_one_transaction_and_releases_the_session() {
         assert_eq!(plan.batch.statements.len(), 3);
         assert!(
             plan.script
-                .starts_with("DELETE FROM \"public\".\"t000\" WHERE \"id\" = 2")
+                .starts_with("DELETE FROM \"nine\".\"public\".\"t000\" WHERE \"id\" = 2")
         );
         let SaveEvent::Done(summary) = end(edit.save(&h, &p, SaveOptions::default())).await else {
             panic!("not saved");
@@ -283,6 +296,88 @@ fn describe_table_without_index_has_no_key() {
         assert!(matches!(
             terminal(&run(&h, "SELECT * FROM numbers(1)").await),
             ExecEvent::Finished { .. }
+        ));
+    });
+}
+
+#[test]
+fn a_save_that_lost_the_sessions_transaction_says_so() {
+    let dir = tempfile::tempdir().unwrap();
+    let wrap = Wrap::new(mock_driver());
+    let (manager, _) = manager(Arc::new(wrap.clone()), dir.path());
+    let edit = service(&manager);
+    ui(async {
+        let h = open_ok(
+            &manager,
+            mock_connection(ConnectionTypeId::dev()),
+            &ConnectionTypes::default(),
+        )
+        .await;
+        let (p, _) = edits(&h).await;
+        h.set_auto_commit(false).await.unwrap().unwrap();
+        h.begin().await.unwrap().unwrap();
+        // The second statement fails, and so does `ROLLBACK TO SAVEPOINT`: the save can only
+        // be undone with the whole transaction, which discards the earlier uncommitted work.
+        // The failure says so instead of looking like a plain failure.
+        *wrap.fail_prefixes.lock().unwrap() = vec!["UPDATE".into(), "ROLLBACK TO".into()];
+        match end(edit.save(&h, &p, SaveOptions::default())).await {
+            SaveEvent::Failed(e @ EditError::TransactionRolledBack { .. }) => {
+                assert!(
+                    matches!(&e, EditError::TransactionRolledBack { source } if matches!(**source, EditError::Core(_)))
+                );
+                assert!(e.to_string().contains("earlier uncommitted changes"));
+                assert_eq!(e.kind(), "transaction-rolled-back");
+            }
+            other => panic!("{other:?}"),
+        }
+        assert!(!h.transaction_state().in_transaction);
+        assert!(!h.is_leased());
+        // A failed statement whose undo works is a plain failure (the transaction would be
+        // kept on an engine; the mock's `ROLLBACK TO` ends it, which is reported the same way).
+        *wrap.fail_prefixes.lock().unwrap() = vec!["UPDATE".into()];
+        h.set_auto_commit(true).await.unwrap().unwrap();
+        assert!(matches!(
+            end(edit.save(&h, &p, SaveOptions::default())).await,
+            SaveEvent::Failed(EditError::Core(_))
+        ));
+        assert!(!h.transaction_state().in_transaction);
+    });
+}
+
+#[test]
+fn manual_commit_without_savepoints_is_refused_and_saves_are_bounded() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut caps = mock_capabilities();
+    caps.transactions.savepoints = false;
+    let driver = ninesql_core::driver_api::mock::MockDriver::new().with_capabilities(caps);
+    let (manager, _) = manager(Arc::new(driver), dir.path());
+    let edit = service(&manager);
+    ui(async {
+        let h = open_ok(
+            &manager,
+            mock_connection(ConnectionTypeId::dev()),
+            &ConnectionTypes::default(),
+        )
+        .await;
+        let (p, _) = edits(&h).await;
+        h.set_auto_commit(false).await.unwrap().unwrap();
+        assert!(matches!(
+            end(edit.save(&h, &p, SaveOptions::default())).await,
+            SaveEvent::Failed(EditError::NoSavepoints)
+        ));
+        // Auto-commit still saves (a transaction of its own).
+        h.set_auto_commit(true).await.unwrap().unwrap();
+        assert!(matches!(
+            end(edit.save(&h, &p, SaveOptions::default())).await,
+            SaveEvent::Done(_)
+        ));
+        let mut big = p.clone();
+        for _ in 0..MAX_CHANGES_PER_SAVE {
+            big.insert_row();
+        }
+        assert!(matches!(
+            big.plan(&*h.dialect(), &h.info().capabilities.editing),
+            Err(EditError::TooManyChanges { .. })
         ));
     });
 }

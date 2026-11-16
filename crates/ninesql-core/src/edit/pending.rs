@@ -20,6 +20,7 @@ use ninesql_driver_api::{
 
 use super::EditError;
 use super::key::{EditableTable, NotEditable};
+use super::query::QuerySource;
 
 /// A row of the grid result, as the grid numbers it (its index in the result, stable while the
 /// result lives).
@@ -106,17 +107,36 @@ fn truncated(field: &Field) -> bool {
 }
 
 impl PendingEdits {
-    /// Starts editing a result with `schema` (the result-set header) on `table`. Result columns
-    /// are matched to table columns by exact name; the result must hold every key column exactly
-    /// once.
+    /// Starts editing a result on `table`. `source` is the [`QuerySource`] of the
+    /// [`BuiltQuery`](super::BuiltQuery) that produced the result
+    /// ([`EditService::table_query`](super::EditService::table_query), the navigator's "open
+    /// table", foreign-key navigation) and `schema` the result-set header.
     ///
-    /// The result must come from `table` with its columns referenced directly (a `SELECT` of
-    /// columns from that one table, or the table opened from the navigator): the caller knows
-    /// that, the core cannot check it from the result.
+    /// The result is accepted only when its source is a query of `table` and its columns are
+    /// exactly the ones the query selected, by name, in order and in number (for `SELECT *`,
+    /// every column of `table` in ordinal order). Only the core creates a `QuerySource`, so a
+    /// result of any other statement (an alias such as `SELECT other_unique AS id`, a join, an
+    /// expression) cannot be edited. Result columns are then matched to table columns by name;
+    /// the result must hold every key column exactly once.
     ///
     /// # Errors
-    /// [`NotEditable::KeyNotInResult`].
-    pub fn new(table: EditableTable, schema: &Schema) -> Result<Self, NotEditable> {
+    /// [`NotEditable::ResultNotFromTable`], [`NotEditable::KeyNotInResult`].
+    pub fn new(
+        table: EditableTable,
+        source: &QuerySource,
+        schema: &Schema,
+    ) -> Result<Self, NotEditable> {
+        if source.table() != table.table.as_slice() {
+            return Err(NotEditable::ResultNotFromTable);
+        }
+        let names: Vec<&str> = schema.fields().iter().map(|f| f.name().as_str()).collect();
+        let expected: Vec<&str> = match source.columns() {
+            Some(cols) => cols.iter().map(String::as_str).collect(),
+            None => table.columns.iter().map(|c| c.name.as_str()).collect(),
+        };
+        if names != expected {
+            return Err(NotEditable::ResultNotFromTable);
+        }
         let mut columns = Vec::with_capacity(schema.fields().len());
         for field in schema.fields() {
             let name = field.name();
@@ -500,7 +520,8 @@ impl PendingEdits {
     /// capabilities: [`SavePlan::script`] is the DML preview shown before saving.
     ///
     /// # Errors
-    /// [`EditError::NothingToSave`]; [`EditError::Dml`] for a change the generator refuses
+    /// [`EditError::NothingToSave`]; [`EditError::TooManyChanges`] above
+    /// [`MAX_CHANGES_PER_SAVE`](super::MAX_CHANGES_PER_SAVE); [`EditError::Dml`] for a change the generator refuses
     /// (a `NULL` key value, a value with no faithful literal, an edit kind the engine does not
     /// support…).
     pub fn plan(
@@ -510,6 +531,11 @@ impl PendingEdits {
     ) -> Result<SavePlan, EditError> {
         if self.is_empty() {
             return Err(EditError::NothingToSave);
+        }
+        if self.change_count() > super::MAX_CHANGES_PER_SAVE {
+            return Err(EditError::TooManyChanges {
+                max: super::MAX_CHANGES_PER_SAVE,
+            });
         }
         let batch = generate_batch(dialect, editing, &self.requests())?;
         let mut unchecked: Vec<String> = Vec::new();
@@ -630,6 +656,21 @@ mod tests {
         RecordBatch::try_new(Arc::new(Schema::new(fields)), cols).unwrap()
     }
 
+    fn src(table: &[&str], cols: Option<&[&str]>) -> QuerySource {
+        let mut q = super::super::TableQuery::new(table.iter().map(|s| (*s).to_owned()).collect());
+        if let Some(c) = cols {
+            q = q.with_columns(c.iter().map(|s| (*s).to_owned()).collect());
+        }
+        super::super::build_table_query(&AnsiDialect, &q)
+            .unwrap()
+            .source()
+            .clone()
+    }
+
+    fn star() -> QuerySource {
+        src(&["s", "t"], None)
+    }
+
     fn all() -> EditingCapabilities {
         ninesql_driver_api::mock::full_capabilities().editing
     }
@@ -637,7 +678,8 @@ mod tests {
     #[test]
     fn edits_plan_in_order_with_guards() {
         let b = batch(true);
-        let mut p = PendingEdits::new(table(), &b.schema()).unwrap();
+        let source = src(&["s", "t"], Some(&["id", "label", "upper"]));
+        let mut p = PendingEdits::new(table(), &source, &b.schema()).unwrap();
         assert_eq!(p.column_status(2), Some(ColumnStatus::NotInTable));
         assert!(p.set_value(0, &b, 0, 2, Param::Text("x".into())).is_err());
         p.set_value(0, &b, 0, 1, Param::Text("new".into())).unwrap();
@@ -672,7 +714,7 @@ mod tests {
     fn key_must_be_in_the_result_and_cut_values_are_refused() {
         let schema = Schema::new(vec![Field::new("label", DataType::Utf8, true)]);
         assert_eq!(
-            PendingEdits::new(table(), &schema).unwrap_err(),
+            PendingEdits::new(table(), &src(&["s", "t"], Some(&["label"])), &schema).unwrap_err(),
             NotEditable::KeyNotInResult(vec!["id".into()])
         );
         let cut = Arc::new(Schema::new(vec![
@@ -681,7 +723,7 @@ mod tests {
                 .with_metadata([(TRUNCATED_VALUES_METADATA_KEY.to_owned(), "true".to_owned())]),
         ]));
         let b = RecordBatch::try_new(cut, batch(false).columns().to_vec()).unwrap();
-        let mut p = PendingEdits::new(table(), &b.schema()).unwrap();
+        let mut p = PendingEdits::new(table(), &star(), &b.schema()).unwrap();
         assert!(matches!(
             p.set_value(0, &b, 0, 1, Param::Null),
             Err(EditError::ValueCut(_))
@@ -696,12 +738,49 @@ mod tests {
     #[test]
     fn parse_input_follows_the_engine_type() {
         let b = batch(false);
-        let p = PendingEdits::new(table(), &b.schema()).unwrap();
+        let p = PendingEdits::new(table(), &star(), &b.schema()).unwrap();
         assert_eq!(p.parse_input(0, "42").unwrap(), Param::Int(42));
         assert!(matches!(
             p.parse_input(0, "x"),
             Err(EditError::InvalidInput("integer"))
         ));
         assert_eq!(p.parse_input(1, "").unwrap(), Param::Text(String::new()));
+    }
+
+    #[test]
+    fn results_not_from_the_tables_query_are_refused() {
+        let b = batch(false);
+        // `SELECT other AS id, label FROM s.t` has the right names but no source of its own;
+        // a source of the same columns is required, and its columns must match exactly.
+        let renamed = Schema::new(vec![
+            Field::new("label", DataType::Utf8, true),
+            Field::new("id", DataType::Int64, false),
+        ]);
+        assert_eq!(
+            PendingEdits::new(table(), &star(), &renamed).unwrap_err(),
+            NotEditable::ResultNotFromTable,
+            "columns out of order"
+        );
+        assert_eq!(
+            PendingEdits::new(table(), &src(&["s", "u"], None), &b.schema()).unwrap_err(),
+            NotEditable::ResultNotFromTable,
+            "another table"
+        );
+        assert_eq!(
+            PendingEdits::new(
+                table(),
+                &src(&["s", "t"], Some(&["label", "id"])),
+                &b.schema()
+            )
+            .unwrap_err(),
+            NotEditable::ResultNotFromTable,
+            "other selected columns"
+        );
+        assert_eq!(
+            PendingEdits::new(table(), &star(), &batch(true).schema()).unwrap_err(),
+            NotEditable::ResultNotFromTable,
+            "an extra column"
+        );
+        assert!(PendingEdits::new(table(), &star(), &b.schema()).is_ok());
     }
 }
