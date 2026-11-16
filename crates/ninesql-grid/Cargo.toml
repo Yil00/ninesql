@@ -17,6 +17,9 @@ workspace = true
 # `ninesql-driver-api`, so the grid sees the exact Arrow version the drivers produce.
 ninesql-core.workspace = true
 tracing.workspace = true
+# Builds the batch of the selected rows for "Copy as …" (MutableArrayData); already in the graph
+# through ninesql-driver-api.
+arrow-data.workspace = true
 # GPUI and gpui-component (DataTable) through gpui-kit, at the workspace pin (ADR-0013). Never
 # enable `hot-reload`, `tracy`, `inspector` or `gpui-fast`. `ninesql-ui` holds the exact pins of
 # the gpui-kit siblings for the whole workspace.
