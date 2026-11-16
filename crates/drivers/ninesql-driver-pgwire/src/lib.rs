@@ -39,6 +39,7 @@ mod auth;
 mod cancel;
 mod conn;
 mod dialect;
+mod dml;
 mod engine;
 mod metadata;
 mod questdb;

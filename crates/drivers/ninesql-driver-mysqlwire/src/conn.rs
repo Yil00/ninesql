@@ -3,7 +3,7 @@
 //! column definitions, rows read value by value under the fetch budget).
 //!
 //! Client capabilities: protocol 4.1, plugin authentication, transactions, multiple results
-//! (`CALL`), connect attributes. Never `CLIENT_MULTI_STATEMENTS` (one statement per protocol
+//! (`CALL`), connect attributes, found rows (update counts are matched rows, P5-B). Never `CLIENT_MULTI_STATEMENTS` (one statement per protocol
 //! call), never `CLIENT_LOCAL_FILES` (a `LOAD DATA LOCAL` request is answered with an empty file
 //! and fails), never compression, never `CLIENT_IGNORE_SPACE` (it changes the lexer).
 
@@ -15,6 +15,10 @@ use crate::proto::{Buf, Packets, put_lenenc_bytes, tls_handshake};
 use crate::types::{BatchBuilder, Column};
 
 pub(crate) const CLIENT_LONG_PASSWORD: u32 = 1;
+/// Update counts are rows **matched** by the `WHERE`, not rows whose value changed (as JDBC
+/// drivers report them): a row edit that writes an unchanged value still reports one row, so
+/// the core's "exactly one row" check of generated DML holds (P5-B).
+pub(crate) const CLIENT_FOUND_ROWS: u32 = 2;
 pub(crate) const CLIENT_LONG_FLAG: u32 = 4;
 pub(crate) const CLIENT_CONNECT_WITH_DB: u32 = 8;
 pub(crate) const CLIENT_MULTI_STATEMENTS: u32 = 1 << 16;
@@ -315,6 +319,7 @@ impl Conn {
             ));
         }
         let mut caps = CLIENT_LONG_PASSWORD
+            | CLIENT_FOUND_ROWS
             | CLIENT_LONG_FLAG
             | CLIENT_PROTOCOL_41
             | CLIENT_TRANSACTIONS

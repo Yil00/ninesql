@@ -19,6 +19,8 @@
 //!   mirrored in `docs/08-engine-capabilities.md`.
 //! - [`DriverError`]: typed, user-presentable errors that never carry secrets or values.
 //! - [`text_may_hold_credentials`]: statement text that drivers never log (I1).
+//! - [`dml`]: row-edit DML (parameterized statement plus typed-literal preview) and SQL `INSERT`
+//!   export text, with key, capability and classification checks (P5-B).
 //!
 //! With the `mock` feature, `mock` provides an in-memory driver for UI and core tests.
 #![forbid(unsafe_code)]
@@ -28,6 +30,7 @@ pub mod capabilities;
 #[cfg(feature = "mock")]
 pub mod conformance;
 pub mod dialect;
+pub mod dml;
 pub mod driver;
 pub mod error;
 pub mod execution;
@@ -50,6 +53,10 @@ pub use dialect::{
     ScriptItem, ScriptItemKind, ScriptRefusal, ScriptState, StatementClass, StatementSpan,
     TextPosition, code_tokens, ensure_single_statement, item_may_change_lexical_modes, position_at,
     script_items, script_items_from, shift_items,
+};
+pub use dml::{
+    ColumnChange, ColumnType, ColumnValue, Concurrency, DmlBatch, DmlChange, DmlColumn, DmlError,
+    DmlKind, DmlRequest, DmlStatement, KeyCandidate, KeyKind, cell_value, choose_row_key,
 };
 pub use driver::{Driver, Session};
 pub use error::{DriverError, DriverResult, redact_connection_string, redact_secret};

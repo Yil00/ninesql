@@ -18,7 +18,10 @@
 //! `;`), so `;` inside the body does not split it.
 
 use ninesql_driver_api::dialect::{classify_with_rules, split_with_rules};
-use ninesql_driver_api::{Dialect, ExplainFormat, LexicalRules, StatementClass, StatementSpan};
+use ninesql_driver_api::dml::ColumnType;
+use ninesql_driver_api::{
+    Dialect, ExplainFormat, LexicalRules, Param, StatementClass, StatementSpan,
+};
 
 /// The SQLite dialect.
 #[derive(Clone, Copy, Debug, Default)]
@@ -428,6 +431,11 @@ impl Dialect for SqliteDialect {
             return StatementClass::Unknown;
         }
         class
+    }
+
+    fn dml_literal(&self, value: &Param, ty: &ColumnType) -> Result<String, &'static str> {
+        let _ = ty;
+        crate::dml::literal(value)
     }
 
     fn explain(&self, query: &str, format: ExplainFormat) -> Option<String> {

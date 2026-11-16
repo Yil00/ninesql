@@ -27,6 +27,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use ninesql_driver_api::dialect::{classify_with_rules, split_with_rules};
+use ninesql_driver_api::dml::{ColumnType, DmlError};
 use ninesql_driver_api::{
     CodeTokenKind, Dialect, DriverError, DriverResult, ExplainFormat, LexicalRules, Param,
     RowChange, RowEdit, ScriptItem, ScriptItemKind, ScriptRefusal, ScriptState, Statement,
@@ -334,6 +335,27 @@ impl Dialect for MyDialect {
             ExplainFormat::Analyze if self.explain_analyze => format!("EXPLAIN ANALYZE {q}"),
             _ => return None,
         })
+    }
+
+    fn dml_literal(&self, value: &Param, ty: &ColumnType) -> Result<String, &'static str> {
+        let _ = ty;
+        crate::dml::literal(
+            value,
+            !self.modes.no_backslash_escapes.load(Ordering::SeqCst),
+        )
+    }
+
+    fn dml_check_identifier(&self, name: &str) -> Result<(), DmlError> {
+        crate::dml::check_identifier(name)
+    }
+
+    fn dml_comparable(&self, ty: &ColumnType) -> bool {
+        crate::dml::comparable(ty)
+    }
+
+    fn dml_insert_default_values(&self, table: &str) -> String {
+        // MySQL has no `DEFAULT VALUES`.
+        format!("INSERT INTO {table} () VALUES ()")
     }
 
     fn render_edit(&self, edit: &RowEdit) -> DriverResult<Statement> {

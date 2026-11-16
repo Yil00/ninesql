@@ -15,6 +15,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use ninesql_driver_api::dialect::classify_with_rules;
+use ninesql_driver_api::dml::{ColumnType, DmlError};
 use ninesql_driver_api::{
     CodeToken, CodeTokenKind, Dialect, ExplainFormat, LexicalRules, Param, ScriptItem,
     ScriptItemKind, ScriptRefusal, ScriptState, StatementClass, StatementSpan, TextPosition,
@@ -141,6 +142,22 @@ impl Dialect for PgDialect {
 
     fn placeholder(&self, index: usize) -> String {
         format!("${index}")
+    }
+
+    fn dml_literal(&self, value: &Param, ty: &ColumnType) -> Result<String, &'static str> {
+        crate::dml::literal(
+            value,
+            ty,
+            self.standard_conforming_strings.load(Ordering::SeqCst),
+        )
+    }
+
+    fn dml_check_identifier(&self, name: &str) -> Result<(), DmlError> {
+        crate::dml::check_identifier(name)
+    }
+
+    fn dml_comparable(&self, ty: &ColumnType) -> bool {
+        crate::dml::comparable(ty)
     }
 
     fn split_statements(&self, script: &str) -> Vec<StatementSpan> {

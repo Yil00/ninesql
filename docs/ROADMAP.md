@@ -381,7 +381,7 @@ Items left by the phase 4 task reports, the security reviews of P4-A, P4-B and P
 | Workstream | Owner | Tasks |
 |----------|--------------|--------|
 | P5-A Editing | `ui-engineer` | [ ] In-cell edit, insert / duplicate / delete rows, save with DML preview (F-DATA-04); requires a key, otherwise read-only with an explanation · [ ] Record and text views (F-DATA-02), value viewers JSON / XML / binary / image (F-DATA-05) · [ ] Sort / filter client- and server-side, filter history (F-DATA-03); FK navigation (F-DATA-07); aggregate and metadata panels (F-DATA-09, F-DATA-10); advanced copy (F-DATA-06) |
-| P5-B Dialect DML | `driver-engineer` | [ ] DML generation with dialect quoting and typed literals for every MVP engine; injection tests on identifiers and values |
+| P5-B Dialect DML | `driver-engineer` | [~] DML generation with dialect quoting and typed literals for every MVP engine; injection tests on identifiers and values |
 | P5-C Transfer | `core-engineer` | [ ] `ninesql-transfer`: streamed export to CSV, TSV, JSON, SQL `INSERT`, Markdown, HTML (F-XFER-01) · [ ] CSV import with mapping and preview (F-XFER-03) · [ ] Script execution with continue / stop on error and summary (F-SQL-16) · [ ] SQL formatter (F-SQL-09) and snippets (F-SQL-10) |
 | P5-D Export to DBeaver | `interop-engineer` | [ ] Write a new `data-sources.json` for selected connections, without passwords (F-CON-15) |
 | P5-E Review | `security-reviewer` | [ ] Review of generated SQL (edits, filters, import), file paths in import / export, production guards |
