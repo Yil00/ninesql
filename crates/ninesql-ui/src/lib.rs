@@ -21,6 +21,7 @@ pub mod app;
 pub mod appearance;
 pub mod browse;
 pub mod connections;
+pub mod dbeaver_export;
 pub mod editor_tab;
 pub mod import;
 pub mod keymap;

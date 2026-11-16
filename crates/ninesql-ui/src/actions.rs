@@ -115,6 +115,44 @@ actions!(
         ExportTable,
         /// Import a CSV file into the selected table.
         ImportCsv,
+        /// Open the rows of the selected table in a new tab, where they can be edited.
+        OpenTableData,
+        /// Edit the focused cell of the table's result.
+        EditCell,
+        /// Set the focused cell of the table's result to NULL.
+        SetCellNull,
+        /// Add a row to insert into the table (asks for its values).
+        InsertRow,
+        /// Add a copy of the focused row to insert into the table.
+        DuplicateRow,
+        /// Mark the selected rows for deletion.
+        DeleteRows,
+        /// Undo the pending changes of the selected rows.
+        RevertRowChanges,
+        /// Drop every pending change of the table's result.
+        DiscardChanges,
+        /// Show the statements a save would run.
+        PreviewChanges,
+        /// Save the pending changes of the table's result (asks first on production).
+        SaveChanges,
+        /// Filter the table's rows on the server with a WHERE expression (with the history).
+        FilterTableRows,
+        /// Keep only the table's rows whose value equals the focused cell's (on the server).
+        FilterTableBySelectedValue,
+        /// Sort the table's rows by the focused column, ascending (on the server).
+        SortTableAscending,
+        /// Sort the table's rows by the focused column, descending (on the server).
+        SortTableDescending,
+        /// Remove the table's server-side filters and order.
+        ClearTableFilter,
+        /// Run the table's query again.
+        RefreshTableData,
+        /// Open the rows the focused row's foreign key points to, in a new tab.
+        OpenReferencedRows,
+        /// Open the rows that point to the focused row through a foreign key, in a new tab.
+        OpenReferencingRows,
+        /// Export chosen connections to a new DBeaver data-sources.json or project folder.
+        ExportToDbeaver,
     ]
 );
 
@@ -608,6 +646,158 @@ pub const ACTIONS: &[ActionSpec] = &[
         Workspace,
         ["alt-g m"],
         keywords = ["csv", "load", "file", "insert", "mapping", "transfer"]
+    ),
+    spec!(
+        OpenTableData,
+        "Open table data",
+        "Data",
+        Workspace,
+        ["alt-g o"],
+        keywords = ["edit", "rows", "browse", "table", "data"]
+    ),
+    spec!(
+        EditCell,
+        "Edit cell…",
+        "Data editing",
+        Workspace,
+        ["alt-e e"],
+        keywords = ["edit", "value", "update", "change"]
+    ),
+    spec!(
+        SetCellNull,
+        "Set cell to NULL",
+        "Data editing",
+        Workspace,
+        ["alt-e n"],
+        keywords = ["null", "edit", "clear"]
+    ),
+    spec!(
+        InsertRow,
+        "Insert row…",
+        "Data editing",
+        Workspace,
+        ["alt-e i"],
+        keywords = ["add", "new", "row", "insert"]
+    ),
+    spec!(
+        DuplicateRow,
+        "Duplicate row",
+        "Data editing",
+        Workspace,
+        ["alt-e c"],
+        keywords = ["copy", "clone", "row", "insert"]
+    ),
+    spec!(
+        DeleteRows,
+        "Delete rows",
+        "Data editing",
+        Workspace,
+        ["alt-e d"],
+        keywords = ["remove", "row", "delete"]
+    ),
+    spec!(
+        RevertRowChanges,
+        "Revert row changes",
+        "Data editing",
+        Workspace,
+        ["alt-e r"],
+        keywords = ["undo", "revert", "row"]
+    ),
+    spec!(
+        DiscardChanges,
+        "Discard changes",
+        "Data editing",
+        Workspace,
+        ["alt-e x"],
+        keywords = ["undo", "cancel", "pending", "drop"]
+    ),
+    spec!(
+        PreviewChanges,
+        "Preview changes…",
+        "Data editing",
+        Workspace,
+        ["alt-e p"],
+        keywords = ["dml", "script", "sql", "preview"]
+    ),
+    spec!(
+        SaveChanges,
+        "Save changes",
+        "Data editing",
+        Workspace,
+        ["alt-e s"],
+        keywords = ["apply", "commit", "write", "save"]
+    ),
+    spec!(
+        FilterTableRows,
+        "Filter table rows…",
+        "Data",
+        Workspace,
+        ["alt-t f"],
+        keywords = ["where", "server", "filter", "history"]
+    ),
+    spec!(
+        FilterTableBySelectedValue,
+        "Filter table by selected value",
+        "Data",
+        Workspace,
+        ["alt-t v"],
+        keywords = ["where", "equals", "server"]
+    ),
+    spec!(
+        SortTableAscending,
+        "Sort table by column ascending",
+        "Data",
+        Workspace,
+        ["alt-t a"],
+        keywords = ["order by", "server", "sort"]
+    ),
+    spec!(
+        SortTableDescending,
+        "Sort table by column descending",
+        "Data",
+        Workspace,
+        ["alt-t d"],
+        keywords = ["order by", "server", "sort"]
+    ),
+    spec!(
+        ClearTableFilter,
+        "Clear table filter and sort",
+        "Data",
+        Workspace,
+        ["alt-t c"],
+        keywords = ["reset", "where", "order by", "server"]
+    ),
+    spec!(
+        RefreshTableData,
+        "Refresh table data",
+        "Data",
+        Workspace,
+        ["alt-t r"],
+        keywords = ["reload", "rerun", "table"]
+    ),
+    spec!(
+        OpenReferencedRows,
+        "Open referenced rows",
+        "Data",
+        Workspace,
+        ["alt-t k"],
+        keywords = ["foreign key", "fk", "parent", "follow", "navigate"]
+    ),
+    spec!(
+        OpenReferencingRows,
+        "Open referencing rows",
+        "Data",
+        Workspace,
+        ["alt-t b"],
+        keywords = ["foreign key", "fk", "children", "references", "navigate"]
+    ),
+    spec!(
+        ExportToDbeaver,
+        "Export connections to DBeaver…",
+        "Connections",
+        Workspace,
+        ["ctrl-k ctrl-shift-d"],
+        keywords = ["dbeaver", "data-sources.json", "export", "project"]
     ),
 ];
 

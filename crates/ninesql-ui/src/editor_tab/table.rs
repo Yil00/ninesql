@@ -409,7 +409,7 @@ impl SqlEditorTab {
     fn sync_grid(&mut self, cx: &mut Context<Self>) {
         let caps = self
             .session()
-            .map(|s| s.info().capabilities.editing.clone())
+            .map(|s| s.info().capabilities.editing)
             .unwrap_or_default();
         let EditMode::Editable(e) = &mut self.table.mode else {
             return;

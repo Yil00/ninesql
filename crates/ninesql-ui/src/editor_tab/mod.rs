@@ -1308,15 +1308,15 @@ impl SqlEditorTab {
                             }),
                     );
             }
-        } else if has_result || self.table.source.is_some() {
-            if let Some(why) = self.read_only_reason() {
-                bar = bar.child(
-                    div()
-                        .id("editor-read-only-reason")
-                        .text_color(muted)
-                        .child(why.to_owned()),
-                );
-            }
+        } else if (has_result || self.table.source.is_some())
+            && let Some(why) = self.read_only_reason()
+        {
+            bar = bar.child(
+                div()
+                    .id("editor-read-only-reason")
+                    .text_color(muted)
+                    .child(why.to_owned()),
+            );
         }
         bar
     }

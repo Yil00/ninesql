@@ -261,6 +261,9 @@ pub fn open_cell_editor(
     });
 }
 
+/// A field of the "Insert row" form: result field, column name, type, input.
+type InsertField = (usize, String, String, Entity<InputState>);
+
 /// The "Insert row" form: one field per editable column; an empty field takes the column's
 /// default, "NULL" sets `NULL`.
 pub fn open_insert_row(
@@ -269,7 +272,7 @@ pub fn open_insert_row(
     window: &mut Window,
     cx: &mut App,
 ) {
-    let fields: Rc<Vec<(usize, String, String, Entity<InputState>)>> = Rc::new(
+    let fields: Rc<Vec<InsertField>> = Rc::new(
         columns
             .into_iter()
             .map(|(f, n, t)| (f, n, t, cx.new(|cx| InputState::new(window, cx))))
