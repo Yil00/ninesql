@@ -83,6 +83,28 @@ actions!(
         CommitTransaction,
         /// Roll back the open transaction of the active SQL editor's session.
         RollbackTransaction,
+        /// Reload the navigator node selected (a group, an object's group, or a connection).
+        RefreshNavigatorNode,
+        /// Load the next objects of the navigator group selected.
+        LoadMoreObjects,
+        /// Edit the navigator filters of the selected connection.
+        ConfigureNavigatorFilters,
+        /// Search the loaded objects of the open connections.
+        FindObject,
+        /// Open the object selected in the navigator in the object editor.
+        OpenObjectEditor,
+        /// Open a SELECT template for the selected table or view in a new SQL editor.
+        GenerateSelectSql,
+        /// Open an INSERT template for the selected table or view in a new SQL editor.
+        GenerateInsertSql,
+        /// Open an UPDATE template (with a WHERE placeholder) in a new SQL editor.
+        GenerateUpdateSql,
+        /// Open a DELETE template (with a WHERE placeholder) in a new SQL editor.
+        GenerateDeleteSql,
+        /// Open the DDL of the selected object in a new SQL editor.
+        ShowObjectDdl,
+        /// Copy the DDL of the active object editor (or of the selected object).
+        CopyObjectDdl,
     ]
 );
 
@@ -444,6 +466,94 @@ pub const ACTIONS: &[ActionSpec] = &[
         Workspace,
         ["ctrl-k ctrl-r"],
         keywords = ["transaction", "rollback", "undo", "discard"]
+    ),
+    spec!(
+        RefreshNavigatorNode,
+        "Refresh navigator node",
+        "Navigator",
+        Workspace,
+        ["f5"],
+        keywords = ["reload", "metadata", "tree"]
+    ),
+    spec!(
+        LoadMoreObjects,
+        "Load more objects",
+        "Navigator",
+        Workspace,
+        ["ctrl-k ctrl-m"],
+        keywords = ["next", "page", "metadata", "tree"]
+    ),
+    spec!(
+        ConfigureNavigatorFilters,
+        "Configure navigator filters",
+        "Navigator",
+        Workspace,
+        ["ctrl-k ctrl-f"],
+        keywords = ["filter", "include", "exclude", "pattern", "hide"]
+    ),
+    spec!(
+        FindObject,
+        "Find object",
+        "Navigator",
+        Workspace,
+        ["ctrl-shift-o"],
+        keywords = ["search", "table", "metadata", "go to", "fuzzy"]
+    ),
+    spec!(
+        OpenObjectEditor,
+        "Open object editor",
+        "Navigator",
+        Workspace,
+        ["ctrl-k enter"],
+        keywords = ["properties", "columns", "indexes", "keys", "ddl"]
+    ),
+    spec!(
+        GenerateSelectSql,
+        "Generate SQL: SELECT",
+        "Navigator",
+        Workspace,
+        ["alt-g s"],
+        keywords = ["template", "query", "script"]
+    ),
+    spec!(
+        GenerateInsertSql,
+        "Generate SQL: INSERT",
+        "Navigator",
+        Workspace,
+        ["alt-g i"],
+        keywords = ["template", "script", "dml"]
+    ),
+    spec!(
+        GenerateUpdateSql,
+        "Generate SQL: UPDATE",
+        "Navigator",
+        Workspace,
+        ["alt-g u"],
+        keywords = ["template", "script", "dml"]
+    ),
+    spec!(
+        GenerateDeleteSql,
+        "Generate SQL: DELETE",
+        "Navigator",
+        Workspace,
+        ["alt-g d"],
+        keywords = ["template", "script", "dml"]
+    ),
+    spec!(
+        ShowObjectDdl,
+        "Show DDL",
+        "Navigator",
+        Workspace,
+        ["alt-g l"],
+        keywords = ["create", "definition", "script", "generate"]
+    ),
+    spec!(
+        CopyObjectDdl,
+        "Copy DDL",
+        "Navigator",
+        Workspace,
+        ["ctrl-k ctrl-shift-c"],
+        keywords = ["create", "definition", "clipboard"]
     ),
 ];
 

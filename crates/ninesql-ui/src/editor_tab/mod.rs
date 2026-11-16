@@ -3,9 +3,11 @@
 //!
 //! - **Setup.** The editor follows the session's dialect: `Dialect::split_script` and the shared
 //!   lexer for splitting and segments, `ParameterStyle::for_engine`, `KeywordSet::for_engine` and
-//!   `Dialect::quote_identifier` for completion. Metadata: the navigator lists connections only
-//!   and caches no schema yet, so completion gets `NoMetadata` (keywords, aliases and CTE names
-//!   only) until a metadata cache exists.
+//!   `Dialect::quote_identifier` for completion. Objects and columns come from the metadata
+//!   cache through `browse::completion::MetadataCompletion` (never loading, I6); when the tab
+//!   binds to a connection it resolves the default schema (the connection's `default_schema`,
+//!   else the first schema the driver reports) and warms it (`warm_schema`), cancelled when the
+//!   tab rebinds or closes.
 //! - **Execution.** The editor's requests reach [`SqlEditorTab::start`] through [`run::TabSink`];
 //!   the tab builds a `RunRequest` (paged for the grid, under the preferences' budget) and calls
 //!   `ExecutionService::run`, which runs on the driver runtime. Each `RunEvent` is awaited on
@@ -55,7 +57,7 @@ use ninesql_core::{
     ConfirmationRequest, ConnectionId, CoreError, RunEnd, RunEvent, RunRequest, SessionHandle,
     SessionId, TransactionState,
 };
-use ninesql_editor::completion::{CompletionEngine, KeywordSet, NoMetadata};
+use ninesql_editor::completion::{CompletionEngine, KeywordSet, MetadataProvider, NoMetadata};
 use ninesql_editor::execution::{ExecutionRequest, StatementError};
 use ninesql_editor::params::ParameterStyle;
 use ninesql_editor::split::DialectSplitter;
@@ -68,9 +70,13 @@ use crate::connections::hub::{ConnectionHub, HubEvent};
 use crate::connections::visuals::{ConnectionBadges, badges, hsla};
 use run::{CurrentRun, RunSource, SharedRun, TabSink};
 
-/// The editor setup for `session` (its dialect), or ANSI without a session.
+/// The editor setup for `session` (its dialect), or ANSI without a session, with object
+/// completion from `metadata` (keywords, aliases and CTE names only without it).
 #[must_use]
-pub fn setup_for(session: Option<&SessionHandle>) -> EditorSetup {
+pub fn setup_for(
+    session: Option<&SessionHandle>,
+    metadata: Option<Rc<dyn MetadataProvider>>,
+) -> EditorSetup {
     let Some(session) = session else {
         return EditorSetup::new(Rc::new(DialectSplitter::new(Arc::new(AnsiDialect))));
     };
@@ -82,9 +88,24 @@ pub fn setup_for(session: Option<&SessionHandle>) -> EditorSetup {
         parameter_style: ParameterStyle::for_engine(engine),
         completion: CompletionEngine::new(KeywordSet::for_engine(engine))
             .with_quoter(Rc::new(move |ident: &str| quoting.quote_identifier(ident))),
-        // The navigator caches no schema metadata yet (connections only).
-        metadata: Rc::new(NoMetadata),
+        metadata: metadata.unwrap_or_else(|| Rc::new(NoMetadata)),
     }
+}
+
+/// The completion provider of a tab bound to `session`: the metadata cache of its connection.
+fn completion_provider(
+    hub: &Entity<ConnectionHub>,
+    session: Option<&SessionHandle>,
+    default_schema: &Rc<RefCell<Option<String>>>,
+    cx: &App,
+) -> Option<Rc<dyn MetadataProvider>> {
+    let session = session?;
+    let service = hub.read(cx).metadata()?;
+    Some(Rc::new(crate::browse::completion::MetadataCompletion::new(
+        service,
+        session.info().connection,
+        default_schema.clone(),
+    )))
 }
 
 /// The cancel button's label for a driver's [`CancelSupport`] (I8): "Cancel" only when the
@@ -194,6 +215,10 @@ pub struct SqlEditorTab {
     budget: GridBudget,
     /// Where [`ConfirmationGuard`]s report their dialog gone.
     confirmation_dropped: Sender<u64>,
+    /// The default schema completion resolves unqualified names in, once known.
+    default_schema: Rc<RefCell<Option<String>>>,
+    /// Resolves the default schema and warms it; dropped (cancelled) on rebind.
+    warming: Option<Task<()>>,
     _tasks: Vec<Task<()>>,
     _subscriptions: Vec<Subscription>,
 }
@@ -211,7 +236,11 @@ impl SqlEditorTab {
         let budget = GridBudget::from_fetch_budget(&fetch);
         let current: SharedRun = Rc::new(RefCell::new(None));
         let (tx, rx) = unbounded::<ExecutionRequest>();
-        let setup = setup_for(session.as_ref());
+        let default_schema: Rc<RefCell<Option<String>>> = Rc::new(RefCell::new(None));
+        let setup = setup_for(
+            session.as_ref(),
+            completion_provider(&hub, session.as_ref(), &default_schema, cx),
+        );
         let connection = session.as_ref().map(|s| s.info().connection);
         let sink = Rc::new(TabSink::new(tx, current.clone()));
         let editor = cx.new(|cx| {
@@ -267,9 +296,56 @@ impl SqlEditorTab {
             message: None,
             budget,
             confirmation_dropped: dropped_tx,
+            default_schema,
+            warming: None,
             _tasks: vec![requests, dropped],
             _subscriptions: subscriptions,
         }
+        .warmed(cx)
+    }
+
+    fn warmed(mut self, cx: &mut Context<Self>) -> Self {
+        self.warm_metadata(cx);
+        self
+    }
+
+    /// Resolves the default schema of the tab's connection and warms it for completion
+    /// (`warm_schema`). Only awaits metadata requests (I6); replaced on rebind.
+    fn warm_metadata(&mut self, cx: &mut Context<Self>) {
+        self.warming = None;
+        *self.default_schema.borrow_mut() = None;
+        let Some(session) = self.session().cloned() else {
+            return;
+        };
+        let hub = self.hub.read(cx);
+        let Some(service) = hub.metadata() else {
+            return;
+        };
+        let connection = session.info().connection;
+        let preferred = hub
+            .connection(connection)
+            .and_then(|c| c.default_schema.clone());
+        let slot = self.default_schema.clone();
+        self.warming = Some(cx.spawn(async move |_, _| {
+            let Some(schema) = crate::browse::completion::resolve_default_schema(
+                &service,
+                connection,
+                preferred.as_deref(),
+            )
+            .await
+            else {
+                return;
+            };
+            *slot.borrow_mut() = schema.leaf().map(|s| s.name.clone());
+            // Held by this task: dropping the task (rebind, close) cancels the prefetch.
+            let _summary = service.warm_schema(connection, schema).await;
+        }));
+    }
+
+    /// The default schema completion uses, once resolved (tests).
+    #[must_use]
+    pub fn default_schema(&self) -> Option<String> {
+        self.default_schema.borrow().clone()
     }
 
     /// Tab title.
@@ -375,7 +451,10 @@ impl SqlEditorTab {
             return false;
         }
         let connection = session.as_ref().map(|s| s.info().connection);
-        let setup = setup_for(session.as_ref());
+        let setup = setup_for(
+            session.as_ref(),
+            completion_provider(&self.hub, session.as_ref(), &self.default_schema, cx),
+        );
         self.transaction = session.as_ref().map(SessionHandle::transaction_state);
         self.session = session;
         self.message = None;
@@ -384,6 +463,7 @@ impl SqlEditorTab {
             e.set_connection(connection, cx);
             e.set_notice(None, cx);
         });
+        self.warm_metadata(cx);
         cx.notify();
         true
     }

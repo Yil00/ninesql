@@ -33,6 +33,8 @@ pub fn init(mut settings: SettingsState, cx: &mut App) {
         tracing::warn!(problem = %problem, "key binding refused");
     }
     settings.diagnostics.extend(problems);
+    // The navigator's keyboard navigation (widget-level, like gpui-component's tree).
+    crate::navigator::bind_keys(cx);
     cx.set_global(settings);
     // Changes still waiting for the debounce timer are written when NineSQL quits.
     cx.on_app_quit(crate::persist::flush_on_quit).detach();

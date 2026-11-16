@@ -127,8 +127,24 @@ pub(crate) fn mock_hub(
     dir: &std::path::Path,
     connections: Vec<Connection>,
 ) -> Entity<ConnectionHub> {
+    mock_hub_with_metadata(
+        cx,
+        dir,
+        connections,
+        ninesql_core::MetadataConfig::default(),
+    )
+}
+
+/// [`mock_hub`] with the metadata service's limits (small pages for "Load more").
+pub(crate) fn mock_hub_with_metadata(
+    cx: &mut TestAppContext,
+    dir: &std::path::Path,
+    connections: Vec<Connection>,
+    metadata: ninesql_core::MetadataConfig,
+) -> Entity<ConnectionHub> {
     let manager = mock_manager(dir);
     let mut config = HubConfig::empty();
+    config.metadata = metadata;
     config.registry = manager.registry().clone();
     config.manager = Some(manager);
     config.connections =
