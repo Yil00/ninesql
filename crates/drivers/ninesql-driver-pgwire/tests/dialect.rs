@@ -472,3 +472,94 @@ proptest! {
         }
     }
 }
+
+/// Security review H1 (P4-C): no dialect variant of the family panics on arbitrary Unicode,
+/// multibyte characters next to comment and quote markers included.
+mod never_panics {
+    use ninesql_driver_api::{Dialect, ScriptState, TextPosition, position_at};
+    use ninesql_driver_pgwire::PgDialect;
+    use proptest::prelude::*;
+
+    fn variants() -> Vec<PgDialect> {
+        let mut out = Vec::new();
+        for d in [
+            PgDialect::new(),
+            PgDialect::timescaledb(),
+            PgDialect::yugabytedb(),
+            PgDialect::questdb(),
+        ] {
+            out.push(d.clone().with_scs(true));
+            out.push(d.with_scs(false));
+        }
+        out
+    }
+
+    const PIECES: &[&str] = &[
+        "/*",
+        "*/",
+        "/*T!",
+        "--",
+        "-- é",
+        " ",
+        "\n",
+        "\r",
+        "é",
+        "€",
+        "日本",
+        "😀",
+        "'",
+        "\"",
+        "E'",
+        "U&'",
+        "$$",
+        "$t$",
+        "\\",
+        ";",
+        "(",
+        ")",
+        ".",
+        "SELECT",
+        "drop_chunks",
+        "COPY",
+        "FROM STDIN",
+        "\\.",
+        "BEGIN ATOMIC",
+        "END",
+        "_timescaledb_functions",
+        "RENAME",
+    ];
+
+    fn exercise(d: &dyn Dialect, text: &str) {
+        let _ = d.classify(text);
+        let _ = d.split_statements(text);
+        let items = d.split_script(text);
+        let state = ScriptState::default();
+        let _ = d.split_script_ahead(text, TextPosition::START, &state);
+        for item in &items {
+            let _ = d.split_script_ahead(text, item.end, &state);
+            let _ = d.classify(item.text(text));
+        }
+        for (offset, _) in text.char_indices().step_by(7) {
+            let _ = d.split_script_ahead(text, position_at(text, offset), &state);
+        }
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(256))]
+
+        #[test]
+        fn arbitrary_unicode(text in "\\PC*") {
+            for d in variants() {
+                exercise(&d, &text);
+            }
+        }
+
+        #[test]
+        fn markers_and_multibyte(parts in proptest::collection::vec(proptest::sample::select(PIECES), 0..40)) {
+            let text = parts.concat();
+            for d in variants() {
+                exercise(&d, &text);
+            }
+        }
+    }
+}

@@ -89,6 +89,16 @@ impl PgDialect {
         }
     }
 
+    /// The same engine's dialect with a fixed `standard_conforming_strings` value (tests,
+    /// offline splitting).
+    #[must_use]
+    pub fn with_scs(self, on: bool) -> Self {
+        Self {
+            standard_conforming_strings: Arc::new(AtomicBool::new(on)),
+            flavor: self.flavor,
+        }
+    }
+
     /// A dialect that follows a session's `standard_conforming_strings` flag.
     #[must_use]
     pub(crate) fn tracking(flag: Arc<AtomicBool>, flavor: Flavor) -> Self {
@@ -168,23 +178,42 @@ impl Dialect for PgDialect {
     fn classify(&self, text: &str) -> StatementClass {
         let rules = self.lexical_rules();
         let base = classify_with_rules(text, rules);
+        // TimescaleDB's functions apply to every flavour (security review M1): a `postgresql`
+        // connection to a database with the extension is accepted, and the names are very
+        // unlikely to be user functions, so the cost is at most an extra confirmation.
+        let timescale = engine_functions(text, rules, TIMESCALE_SIDE_EFFECT_FUNCTIONS)
+            .max(timescale_internal_calls(text, rules));
         let extra = match self.flavor {
-            Flavor::Timescale => engine_functions(text, rules, TIMESCALE_SIDE_EFFECT_FUNCTIONS),
             Flavor::QuestDb => questdb_statement(text, rules).max(engine_functions(
                 text,
                 rules,
                 QUESTDB_SIDE_EFFECT_FUNCTIONS,
             )),
-            Flavor::Postgres | Flavor::Yugabyte => StatementClass::Read,
+            Flavor::Postgres | Flavor::Timescale | Flavor::Yugabyte => StatementClass::Read,
         };
+        let extra = extra.max(timescale);
         base.max(extra)
     }
 }
 
 /// TimescaleDB functions (and procedures) that drop, move, convert or schedule changes to data
 /// or schema, callable from a `SELECT` (`SELECT drop_chunks('t', older_than => …)` deletes
-/// rows). TimescaleDB 2.x API, lower case.
+/// rows). TimescaleDB 2.x API (multi-node functions of 2.x before 2.14 included), lower case.
+/// Checked in every pgwire dialect.
 const TIMESCALE_SIDE_EFFECT_FUNCTIONS: &[&str] = &[
+    "add_data_node",
+    "alter_data_node",
+    "attach_data_node",
+    "cleanup_copy_chunk_operation",
+    "copy_chunk",
+    "create_distributed_hypertable",
+    "create_distributed_restore_point",
+    "delete_data_node",
+    "detach_data_node",
+    "distributed_exec",
+    "freeze_chunk",
+    "set_replication_factor",
+    "unfreeze_chunk",
     "add_columnstore_policy",
     "add_compression_policy",
     "add_continuous_aggregate_policy",
@@ -225,6 +254,42 @@ const TIMESCALE_SIDE_EFFECT_FUNCTIONS: &[&str] = &[
     "timescaledb_post_restore",
     "timescaledb_pre_restore",
 ];
+
+/// Schemas of TimescaleDB's internal and experimental functions: any call qualified with one of
+/// them is `Unknown` (security review L1).
+const TIMESCALE_INTERNAL_SCHEMAS: &[&str] = &[
+    "_timescaledb_functions",
+    "_timescaledb_internal",
+    "timescaledb_experimental",
+];
+
+/// `Unknown` when `text` calls a function qualified with a [`TIMESCALE_INTERNAL_SCHEMAS`]
+/// schema (`schema.name(`, either part plain or quoted), `Read` otherwise.
+fn timescale_internal_calls(text: &str, rules: LexicalRules) -> StatementClass {
+    let toks = code_tokens(text, rules);
+    let name = |t: &CodeToken| -> String {
+        let raw = t.text(text);
+        match t.kind {
+            CodeTokenKind::Word => raw.to_ascii_lowercase(),
+            CodeTokenKind::QuotedIdent => raw
+                .get(1..raw.len().saturating_sub(1))
+                .unwrap_or("")
+                .to_owned(),
+            _ => String::new(),
+        }
+    };
+    let calls = toks.windows(4).any(|w| {
+        w[1].text(text) == "."
+            && w[3].kind == CodeTokenKind::OpenParen
+            && matches!(w[2].kind, CodeTokenKind::Word | CodeTokenKind::QuotedIdent)
+            && TIMESCALE_INTERNAL_SCHEMAS.contains(&name(&w[0]).as_str())
+    });
+    if calls {
+        StatementClass::Unknown
+    } else {
+        StatementClass::Read
+    }
+}
 
 /// QuestDB functions with side effects callable from a `SELECT`.
 const QUESTDB_SIDE_EFFECT_FUNCTIONS: &[&str] = &["reload_config", "cancel_query"];

@@ -956,15 +956,32 @@ fn engine_dialects_classify_their_own_statements() {
     ] {
         assert_eq!(ts.classify(sql), class, "timescaledb: {sql}");
     }
-    // PostgreSQL and YugabyteDB do not know these functions.
-    assert_eq!(
-        pg.classify("SELECT drop_chunks('t', 1)"),
-        StatementClass::Read
-    );
-    assert_eq!(
-        yb.classify("SELECT drop_chunks('t', 1)"),
-        StatementClass::Read
-    );
+    // Every flavour knows TimescaleDB's functions: a `postgresql` connection may reach a
+    // database with the extension (security review M1, L1).
+    for d in [&pg as &dyn Dialect, &yb, &q, &ts] {
+        for sql in [
+            "SELECT drop_chunks('t', 1)",
+            "SELECT add_retention_policy('t', INTERVAL '7 days')",
+            "SELECT delete_job(1000)",
+            "SELECT freeze_chunk('_timescaledb_internal._hyper_1_1_chunk')",
+            "SELECT unfreeze_chunk(c) FROM show_chunks('t') c",
+            "CALL distributed_exec('DROP TABLE t')",
+            "SELECT add_data_node('dn1', host => 'h')",
+            "SELECT create_distributed_hypertable('t', 'time')",
+            "CALL timescaledb_experimental.copy_chunk('c', 'a', 'b')",
+            "SELECT set_replication_factor('t', 2)",
+            "SELECT _timescaledb_functions.any_function(1)",
+            "SELECT \"_timescaledb_internal\".f()",
+            "SELECT * FROM timescaledb_experimental.\"policies\"()",
+        ] {
+            assert_eq!(d.classify(sql), StatementClass::Unknown, "{sql}");
+        }
+        // Reading the catalogs is not a call.
+        assert_eq!(
+            d.classify("SELECT * FROM _timescaledb_catalog.hypertable"),
+            StatementClass::Read
+        );
+    }
     for (sql, class) in [
         (
             "ALTER TABLE orders DROP PARTITION LIST '2025-01'",

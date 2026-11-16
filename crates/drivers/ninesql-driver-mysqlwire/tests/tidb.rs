@@ -671,4 +671,31 @@ fn tidb_dialect_overrides() {
         d.classify("SET GLOBAL tidb_restricted_read_only = OFF")
             >= StatementClass::ChangesAccessMode
     );
+    // Sequences and user-level locks: side effects a `SELECT` can carry (security review L4),
+    // on every engine of the family.
+    for d in [&d as &dyn Dialect, &my, &MyDialect::mariadb()] {
+        for sql in [
+            "SELECT NEXTVAL(s)",
+            "SELECT nextval(nine.s), 1",
+            "SELECT SETVAL(s, 100)",
+            "SELECT LASTVAL(s)",
+            "SELECT NEXT VALUE FOR s",
+            "SELECT NEXTVAL FOR s",
+            "SELECT PREVIOUS VALUE FOR s",
+            "SELECT GET_LOCK('l', 10)",
+            "SELECT RELEASE_LOCK('l')",
+            "SELECT release_all_locks()",
+            "INSERT INTO t VALUES (NEXT VALUE FOR s)",
+        ] {
+            assert_eq!(d.classify(sql), StatementClass::Unknown, "{sql}");
+        }
+        for sql in [
+            "SELECT 'GET_LOCK(' AS s",
+            "SELECT `get_lock` FROM t",
+            "SELECT IS_FREE_LOCK('l')",
+            "SELECT next_value FROM t",
+        ] {
+            assert_eq!(d.classify(sql), StatementClass::Read, "{sql}");
+        }
+    }
 }
