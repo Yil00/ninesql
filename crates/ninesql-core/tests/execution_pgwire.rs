@@ -17,8 +17,8 @@ use ninesql_core::driver_api::arrow_array::StringArray;
 use ninesql_core::driver_api::{FetchBudget, ResultItem};
 use ninesql_core::{
     Auth, Connection, ConnectionTypeId, ConnectionTypes, Endpoint, EngineId, ExecutionService,
-    OpenOutcome, OpenRequest, Preferences, RunEnd, RunEvent, RunRequest, SecretSlot, SecretSource,
-    TlsMode, TransactionEnd,
+    FetchMode, OpenOutcome, OpenRequest, Preferences, RunEnd, RunEvent, RunRequest, SecretSlot,
+    SecretSource, TlsMode, TransactionEnd,
 };
 use ninesql_driver_pgwire::PgWireDriver;
 use ninesql_secrets::SecretString;
@@ -356,6 +356,270 @@ fn big_select_streams_first_rows_fast_and_cancels_and_production_deletes_ask() {
         )));
         assert!(p.transaction_state().in_transaction);
         p.close_with(TransactionEnd::Rollback).await.unwrap();
+    });
+    manager.shutdown(Duration::from_secs(5));
+}
+
+/// Review L5: the exit criterion with the request shape the UI sends (`with_budget` from the
+/// preferences and `with_paging`): the first page of the 1 M-row `SELECT` arrives fast, the
+/// result pauses (`PageEnd`), more pages come on `fetch`, the run can be cancelled while it is
+/// paused and the session is usable right after; a production `DELETE` without `WHERE` still
+/// asks for confirmation when the run is paged.
+#[test]
+fn paged_big_select_pauses_cancels_and_production_deletes_ask() {
+    let Some(dev) = dev() else { return };
+    let tmp = tempfile::tempdir().unwrap();
+    let (manager, _) = manager(Arc::new(PgWireDriver::new()), tmp.path());
+    let prefs = Preferences::default();
+    let budget = prefs.execution.budget();
+    let page = budget.batch_rows;
+    let exec = ExecutionService::new(manager.clone(), None, prefs);
+    let types = ConnectionTypes::default();
+    let open_pg = |ty: ConnectionTypeId| {
+        let request = OpenRequest::new(pg_connection(&dev, ty), &types)
+            .with_secret(SecretSlot::Auth, SecretString::from(dev.password.clone()));
+        let manager = manager.clone();
+        async move {
+            match open(&manager, request).await.unwrap() {
+                OpenOutcome::Opened(h) => h,
+                other => panic!("{other:?}"),
+            }
+        }
+    };
+    ui(async {
+        let h = open_pg(ConnectionTypeId::dev()).await;
+        let started = Instant::now();
+        let mut run = exec.run(
+            &h,
+            RunRequest::statement(
+                "SELECT g, md5(g::text) AS label FROM generate_series(1, 1000000) AS g",
+            )
+            .with_budget(budget)
+            .with_paging(page),
+        );
+        let mut first_rows = None;
+        let mut rows = 0u64;
+        let paused_at = loop {
+            match tokio::time::timeout(Duration::from_secs(30), run.next())
+                .await
+                .unwrap()
+            {
+                Some(RunEvent::Item {
+                    item: ResultItem::Rows(batch),
+                    ..
+                }) => {
+                    first_rows.get_or_insert_with(|| started.elapsed());
+                    rows += batch.num_rows() as u64;
+                }
+                Some(RunEvent::PageEnd { index: 0, rows: r }) => break r,
+                Some(RunEvent::Done(s)) => panic!("ended before the first page end: {s:?}"),
+                Some(_) => {}
+                None => panic!("no Done"),
+            }
+        };
+        let first_rows = first_rows.expect("first page");
+        eprintln!("time to first rows (paged 1 M-row SELECT, debug build): {first_rows:?}");
+        assert!(
+            first_rows < Duration::from_secs(3),
+            "first rows took {first_rows:?}"
+        );
+        assert_eq!(paused_at, rows);
+        assert_eq!(rows, u64::from(page), "the first page, nothing more");
+        // Paused: nothing more comes until asked.
+        assert!(
+            tokio::time::timeout(Duration::from_millis(300), run.next())
+                .await
+                .is_err()
+        );
+        run.fetch(0, FetchMode::Page(page));
+        loop {
+            match tokio::time::timeout(Duration::from_secs(30), run.next())
+                .await
+                .unwrap()
+            {
+                Some(RunEvent::Item {
+                    item: ResultItem::Rows(batch),
+                    ..
+                }) => rows += batch.num_rows() as u64,
+                Some(RunEvent::PageEnd { index: 0, .. }) => break,
+                Some(RunEvent::Done(s)) => panic!("ended before the second page end: {s:?}"),
+                Some(_) => {}
+                None => panic!("no Done"),
+            }
+        }
+        assert_eq!(rows, 2 * u64::from(page));
+        // Cancel while paused.
+        run.cancel();
+        let summary = loop {
+            match tokio::time::timeout(Duration::from_secs(30), run.next())
+                .await
+                .unwrap()
+            {
+                Some(RunEvent::Done(s)) => break s,
+                Some(_) => {}
+                None => panic!("no Done"),
+            }
+        };
+        assert_eq!(summary.end, RunEnd::Cancelled { index: 0 });
+        let (events, end) = collect_all(
+            exec.run(
+                &h,
+                RunRequest::statement("SELECT 1")
+                    .with_budget(budget)
+                    .with_paging(page),
+            ),
+        )
+        .await;
+        assert_eq!(end, RunEnd::Completed, "{events:?}");
+        h.close().await.unwrap().unwrap();
+
+        // Production, paged: a DELETE without WHERE asks first, then runs once confirmed.
+        let p = open_pg(ConnectionTypeId::prod()).await;
+        let script = "CREATE TEMP TABLE p3r_scratch (i int);\nINSERT INTO p3r_scratch VALUES (1), (2);\nDELETE FROM p3r_scratch";
+        let paged = |r: RunRequest| r.with_budget(budget).with_paging(page);
+        let (events, end) = collect_all(exec.run(&p, paged(RunRequest::script(script)))).await;
+        assert_eq!(end, RunEnd::NeedsConfirmation { index: 2 }, "{events:?}");
+        let (start, token) = events
+            .iter()
+            .find_map(|e| match e {
+                RunEvent::NeedsConfirmation { span, request, .. } => {
+                    Some((span.start, request.token))
+                }
+                _ => None,
+            })
+            .unwrap();
+        let (events, end) = collect_all(
+            exec.run(
+                &p,
+                paged(
+                    RunRequest::script(script)
+                        .resume_from(start)
+                        .confirmed(token),
+                ),
+            ),
+        )
+        .await;
+        assert_eq!(end, RunEnd::Completed, "{events:?}");
+        assert!(events.iter().any(|e| matches!(
+            e,
+            RunEvent::StatementFinished {
+                index: 0,
+                update_count: Some(2),
+                ..
+            }
+        )));
+        p.close_with(TransactionEnd::Rollback).await.unwrap();
+    });
+    manager.shutdown(Duration::from_secs(5));
+}
+
+/// Review M1 on PostgreSQL: a paged read left paused past the idle limit (short here) is
+/// closed by the run before the driver's `IDLE_CURSOR_TIMEOUT`; the session stays usable and
+/// the user's open transaction (manual commit) is still open with its write.
+#[test]
+fn an_idle_paused_read_is_closed_without_touching_the_transaction() {
+    let Some(dev) = dev() else { return };
+    let tmp = tempfile::tempdir().unwrap();
+    let (manager, _) = manager(Arc::new(PgWireDriver::new()), tmp.path());
+    let mut prefs = Preferences::default();
+    let idle = Duration::from_secs(1);
+    // Set in memory: the saved preference cannot go below 30 s.
+    prefs.execution.paused_result_idle = idle;
+    let budget = prefs.execution.budget().with_batch_rows(100);
+    let exec = ExecutionService::new(manager.clone(), None, prefs);
+    let types = ConnectionTypes::default();
+    ui(async {
+        let mut c = pg_connection(&dev, ConnectionTypeId::dev());
+        c.auto_commit = Some(false);
+        let request = OpenRequest::new(c, &types)
+            .with_secret(SecretSlot::Auth, SecretString::from(dev.password.clone()));
+        let h = match open(&manager, request).await.unwrap() {
+            OpenOutcome::Opened(h) => h,
+            other => panic!("{other:?}"),
+        };
+        let script =
+            "CREATE TEMP TABLE p3r_idle (i int);\nINSERT INTO p3r_idle VALUES (1), (2), (3)";
+        let (events, end) = collect_all(exec.run(&h, RunRequest::script(script))).await;
+        assert_eq!(end, RunEnd::Completed, "{events:?}");
+        assert!(h.transaction_state().in_transaction);
+
+        let mut run = exec.run(
+            &h,
+            RunRequest::statement("SELECT g FROM generate_series(1, 1000000) AS g")
+                .with_budget(budget)
+                .with_paging(100),
+        );
+        let mut events = Vec::new();
+        let summary = loop {
+            match tokio::time::timeout(Duration::from_secs(30), run.next())
+                .await
+                .unwrap()
+            {
+                Some(RunEvent::Done(s)) => break s,
+                Some(e) => events.push(e),
+                None => panic!("no Done"),
+            }
+        };
+        assert_eq!(summary.end, RunEnd::Completed, "{events:?}");
+        let closed = events
+            .iter()
+            .position(|e| {
+                matches!(
+                    e,
+                    RunEvent::ResultClosedIdle {
+                        index: 0,
+                        rows: 100,
+                        ..
+                    }
+                )
+            })
+            .unwrap_or_else(|| panic!("no ResultClosedIdle: {events:?}"));
+        assert!(
+            matches!(
+                events.get(closed + 1),
+                Some(RunEvent::StatementClosed {
+                    index: 0,
+                    rows: 100
+                })
+            ),
+            "{events:?}"
+        );
+        if let RunEvent::ResultClosedIdle { after, .. } = &events[closed] {
+            assert!(
+                *after >= idle && *after < Duration::from_secs(30),
+                "{after:?}"
+            );
+        }
+        assert!(!h.is_closed());
+        assert!(
+            h.transaction_state().in_transaction,
+            "the open transaction is not ended by the idle close"
+        );
+        // The session runs the next statement, inside the same transaction: the write is there.
+        let (events, end) = collect_all(exec.run(
+            &h,
+            RunRequest::statement("SELECT count(*)::text FROM p3r_idle"),
+        ))
+        .await;
+        assert_eq!(end, RunEnd::Completed, "{events:?}");
+        let count = events.iter().find_map(|e| match e {
+            RunEvent::Item {
+                item: ResultItem::Rows(b),
+                ..
+            } if b.num_rows() > 0 => b
+                .column(0)
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .map(|c| c.value(0).to_owned()),
+            _ => None,
+        });
+        assert_eq!(
+            count.as_deref(),
+            Some("3"),
+            "the transaction still holds the write"
+        );
+        assert!(h.transaction_state().in_transaction);
+        h.close_with(TransactionEnd::Rollback).await.unwrap();
     });
     manager.shutdown(Duration::from_secs(5));
 }
