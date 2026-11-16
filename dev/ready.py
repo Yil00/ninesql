@@ -5,6 +5,7 @@ Usage (from the repository root):
     python3 dev/ready.py check                 # engines.json <-> compose.yaml, no containers
     python3 dev/ready.py up <profile>          # docker compose up -d, then wait
     python3 dev/ready.py wait <profile>        # wait for running services
+    python3 dev/ready.py up sql --engines timescaledb,tidb   # only these engines of the profile
     python3 dev/ready.py down                  # stop everything, delete volumes
 
 A profile is ready when every engine container of the profile reports
@@ -44,8 +45,20 @@ def profile_engines(doc: dict, profile: str) -> list[dict]:
     return [e for e in doc["engines"] if e["profile"] in included]
 
 
-def expected_services(doc: dict, profile: str) -> tuple[list[str], list[str]]:
-    engines = [e for e in profile_engines(doc, profile) if e["service"]]
+def select_engines(doc: dict, profile: str, only: list[str] | None) -> list[dict]:
+    """The engines of `profile`, restricted to the ids in `only` when given."""
+    engines = profile_engines(doc, profile)
+    if only is None:
+        return engines
+    known = {e["id"] for e in engines}
+    unknown = [i for i in only if i not in known]
+    if unknown:
+        raise SystemExit(f"error: not in profile '{profile}': {', '.join(unknown)}")
+    return [e for e in engines if e["id"] in only]
+
+
+def expected_services(doc: dict, profile: str, only: list[str] | None = None) -> tuple[list[str], list[str]]:
+    engines = [e for e in select_engines(doc, profile, only) if e["service"]]
     services = [e["service"] for e in engines]
     seeds = [e["readiness"]["seed_service"] for e in engines if e["readiness"]["seed_service"]]
     return services, seeds
@@ -153,9 +166,9 @@ def container_states() -> dict[str, dict]:
     return {item["Service"]: item for item in items}
 
 
-def wait(profile: str, timeout: int) -> int:
+def wait(profile: str, timeout: int, only: list[str] | None = None) -> int:
     doc = load_engines()
-    services, seeds = expected_services(doc, profile)
+    services, seeds = expected_services(doc, profile, only)
     deadline = time.monotonic() + timeout
     start = time.monotonic()
     reported: set[str] = set()
@@ -205,11 +218,15 @@ def wait(profile: str, timeout: int) -> int:
         time.sleep(3)
 
 
-def up(profile: str, timeout: int) -> int:
-    proc = compose("--profile", profile, "up", "--detach")
+def up(profile: str, timeout: int, only: list[str] | None = None) -> int:
+    services: list[str] = []
+    if only is not None:
+        engines, seeds = expected_services(load_engines(), profile, only)
+        services = engines + seeds
+    proc = compose("--profile", profile, "up", "--detach", *services)
     if proc.returncode != 0:
         return proc.returncode
-    return wait(profile, timeout)
+    return wait(profile, timeout, only)
 
 
 def main() -> int:
@@ -220,14 +237,19 @@ def main() -> int:
         p = sub.add_parser(name)
         p.add_argument("profile", choices=ALL_PROFILES)
         p.add_argument("--timeout", type=int, default=900, help="seconds (default 900)")
+        p.add_argument(
+            "--engines",
+            help="comma-separated engine ids of the profile to start or wait for (default: all)",
+        )
     sub.add_parser("down", help="stop all services and delete their volumes")
     args = parser.parse_args()
     if args.cmd == "check":
         return check()
+    only = [e.strip() for e in args.engines.split(",") if e.strip()] if getattr(args, "engines", None) else None
     if args.cmd == "up":
-        return up(args.profile, args.timeout)
+        return up(args.profile, args.timeout, only)
     if args.cmd == "wait":
-        return wait(args.profile, args.timeout)
+        return wait(args.profile, args.timeout, only)
     return compose("--profile", "all", "down", "--volumes", "--remove-orphans").returncode
 
 

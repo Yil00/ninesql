@@ -48,13 +48,17 @@ jobs:
   driver-integration:
     name: Driver integration tests (dev containers)
     runs-on: ubuntu-24.04
-    timeout-minutes: 45
+    timeout-minutes: 60
     env:
       # Own compose project, so this job never stops or reuses the containers of another run
       # on the same Docker daemon (the dev-env workflow and local runs use `ninesql-dev`).
       # The published ports are still the fixed ones of dev/compose.yaml.
       COMPOSE_PROJECT_NAME: ninesql-ci-drivers
-      NINESQL_REQUIRE_ENGINES: postgresql,mysql,mariadb,ssh
+      # P4-C: the wire-compatible engines of the sql profile (TimescaleDB, YugabyteDB and
+      # QuestDB for pgwire, TiDB for mysqlwire). Measured locally: seeded within about 45 s
+      # (YugabyteDB, the slowest), about 2.3 GB of memory together.
+      NINESQL_REQUIRE_ENGINES: postgresql,mysql,mariadb,ssh,timescaledb,yugabytedb,questdb,tidb
+      WIRE_ENGINES: timescaledb,yugabytedb,questdb,tidb
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master
@@ -63,9 +67,14 @@ jobs:
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       # No GPUI system packages: none of the tested crates depends on GPUI.
       - name: Pull images
-        run: timeout 900 docker compose -f dev/compose.yaml --profile core pull --quiet
+        run: |
+          timeout 900 docker compose -f dev/compose.yaml --profile core pull --quiet
+          timeout 900 docker compose -f dev/compose.yaml --profile sql pull --quiet \
+            timescaledb yugabytedb questdb tidb
       - name: Start and wait for readiness
-        run: python3 dev/ready.py up core --timeout 900
+        run: |
+          python3 dev/ready.py up core --timeout 900
+          python3 dev/ready.py up sql --engines "$WIRE_ENGINES" --timeout 900
       - name: Integration tests
         run: >-
           cargo test --locked
