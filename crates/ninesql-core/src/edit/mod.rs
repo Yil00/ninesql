@@ -3,8 +3,10 @@
 //!
 //! # Editing (F-DATA-04)
 //! ```text
-//! let table = core.edit().describe_table(&session, path).await?;   // key from the metadata
-//! let mut edits = PendingEdits::new(table, &result_schema)?;        // one per result tab
+//! let table = core.edit().describe_table(&session, path.clone()).await?; // key from the metadata
+//! let query = core.edit().table_query(&session, &TableQuery::of_path(&path))?;
+//! // run query.text with query.params; keep query.source() with the result
+//! let mut edits = PendingEdits::new(table, query.source(), &result_schema)?; // one per result tab
 //! edits.set_value(row, &batch, batch_row, field, edits.parse_input(field, "42")?)?;
 //! edits.delete_row(row2, &batch, batch_row2)?;
 //! let plan = edits.plan(&*session.dialect(), &session.info().capabilities.editing)?;
@@ -18,8 +20,16 @@
 //!   driver's flags only) and SQLite's `INTEGER PRIMARY KEY`; the primary key first, then the
 //!   smallest non-null unique key, then the smallest nullable one. Without a key, or when the
 //!   session is read-only, the driver declares no editing (I8), has no transactions or no bind
-//!   parameters, or the table's storage engine is not transactional, editing is unavailable
-//!   with a [`NotEditable`] explanation.
+//!   parameters, or the table's storage engine is not transactional (or, on the MySQL family,
+//!   not known to be), or the table is not found in its schema's listing, editing is
+//!   unavailable with a [`NotEditable`] explanation.
+//! - **Provenance**: only a result whose rows come from the core's own query of the table can be
+//!   edited. [`EditService::table_query`] (and [`build_table_query`], the foreign-key queries)
+//!   return a [`BuiltQuery`] whose [`QuerySource`] names the table and the selected columns;
+//!   the UI keeps it with the result and passes it to [`PendingEdits::new`], which refuses a
+//!   result whose columns are not exactly those (name, order, number) with
+//!   [`NotEditable::ResultNotFromTable`]. A statement the user typed is never editable, so an
+//!   alias (`SELECT other_unique AS id …`) cannot point an edit at the wrong rows.
 //! - **Pending changes** ([`PendingEdits`]): cell edits, inserted, duplicated and deleted rows;
 //!   [`PendingEdits::plan`] renders them with the P5-B generator (`generate_batch`) into the
 //!   statements and the DML preview ([`SavePlan::script`]).
@@ -30,11 +40,15 @@
 //!   - auto-commit session: `BEGIN` … `COMMIT` of its own, rolled back on failure (an open
 //!     transaction there is refused);
 //!   - manual-commit session (production by default, ADR-0007 §5): inside the session's
-//!     transaction (opened with `BEGIN` when none is), around `SAVEPOINT ninesql_edit_save`;
-//!     on failure `ROLLBACK TO SAVEPOINT` (or a full rollback when the save opened the
-//!     transaction), on success `RELEASE SAVEPOINT` and the transaction stays open for the user
-//!     to commit ([`SaveSummary::committed`] is `false`). A driver without savepoints refuses a
-//!     save while a transaction is open.
+//!     transaction (opened with `BEGIN` when none is), around a savepoint
+//!     `ninesql_edit_save_<random>`; on failure `ROLLBACK TO SAVEPOINT` (or a full rollback when
+//!     the save opened the transaction), on success `RELEASE SAVEPOINT` and the transaction
+//!     stays open for the user to commit ([`SaveSummary::committed`] is `false`). Earlier
+//!     uncommitted work of the session survives a failed save; when undoing the save alone
+//!     fails and the whole transaction had to be rolled back, the save fails with
+//!     [`EditError::TransactionRolledBack`] so the UI can say that earlier work was lost too
+//!     ([`EditError::UndoFailed`] when even that rollback failed). A driver without savepoints
+//!     refuses saves in manual-commit mode ([`EditError::NoSavepoints`]).
 //!
 //!   `UPDATE` / `DELETE` carry the original values of the edited columns
 //!   (`Concurrency::EditedColumns`); columns without reliable equality, or whose values were
@@ -43,9 +57,10 @@
 //!   write, the first call ends with [`SaveEvent::NeedsConfirmation`]: **one confirmation for
 //!   the whole save**, showing the preview script, with a single-use [`SaveToken`] bound to the
 //!   session, the table and the exact statements and values (ten minutes), the design of the
-//!   P5-C import confirmation. Once confirmed, the per-statement confirmation the session asks
-//!   for each statement (types that confirm every write) is answered by the service for the
-//!   confirmed statements only; anything else fails the save. A statement the dialect classifies
+//!   P5-C import confirmation (the service keeps a SHA-256 digest of them, not a copy). A save
+//!   holds at most [`MAX_CHANGES_PER_SAVE`] changes. Once confirmed, the per-statement
+//!   confirmation the session asks for each statement (types that confirm every write) is
+//!   answered by the service for the confirmed statements only; anything else fails the save. A statement the dialect classifies
 //!   as anything but a filtered write never runs (the P5-B self-check).
 //! - **Non-transactional tables** (`TableInfo::transactional == Some(false)`): refused, with
 //!   no override, since a rollback would undo nothing.
@@ -88,8 +103,8 @@ pub use self::history::{FilterHistoryEntry, FilterRecorded, MAX_FILTERS_PER_CONN
 pub use self::key::{EditableTable, NotEditable, RowKey, TableColumn, table_parts};
 pub use self::pending::{ColumnStatus, NewRowId, PendingEdits, RowId, SavePlan};
 pub use self::query::{
-    BuiltQuery, ColumnFilter, FilterOp, QueryError, SortDirection, SortKey, TableQuery,
-    build_table_query, check_raw_where, referenced_rows_query, referencing_rows_query,
+    BuiltQuery, ColumnFilter, FilterOp, QueryError, QuerySource, SortDirection, SortKey,
+    TableQuery, build_table_query, check_raw_where, referenced_rows_query, referencing_rows_query,
 };
 use crate::connection::ConnectionId;
 use crate::error::CoreError;
@@ -107,8 +122,13 @@ const CONFIRMATION_TTL: Duration = Duration::from_secs(10 * 60);
 const MAX_PENDING_CONFIRMATIONS: usize = 16;
 /// Events buffered per save before progress events are dropped.
 const EVENT_QUEUE: usize = 16;
-/// Savepoint around a save inside the session's transaction (manual-commit mode).
+/// Prefix of the savepoint around a save inside the session's transaction (manual-commit mode),
+/// followed by a random suffix per save.
 const SAVEPOINT: &str = "ninesql_edit_save";
+/// Most changes (statements) in one save.
+pub const MAX_CHANGES_PER_SAVE: usize = 10_000;
+/// Overall time allowed to [`EditService::referencing_foreign_keys`].
+const REFERENCING_DEADLINE: Duration = Duration::from_secs(60);
 /// Time allowed to a `SAVEPOINT`, `RELEASE` or `ROLLBACK TO`.
 const CONTROL_TIMEOUT: Duration = Duration::from_secs(30);
 
@@ -186,6 +206,37 @@ pub enum EditError {
         /// The count error.
         source: DmlError,
     },
+    /// The save failed, and undoing it on its own (`ROLLBACK TO SAVEPOINT`) did not work, so
+    /// the session's **whole transaction** was rolled back: changes made earlier in that
+    /// transaction and not committed are lost too.
+    #[error(
+        "{source}; the save could not be undone on its own, so the session's whole transaction was rolled back: earlier uncommitted changes in this session were lost as well"
+    )]
+    TransactionRolledBack {
+        /// Why the save failed.
+        source: Box<EditError>,
+    },
+    /// The save failed and could not be undone: the session's transaction may still hold part
+    /// of it. Roll the transaction back (or close the session, which rolls back).
+    #[error(
+        "{source}; the save could not be undone: roll back the session's transaction (or close the session) before doing anything else"
+    )]
+    UndoFailed {
+        /// Why the save failed.
+        source: Box<EditError>,
+    },
+    /// A manual-commit session whose driver has no savepoints: a failed save could not be
+    /// undone without discarding the session's other uncommitted work.
+    #[error(
+        "this engine has no savepoints, so rows cannot be saved in manual-commit mode: switch the session to auto-commit to save"
+    )]
+    NoSavepoints,
+    /// More changes than one save takes.
+    #[error("too many changes for one save (at most {max}): save in smaller steps")]
+    TooManyChanges {
+        /// The limit.
+        max: usize,
+    },
     /// The save was cancelled; nothing was saved.
     #[error("cancelled; nothing was saved")]
     Cancelled,
@@ -213,6 +264,10 @@ impl EditError {
             Self::InvalidConfirmation => "invalid-confirmation",
             Self::UnexpectedConfirmation => "unexpected-confirmation",
             Self::RowCount { .. } => "row-count",
+            Self::TransactionRolledBack { .. } => "transaction-rolled-back",
+            Self::UndoFailed { .. } => "undo-failed",
+            Self::NoSavepoints => "no-savepoints",
+            Self::TooManyChanges { .. } => "too-many-changes",
             Self::Cancelled => "cancelled",
         }
     }
@@ -400,8 +455,73 @@ pub type SaveJob = Job<SaveEvent>;
 #[derive(PartialEq)]
 struct SaveKey {
     session: SessionId,
-    table: Vec<String>,
-    statements: Vec<(String, Vec<Param>)>,
+    /// SHA-256 of the table, the statement texts and every parameter value, in order.
+    digest: [u8; 32],
+}
+
+impl SaveKey {
+    fn new(session: SessionId, table: &[String], statements: &[DmlStatement]) -> Self {
+        use sha2::{Digest, Sha256};
+        fn bytes(h: &mut Sha256, b: &[u8]) {
+            h.update((b.len() as u64).to_le_bytes());
+            h.update(b);
+        }
+        let mut h = Sha256::new();
+        h.update((table.len() as u64).to_le_bytes());
+        for part in table {
+            bytes(&mut h, part.as_bytes());
+        }
+        h.update((statements.len() as u64).to_le_bytes());
+        for s in statements {
+            bytes(&mut h, s.statement.text.as_bytes());
+            h.update((s.statement.params.len() as u64).to_le_bytes());
+            for p in &s.statement.params {
+                match p {
+                    Param::Null => h.update([0]),
+                    Param::Bool(b) => h.update([1, u8::from(*b)]),
+                    Param::Int(i) => {
+                        h.update([2]);
+                        h.update(i.to_le_bytes());
+                    }
+                    Param::Float(f) => {
+                        h.update([3]);
+                        h.update(f.to_bits().to_le_bytes());
+                    }
+                    Param::Decimal(d) => {
+                        h.update([4]);
+                        bytes(&mut h, d.as_bytes());
+                    }
+                    Param::Text(t) => {
+                        h.update([5]);
+                        bytes(&mut h, t.as_bytes());
+                    }
+                    Param::Bytes(b) => {
+                        h.update([6]);
+                        bytes(&mut h, b);
+                    }
+                    Param::Date(d) => {
+                        h.update([7]);
+                        h.update(d.to_le_bytes());
+                    }
+                    Param::Timestamp { micros, utc } => {
+                        h.update([8, u8::from(*utc)]);
+                        h.update(micros.to_le_bytes());
+                    }
+                    Param::Json(j) => {
+                        h.update([9]);
+                        bytes(&mut h, j.as_bytes());
+                    }
+                    // A value kind this code does not know: the key never matches (fail
+                    // closed: the user is asked again rather than a token reused).
+                    _ => h.update(Uuid::new_v4().as_bytes()),
+                }
+            }
+        }
+        Self {
+            session,
+            digest: h.finalize().into(),
+        }
+    }
 }
 
 struct PendingSave {
@@ -493,7 +613,8 @@ impl EditService {
     /// F-DATA-07): the foreign keys of the tables of the same schema (or the same parent), read
     /// through the metadata service (cached, bounded), at most [`MAX_REFERENCING_SCAN`] tables.
     /// Keys from other schemas are not found; [`ReferencingKeys::complete`] is `false` when the
-    /// scan stopped at the bound or the table list was incomplete.
+    /// scan stopped at the bound or the table list was incomplete. The whole scan has a 60 s
+    /// deadline; dropping the [`Reply`] stops it.
     pub fn referencing_foreign_keys(
         &self,
         session: &SessionHandle,
@@ -503,7 +624,17 @@ impl EditService {
         let metadata = self.metadata.clone();
         let connection = session.info().connection;
         self.manager.runtime().spawn(async move {
-            let result = referencing(&metadata, connection, path).await;
+            let mut tx = tx;
+            let result = tokio::select! {
+                // Nobody waits any more: stop (the pending metadata requests are dropped).
+                () = tx.closed() => return,
+                r = tokio::time::timeout(
+                    REFERENCING_DEADLINE,
+                    referencing(&metadata, connection, path),
+                ) => r.unwrap_or(Err(EditError::Metadata(MetadataError::Timeout(
+                    REFERENCING_DEADLINE,
+                )))),
+            };
             let _ = tx.send(result);
         });
         reply
@@ -761,16 +892,7 @@ impl SaveTask {
 
         // Confirmation (ADR-0007): one for the whole save.
         let confirmed = if info.policy.production || info.policy.confirm_every_write {
-            let key = SaveKey {
-                session: info.id,
-                table: self.table.clone(),
-                statements: plan
-                    .batch
-                    .statements
-                    .iter()
-                    .map(|s| (s.statement.text.clone(), s.statement.params.clone()))
-                    .collect(),
-            };
+            let key = SaveKey::new(info.id, &self.table, &plan.batch.statements);
             match self.options.confirmation {
                 None => {
                     let token = self.service.issue_confirmation(key);
@@ -813,11 +935,11 @@ impl SaveTask {
             TxMode::Savepoint {
                 opened: !state.in_transaction,
             }
-        } else if state.in_transaction {
-            return SaveEvent::Failed(EditError::PendingTransaction);
         } else {
-            TxMode::Own
+            return SaveEvent::Failed(EditError::NoSavepoints);
         };
+        // A fresh name per save, so it never meets a savepoint of the user's.
+        let sp = format!("{SAVEPOINT}_{}", &Uuid::new_v4().simple().to_string()[..12]);
         let mut guard = SaveTx {
             lease,
             in_tx: false,
@@ -830,7 +952,7 @@ impl SaveTask {
                 guard.in_tx = true;
             }
             if matches!(mode, TxMode::Savepoint { .. }) {
-                self.control(&guard.lease, &format!("SAVEPOINT {SAVEPOINT}"))
+                self.control(&guard.lease, &format!("SAVEPOINT {sp}"))
                     .await?;
                 savepoint = true;
                 // A save dropped mid-way rolls the session's transaction back (the safe side).
@@ -863,7 +985,7 @@ impl SaveTask {
                     tx(guard.lease.commit()).await?;
                 }
                 TxMode::Savepoint { .. } => {
-                    self.control(&guard.lease, &format!("RELEASE SAVEPOINT {SAVEPOINT}"))
+                    self.control(&guard.lease, &format!("RELEASE SAVEPOINT {sp}"))
                         .await?;
                 }
             }
@@ -881,32 +1003,53 @@ impl SaveTask {
             }),
             Err(e) => {
                 guard.in_tx = false;
-                let undone = match mode {
-                    // The session's own transaction is kept: only the save is undone.
+                // The session had a transaction of its own before the save (manual-commit mode).
+                let kept = mode == TxMode::Savepoint { opened: false };
+                let undone: Result<(), EditError> = match mode {
                     // The savepoint was never set: the session's transaction is left as it is.
                     TxMode::Savepoint { opened: false } if !savepoint => Ok(()),
-                    TxMode::Savepoint { opened: false } => self
-                        .control(&guard.lease, &format!("ROLLBACK TO SAVEPOINT {SAVEPOINT}"))
-                        .await
-                        .and(
-                            self.control(&guard.lease, &format!("RELEASE SAVEPOINT {SAVEPOINT}"))
-                                .await,
-                        ),
+                    // Only the save is undone; the session's transaction is kept.
+                    TxMode::Savepoint { opened: false } => {
+                        match self
+                            .control(&guard.lease, &format!("ROLLBACK TO SAVEPOINT {sp}"))
+                            .await
+                        {
+                            Ok(()) => {
+                                self.control(&guard.lease, &format!("RELEASE SAVEPOINT {sp}"))
+                                    .await
+                            }
+                            Err(re) => Err(re),
+                        }
+                    }
                     _ if self.session.transaction_state().in_transaction => {
                         tx(guard.lease.rollback()).await
                     }
                     _ => Ok(()),
                 };
+                let mut not_undone = false;
                 if let Err(re) = undone {
                     tracing::warn!(
                         kind = re.kind(),
-                        "undoing a failed save failed; rolling back"
+                        "undoing a failed save failed; rolling the transaction back"
                     );
                     if let Err(re) = tx(guard.lease.rollback()).await {
                         tracing::warn!(kind = re.kind(), "rollback after a failed save failed");
+                        not_undone = true;
                     }
                 }
-                SaveEvent::Failed(e)
+                if not_undone {
+                    SaveEvent::Failed(EditError::UndoFailed {
+                        source: Box::new(e),
+                    })
+                } else if kept && !self.session.transaction_state().in_transaction {
+                    // The fallback rollback (or an engine whose `ROLLBACK TO` ends the
+                    // transaction) discarded the user's earlier uncommitted work: say so.
+                    SaveEvent::Failed(EditError::TransactionRolledBack {
+                        source: Box::new(e),
+                    })
+                } else {
+                    SaveEvent::Failed(e)
+                }
             }
         }
     }

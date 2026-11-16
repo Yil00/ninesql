@@ -48,7 +48,8 @@ pub struct EditableTable {
     pub columns: Vec<TableColumn>,
     /// The row key.
     pub key: RowKey,
-    /// [`TableInfo::transactional`]: `Some(true)`, or `None` when the driver does not know.
+    /// [`TableInfo::transactional`]: `Some(true)`, or `None` when the driver does not report it
+    /// (never on the MySQL family).
     pub transactional: Option<bool>,
 }
 
@@ -73,9 +74,18 @@ pub enum NotEditable {
     /// does not know the source of).
     #[error("the result does not come from a single table")]
     NotSingleTable,
-    /// The table's metadata could not be read completely (the column list was cut).
-    #[error("the table's columns could not all be read")]
+    /// The table's metadata could not be read completely: the column list was cut, or the
+    /// table was not found in its schema's listing (a navigator filter may hide it).
+    #[error(
+        "the table's metadata could not all be read (a navigator filter may hide the table or some of its columns)"
+    )]
     IncompleteMetadata,
+    /// The driver reports per table whether it is transactional (MySQL family) and did not
+    /// for this one: a failed save might not be rolled back, so editing is refused.
+    #[error(
+        "whether the table's storage engine has transactions is unknown, so a failed save might not be rolled back: rows cannot be edited"
+    )]
+    TransactionalUnknown,
     /// No primary key or usable unique key (P5-B review M1 rules).
     #[error(
         "the table has no primary key or unique key that identifies rows: rows cannot be edited"
@@ -88,31 +98,49 @@ pub enum NotEditable {
         "the table's storage engine has no transactions, so a failed save could not be rolled back: rows cannot be edited"
     )]
     NotTransactional,
+    /// The result was not produced by NineSQL's query of this table, or its columns are not
+    /// the ones that query selected (name, order, number): rows cannot be matched to the table.
+    #[error(
+        "the result does not come from NineSQL's query of this table (open the table, or use its data view, to edit rows)"
+    )]
+    ResultNotFromTable,
     /// A key column is not in the result (or appears twice): rows cannot be identified.
     #[error("the result does not include every key column ({}) exactly once", .0.join(", "))]
     KeyNotInResult(Vec<String>),
 }
 
-/// The DML name parts of a table path: its nearest schema (else its catalog) and its name.
+/// The DML name parts of a table path: its catalog and schema when the engine has both, else
+/// its nearest schema or catalog, then its name (`["nine", "public", "t"]`, `["public", "t"]`).
 #[must_use]
 pub fn table_parts(path: &ObjectPath) -> Vec<String> {
     let Some((leaf, parents)) = path.0.split_last() else {
         return Vec::new();
     };
-    let container = parents
+    let schema = parents.iter().rposition(|s| s.kind == ObjectKind::Schema);
+    let catalog = parents[..schema.unwrap_or(parents.len())]
         .iter()
-        .rev()
-        .find(|s| s.kind == ObjectKind::Schema)
-        .or_else(|| parents.iter().rev().find(|s| s.kind == ObjectKind::Catalog));
-    match container {
-        Some(c) => vec![c.name.clone(), leaf.name.clone()],
-        None => vec![leaf.name.clone()],
+        .rposition(|s| s.kind == ObjectKind::Catalog);
+    let mut out = Vec::with_capacity(3);
+    if let Some(c) = catalog {
+        out.push(parents[c].name.clone());
     }
+    if let Some(s) = schema {
+        out.push(parents[s].name.clone());
+    }
+    out.push(leaf.name.clone());
+    out
+}
+
+/// Engines whose driver reports [`TableInfo::transactional`] per table (the MySQL family, where
+/// storage engines differ): there an unknown value means not editable.
+fn reports_transactional(engine: &EngineId) -> bool {
+    *engine == EngineId::MYSQL || *engine == EngineId::MARIADB || *engine == EngineId::TIDB
 }
 
 impl EditableTable {
     /// The editable view of a table from its metadata: the table's own listing entry (for
-    /// [`TableInfo::transactional`]; `None` when unknown), its columns (every one: pass
+    /// [`TableInfo::transactional`]; `None` when the table was not found in its parent's
+    /// listing, which refuses editing), its columns (every one: pass
     /// `columns_complete = false` when the listing was cut) and its indexes.
     ///
     /// The key is chosen with [`choose_row_key`] among the unique indexes
@@ -132,12 +160,18 @@ impl EditableTable {
         columns_complete: bool,
         indexes: &[ObjectInfo],
     ) -> Result<Self, NotEditable> {
-        if !columns_complete {
+        // A table missing from its parent's listing (hidden by a navigator filter, beyond the
+        // pages loaded) has unknown storage: fail closed.
+        let (Some(table), true) = (table, columns_complete) else {
             return Err(NotEditable::IncompleteMetadata);
-        }
-        let transactional = table.and_then(|t| t.transactional);
-        if transactional == Some(false) {
-            return Err(NotEditable::NotTransactional);
+        };
+        let transactional = table.transactional;
+        match transactional {
+            Some(false) => return Err(NotEditable::NotTransactional),
+            None if reports_transactional(engine) => {
+                return Err(NotEditable::TransactionalUnknown);
+            }
+            _ => {}
         }
         let mut cols: Vec<(u32, TableColumn)> = columns
             .iter()
@@ -225,6 +259,12 @@ mod tests {
             .child(ObjectKind::Table, "t")
     }
 
+    fn tx() -> TableInfo {
+        let mut t = TableInfo::default();
+        t.transactional = Some(true);
+        t
+    }
+
     fn col(name: &str, ordinal: u32, ty: &str, nullable: bool, pk: bool) -> ObjectInfo {
         let mut c = ColumnInfo::new(ordinal, ty);
         c.nullable = nullable;
@@ -260,9 +300,15 @@ mod tests {
             index("u_email", &["email"], |_| {}),
             index("pk", &["id"], |i| i.primary = true),
         ];
-        let t =
-            EditableTable::from_metadata(&EngineId::POSTGRESQL, table(), None, &cols, true, &idx)
-                .unwrap();
+        let t = EditableTable::from_metadata(
+            &EngineId::POSTGRESQL,
+            table(),
+            Some(&tx()),
+            &cols,
+            true,
+            &idx,
+        )
+        .unwrap();
         assert_eq!(t.key.columns, vec!["id"]);
         assert_eq!(t.key.kind, KeyKind::PrimaryKey);
         assert_eq!(t.table, vec!["public", "t"]);
@@ -283,7 +329,7 @@ mod tests {
                 EditableTable::from_metadata(
                     &EngineId::POSTGRESQL,
                     table(),
-                    None,
+                    Some(&tx()),
                     &cols,
                     true,
                     &idx
@@ -294,7 +340,14 @@ mod tests {
         // An index on a column that is not listed (an expression reported by name) is ignored.
         let idx = [index("x", &["lower(a)"], |_| {})];
         assert_eq!(
-            EditableTable::from_metadata(&EngineId::POSTGRESQL, table(), None, &cols, true, &idx),
+            EditableTable::from_metadata(
+                &EngineId::POSTGRESQL,
+                table(),
+                Some(&tx()),
+                &cols,
+                true,
+                &idx
+            ),
             Err(NotEditable::NoKey)
         );
     }
@@ -305,17 +358,32 @@ mod tests {
             col("id", 1, "INTEGER", true, true),
             col("v", 2, "TEXT", true, false),
         ];
-        let t = EditableTable::from_metadata(&EngineId::SQLITE, table(), None, &cols, true, &[])
-            .unwrap();
+        let t =
+            EditableTable::from_metadata(&EngineId::SQLITE, table(), Some(&tx()), &cols, true, &[])
+                .unwrap();
         assert_eq!(t.key.columns, vec!["id"]);
         // Not on another engine, and not for another type.
         assert_eq!(
-            EditableTable::from_metadata(&EngineId::POSTGRESQL, table(), None, &cols, true, &[]),
+            EditableTable::from_metadata(
+                &EngineId::POSTGRESQL,
+                table(),
+                Some(&tx()),
+                &cols,
+                true,
+                &[]
+            ),
             Err(NotEditable::NoKey)
         );
         let cols2 = [col("id", 1, "INT", true, true)];
         assert_eq!(
-            EditableTable::from_metadata(&EngineId::SQLITE, table(), None, &cols2, true, &[]),
+            EditableTable::from_metadata(
+                &EngineId::SQLITE,
+                table(),
+                Some(&tx()),
+                &cols2,
+                true,
+                &[]
+            ),
             Err(NotEditable::NoKey)
         );
         let mut info = TableInfo::default();
@@ -325,7 +393,14 @@ mod tests {
             Err(NotEditable::NotTransactional)
         );
         assert_eq!(
-            EditableTable::from_metadata(&EngineId::SQLITE, table(), None, &cols, false, &[]),
+            EditableTable::from_metadata(
+                &EngineId::SQLITE,
+                table(),
+                Some(&tx()),
+                &cols,
+                false,
+                &[]
+            ),
             Err(NotEditable::IncompleteMetadata)
         );
     }
@@ -341,8 +416,9 @@ mod tests {
             index("ua", &["a"], |_| {}),
             index("ubc", &["b", "c"], |_| {}),
         ];
-        let t = EditableTable::from_metadata(&EngineId::MYSQL, table(), None, &cols, true, &idx)
-            .unwrap();
+        let t =
+            EditableTable::from_metadata(&EngineId::MYSQL, table(), Some(&tx()), &cols, true, &idx)
+                .unwrap();
         assert_eq!(t.key.columns, vec!["b", "c"]);
         assert_eq!(
             t.key.kind,
@@ -350,5 +426,49 @@ mod tests {
                 nulls_distinct: true
             }
         );
+    }
+
+    #[test]
+    fn unknown_storage_is_refused() {
+        let cols = [col("id", 1, "INTEGER", false, true)];
+        let idx = [index("pk", &["id"], |i| i.primary = true)];
+        // Not found in the listing.
+        assert_eq!(
+            EditableTable::from_metadata(&EngineId::POSTGRESQL, table(), None, &cols, true, &idx),
+            Err(NotEditable::IncompleteMetadata)
+        );
+        // Found, but the MySQL family did not say whether it is transactional.
+        let unknown = TableInfo::default();
+        for engine in [EngineId::MYSQL, EngineId::MARIADB, EngineId::TIDB] {
+            assert_eq!(
+                EditableTable::from_metadata(&engine, table(), Some(&unknown), &cols, true, &idx),
+                Err(NotEditable::TransactionalUnknown)
+            );
+        }
+        assert!(
+            EditableTable::from_metadata(
+                &EngineId::POSTGRESQL,
+                table(),
+                Some(&unknown),
+                &cols,
+                true,
+                &idx
+            )
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn parts_keep_catalog_and_schema() {
+        let p = ObjectPath::root()
+            .child(ObjectKind::Catalog, "c")
+            .child(ObjectKind::Schema, "s")
+            .child(ObjectKind::Table, "t");
+        assert_eq!(table_parts(&p), vec!["c", "s", "t"]);
+        let p = ObjectPath::root()
+            .child(ObjectKind::Catalog, "c")
+            .child(ObjectKind::Table, "t");
+        assert_eq!(table_parts(&p), vec!["c", "t"]);
+        assert_eq!(table_parts(&table()), vec!["public", "t"]);
     }
 }

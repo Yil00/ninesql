@@ -46,6 +46,9 @@ pub struct Wrap {
     /// Also drops `inside_dbeaver_workspace` (a file driver that does not know the flag).
     pub ignore_dbeaver_flag: bool,
     pub busy_until: Arc<Mutex<Option<Instant>>>,
+    /// Statements starting with one of these prefixes (ASCII case ignored) fail with a query
+    /// error, as an engine error would.
+    pub fail_prefixes: Arc<Mutex<Vec<String>>>,
 }
 
 impl Wrap {
@@ -56,6 +59,7 @@ impl Wrap {
             ignore_read_only: false,
             ignore_dbeaver_flag: false,
             busy_until: Arc::default(),
+            fail_prefixes: Arc::default(),
         }
     }
 
@@ -112,6 +116,7 @@ impl Driver for Wrap {
         Ok(Box::new(WrapSession {
             inner,
             busy_until: Arc::clone(&self.busy_until),
+            fail_prefixes: Arc::clone(&self.fail_prefixes),
         }))
     }
 }
@@ -119,6 +124,7 @@ impl Driver for Wrap {
 pub struct WrapSession {
     inner: Box<dyn Session>,
     busy_until: Arc<Mutex<Option<Instant>>>,
+    fail_prefixes: Arc<Mutex<Vec<String>>>,
 }
 
 #[async_trait::async_trait]
@@ -143,6 +149,20 @@ impl Session for WrapSession {
             .is_some_and(|until| Instant::now() < until);
         if busy {
             return Err(DriverError::Busy);
+        }
+        let lower = s.text.to_ascii_lowercase();
+        if self
+            .fail_prefixes
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|p| lower.starts_with(&p.to_ascii_lowercase()))
+        {
+            return Err(DriverError::Query {
+                code: Some("XX000".into()),
+                message: "injected failure".into(),
+                position: None,
+            });
         }
         self.inner.execute(s, o).await
     }

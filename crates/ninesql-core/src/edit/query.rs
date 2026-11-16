@@ -10,9 +10,14 @@
 //!   write (`UNION`, `ORDER`, `LIMIT`, `INTO`, `FOR`, `UPDATE`, `DELETE`…), no token that runs
 //!   past it (an unterminated string or comment), and the whole statement must split into one
 //!   statement and classify as [`StatementClass::Read`] with the session's dialect, on every
-//!   connection type. A function with side effects that the classifier reads as a read stays
-//!   the classifier's documented limit; the statement then runs under the session's own rules
-//!   (read-only sessions are enforced engine-side, I3).
+//!   connection type.
+//!
+//!   **What this does not block**: the checks are lexical. A function call with side effects
+//!   that the dialect's classifier reads as a read passes (PostgreSQL `pg_advisory_lock`,
+//!   `pg_notify`, `pg_terminate_backend`, `set_config`, `dblink_exec`; MySQL `SLEEP`,
+//!   `BENCHMARK`, `GET_LOCK` where the dialect does not flag it; user functions that write).
+//!   On a read-only session the engine refuses writes (I3); elsewhere such a filter runs like
+//!   any statement the user types. Listing more functions is a classifier (driver-API) change.
 //! - Nothing here logs a value or the raw text; `Debug` shows counts only.
 
 use std::fmt;
@@ -21,13 +26,17 @@ use ninesql_driver_api::dml::DmlError;
 use ninesql_driver_api::metadata::{ForeignKeyInfo, ObjectPath};
 use ninesql_driver_api::{CodeTokenKind, Dialect, Param, StatementClass, code_tokens};
 
+use uuid::Uuid;
+
 use super::key::table_parts;
 
 /// Longest raw `WHERE` text accepted, in bytes.
 pub const MAX_RAW_WHERE_BYTES: usize = 16 * 1024;
 
-/// Words a raw `WHERE` may not hold outside strings and quoted names: they would change the
-/// statement's shape, take locks or write.
+/// Keywords a raw `WHERE` may not hold outside strings and quoted names: they would change the
+/// statement's shape (a second query, another order or limit), or add a locking or writing
+/// clause spelled with these words. This list is about keywords only: it does not stop a
+/// function call with side effects (see the [module documentation](self)).
 const FORBIDDEN_WORDS: &[&str] = &[
     "UNION",
     "INTERSECT",
@@ -246,8 +255,51 @@ impl TableQuery {
     }
 }
 
+/// Where a [`BuiltQuery`]'s rows come from: one table and the columns selected (`None`: `*`).
+/// Only the core creates it ([`build_table_query`], [`EditService::table_query`] and the
+/// foreign-key queries), so a result whose source is known can be edited:
+/// [`PendingEdits::new`](super::PendingEdits::new) requires it and checks the result's columns
+/// against it. The UI keeps it with the result of the query it ran. `Debug` shows the id only.
+///
+/// [`EditService::table_query`]: super::EditService::table_query
+#[derive(Clone, PartialEq, Eq)]
+pub struct QuerySource {
+    id: Uuid,
+    table: Vec<String>,
+    columns: Option<Vec<String>>,
+}
+
+impl QuerySource {
+    /// A random id, to match a source with the result of its query.
+    #[must_use]
+    pub fn id(&self) -> Uuid {
+        self.id
+    }
+
+    /// The table's name parts.
+    #[must_use]
+    pub fn table(&self) -> &[String] {
+        &self.table
+    }
+
+    /// The columns selected, in order; `None` for `*` (every column, in ordinal order).
+    #[must_use]
+    pub fn columns(&self) -> Option<&[String]> {
+        self.columns.as_deref()
+    }
+}
+
+impl fmt::Debug for QuerySource {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("QuerySource")
+            .field("id", &self.id)
+            .finish_non_exhaustive()
+    }
+}
+
 /// A statement to run with its bind parameters (through the execution service:
-/// `RunRequest::with_params`). `Debug` hides the parameters.
+/// `RunRequest::with_params`), and where its rows come from ([`BuiltQuery::source`]). `Debug`
+/// hides the parameters.
 #[derive(Clone, PartialEq)]
 #[non_exhaustive]
 pub struct BuiltQuery {
@@ -255,6 +307,16 @@ pub struct BuiltQuery {
     pub text: String,
     /// Bind parameters, in placeholder order.
     pub params: Vec<Param>,
+    source: QuerySource,
+}
+
+impl BuiltQuery {
+    /// The table and columns the rows come from: keep it with the result and pass it to
+    /// [`PendingEdits::new`](super::PendingEdits::new) to edit the rows.
+    #[must_use]
+    pub fn source(&self) -> &QuerySource {
+        &self.source
+    }
 }
 
 impl fmt::Debug for BuiltQuery {
@@ -403,7 +465,7 @@ impl Builder<'_> {
         Ok(())
     }
 
-    fn finish(self) -> Result<BuiltQuery, QueryError> {
+    fn finish(self, source: QuerySource) -> Result<BuiltQuery, QueryError> {
         if self.dialect.split_statements(&self.text).len() != 1 {
             return Err(QueryError::RawWhere(
                 "the query does not stay one statement",
@@ -416,6 +478,7 @@ impl Builder<'_> {
         Ok(BuiltQuery {
             text: self.text,
             params: self.params,
+            source,
         })
     }
 }
@@ -581,7 +644,11 @@ pub fn build_table_query(
     if let Some(range) = raw_range {
         check_raw_in_place(dialect, &b.text, range)?;
     }
-    b.finish()
+    b.finish(QuerySource {
+        id: Uuid::new_v4(),
+        table: query.table.clone(),
+        columns: query.columns.clone().filter(|c| !c.is_empty()),
+    })
 }
 
 fn key_query(
@@ -774,6 +841,24 @@ mod tests {
             let q = TableQuery::new(vec!["t".into()]).with_raw_where(raw);
             assert!(build_table_query(&My, &q).is_err(), "{raw:?} accepted");
         }
+        // PostgreSQL dollar quotes: a closed one is a string (its content is inert), an open
+        // one would swallow the closing parenthesis, a `$1` is a placeholder.
+        for raw in ["label = $$it's ) UNION SELECT 1 --$$", "label = $q$x$q$"] {
+            let q = TableQuery::new(vec!["t".into()]).with_raw_where(raw);
+            assert!(build_table_query(&Pg, &q).is_ok(), "{raw:?} refused");
+        }
+        for raw in ["label = $$open", "label = $q$x$$", "a = $1 OR 1 = 1"] {
+            let q = TableQuery::new(vec!["t".into()]).with_raw_where(raw);
+            assert!(build_table_query(&Pg, &q).is_err(), "{raw:?} accepted");
+        }
+        // MariaDB executable comments are code.
+        for raw in [
+            "a = 1 /*M! UNION SELECT 1 */",
+            "a = 1 /*M!100000 ) OR (1=1 */",
+        ] {
+            let q = TableQuery::new(vec!["t".into()]).with_raw_where(raw);
+            assert!(build_table_query(&My, &q).is_err(), "{raw:?} accepted");
+        }
         // A destructive function the classifier knows is refused on every type.
         let q =
             TableQuery::new(vec!["t".into()]).with_raw_where("a = 1 AND (SELECT 1 FROM t2) = 1");
@@ -795,6 +880,8 @@ mod tests {
             "SELECT * FROM \"public\".\"customers\" WHERE \"id\" = $1"
         );
         assert_eq!(b.params, vec![Param::Int(7)]);
+        assert_eq!(b.source().table(), ["public", "customers"]);
+        assert_eq!(b.source().columns(), None);
         let orders = ObjectPath::root()
             .child(ObjectKind::Schema, "public")
             .child(ObjectKind::Table, "orders");
