@@ -27,6 +27,8 @@ use ninesql_driver_api::{
 
 use crate::actor::Rows;
 use crate::cancel::CancelTarget;
+use crate::engine::Flavor;
+use crate::questdb;
 use crate::session::Link;
 
 /// Largest DDL text returned; a longer definition is an error, never returned cut.
@@ -104,6 +106,39 @@ const RELATIONS_SQL: &str = concat!(
     "WHERE n.nspname::pg_catalog.text OPERATOR(pg_catalog.=) $4::pg_catalog.text ",
     "AND c.relkind::pg_catalog.text OPERATOR(pg_catalog.=) ANY($5::pg_catalog.text[]) ",
     "AND NOT c.relispartition",
+    page_tail!("c.relname::pg_catalog.text", "c.relname::pg_catalog.text")
+);
+
+/// TimescaleDB (P4-C): [`RELATIONS_SQL`] without the chunks of hypertables (they would drown
+/// `_timescaledb_internal` in thousands of tables; a chunk is still reachable with SQL), with
+/// hypertables reported as kind `h` and continuous aggregates as `a`. The catalog tables of the
+/// extension are schema-qualified like the rest; the connect check guarantees the extension.
+const TS_RELATIONS_SQL: &str = concat!(
+    "SELECT c.relname::pg_catalog.text, ",
+    "pg_catalog.obj_description(c.oid, 'pg_class'::pg_catalog.name), ",
+    "c.reltuples::pg_catalog.int8::pg_catalog.text, ",
+    "CASE WHEN EXISTS (SELECT 1 FROM _timescaledb_catalog.hypertable h ",
+    "WHERE h.schema_name OPERATOR(pg_catalog.=) n.nspname ",
+    "AND h.table_name OPERATOR(pg_catalog.=) c.relname) THEN 'h'::pg_catalog.text ",
+    "WHEN EXISTS (SELECT 1 FROM _timescaledb_catalog.continuous_agg a ",
+    "WHERE a.user_view_schema OPERATOR(pg_catalog.=) n.nspname ",
+    "AND a.user_view_name OPERATOR(pg_catalog.=) c.relname) THEN 'a'::pg_catalog.text ",
+    "ELSE c.relkind::pg_catalog.text END, ",
+    "CASE WHEN c.relkind OPERATOR(pg_catalog.=) 'p'::pg_catalog.\"char\" ",
+    "THEN pg_catalog.pg_get_partkeydef(c.oid) END ",
+    "FROM pg_catalog.pg_class c JOIN pg_catalog.pg_namespace n ",
+    "ON n.oid OPERATOR(pg_catalog.=) c.relnamespace ",
+    "WHERE n.nspname::pg_catalog.text OPERATOR(pg_catalog.=) $4::pg_catalog.text ",
+    "AND c.relkind::pg_catalog.text OPERATOR(pg_catalog.=) ANY($5::pg_catalog.text[]) ",
+    "AND NOT c.relispartition ",
+    // A chunk inherits from its hypertable (compressed chunks from the compressed one):
+    // the same test on every TimescaleDB 2.x, whose `chunk` catalog changed shape.
+    "AND NOT EXISTS (SELECT 1 FROM pg_catalog.pg_inherits i ",
+    "JOIN pg_catalog.pg_class p ON p.oid OPERATOR(pg_catalog.=) i.inhparent ",
+    "JOIN pg_catalog.pg_namespace pn ON pn.oid OPERATOR(pg_catalog.=) p.relnamespace ",
+    "JOIN _timescaledb_catalog.hypertable ph ON ph.schema_name OPERATOR(pg_catalog.=) pn.nspname ",
+    "AND ph.table_name OPERATOR(pg_catalog.=) p.relname ",
+    "WHERE i.inhrelid OPERATOR(pg_catalog.=) c.oid)",
     page_tail!("c.relname::pg_catalog.text", "c.relname::pg_catalog.text")
 );
 
@@ -565,7 +600,11 @@ fn ensure_ddl_size(ddl: String) -> DriverResult<String> {
 }
 
 impl PgMetadata {
-    async fn query(
+    fn flavor(&self) -> Flavor {
+        self.link.shared.flavor
+    }
+
+    pub(crate) async fn query(
         &self,
         sql: &str,
         params: Vec<Option<String>>,
@@ -794,6 +833,9 @@ impl PgMetadata {
 #[async_trait::async_trait]
 impl Metadata for PgMetadata {
     fn child_kinds(&self, parent: Option<ObjectKind>) -> Vec<ObjectKind> {
+        if self.flavor() == Flavor::QuestDb {
+            return questdb::child_kinds(parent);
+        }
         match parent {
             None => vec![ObjectKind::Schema],
             Some(ObjectKind::Schema) => vec![
@@ -824,6 +866,9 @@ impl Metadata for PgMetadata {
         kind: ObjectKind,
         page: PageRequest,
     ) -> DriverResult<Page<ObjectInfo>> {
+        if self.flavor() == Flavor::QuestDb {
+            return self.questdb_list(parent, kind, page).await;
+        }
         if !self.child_kinds(parent.kind()).contains(&kind) {
             return Err(DriverError::Unsupported(Feature::Metadata(kind)));
         }
@@ -848,7 +893,11 @@ impl Metadata for PgMetadata {
                             }
                             .to_owned(),
                         ));
-                        RELATIONS_SQL
+                        if self.flavor() == Flavor::Timescale {
+                            TS_RELATIONS_SQL
+                        } else {
+                            RELATIONS_SQL
+                        }
                     }
                     ObjectKind::Routine => ROUTINES_SQL,
                     ObjectKind::Sequence => SEQUENCES_SQL,
@@ -893,6 +942,9 @@ impl Metadata for PgMetadata {
                     t.flavour = match cell(row, 3).as_deref() {
                         Some("p") => Some("partitioned".to_owned()),
                         Some("f") => Some("foreign".to_owned()),
+                        // TimescaleDB (TS_RELATIONS_SQL).
+                        Some("h") => Some("hypertable".to_owned()),
+                        Some("a") => Some("continuous aggregate".to_owned()),
                         _ => None,
                     };
                     t.partition_key = cell(row, 4);
@@ -1005,6 +1057,9 @@ impl Metadata for PgMetadata {
     }
 
     async fn ddl(&self, object: &ObjectPath) -> DriverResult<String> {
+        if self.flavor() == Flavor::QuestDb {
+            return self.questdb_ddl(object).await;
+        }
         let leaf = object.leaf().ok_or_else(bad_path)?;
         let segs = object.0.as_slice();
         if segs.first().map(|s| s.kind) != Some(ObjectKind::Schema) {
@@ -1132,6 +1187,7 @@ mod tests {
         for sql in [
             SCHEMAS_SQL,
             RELATIONS_SQL,
+            TS_RELATIONS_SQL,
             COLUMNS_SQL,
             CONSTRAINTS_SQL,
             FOREIGN_KEYS_SQL,

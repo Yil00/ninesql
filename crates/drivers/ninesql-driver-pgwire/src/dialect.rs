@@ -14,11 +14,14 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
+use ninesql_driver_api::dialect::classify_with_rules;
 use ninesql_driver_api::{
     CodeToken, CodeTokenKind, Dialect, ExplainFormat, LexicalRules, Param, ScriptItem,
-    ScriptItemKind, ScriptRefusal, ScriptState, StatementSpan, TextPosition, code_tokens,
-    script_items, script_items_from,
+    ScriptItemKind, ScriptRefusal, ScriptState, StatementClass, StatementSpan, TextPosition,
+    code_tokens, script_items, script_items_from,
 };
+
+use crate::engine::Flavor;
 
 /// The PostgreSQL dialect.
 ///
@@ -27,9 +30,15 @@ use ninesql_driver_api::{
 /// shares the session's `standard_conforming_strings` flag, updated from every `ParameterStatus`
 /// message, so the classifier and the splitter follow the session: with the setting off, a
 /// backslash escapes the next character in every string literal.
+///
+/// Per-engine overrides (P4-C, docs/08): TimescaleDB's functions that drop, move or convert data
+/// classify as `Unknown` (confirmation in production, refused in read-only sessions); QuestDB's
+/// statements and functions that change data or the server outside PostgreSQL's grammar do the
+/// same, and QuestDB has no `EXPLAIN ANALYZE`.
 #[derive(Clone, Debug)]
 pub struct PgDialect {
     standard_conforming_strings: Arc<AtomicBool>,
+    flavor: Flavor,
 }
 
 impl Default for PgDialect {
@@ -42,9 +51,33 @@ impl PgDialect {
     /// The dialect of a server with `standard_conforming_strings = on` (the default since 9.1).
     #[must_use]
     pub fn new() -> Self {
+        Self::for_engine(Flavor::Postgres)
+    }
+
+    /// The dialect of one engine of the family.
+    pub(crate) fn for_engine(flavor: Flavor) -> Self {
         Self {
             standard_conforming_strings: Arc::new(AtomicBool::new(true)),
+            flavor,
         }
+    }
+
+    /// The TimescaleDB dialect (PostgreSQL plus TimescaleDB's data-changing functions).
+    #[must_use]
+    pub fn timescaledb() -> Self {
+        Self::for_engine(Flavor::Timescale)
+    }
+
+    /// The YugabyteDB (YSQL) dialect.
+    #[must_use]
+    pub fn yugabytedb() -> Self {
+        Self::for_engine(Flavor::Yugabyte)
+    }
+
+    /// The QuestDB dialect.
+    #[must_use]
+    pub fn questdb() -> Self {
+        Self::for_engine(Flavor::QuestDb)
     }
 
     /// A dialect with a fixed `standard_conforming_strings` value (tests, offline splitting).
@@ -52,14 +85,16 @@ impl PgDialect {
     pub fn with_standard_conforming_strings(on: bool) -> Self {
         Self {
             standard_conforming_strings: Arc::new(AtomicBool::new(on)),
+            flavor: Flavor::Postgres,
         }
     }
 
     /// A dialect that follows a session's `standard_conforming_strings` flag.
     #[must_use]
-    pub(crate) fn tracking(flag: Arc<AtomicBool>) -> Self {
+    pub(crate) fn tracking(flag: Arc<AtomicBool>, flavor: Flavor) -> Self {
         Self {
             standard_conforming_strings: flag,
+            flavor,
         }
     }
 }
@@ -123,9 +158,121 @@ impl Dialect for PgDialect {
         Some(match format {
             ExplainFormat::Text => format!("EXPLAIN {q}"),
             ExplainFormat::Json => format!("EXPLAIN (FORMAT JSON) {q}"),
-            ExplainFormat::Analyze => format!("EXPLAIN ANALYZE {q}"),
+            ExplainFormat::Analyze if self.flavor != Flavor::QuestDb => {
+                format!("EXPLAIN ANALYZE {q}")
+            }
             _ => return None,
         })
+    }
+
+    fn classify(&self, text: &str) -> StatementClass {
+        let rules = self.lexical_rules();
+        let base = classify_with_rules(text, rules);
+        let extra = match self.flavor {
+            Flavor::Timescale => engine_functions(text, rules, TIMESCALE_SIDE_EFFECT_FUNCTIONS),
+            Flavor::QuestDb => questdb_statement(text, rules).max(engine_functions(
+                text,
+                rules,
+                QUESTDB_SIDE_EFFECT_FUNCTIONS,
+            )),
+            Flavor::Postgres | Flavor::Yugabyte => StatementClass::Read,
+        };
+        base.max(extra)
+    }
+}
+
+/// TimescaleDB functions (and procedures) that drop, move, convert or schedule changes to data
+/// or schema, callable from a `SELECT` (`SELECT drop_chunks('t', older_than => …)` deletes
+/// rows). TimescaleDB 2.x API, lower case.
+const TIMESCALE_SIDE_EFFECT_FUNCTIONS: &[&str] = &[
+    "add_columnstore_policy",
+    "add_compression_policy",
+    "add_continuous_aggregate_policy",
+    "add_dimension",
+    "add_job",
+    "add_reorder_policy",
+    "add_retention_policy",
+    "alter_job",
+    "attach_chunk",
+    "attach_tablespace",
+    "compress_chunk",
+    "convert_to_columnstore",
+    "convert_to_rowstore",
+    "create_hypertable",
+    "decompress_chunk",
+    "delete_job",
+    "detach_chunk",
+    "detach_tablespace",
+    "detach_tablespaces",
+    "disable_chunk_skipping",
+    "drop_chunks",
+    "enable_chunk_skipping",
+    "merge_chunks",
+    "move_chunk",
+    "refresh_continuous_aggregate",
+    "remove_columnstore_policy",
+    "remove_compression_policy",
+    "remove_continuous_aggregate_policy",
+    "remove_reorder_policy",
+    "remove_retention_policy",
+    "reorder_chunk",
+    "run_job",
+    "set_chunk_time_interval",
+    "set_integer_now_func",
+    "set_number_partitions",
+    "set_partitioning_interval",
+    "split_chunk",
+    "timescaledb_post_restore",
+    "timescaledb_pre_restore",
+];
+
+/// QuestDB functions with side effects callable from a `SELECT`.
+const QUESTDB_SIDE_EFFECT_FUNCTIONS: &[&str] = &["reload_config", "cancel_query"];
+
+/// `Unknown` when `text` calls one of `functions` (a word or quoted name right before `(`,
+/// schema-qualified or not), `Read` otherwise.
+fn engine_functions(text: &str, rules: LexicalRules, functions: &[&str]) -> StatementClass {
+    let toks = code_tokens(text, rules);
+    let calls = toks.windows(2).any(|w| {
+        w[1].kind == CodeTokenKind::OpenParen
+            && match w[0].kind {
+                CodeTokenKind::Word => {
+                    let name = w[0].text(text).to_ascii_lowercase();
+                    functions.contains(&name.as_str())
+                }
+                CodeTokenKind::QuotedIdent => {
+                    let t = w[0].text(text);
+                    let name = t.get(1..t.len().saturating_sub(1)).unwrap_or("");
+                    functions.contains(&name)
+                }
+                _ => false,
+            }
+    });
+    if calls {
+        StatementClass::Unknown
+    } else {
+        StatementClass::Read
+    }
+}
+
+/// QuestDB statements outside PostgreSQL's grammar that change data, files or the server, by
+/// their first words: they classify as `Unknown` whatever the shared classifier reads.
+/// `ALTER TABLE … DROP | DETACH PARTITION`, `DROP ALL TABLES`, `TRUNCATE` and `UPDATE` without
+/// `WHERE` are already `Destructive` there.
+fn questdb_statement(text: &str, rules: LexicalRules) -> StatementClass {
+    let toks = code_tokens(text, rules);
+    let words: Vec<String> = toks
+        .iter()
+        .take_while(|t| t.kind == CodeTokenKind::Word)
+        .take(2)
+        .map(|t| t.text(text).to_ascii_uppercase())
+        .collect();
+    match words.first().map(String::as_str) {
+        Some(
+            "RENAME" | "VACUUM" | "REINDEX" | "SNAPSHOT" | "CHECKPOINT" | "BACKUP" | "COPY"
+            | "CANCEL" | "REFRESH" | "DECLARE",
+        ) => StatementClass::Unknown,
+        _ => StatementClass::Read,
     }
 }
 
@@ -416,7 +563,7 @@ mod tests {
     #[test]
     fn standard_conforming_strings_drive_the_lexer() {
         let flag = Arc::new(AtomicBool::new(true));
-        let d = PgDialect::tracking(Arc::clone(&flag));
+        let d = PgDialect::tracking(Arc::clone(&flag), Flavor::Postgres);
         // With scs on, `\` is an ordinary character: the quote closes the literal.
         let sql = r"SELECT 'a\'; DELETE FROM t; --'";
         assert_eq!(d.split_statements(sql).len(), 2);

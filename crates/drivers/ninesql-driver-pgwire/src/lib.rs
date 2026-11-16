@@ -1,8 +1,9 @@
-//! `ninesql-driver-pgwire`: the PostgreSQL wire protocol family (ADR-0003). PostgreSQL is the
-//! only engine served for now; TimescaleDB, YugabyteDB and QuestDB will be added with their own
-//! capability overrides once their integration tests prove them (I8).
+//! `ninesql-driver-pgwire`: the PostgreSQL wire protocol family (ADR-0003): PostgreSQL,
+//! TimescaleDB, YugabyteDB (YSQL) and QuestDB, each with its own engine id, capabilities and
+//! dialect overrides (I8, P4-C). The server is checked against the declared engine at connect
+//! (`engine` module).
 //!
-//! ROADMAP: P1-B. Built on the message codec of `postgres-protocol` (rust-postgres), tokio and
+//! ROADMAP: P1-B, P4-C. Built on the message codec of `postgres-protocol` (rust-postgres), tokio and
 //! rustls with the `ring` provider: no OpenSSL, no C library (ADR-0002, ADR-0011).
 //!
 //! # Contract highlights (docs/08-engine-capabilities.md)
@@ -38,21 +39,20 @@ mod auth;
 mod cancel;
 mod conn;
 mod dialect;
+mod engine;
 mod metadata;
+mod questdb;
 mod session;
 mod tls;
 mod types;
 
-use std::collections::BTreeSet;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use ninesql_driver_api::{
-    Auth, AuthKind, CancelSupport, Capabilities, ConnectCapabilities, ConnectParams, Dialect,
-    Driver, DriverError, DriverResult, EditingCapabilities, Endpoint, EngineId, ExecOptions,
-    ExplainFormat, HostKeyVerification, IsolationLevel, MetadataCapabilities, ObjectKind,
-    PasswordExchange, PropertyValue, ReadOnlyMechanism, Session, Statement, TlsMode,
-    TransactionCapabilities, echo_property_key, redact_connection_string, redact_secret,
+    Auth, Capabilities, ConnectParams, Dialect, Driver, DriverError, DriverResult, Endpoint,
+    EngineId, ExecOptions, HostKeyVerification, PasswordExchange, PropertyValue, Session,
+    Statement, TlsMode, echo_property_key, redact_connection_string, redact_secret,
 };
 use tokio::sync::mpsc;
 
@@ -64,6 +64,7 @@ pub use session::PgSession;
 use crate::actor::{Actor, Shared};
 use crate::cancel::CancelTarget;
 use crate::conn::{Conn, Startup, open_transport};
+use crate::engine::{Flavor, ServerInfo};
 
 /// Family name.
 pub const FAMILY: &str = "pgwire";
@@ -105,14 +106,19 @@ pub struct PgWireDriver {
     _private: (),
 }
 
-const ENGINES: &[EngineId] = &[EngineId::POSTGRESQL];
+const ENGINES: &[EngineId] = &[
+    EngineId::POSTGRESQL,
+    EngineId::TIMESCALEDB,
+    EngineId::YUGABYTEDB,
+    EngineId::QUESTDB,
+];
 
 impl PgWireDriver {
     /// `Driver::connect` with the concrete session type (crate-internal tests use it).
     async fn open(&self, params: ConnectParams) -> DriverResult<PgSession> {
-        Self::check_engine(&params.engine)?;
+        let flavor = Self::check_engine(&params.engine)?;
         // Before any network traffic: properties, endpoint, credentials, TLS files.
-        let declared = postgres_capabilities(None);
+        let declared = engine::capabilities(flavor, None, None);
         declared.check_properties(&params.properties)?;
         declared.connect.check_connect_params(&params)?;
         let extra = accepted_properties(&params.properties)?;
@@ -131,22 +137,23 @@ impl PgWireDriver {
             application_name,
             ..
         } = params;
+        let name = flavor.name();
         let Endpoint::Tcp { host, port } = endpoint else {
-            return Err(DriverError::InvalidParams(
-                "PostgreSQL needs a host and a port".into(),
-            ));
+            return Err(DriverError::InvalidParams(format!(
+                "{name} needs a host and a port"
+            )));
         };
         let (user, password) = match auth {
             Auth::Password { user, password, .. } => (user, password),
             Auth::None => {
-                return Err(DriverError::InvalidParams(
-                    "PostgreSQL needs a user name".into(),
-                ));
+                return Err(DriverError::InvalidParams(format!(
+                    "{name} needs a user name"
+                )));
             }
             _ => {
-                return Err(DriverError::InvalidParams(
-                    "PostgreSQL authenticates with a user name and a password".into(),
-                ));
+                return Err(DriverError::InvalidParams(format!(
+                    "{name} authenticates with a user name and a password"
+                )));
             }
         };
         if application_name.contains('\0') || user.contains('\0') {
@@ -218,7 +225,24 @@ impl PgWireDriver {
             ));
         }
         let version = conn.server.get("server_version").map(str::to_owned);
-        let shared = Arc::new(Shared::new(conn.server.major_version(), conn.txn_status));
+        // A startup parameter naming YugabyteDB or QuestDB is enough to refuse another engine
+        // early; QuestDB reports a plain `11.3` there, so `version()` is checked in every case
+        // in the session setup below, before anything else runs.
+        let early = engine::server_family(version.as_deref().unwrap_or(""), None);
+        if early != Flavor::Postgres
+            && let Err(e) =
+                engine::check_family(flavor, early, version.as_deref().unwrap_or("unknown"))
+        {
+            let mut conn = conn;
+            conn.terminate().await;
+            return Err(e);
+        }
+        let cancel_key = conn.process_id != 0 || conn.secret_key != 0;
+        let shared = Arc::new(Shared::new(
+            conn.server.major_version(),
+            conn.txn_status,
+            flavor,
+        ));
         let cancel_target = Arc::new(CancelTarget {
             addr: peer,
             tls: tls_setup,
@@ -228,26 +252,33 @@ impl PgWireDriver {
         let (tx, rx) = mpsc::channel(8);
         let actor = Actor::new(conn, Arc::clone(&shared), Arc::clone(&cancel_target));
         tokio::spawn(actor.run(rx));
+        let mut info = ServerInfo {
+            cancel_key,
+            ..ServerInfo::default()
+        };
         let mut session = PgSession {
             link: session::Link {
                 tx,
                 shared,
                 tracker: ninesql_driver_api::ExecutionTracker::new(),
             },
-            capabilities: postgres_capabilities(version.as_deref()),
-            dialect: Arc::new(PgDialect::tracking(scs)),
+            capabilities: engine::capabilities(flavor, version.as_deref(), Some(&info)),
+            dialect: Arc::new(PgDialect::tracking(scs, flavor)),
             cancel_target,
-            auto_commit,
+            auto_commit: auto_commit && flavor != Flavor::QuestDb,
             log_statements,
             current_exec: std::sync::Mutex::new(Arc::default()),
         };
         tracing::debug!(
             server_version = version.as_deref().unwrap_or("unknown"),
+            engine = name,
             read_only,
             "pgwire session opened"
         );
-        // Read-only before anything else, init statements after it (I3).
+        // The engine check, then read-only before anything else, init statements after it (I3).
         let setup = async {
+            session.check_server(&mut info).await?;
+            session.capabilities = engine::capabilities(flavor, version.as_deref(), Some(&info));
             if read_only {
                 session.apply_read_only(true).await?;
             }
@@ -293,96 +324,13 @@ impl PgWireDriver {
         EXTRA_RESERVED_PROPERTIES
     }
 
-    fn check_engine(engine: &EngineId) -> DriverResult<()> {
-        if ENGINES.contains(engine) {
-            Ok(())
-        } else {
-            Err(DriverError::InvalidParams(format!(
+    fn check_engine(engine: &EngineId) -> DriverResult<Flavor> {
+        Flavor::of(engine).ok_or_else(|| {
+            DriverError::InvalidParams(format!(
                 "engine `{engine}` is not served by the pgwire driver"
-            )))
-        }
+            ))
+        })
     }
-}
-
-/// Capabilities of PostgreSQL through this driver (mirrored in docs/08).
-fn postgres_capabilities(server_version: Option<&str>) -> Capabilities {
-    let mut c = Capabilities::minimal(EngineId::POSTGRESQL);
-    c.server_version = server_version.map(str::to_owned);
-    let mut metadata = MetadataCapabilities::default();
-    metadata.kinds = BTreeSet::from([
-        ObjectKind::Schema,
-        ObjectKind::Table,
-        ObjectKind::View,
-        ObjectKind::MaterializedView,
-        ObjectKind::Column,
-        ObjectKind::Constraint,
-        ObjectKind::ForeignKey,
-        ObjectKind::Index,
-        ObjectKind::Trigger,
-        ObjectKind::Partition,
-        ObjectKind::Routine,
-        ObjectKind::Sequence,
-        ObjectKind::Type,
-    ]);
-    // Every listed kind but `Column` has DDL (P4-A, F-NAV-07).
-    metadata.ddl = metadata
-        .kinds
-        .iter()
-        .copied()
-        .filter(|k| *k != ObjectKind::Column)
-        .collect();
-    c.metadata = metadata;
-    let mut editing = EditingCapabilities::default();
-    editing.insert = true;
-    editing.update = true;
-    editing.delete = true;
-    editing.requires_unique_key = true;
-    c.editing = editing;
-    let mut tx = TransactionCapabilities::default();
-    tx.manual_commit = true;
-    tx.savepoints = true;
-    tx.isolation_levels = BTreeSet::from([
-        IsolationLevel::ReadCommitted,
-        IsolationLevel::RepeatableRead,
-        IsolationLevel::Serializable,
-    ]);
-    c.transactions = tx;
-    c.read_only = ReadOnlyMechanism::SessionSetting { liftable: true };
-    c.cancel = CancelSupport::ServerSide;
-    c.explain = BTreeSet::from([
-        ExplainFormat::Text,
-        ExplainFormat::Json,
-        ExplainFormat::Analyze,
-    ]);
-    c.multiple_result_sets = false;
-    c.server_side_timeout = false;
-    c.tls = BTreeSet::from([
-        TlsMode::Disable,
-        TlsMode::Require,
-        TlsMode::VerifyCa,
-        TlsMode::VerifyFull,
-    ]);
-    c.parameters = true;
-    c.extra_reserved_properties = EXTRA_RESERVED_PROPERTIES
-        .iter()
-        .map(|k| (*k).to_owned())
-        .collect();
-    c.retains_secret_after_connect = false;
-    let mut connect = ConnectCapabilities::default();
-    connect.accepted_properties = Some(
-        ACCEPTED_PROPERTIES
-            .iter()
-            .map(|(_, name)| (*name).to_owned())
-            .collect(),
-    );
-    connect.auth = BTreeSet::from([AuthKind::Password]);
-    connect.password_exchanges =
-        BTreeSet::from([PasswordExchange::Any, PasswordExchange::ScramOnly]);
-    connect.verify_ca_requires_ca_file = true;
-    connect.client_certificates = true;
-    connect.encrypted_client_keys = false;
-    c.connect = connect;
-    c
 }
 
 /// `true` when a `search_path` value leaves `pg_catalog` first: not listed (PostgreSQL then
@@ -470,13 +418,13 @@ impl Driver for PgWireDriver {
         engine: &EngineId,
         server_version: Option<&str>,
     ) -> DriverResult<Capabilities> {
-        Self::check_engine(engine)?;
-        Ok(postgres_capabilities(server_version))
+        let flavor = Self::check_engine(engine)?;
+        Ok(engine::capabilities(flavor, server_version, None))
     }
 
     fn dialect(&self, engine: &EngineId) -> DriverResult<Arc<dyn Dialect>> {
-        Self::check_engine(engine)?;
-        Ok(Arc::new(PgDialect::new()))
+        let flavor = Self::check_engine(engine)?;
+        Ok(Arc::new(PgDialect::for_engine(flavor)))
     }
 
     async fn connect(&self, params: ConnectParams) -> DriverResult<Box<dyn Session>> {
@@ -487,7 +435,8 @@ impl Driver for PgWireDriver {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::BTreeMap;
+    use ninesql_driver_api::{AuthKind, CancelSupport, ReadOnlyMechanism};
+    use std::collections::{BTreeMap, BTreeSet};
 
     #[test]
     fn capabilities_are_declared() {
@@ -505,9 +454,10 @@ mod tests {
             assert!(c.is_reserved_property(key), "{key}");
         }
         assert!(!c.is_reserved_property("search_path"));
-        assert!(d.capabilities(&EngineId::TIMESCALEDB, None).is_err());
+        assert!(d.capabilities(&EngineId::TIMESCALEDB, None).is_ok());
+        assert!(d.capabilities(&EngineId::TIDB, None).is_err());
         assert!(d.dialect(&EngineId::MYSQL).is_err());
-        assert_eq!(d.engines(), &[EngineId::POSTGRESQL]);
+        assert_eq!(d.engines().len(), 4);
     }
 
     #[test]
@@ -576,7 +526,23 @@ mod tests {
             Err(DriverError::InvalidParams(_))
         ));
         let mut p = base();
+        p.engine = EngineId::TIDB;
+        assert!(matches!(
+            d.connect(p).await,
+            Err(DriverError::InvalidParams(_))
+        ));
+        // QuestDB accepts no property and no SCRAM-only policy (cleartext password only).
+        let mut p = base();
         p.engine = EngineId::QUESTDB;
+        p.properties
+            .insert("search_path".into(), PropertyValue::Plain("x".into()));
+        assert!(matches!(
+            d.connect(p).await,
+            Err(DriverError::InvalidParams(_))
+        ));
+        let mut p = base();
+        p.engine = EngineId::QUESTDB;
+        p.password_exchange = PasswordExchange::ScramOnly;
         assert!(matches!(
             d.connect(p).await,
             Err(DriverError::InvalidParams(_))
@@ -631,7 +597,7 @@ mod tests {
 
     #[test]
     fn connect_capabilities_match_the_driver() {
-        let c = postgres_capabilities(None).connect;
+        let c = engine::capabilities(Flavor::Postgres, None, None).connect;
         for (_, name) in ACCEPTED_PROPERTIES {
             assert!(c.accepts_property(name), "{name}");
         }
