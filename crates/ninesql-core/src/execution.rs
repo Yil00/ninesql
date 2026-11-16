@@ -512,12 +512,19 @@ pub enum FetchMode {
 pub const MAX_PAUSED_RESULT_IDLE: Duration =
     Duration::from_secs(crate::preferences::PAUSED_RESULT_IDLE_SECS_RANGE.1);
 
-/// The idle limit of a paused result: the preference, capped at [`MAX_PAUSED_RESULT_IDLE`], and
-/// the driver's own limit when it declares a lower one (`driver`). The driver API does not
-/// declare such a limit yet, so callers pass `None` until it does.
+/// Shortest idle limit of a paused result, whatever the preferences hold (security review L1):
+/// a zero or tiny value set in memory would close every paged read right after its first page.
+pub const MIN_PAUSED_RESULT_IDLE: Duration =
+    Duration::from_secs(crate::preferences::PAUSED_RESULT_IDLE_SECS_RANGE.0);
+
+/// The idle limit of a paused result: the preference, clamped to
+/// [`MIN_PAUSED_RESULT_IDLE`]..=[`MAX_PAUSED_RESULT_IDLE`], and the driver's own limit when it
+/// declares a lower one (`driver`; it wins even below the floor, since past it the driver ends
+/// the session). The driver API does not declare such a limit yet, so callers pass `None` until
+/// it does.
 #[must_use]
 pub fn paused_result_idle_limit(preference: Duration, driver: Option<Duration>) -> Duration {
-    let limit = preference.min(MAX_PAUSED_RESULT_IDLE);
+    let limit = preference.clamp(MIN_PAUSED_RESULT_IDLE, MAX_PAUSED_RESULT_IDLE);
     match driver {
         Some(d) => limit.min(d),
         None => limit,
@@ -681,6 +688,8 @@ struct ServiceInner {
     manager: SessionManager,
     history: Option<History>,
     prefs: RwLock<Preferences>,
+    /// Test hook: an idle limit used as is, below the floor ([`ExecutionService::set_paused_result_idle_for_tests`]).
+    idle_override: RwLock<Option<Duration>>,
 }
 
 /// The execution service. Cheap to clone. Built by [`crate::CoreServices`]
@@ -709,6 +718,7 @@ impl ExecutionService {
                 manager,
                 history,
                 prefs: RwLock::new(prefs),
+                idle_override: RwLock::new(None),
             }),
         }
     }
@@ -738,6 +748,18 @@ impl ExecutionService {
             .prefs
             .write()
             .unwrap_or_else(PoisonError::into_inner) = prefs;
+    }
+
+    /// **Tests only.** Uses `limit` as the idle limit of paused results of the next runs, as
+    /// is (below [`MIN_PAUSED_RESULT_IDLE`] too), instead of the preference; `None` goes back
+    /// to the preference. Never called by the application.
+    #[doc(hidden)]
+    pub fn set_paused_result_idle_for_tests(&self, limit: Option<Duration>) {
+        *self
+            .inner
+            .idle_override
+            .write()
+            .unwrap_or_else(PoisonError::into_inner) = limit;
     }
 
     /// The query history, when it could be opened.
@@ -820,7 +842,14 @@ impl ExecutionService {
             control: Arc::clone(&control),
             started: Instant::now(),
             progress: Progress::default(),
-            idle_limit: paused_result_idle_limit(prefs.execution.paused_result_idle, None),
+            idle_limit: self
+                .inner
+                .idle_override
+                .read()
+                .unwrap_or_else(PoisonError::into_inner)
+                .unwrap_or_else(|| {
+                    paused_result_idle_limit(prefs.execution.paused_result_idle, None)
+                }),
         };
         // The session's own dialect: drivers keep its lexical rules in sync with the session's
         // modes (`standard_conforming_strings`, `NO_BACKSLASH_ESCAPES`).
@@ -1759,7 +1788,12 @@ impl RunJob {
                         // real engine error that arrived meanwhile is reported as a failure.
                         _ if releasing && cancel_error => {
                             record(EntryStatus::Succeeded, Some(delivered), update_count, None);
-                            if let Some(after) = idle_closed {
+                            // Not after a cancel: `send_end` then only `try_send`s, and this
+                            // event must never take the slot of the `StatementClosed` (security
+                            // review L3).
+                            if let Some(after) = idle_closed
+                                && !self.cancel.is_cancelled()
+                            {
                                 self.out
                                     .send_end(RunEvent::ResultClosedIdle {
                                         index,

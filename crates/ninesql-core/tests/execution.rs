@@ -1396,12 +1396,12 @@ fn coalesced_fetches_and_close_with_commit_behind_a_paused_result() {
 // ---------------------------------------------------------------------------------------------
 // Idle paused results (phase 3 review M1)
 
-/// A service whose paused results are closed after `idle` with no fetch. Set in memory: the
-/// saved preference cannot go below 30 s.
+/// A service whose paused results are closed after `idle` with no fetch, through the test
+/// hook: the preference is clamped to at least 30 s.
 fn service_with_idle(manager: &SessionManager, idle: Duration) -> ExecutionService {
-    let mut prefs = Preferences::default();
-    prefs.execution.paused_result_idle = idle;
-    ExecutionService::new(manager.clone(), None, prefs)
+    let exec = ExecutionService::new(manager.clone(), None, Preferences::default());
+    exec.set_paused_result_idle_for_tests(Some(idle));
+    exec
 }
 
 /// Review M1: a read paused with no fetch past the idle limit is released by its run
@@ -1611,7 +1611,7 @@ fn a_non_read_is_never_closed_after_idle() {
 
 #[test]
 fn the_idle_limit_stays_below_the_drivers_limits() {
-    use ninesql_core::{MAX_PAUSED_RESULT_IDLE, paused_result_idle_limit};
+    use ninesql_core::{MAX_PAUSED_RESULT_IDLE, MIN_PAUSED_RESULT_IDLE, paused_result_idle_limit};
     let d = Duration::from_secs;
     assert_eq!(MAX_PAUSED_RESULT_IDLE, d(280));
     // Below the shipped drivers' own limits, with a margin for the release to reach the server.
@@ -1628,6 +1628,19 @@ fn the_idle_limit_stays_below_the_drivers_limits() {
     );
     assert_eq!(paused_result_idle_limit(d(240), None), d(240));
     assert_eq!(paused_result_idle_limit(d(10_000), None), d(280), "capped");
+    // Security review L1: a zero or tiny value set in memory is raised to the floor.
+    assert_eq!(MIN_PAUSED_RESULT_IDLE, d(30));
+    assert_eq!(
+        paused_result_idle_limit(Duration::ZERO, None),
+        d(30),
+        "floor"
+    );
+    assert_eq!(
+        paused_result_idle_limit(Duration::from_millis(300), None),
+        d(30)
+    );
+    // A lower driver limit still wins, even below the floor (the driver would end the session).
+    assert_eq!(paused_result_idle_limit(Duration::ZERO, Some(d(10))), d(10));
     assert_eq!(
         paused_result_idle_limit(d(240), Some(d(60))),
         d(60),

@@ -521,12 +521,12 @@ fn an_idle_paused_read_is_closed_without_touching_the_transaction() {
     let Some(dev) = dev() else { return };
     let tmp = tempfile::tempdir().unwrap();
     let (manager, _) = manager(Arc::new(PgWireDriver::new()), tmp.path());
-    let mut prefs = Preferences::default();
+    let prefs = Preferences::default();
     let idle = Duration::from_secs(1);
-    // Set in memory: the saved preference cannot go below 30 s.
-    prefs.execution.paused_result_idle = idle;
     let budget = prefs.execution.budget().with_batch_rows(100);
     let exec = ExecutionService::new(manager.clone(), None, prefs);
+    // The test hook: the preference is clamped to at least 30 s.
+    exec.set_paused_result_idle_for_tests(Some(idle));
     let types = ConnectionTypes::default();
     ui(async {
         let mut c = pg_connection(&dev, ConnectionTypeId::dev());
