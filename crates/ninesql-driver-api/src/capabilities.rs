@@ -409,6 +409,8 @@ pub enum ObjectKind {
     Label,
     /// Graph relationship type.
     RelationshipType,
+    /// Scheduled event (MySQL / MariaDB `CREATE EVENT`).
+    Event,
 }
 
 /// Navigator support.
