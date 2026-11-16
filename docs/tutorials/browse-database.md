@@ -1,6 +1,6 @@
 # Browse a database
 
-This tutorial browses a database in the navigator (phase 4): expand the object tree, load more objects, refresh, filter, find an object, read it in the object editor, generate SQL templates and DDL, and use object completion in the SQL editor. It uses the PostgreSQL dev database and its "nine" dataset; the other engines work the same way, with the object kinds their driver declares.
+This tutorial browses a database in the navigator (phase 4): expand the object tree, load more objects, refresh, filter, find an object, read it in the object editor, generate SQL templates and DDL, and use object completion in the SQL editor; from phase 5, open a table's rows, export it or import a CSV file into it. It uses the PostgreSQL dev database and its "nine" dataset; the other engines work the same way, with the object kinds their driver declares.
 
 > Written without a display: the labels and keys below come from the code, but the screens have not had their visual pass yet (deferred to the end of the MVP, P6-F). The navigator is tested with the mock driver; the drivers' metadata is tested against each dev engine.
 
@@ -44,7 +44,7 @@ Select a table and run "Open object editor" (`Ctrl+K` then `Enter`), or press `E
 - **"Properties"**: name, kind, connection, comment, and what the engine reports (estimated rows, flavour such as `hypertable` on TimescaleDB, column type and nullability).
 - **"Columns"**: name, type, null, default, primary key ("PK"), generated ("Auto"), comment.
 - **"Keys / Constraints"**: primary key, unique, check and exclusion constraints and foreign keys, with their columns and targets in "Details".
-- **"Indexes"**: key parts, uniqueness, method and partial-index predicate where the engine reports them.
+- **"Indexes"**: key parts, uniqueness, method and partial-index predicate where the engine reports them, and the flags that matter for editing: "partial" (also for a SQLite partial index, whose predicate is not read), "invalid", "deferrable" and "NULLS NOT DISTINCT", for example "unique · (email) · partial". A partial, invalid or deferrable unique index, or one with an expression part, is never used as the key to edit rows ([Edit data](edit-data.md#1-open-table-data)).
 - **"DDL"**: only when the driver can produce DDL for this kind of object; read-only, highlighted, with "Copy DDL".
 
 A list the engine does not provide says "Not available for this engine." instead of an empty list. The toolbar has one button per SQL template that applies (section 6) and "Refresh". The editor reloads when the metadata under it is refreshed or filtered; when the session closes it keeps what it shows and says "The session is closed: reconnect, then Refresh."
@@ -84,6 +84,13 @@ Open an SQL editor on the connection (`Ctrl+T`, [Run SQL](run-sql.md)) and press
 - Unqualified names resolve in that default schema: the connection's default schema when it has one (set by a DBeaver import) and the server lists it, otherwise the first schema the driver lists.
 - Names the editor would change are not offered.
 
+## 9. Open a table's rows, export, import
+With a table (or view) selected in the navigator:
+- "Open table data" (`Alt+G` then `O`) opens its rows in a new tab, editable when the table has a usable key ([Edit data](edit-data.md));
+- "Export table…" (`Alt+G` then `X`) writes every row to a file, "Import CSV…" (`Alt+G` then `M`) loads a CSV file into a table ([Export and import data](export-import.md)).
+
+These actions are in the command palette and on their keys; they are not in the navigator's context menu yet.
+
 ## Labels with unusual characters
 Object names are shown as stored, with markers for what would otherwise be invisible or misleading: control, bidirectional and zero-width characters appear as `�` (U+FFFD), space characters other than the ordinary space as `␣` (U+2423), and a leading or trailing space as `␠` (U+2420). Long names are cut at 200 characters with `…`. These markers are labels only; generated SQL always uses the real name, quoted.
 
@@ -96,5 +103,6 @@ Object names are shown as stored, with markers for what would otherwise be invis
 
 ## Next
 - [Run SQL and read results](run-sql.md).
+- [Edit data](edit-data.md) and [Export and import data](export-import.md).
 - Per-engine object kinds, DDL and limits: [docs/08](../08-engine-capabilities.md).
 - How the metadata service works: [docs/02](../02-architecture.md#metadata-service-p4-b).

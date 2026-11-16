@@ -81,3 +81,4 @@ Run the import again whenever DBeaver changes: connections imported before are u
 ## Next
 - [Create your first connection](first-connection.md) explains each field of the connection dialog, useful to fix an imported connection.
 - [Secrets](secrets.md): where the moved passwords live, and how to lock them.
+- [Export and import data](export-import.md#7-export-connections-to-dbeaver): the other direction, NineSQL connections written to a new DBeaver file without passwords. Since phase 5, when a DBeaver connection sets its TLS mode both in its SSL handler and in an `sslMode` driver property, the import keeps the stricter of the two.

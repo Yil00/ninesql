@@ -1,6 +1,6 @@
 # ADR-0020: Phase 1 driver decisions
 
-- **Status**: Accepted (maintainer, 2026-11-15)
+- **Status**: Accepted (maintainer, 2026-11-15). Dated note on §2 (2026-11-16, phase 5): the MySQL text literal is now spelled `CONCAT(_utf8mb4 X'…')`, rule unchanged.
 - **Date**: 2026-11-15
 
 ## Context
@@ -19,6 +19,8 @@ Invariants involved: I1 (no secret in clear), I3 (engine-side read-only), I4 (DB
 2. Placeholders are found with the session's lexical rules, so a `?` inside a string, an identifier or a comment is never replaced; the numbers of placeholders and parameters must match.
 3. Values with no faithful MySQL literal are refused: UTC timestamps, NaN and infinities.
 4. The driver's own queries follow the same rule: user input (filters, schema and table names, cursors) reaches the SQL text only as hexadecimal literals compared as binary strings.
+
+   > **Note (2026-11-16, phase 5).** The rule of this section is unchanged: values still reach the statement text only as hexadecimal literals. Its text form is now spelled `CONCAT(_utf8mb4 X'…')` instead of `CONVERT(X'…' USING utf8mb4)` (P5-B re-review, commit 2b64682): the `_utf8mb4` introducer makes the string coercible, so the column's collation applies in comparisons (a `latin1_swedish_ci` or `_as_cs` key), and `CONCAT` makes it a string expression (alone, an introduced hex literal is stored into `JSON` as binary and read as a bit literal by TiDB). The empty string is `_utf8mb4''`. The same form is used by the DML previews ([ADR-0027](0027-phase-5-editing-transfer-and-export-decisions.md) §1.2, proposed; [docs/08](../08-engine-capabilities.md#mysqlwire-mysql-and-mariadb-p1-b)).
 
 ### 3. mysqlwire: the password only over a protected transport
 1. A transport is **protected** when TLS is `verify-ca` or `verify-full`, or when it is an SSH tunnel whose hops all verify host keys and whose local end is loopback. TLS `require` is not protected.

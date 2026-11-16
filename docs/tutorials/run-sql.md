@@ -1,6 +1,6 @@
 # Run SQL and read results
 
-This tutorial runs statements from the SQL editor and reads their results in the grid (phase 3: P3-A editor, P3-B grid, P3-C execution, P3-D dialects; features F-SQL-03 to F-SQL-08, F-SQL-12, F-SQL-15, F-SQL-18, F-DATA-01). It covers the editor tab and its connection, the three ways to run, parameters, confirmations on production, cancel, commit and roll back, the grid, and the history and preferences kept in `settings.toml`.
+This tutorial runs statements from the SQL editor and reads their results in the grid (phase 3: P3-A editor, P3-B grid, P3-C execution, P3-D dialects; features F-SQL-03 to F-SQL-08, F-SQL-12, F-SQL-15, F-SQL-18, F-DATA-01). It covers the editor tab and its connection, the three ways to run, parameters, confirmations on production, cancel, commit and roll back, the grid, the history and preferences kept in `settings.toml`, and (phase 5, F-SQL-09, F-SQL-10) "Format SQL" and snippets.
 
 The screens were written without a display (cloud sessions); their visual pass is part of the MVP-end tests (P6-F). The labels and key bindings below are the exact texts and defaults of the code. Every action is also in the command palette (`Ctrl+Shift+P` or `F1`): the editor's under "SQL editor", the grid's under "Results".
 
@@ -122,7 +122,7 @@ Only reads wait for you between pages; a statement that changes data (a `DELETE 
 
 Arrow keys, Page Up / Down, Home / End move between cells; drag a header to reorder a column, drag its edge to resize, double-click the edge to fit. After a copy, the status line says "Copied N rows × M columns", with "(stopped at the clipboard size limit)" past 64 MiB.
 
-Not built yet: editing cells, sorting and filtering, record view and value viewers (phase 5), pinned or detached result tabs, export (P5-C).
+More copy formats (CSV, Markdown, JSON, SQL `INSERT`), export to a file, record and text views, value viewers, aggregate and metadata panels, client- and server-side sort and filter, and row editing came with phase 5: see [Edit data](edit-data.md) and [Export and import data](export-import.md). Not built yet: pinned or detached result tabs.
 
 ## 9. History
 Each statement run from the editor is recorded in `~/.local/state/ninesql/history.sqlite` (the file is readable by you only), with its text, connection, time, duration, row count and status, **except**:
@@ -161,10 +161,34 @@ close_with_open_transaction = true   # always asked for production connections
 - Statement confirmations are not a preference: they come from the connection type ([Create your first connection](first-connection.md#5-connection-type-and-read-only)).
 - Editor and grid key bindings are overridden under `[keybindings]` with their full names, for example `"ninesql_editor::ExecuteStatement" = "f9"` or `"ninesql_grid::FetchAllRows" = ["alt-end", "ctrl-shift-end"]`.
 
+## 11. Format SQL and snippets
+**"Format SQL"** (`Ctrl+Shift+F`) formats the selection, or the whole script when nothing is selected, with the dialect of the editor's connection: keywords in upper case and one clause per line with a 2-space indent. It never changes what the statement means: only the case of words reserved in every dialect and the blanks between tokens change; strings, quoted names, numbers, operators and comments stay byte for byte, a compound statement body (with `;` inside) or a MySQL executable comment keeps its layout, and a statement holding `[` is left as it is. `AND` / `OR` are not broken onto lines, and the layout has no settings yet. It is refused during a run ("Wait for the run to end before formatting.") and while a table result has unsaved changes.
+
+**"Insert snippet"** (`Ctrl+K` then `Ctrl+J`) lists the project's snippets usable with the connection's engine ("Insert snippet"), asks for their placeholders ("Snippet: <name>", "Values are inserted as typed. Nothing runs until you run the statement."), and inserts the text at the cursor with "Insert". Nothing runs: you read and run the text like any other statement, with its confirmations.
+
+There is no screen to create snippets yet: they live in the project's `snippets.json`, next to `connections.json` ([where files are](build-and-run.md#where-ninesql-keeps-its-files)); with none, the picker says "No snippet for this engine yet: snippets are kept per project in snippets.json." NineSQL reads it each time you run "Insert snippet". For example:
+```json
+{
+  "schema_version": 1,
+  "snippets": [
+    {
+      "name": "rows by id",
+      "body": "SELECT ${cols:*} FROM ${table} WHERE ${table}.id = ${cursor}",
+      "engine": "postgresql",
+      "description": "One row by id"
+    }
+  ]
+}
+```
+- `${name}` asks for a value, `${name:default}` proposes a default, `${cursor}` is where the caret goes, `$$` is a `$`. `engine` is optional (without it the snippet is offered on every engine).
+- Names are unique (ignoring case), up to 128 bytes; bodies up to 64 KiB; at most 1 000 snippets.
+- A snippet must never hold a password: a body with a URL holding credentials, or a credential word (`PASSWORD`, `IDENTIFIED`, `SECRET`, `TOKEN`…) next to a literal written in the body, is refused and dropped when the file is read. Use a placeholder instead: `CREATE USER ${user} IDENTIFIED BY ${password}`.
+
 ## Not built yet
 - Saving and opening script files, and reopening tabs after a restart. Unsaved tabs will not be restored even then: their text could hold a password.
 - Completion of joins on foreign keys.
 - A keyboard fold action, a history view, a preferences page, an auto-commit toggle, a reconnect when a session is lost.
+- Formatter settings, a screen to create and edit snippets, the per-statement run summary in the interface.
 - Measurements on a real GPU: the time to first rows was measured only at the core level, and scrolling has not been measured ([ROADMAP](../ROADMAP.md#phase-3--sql-editor-and-results-grid)).
 
 ## Next
