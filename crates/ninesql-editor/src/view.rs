@@ -612,6 +612,61 @@ impl SqlEditor {
         sink.submit(request);
     }
 
+    /// Replaces the document with `text` and submits it as one statement with `params` (a
+    /// query the application built, such as the core's filtered table query, P5-A): the user
+    /// sees exactly what runs. Refused (`Err` with the reason) while a run is going on, without
+    /// a sink, or when the text holds characters the editor would strip or change (it would no
+    /// longer be what runs). Returns the request id.
+    ///
+    /// # Errors
+    /// The reason, shown by the caller.
+    pub fn submit_built(
+        &mut self,
+        text: &str,
+        params: Vec<ninesql_core::driver_api::Param>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Result<RequestId, String> {
+        if self.running.is_some() {
+            return Err("A run is already going on in this editor: cancel it first.".to_owned());
+        }
+        let Some(sink) = self.sink.clone() else {
+            return Err("No connection: choose one for this editor first".to_owned());
+        };
+        if !hygiene::fixes(text).is_empty() {
+            return Err(
+                "The query holds control or invisible characters the editor would change: remove them from the filter."
+                    .to_owned(),
+            );
+        }
+        self.set_text(text, window, cx);
+        let id = RequestId(self.next_request);
+        self.next_request += 1;
+        let item = crate::execution::ExecutionItem::built_statement(text.to_owned(), params);
+        let mut kept_item = item.clone();
+        kept_item.params.clear();
+        let request = ExecutionRequest {
+            id,
+            kind: ExecutionKind::Statement,
+            connection: self.connection,
+            items: vec![item],
+            range_text: text.to_owned(),
+            bidi_controls: self.bidi.len(),
+        };
+        // Keep the mapping for error positions, not the values (I1).
+        self.last_request = Some(ExecutionRequest {
+            items: vec![kept_item],
+            range_text: request.range_text.clone(),
+            ..request.clone()
+        });
+        self.running = Some(id);
+        self.error = None;
+        self.refresh_diagnostics(cx);
+        sink.submit(request);
+        cx.notify();
+        Ok(id)
+    }
+
     /// The core reports an error for an item of a run. Answers to an older run are ignored.
     pub fn report_error(&mut self, error: &StatementError, cx: &mut Context<Self>) {
         let Some(request) = self.last_request.as_ref().filter(|r| r.id == error.request) else {

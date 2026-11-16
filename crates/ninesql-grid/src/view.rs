@@ -322,16 +322,32 @@ impl TableDelegate for GridDelegate {
             .and_then(|(r, c)| m.cell(r, c, &self.options));
         let rows = self.rows.len(m.row_count());
         drop(m);
-        let (dirty, deleted) = match (model_row, model_col) {
-            (Some(r), Some(c)) => (self.edits.is_cell_dirty(r, c), self.edits.is_row_deleted(r)),
-            _ => (false, false),
+        let (dirty, deleted, pending) = match (model_row, model_col) {
+            (Some(r), Some(c)) => (
+                self.edits.is_cell_dirty(r, c),
+                self.edits.is_row_deleted(r),
+                self.edits.pending(r, c).cloned(),
+            ),
+            _ => (false, false, None),
         };
         let selected = self.selection.cell_count(rows, self.order.len()) > 1
             && self.selection.row_range(rows).contains(&row_ix)
             && self.selection.col_range(self.order.len()).contains(&col_ix);
-        let Some(cell) = cell else {
+        let Some(mut cell) = cell else {
             return div().into_any_element();
         };
+        // A pending value is shown in place of the loaded one (with the dirty marker).
+        match pending {
+            Some(crate::edit::EditValue::Null) => {
+                cell.text = self.options.null_text.to_owned();
+                cell.is_null = true;
+            }
+            Some(crate::edit::EditValue::Text(t)) => {
+                cell.text = display_line(&t, 200).0;
+                cell.is_null = false;
+            }
+            Some(crate::edit::EditValue::Default) | None => {}
+        }
         div()
             .w_full()
             .truncate()
@@ -443,6 +459,9 @@ pub struct ResultsView {
     status: Option<String>,
     /// View modes, panels, client-side sort / filter bar, advanced copy (P5-A).
     p5: panels::P5State,
+    /// Pending edits per result tab, set by the owner (the core's editing, P5-A); copied into
+    /// the tab's table when it is built.
+    edit_buffers: std::collections::HashMap<usize, EditBuffer>,
 }
 
 impl EventEmitter<GridEvent> for ResultsView {}
@@ -469,6 +488,95 @@ impl ResultsView {
             focus_handle: cx.focus_handle(),
             status: None,
             p5: panels::P5State::default(),
+            edit_buffers: std::collections::HashMap::new(),
+        }
+    }
+
+    /// Sets the pending edits shown on result tab `ix` (dirty markers, pending values, deleted
+    /// rows); `None` makes the tab read-only again.
+    pub fn set_edit_buffer(
+        &mut self,
+        ix: usize,
+        buffer: Option<EditBuffer>,
+        cx: &mut Context<Self>,
+    ) {
+        match buffer {
+            Some(b) => {
+                self.edit_buffers.insert(ix, b);
+            }
+            None => {
+                self.edit_buffers.remove(&ix);
+            }
+        }
+        let buffer = self.edit_buffers.get(&ix).cloned().unwrap_or_default();
+        if let Some(table) = self.table(ix) {
+            table.update(cx, |t, cx| {
+                *t.delegate_mut().edits_mut() = buffer;
+                cx.notify();
+            });
+        }
+        cx.notify();
+    }
+
+    /// The pending edits of result tab `ix`, if the owner set any.
+    #[must_use]
+    pub fn edit_buffer(&self, ix: usize) -> Option<&EditBuffer> {
+        self.edit_buffers.get(&ix)
+    }
+
+    /// The index of the result tab of `statement`'s first result set.
+    #[must_use]
+    pub fn tab_of_statement(&self, statement: u32) -> Option<usize> {
+        self.results
+            .tabs()
+            .iter()
+            .position(|t| matches!(t, ResultTab::Table(_)) && t.statement() == statement)
+    }
+
+    /// The active result tab's index, when a result set is shown.
+    #[must_use]
+    pub fn active_result_tab(&self) -> Option<usize> {
+        match self.active {
+            ActivePane::Result(ix) => Some(ix),
+            _ => None,
+        }
+    }
+
+    /// The focused cell of the active result as (tab, model row, model column).
+    #[must_use]
+    pub fn focused_cell(&self, cx: &App) -> Option<(usize, usize, usize)> {
+        let ix = self.active_result_tab()?;
+        let (r, c) = self.table(ix)?.read(cx).delegate().focused_cell()?;
+        Some((ix, r, c))
+    }
+
+    /// The model rows of the active result's selection (the focused row for a cell selection),
+    /// with the tab index.
+    #[must_use]
+    pub fn selected_model_rows(&self, cx: &App) -> Option<(usize, Vec<usize>)> {
+        let ix = self.active_result_tab()?;
+        let t = self.table(ix)?.read(cx);
+        let d = t.delegate();
+        let rows = d.rows.len(d.model.borrow().row_count());
+        if matches!(d.selection, GridSelection::None) {
+            return None;
+        }
+        let out: Vec<usize> = d
+            .selection
+            .row_range(rows)
+            .filter_map(|r| d.rows.model_row(r))
+            .collect();
+        (!out.is_empty()).then_some((ix, out))
+    }
+
+    /// Selects a cell of result tab `ix` in display coordinates (tests, keyboard flows).
+    pub fn select_cell(&mut self, ix: usize, row: usize, col: usize, cx: &mut Context<Self>) {
+        if let Some(table) = self.table(ix) {
+            table.update(cx, |t, cx| {
+                t.delegate_mut()
+                    .set_selection(GridSelection::cell(row, col));
+                cx.notify();
+            });
         }
     }
 
@@ -559,6 +667,7 @@ impl ResultsView {
         let applied = self.results.apply(event);
         if applied.reset {
             self.tables.clear();
+            self.edit_buffers.clear();
             self.active = ActivePane::UpdateCounts;
             self.status = None;
         }
@@ -593,7 +702,11 @@ impl ResultsView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> TableTab {
-        let delegate = GridDelegate::new(model, self.options.clone(), cx.entity().downgrade(), ix);
+        let mut delegate =
+            GridDelegate::new(model, self.options.clone(), cx.entity().downgrade(), ix);
+        if let Some(b) = self.edit_buffers.get(&ix) {
+            *delegate.edits_mut() = b.clone();
+        }
         let table = cx.new(|cx| {
             TableState::new(delegate, window, cx)
                 .cell_selectable(true)

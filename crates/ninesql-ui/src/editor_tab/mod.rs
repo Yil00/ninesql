@@ -36,7 +36,9 @@
 //!   result says it was closed, fetching is off for it) and to the toolbar, with a hint when the
 //!   session's transaction is still open.
 
+pub mod edit_dialogs;
 pub mod run;
+pub mod table;
 
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -232,6 +234,8 @@ pub struct SqlEditorTab {
     default_schema: Rc<RefCell<Option<String>>>,
     /// Resolves the default schema and warms it; dropped (cancelled) on rebind.
     warming: Option<Task<()>>,
+    /// The table the tab shows and its editing (P5-A).
+    table: table::TableState,
     _tasks: Vec<Task<()>>,
     _subscriptions: Vec<Subscription>,
 }
@@ -314,6 +318,7 @@ impl SqlEditorTab {
             statement_texts: HashMap::new(),
             default_schema,
             warming: None,
+            table: table::TableState::default(),
             _tasks: vec![requests, dropped],
             _subscriptions: subscriptions,
         }
@@ -469,6 +474,16 @@ impl SqlEditorTab {
             );
             return false;
         }
+        if self.has_pending_edits() || self.table.saving || self.table.confirmation.is_some() {
+            self.say(
+                "There are unsaved changes in the result: save or discard them before choosing another connection.",
+                true,
+                cx,
+            );
+            return false;
+        }
+        // The table (and its key) belonged to the previous session.
+        self.table = table::TableState::default();
         let connection = session.as_ref().map(|s| s.info().connection);
         let setup = setup_for(
             session.as_ref(),
@@ -597,6 +612,14 @@ impl SqlEditorTab {
                 cx,
             );
         }
+        if self.has_pending_edits() {
+            return refuse(
+                self,
+                "There are unsaved changes in the result: save or discard them first (Save changes / Discard changes)."
+                    .to_owned(),
+                cx,
+            );
+        }
         let Some(session) = self.session().cloned() else {
             return refuse(
                 self,
@@ -621,6 +644,7 @@ impl SqlEditorTab {
             };
         self.message = None;
         self.statement_texts.clear();
+        self.table_run_started(request.id);
         self.grid(ExecutionEvent::Started, window, cx);
         self.run = Some(ActiveRun {
             session,
@@ -733,14 +757,17 @@ impl SqlEditorTab {
             RunEvent::WaitingForPreviousCancel { .. } => {
                 self.say("Waiting for the previous statement to stop…", false, cx);
             }
-            RunEvent::Item { index, item } => self.grid(
-                ExecutionEvent::Item {
-                    statement: n(index),
-                    item,
-                },
-                window,
-                cx,
-            ),
+            RunEvent::Item { index, item } => {
+                self.grid(
+                    ExecutionEvent::Item {
+                        statement: n(index),
+                        item,
+                    },
+                    window,
+                    cx,
+                );
+                self.refresh_editing(cx);
+            }
             RunEvent::ResultClosedIdle { index, rows, after } => {
                 // The session's own state: a paused read may sit inside an open transaction.
                 let in_tx = self
@@ -882,6 +909,7 @@ impl SqlEditorTab {
         };
         *self.current.borrow_mut() = None;
         self.grid(ExecutionEvent::Finished, window, cx);
+        self.refresh_editing(cx);
         let id = active.request.id;
         self.editor.update(cx, |e, cx| e.finish_run(id, cx));
         cx.notify();
@@ -933,6 +961,11 @@ impl SqlEditorTab {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if generation == edit_dialogs::SAVE_CONFIRMATION_GENERATION {
+            // The save confirmation closed without an answer: nothing is saved.
+            self.decline_save(cx);
+            return;
+        }
         let unanswered = self
             .run
             .as_ref()
@@ -1198,6 +1231,7 @@ impl SqlEditorTab {
                     }),
             );
         }
+        bar = self.render_edit_status(bar, muted, warning, cx);
         if let Some(m) = &self.message {
             bar = bar.child(
                 div()
@@ -1205,6 +1239,84 @@ impl SqlEditorTab {
                     .text_color(if m.error { danger } else { muted })
                     .child(m.text.clone()),
             );
+        }
+        bar
+    }
+}
+
+impl SqlEditorTab {
+    /// The editing part of the toolbar: the table, why the result is read-only, or the pending
+    /// changes with "Save" and "Discard".
+    fn render_edit_status(
+        &self,
+        mut bar: Stateful<Div>,
+        muted: Hsla,
+        warning: Hsla,
+        cx: &mut Context<Self>,
+    ) -> Stateful<Div> {
+        let has_result = !self.results.read(cx).results().tabs().is_empty();
+        if let Some(source) = &self.table.source {
+            bar = bar.child(
+                div()
+                    .id("editor-table")
+                    .text_color(muted)
+                    .child(format!("Table: {}", source.label())),
+            );
+        }
+        if let Some(e) = self.editing() {
+            let changes = e.pending.change_count();
+            let busy = self.table.saving
+                || self.table.confirmation.is_some()
+                || self.is_running()
+                || self.session().is_none_or(SessionHandle::is_leased);
+            bar = bar.child(
+                div()
+                    .id("editor-edit-status")
+                    .text_color(if changes > 0 { warning } else { muted })
+                    .child(if changes > 0 {
+                        format!(
+                            "Editable (key: {}) · {changes} unsaved changes",
+                            e.table.key
+                        )
+                    } else {
+                        format!("Editable (key: {})", e.table.key)
+                    }),
+            );
+            if changes > 0 {
+                let save = cx.entity().downgrade();
+                let discard = cx.entity().downgrade();
+                bar = bar
+                    .child(
+                        Button::new("editor-save-changes")
+                            .xsmall()
+                            .primary()
+                            .label("Save")
+                            .tooltip("Save changes")
+                            .disabled(busy)
+                            .on_click(move |_, window, cx| {
+                                let _ = save.update(cx, |t, cx| t.save_changes(window, cx));
+                            }),
+                    )
+                    .child(
+                        Button::new("editor-discard-changes")
+                            .xsmall()
+                            .label("Discard")
+                            .tooltip("Discard changes")
+                            .disabled(busy)
+                            .on_click(move |_, _, cx| {
+                                let _ = discard.update(cx, |t, cx| t.discard_changes(cx));
+                            }),
+                    );
+            }
+        } else if has_result || self.table.source.is_some() {
+            if let Some(why) = self.read_only_reason() {
+                bar = bar.child(
+                    div()
+                        .id("editor-read-only-reason")
+                        .text_color(muted)
+                        .child(why.to_owned()),
+                );
+            }
         }
         bar
     }
