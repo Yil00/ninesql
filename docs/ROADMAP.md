@@ -325,7 +325,7 @@ Items left by the phase 3 task reports, the remaining Low findings of its securi
 |----------|--------------|--------|
 | P4-A Metadata (MVP families) | `driver-engineer` | [~] `Metadata` for pg-wire (PostgreSQL first, then per-engine overrides), mysql-wire, SQLite: every object kind of F-NAV-01 and F-NAV-02 the engine has · [~] DDL generation where the engine provides it (F-NAV-07) |
 | P4-B Navigator UI | `ui-engineer` | [~] Lazy async tree with cancel and per-node refresh (F-NAV-03), filters (F-NAV-04), fuzzy object search (F-NAV-05) · [~] Object editor: properties, columns, keys, indexes, DDL tab (F-NAV-06) · [~] "Generate SQL" actions (F-NAV-07) |
-| P4-C Wire-compatible engines | `driver-engineer` | [ ] TimescaleDB, YugabyteDB, QuestDB (pg-wire) and TiDB (mysql-wire): engine ids, capability overrides, metadata differences, dev containers green in CI |
+| P4-C Wire-compatible engines | `driver-engineer` | [~] TimescaleDB, YugabyteDB, QuestDB (pg-wire) and TiDB (mysql-wire): engine ids, capability overrides, metadata differences, dev containers green in CI ([docs/08](08-engine-capabilities.md#wire-compatible-engines-p4-c); the four engines added to the `driver-integration` job, not run on GitHub yet) |
 
 **Exit criterion**: the 8 MVP engines browse their "nine" dataset fully in the navigator; each engine's capability row in docs/08 matches what its integration tests prove.
 

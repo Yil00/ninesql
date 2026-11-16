@@ -41,6 +41,7 @@ use tokio::time::Instant;
 
 use crate::cancel::{CancelTarget, ExecCancel, MetaGate};
 use crate::conn::{Conn, Msg, PgError, RowSink};
+use crate::engine::Flavor;
 use crate::types::{BatchBuilder, ColPlan, builtin_type_name, schema_for};
 
 /// Name of the prepared statement the driver uses for user statements.
@@ -65,16 +66,19 @@ pub(crate) struct Shared {
     /// The session is read-only (the engine-side setting must stay on).
     pub(crate) read_only: AtomicBool,
     pub(crate) major_version: Option<u32>,
+    /// The engine of the family the session was checked against at connect.
+    pub(crate) flavor: Flavor,
 }
 
 impl Shared {
-    pub(crate) fn new(major_version: Option<u32>, txn_status: u8) -> Self {
+    pub(crate) fn new(major_version: Option<u32>, txn_status: u8, flavor: Flavor) -> Self {
         Self {
             closed: AtomicBool::new(false),
             close_reason: Mutex::new(None),
             txn_status: AtomicU8::new(txn_status),
             read_only: AtomicBool::new(false),
             major_version,
+            flavor,
         }
     }
 
@@ -98,7 +102,9 @@ impl Shared {
     }
 
     pub(crate) fn in_transaction(&self) -> bool {
-        self.txn_status.load(Ordering::SeqCst) != b'I'
+        // QuestDB accepts `BEGIN` and may report a transaction block after DDL, but has no
+        // transactions in the PostgreSQL sense (none is declared).
+        self.flavor != Flavor::QuestDb && self.txn_status.load(Ordering::SeqCst) != b'I'
     }
 }
 
@@ -552,7 +558,8 @@ impl Actor {
         const SAVEPOINT: &str = "SAVEPOINT ninesql_meta";
         const RELEASE: &str = "RELEASE SAVEPOINT ninesql_meta";
         const ROLLBACK_TO: &str = "ROLLBACK TO SAVEPOINT ninesql_meta";
-        let in_tx = self.conn.txn_status == b'T';
+        // QuestDB has no transactions (and no savepoints), whatever status it reports.
+        let in_tx = self.conn.txn_status == b'T' && self.shared.flavor != Flavor::QuestDb;
         if in_tx {
             self.internal(SAVEPOINT, &[], 0).await?;
         }
@@ -669,6 +676,11 @@ impl Actor {
             )));
         }
         if !self.shared.read_only.load(Ordering::SeqCst) {
+            return Ok(());
+        }
+        if self.shared.flavor == Flavor::QuestDb {
+            // QuestDB's read-only user or read-only server: verified at connect, and no
+            // statement can lift it (`ServerSetting { liftable: false }`).
             return Ok(());
         }
         let on = match self.shared.major_version {
@@ -1055,8 +1067,16 @@ impl Actor {
                 ))));
             ex.builder = Some(BatchBuilder::new(schema, plans, budget));
             let outside_txn = self.conn.txn_status == b'I';
-            ex.implicit_txn = outside_txn && ex.class == StatementClass::Read && !is_call;
-            ex.paged = !outside_txn || ex.implicit_txn;
+            if self.shared.flavor == Flavor::QuestDb {
+                // QuestDB has no transactions to hold a suspended portal (and no `set_config`):
+                // one `Execute`, read as the consumer asks (TCP back-pressure pauses the server);
+                // a dropped or cancelled read is cancelled server-side.
+                ex.implicit_txn = false;
+                ex.paged = false;
+            } else {
+                ex.implicit_txn = outside_txn && ex.class == StatementClass::Read && !is_call;
+                ex.paged = !outside_txn || ex.implicit_txn;
+            }
             self.bind_execute(params, &formats, ex)?;
             self.conn.flush().await?;
             self.fetch_loop(ex, reply).await

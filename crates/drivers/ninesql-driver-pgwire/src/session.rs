@@ -16,6 +16,7 @@ use tokio::sync::{mpsc, oneshot};
 use crate::actor::{Chunk, Command, Demand, ExecRequest, Rows, Shared, params_supported};
 use crate::cancel::{CancelTarget, ExecCancel, MetaGate, PgCancel};
 use crate::dialect::PgDialect;
+use crate::engine::{self, Flavor, ServerInfo};
 use crate::metadata::PgMetadata;
 
 /// Handles shared by the session and its metadata.
@@ -208,8 +209,133 @@ impl PgSession {
         self.link.internal(sql, Vec::new(), 0).await
     }
 
+    fn flavor(&self) -> Flavor {
+        self.link.shared.flavor
+    }
+
+    /// QuestDB has no transactions in the PostgreSQL sense (I8).
+    fn refuse_on_questdb(&self) -> DriverResult<()> {
+        if self.flavor() == Flavor::QuestDb {
+            Err(DriverError::Unsupported(Feature::Transactions))
+        } else {
+            Ok(())
+        }
+    }
+
+    /// Checks the server against the declared engine from inside the session (`version()`,
+    /// the `timescaledb` extension) and reads what the exact capabilities depend on. A mismatch
+    /// fails the connect (docs/08, P4-C).
+    pub(crate) async fn check_server(&mut self, info: &mut ServerInfo) -> DriverResult<()> {
+        let flavor = self.flavor();
+        let first = |rows: Rows| {
+            rows.into_iter()
+                .next()
+                .and_then(|r| r.into_iter().next())
+                .flatten()
+        };
+        let version_fn = first(self.run("SELECT pg_catalog.version()").await?).unwrap_or_default();
+        let param = self.capabilities.server_version.clone().unwrap_or_default();
+        engine::check_family(
+            flavor,
+            engine::server_family(&param, Some(&version_fn)),
+            &version_fn,
+        )?;
+        match flavor {
+            Flavor::Postgres | Flavor::Timescale => {
+                let ts = first(
+                    self.run(
+                        "SELECT e.extversion::pg_catalog.text FROM pg_catalog.pg_extension e \
+                         WHERE e.extname OPERATOR(pg_catalog.=) 'timescaledb'::pg_catalog.name",
+                    )
+                    .await?,
+                );
+                if flavor == Flavor::Timescale {
+                    if ts.is_none() {
+                        return Err(DriverError::Connect(
+                            "this database has no timescaledb extension, so it is not \
+                             TimescaleDB; choose PostgreSQL, or create the extension first"
+                                .into(),
+                        ));
+                    }
+                    info.timescale_version = ts;
+                }
+            }
+            Flavor::Yugabyte => {
+                // Without its read-committed mode YugabyteDB runs READ COMMITTED as snapshot
+                // isolation: ask the server what a READ COMMITTED transaction really runs.
+                self.run("BEGIN ISOLATION LEVEL READ COMMITTED").await?;
+                let effective = self
+                    .run(
+                        "SELECT pg_catalog.current_setting(\
+                         'yb_effective_transaction_isolation_level'::pg_catalog.text, true)",
+                    )
+                    .await;
+                self.run("ROLLBACK").await?;
+                info.yb_read_committed =
+                    first(effective?).is_some_and(|v| v.eq_ignore_ascii_case("read committed"));
+            }
+            Flavor::QuestDb => {}
+        }
+        Ok(())
+    }
+
+    /// QuestDB: no session read-only mode. A session is read-only only when the server makes it
+    /// so (its read-only user, or a read-only server), which is checked twice: in the server's
+    /// settings, and with a write that changes nothing whatever the account and must fail with
+    /// a permission error. Anything else is refused, never faked (I3, I8).
+    async fn apply_questdb_read_only(&mut self, read_only: bool) -> DriverResult<()> {
+        if !read_only {
+            return Err(DriverError::ReadOnly(
+                "QuestDB's read-only mode belongs to the account or the server; connect as a \
+                 user that may write instead"
+                    .into(),
+            ));
+        }
+        let refused = || {
+            DriverError::ReadOnly(
+                "QuestDB has no session read-only mode and this account can write, so the \
+                 read-only session was refused; connect as QuestDB's read-only user \
+                 (pg.readonly.user) or to a read-only server (pg.security.readonly)"
+                    .into(),
+            )
+        };
+        let settings: Vec<(String, String)> = self
+            .run(engine::QUESTDB_READ_ONLY_SETTINGS_SQL)
+            .await
+            .map_err(|_| refused())?
+            .into_iter()
+            .filter_map(|r| {
+                let mut it = r.into_iter();
+                Some((it.next().flatten()?, it.next().flatten()?))
+            })
+            .collect();
+        let user = self
+            .run("SELECT current_user()")
+            .await
+            .map_err(|_| refused())?
+            .into_iter()
+            .next()
+            .and_then(|r| r.into_iter().next())
+            .flatten()
+            .unwrap_or_default();
+        let denied = match self.run(engine::QUESTDB_WRITE_PROBE_SQL).await {
+            Err(DriverError::Query { message, .. }) => engine::questdb_probe_denied(&message),
+            Err(DriverError::ReadOnly(_)) => true,
+            _ => false,
+        };
+        if engine::questdb_settings_read_only(&settings, &user) && denied {
+            self.link.shared.read_only.store(true, Ordering::SeqCst);
+            Ok(())
+        } else {
+            Err(refused())
+        }
+    }
+
     /// Applies (or lifts) the engine-side read-only mode and verifies it by reading it back.
     pub(crate) async fn apply_read_only(&mut self, read_only: bool) -> DriverResult<()> {
+        if self.flavor() == Flavor::QuestDb {
+            return self.apply_questdb_read_only(read_only).await;
+        }
         let sql = if read_only {
             "SET SESSION CHARACTERISTICS AS TRANSACTION READ ONLY"
         } else {
@@ -331,6 +457,9 @@ impl Session for PgSession {
         // One statement per protocol call, with the session's current lexical rules.
         ensure_single_statement(self.dialect.as_ref(), &statement.text)?;
         let class = self.dialect.classify(&statement.text);
+        if class == StatementClass::Transaction && self.flavor() == Flavor::QuestDb {
+            return Err(DriverError::Unsupported(Feature::Transactions));
+        }
         if self.is_read_only() && class.is_write() {
             return Err(DriverError::ReadOnly(
                 "statement refused: the session is read-only".into(),
@@ -361,6 +490,9 @@ impl Session for PgSession {
     }
 
     async fn set_auto_commit(&mut self, auto_commit: bool) -> DriverResult<()> {
+        if !auto_commit {
+            self.refuse_on_questdb()?;
+        }
         if auto_commit && !self.auto_commit && self.in_transaction() {
             // JDBC semantics: switching to auto-commit commits the open transaction.
             self.commit().await?;
@@ -370,10 +502,14 @@ impl Session for PgSession {
     }
 
     async fn begin(&mut self) -> DriverResult<()> {
+        self.refuse_on_questdb()?;
         self.run("BEGIN").await.map(drop)
     }
 
     async fn commit(&mut self) -> DriverResult<()> {
+        if self.flavor() == Flavor::QuestDb && !self.in_transaction() {
+            return Ok(());
+        }
         let failed = self.link.shared.txn_status.load(Ordering::SeqCst) == b'E';
         self.run("COMMIT").await?;
         if failed {
@@ -387,15 +523,20 @@ impl Session for PgSession {
     }
 
     async fn rollback(&mut self) -> DriverResult<()> {
+        if self.flavor() == Flavor::QuestDb && !self.in_transaction() {
+            return Ok(());
+        }
         self.run("ROLLBACK").await.map(drop)
     }
 
     async fn savepoint(&mut self, name: &str) -> DriverResult<()> {
+        self.refuse_on_questdb()?;
         let sql = format!("SAVEPOINT {}", self.dialect.quote_identifier(name));
         self.run(&sql).await.map(drop)
     }
 
     async fn rollback_to_savepoint(&mut self, name: &str) -> DriverResult<()> {
+        self.refuse_on_questdb()?;
         let sql = format!(
             "ROLLBACK TO SAVEPOINT {}",
             self.dialect.quote_identifier(name)
@@ -404,6 +545,15 @@ impl Session for PgSession {
     }
 
     async fn set_isolation_level(&mut self, level: IsolationLevel) -> DriverResult<()> {
+        self.refuse_on_questdb()?;
+        if !self
+            .capabilities
+            .transactions
+            .isolation_levels
+            .contains(&level)
+        {
+            return Err(DriverError::Unsupported(Feature::Transactions));
+        }
         let level = match level {
             IsolationLevel::ReadCommitted => "READ COMMITTED",
             IsolationLevel::RepeatableRead => "REPEATABLE READ",

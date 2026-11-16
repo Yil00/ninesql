@@ -143,6 +143,73 @@ fn pgjdbc_options_read_only_and_secrets() {
     assert!(!format!("{p:?}").contains("fixture-opt-not-a-secret"));
 }
 
+/// QuestDB accepts no driver property (pgwire declares an empty allowlist): every pgjdbc
+/// property is dropped with a report entry, `options` is still read for read-only and secrets,
+/// TLS properties still feed the TLS settings, and pgjdbc's URL precedence still applies.
+#[test]
+fn questdb_drops_every_property() {
+    let cfg = r#"{"url":"jdbc:postgresql://db.example.test:8812/qdb?currentSchema=from_url",
+        "properties":{
+            "currentSchema":"app",
+            "options":"-c default_transaction_read_only=on -c statement_timeout=1 -c password=fixture-qdb-not-a-secret",
+            "ApplicationName":"nine-app","search_path":"app","sslmode":"disable"}}"#;
+    let p = map(&one("questdb", "questdb", cfg));
+    let c = only(&p);
+    assert_eq!(c.engine, EngineId::QUESTDB);
+    assert!(c.properties.is_empty(), "{:?}", c.properties);
+    assert_eq!(c.read_only, Some(true));
+    assert_eq!(c.tls.mode, ninesql_dbeaver::mapping::TlsMode::Disable);
+    let d = dropped(c);
+    for expected in [
+        ("configuration.url.currentSchema", NoEquivalent),
+        // pgjdbc lets the URL win: the property is dropped as overridden.
+        ("configuration.properties.currentSchema", NoEquivalent),
+        ("configuration.properties.ApplicationName", NoEquivalent),
+        ("configuration.properties.search_path", NoEquivalent),
+        (
+            "configuration.properties.options.statement_timeout",
+            NoEquivalent,
+        ),
+        ("configuration.properties.options.password", LooksLikeSecret),
+    ] {
+        assert!(d.contains(&expected), "{expected:?} not in {d:?}");
+    }
+    assert!(has_issue(
+        &p,
+        IssueKind::PropertyMapped,
+        "configuration.properties.options.default_transaction_read_only"
+    ));
+    assert!(p.connections[0].issues.iter().any(|i| {
+        i.key.as_deref() == Some("configuration.properties.search_path")
+            && i.message
+                .contains("QuestDB driver accepts no driver property")
+    }));
+    assert!(!format!("{p:?}").contains("fixture-qdb-not-a-secret"));
+    for i in &p.connections[0].issues {
+        assert!(!i.to_string().contains("fixture-qdb-not-a-secret"));
+    }
+    // What the import produces passes the driver's declared connect checks.
+    let caps = ninesql_driver_pgwire::PgWireDriver::default()
+        .capabilities(&EngineId::QUESTDB, None)
+        .unwrap_or_else(|e| panic!("{e}"));
+    assert_eq!(
+        caps.connect.accepted_properties,
+        Some(std::collections::BTreeSet::new())
+    );
+    assert!(caps.tls.contains(&ninesql_driver_api::TlsMode::Disable));
+    // A read-only intent is never lost, also through an unreadable entry.
+    let ro = |options: &str| {
+        read_only_of(
+            "questdb",
+            "questdb",
+            &format!(r#"{{"options":"{options}"}}"#),
+        )
+    };
+    assert_eq!(ro("-c default_transaction_read_only=maybe"), Some(true));
+    assert_eq!(ro("-c default_transaction_read_only"), Some(true));
+    assert_eq!(ro("-c default_transaction_read_only=off"), None);
+}
+
 #[test]
 fn connector_j_properties() {
     let cfg = r#"{"host":"db.example.test","properties":{
@@ -370,24 +437,45 @@ type Case = (
 /// `validate_for_driver` and the driver's connect accept it.
 #[test]
 fn produced_names_are_on_the_driver_allowlists() {
-    let cases: [Case; 4] = [
+    const PG_ALL: &str = r#"{"host":"db.example.test","properties":{"currentSchema":"app",
+            "options":"-c TimeZone=UTC -c statement_timeout=1 -c lock_timeout=1 -c work_mem=4MB -c client_min_messages=warning"}}"#;
+    const MYSQL_ALL: &str = r#"{"host":"db.example.test","properties":{"connectionTimeZone":"UTC",
+            "forceConnectionTimeZoneToSession":"true",
+            "sessionVariables":"lock_wait_timeout=1,innodb_lock_wait_timeout=1,group_concat_max_len=1,max_execution_time=1"}}"#;
+    let pg = || Box::new(ninesql_driver_pgwire::PgWireDriver::default());
+    let my = || Box::new(ninesql_driver_mysqlwire::MySqlWireDriver::default());
+    let cases: [Case; 8] = [
         (
             "postgresql",
             "postgres-jdbc",
             EngineId::POSTGRESQL,
-            Box::new(ninesql_driver_pgwire::PgWireDriver::default()),
-            r#"{"host":"db.example.test","properties":{"currentSchema":"app",
-            "options":"-c TimeZone=UTC -c statement_timeout=1 -c lock_timeout=1 -c work_mem=4MB -c client_min_messages=warning"}}"#,
+            pg(),
+            PG_ALL,
         ),
         (
-            "mysql",
-            "mysql8",
-            EngineId::MYSQL,
-            Box::new(ninesql_driver_mysqlwire::MySqlWireDriver::default()),
-            r#"{"host":"db.example.test","properties":{"connectionTimeZone":"UTC",
-            "forceConnectionTimeZoneToSession":"true",
-            "sessionVariables":"lock_wait_timeout=1,innodb_lock_wait_timeout=1,group_concat_max_len=1,max_execution_time=1"}}"#,
+            "postgresql",
+            "postgres-timescale-jdbc",
+            EngineId::TIMESCALEDB,
+            pg(),
+            PG_ALL,
         ),
+        (
+            "postgresql",
+            "postgres-yugabytedb-jdbc",
+            EngineId::YUGABYTEDB,
+            pg(),
+            PG_ALL,
+        ),
+        // QuestDB accepts no property: nothing to produce.
+        (
+            "questdb",
+            "questdb",
+            EngineId::QUESTDB,
+            pg(),
+            r#"{"host":"db.example.test","properties":{}}"#,
+        ),
+        ("mysql", "mysql8", EngineId::MYSQL, my(), MYSQL_ALL),
+        ("tidb", "tidb", EngineId::TIDB, my(), MYSQL_ALL),
         (
             "mysql",
             "mariaDB",

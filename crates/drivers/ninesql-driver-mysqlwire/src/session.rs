@@ -192,6 +192,9 @@ impl MySession {
     /// Applies (or lifts) the engine-side read-only mode on the session and the control
     /// connection, and verifies it on the session by reading it back.
     pub(crate) async fn apply_read_only(&mut self, read_only: bool) -> DriverResult<()> {
+        if self.link.shared.tidb {
+            return self.apply_tidb_read_only(read_only).await;
+        }
         let sql = if read_only {
             "SET SESSION TRANSACTION READ ONLY"
         } else {
@@ -216,7 +219,7 @@ impl MySession {
                 e
             });
         }
-        let check = format!("SELECT @@SESSION.{}", self.link.shared.ro_var);
+        let check = format!("SELECT {}", self.link.shared.ro_expr);
         let rows = match self.run(&check).await {
             Ok(r) => r,
             Err(e) => {
@@ -240,6 +243,38 @@ impl MySession {
             .read_only
             .store(read_only, Ordering::SeqCst);
         Ok(())
+    }
+
+    /// TiDB has no session read-only mode: `SET SESSION TRANSACTION READ ONLY` is a no-op
+    /// that TiDB refuses by default (error 1235). A session is read-only only when the whole
+    /// instance refuses writes (`tidb_super_read_only` / `tidb_restricted_read_only`), read
+    /// back here and after every statement; anything else is refused, never faked (I3, I8).
+    /// Leaving read-only mode only clears the driver's flag: the instance stays as it is.
+    async fn apply_tidb_read_only(&mut self, read_only: bool) -> DriverResult<()> {
+        if !read_only {
+            self.link.shared.read_only.store(false, Ordering::SeqCst);
+            return Ok(());
+        }
+        let check = format!("SELECT {}", self.link.shared.ro_expr);
+        let value = self
+            .run(&check)
+            .await?
+            .into_iter()
+            .next()
+            .and_then(|r| r.into_iter().next())
+            .flatten();
+        if value.as_deref() == Some("1") {
+            self.link.shared.read_only.store(true, Ordering::SeqCst);
+            Ok(())
+        } else {
+            Err(DriverError::ReadOnly(
+                "TiDB has no session read-only mode (SET TRANSACTION READ ONLY is a no-op \
+                 there), so a read-only session is refused unless the TiDB instance itself is \
+                 read-only (tidb_super_read_only or tidb_restricted_read_only); use an account \
+                 with SELECT privileges only, on a connection that is not read-only"
+                    .into(),
+            ))
+        }
     }
 
     fn raw_stream(
@@ -303,6 +338,7 @@ impl Session for MySession {
             link: self.link.clone(),
             control: Arc::clone(&self.control),
             mariadb: self.capabilities.engine == EngineId::MARIADB,
+            tidb: self.capabilities.engine == EngineId::TIDB,
         })
     }
 
@@ -401,6 +437,15 @@ impl Session for MySession {
     }
 
     async fn set_isolation_level(&mut self, level: IsolationLevel) -> DriverResult<()> {
+        // Only the declared levels (TiDB refuses SERIALIZABLE and READ UNCOMMITTED).
+        if !self
+            .capabilities
+            .transactions
+            .isolation_levels
+            .contains(&level)
+        {
+            return Err(DriverError::Unsupported(Feature::Transactions));
+        }
         let level = match level {
             IsolationLevel::ReadUncommitted => "READ UNCOMMITTED",
             IsolationLevel::ReadCommitted => "READ COMMITTED",

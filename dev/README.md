@@ -18,12 +18,13 @@ python3 dev/ready.py up sql      # core + TimescaleDB, YugabyteDB, QuestDB, TiDB
 python3 dev/ready.py up nosql    # MongoDB, Redis, Valkey
 python3 dev/ready.py up heavy    # Elasticsearch, OpenSearch, Cassandra, Neo4j (about 8 GB of RAM)
 python3 dev/ready.py up all      # everything
+python3 dev/ready.py up sql --engines timescaledb,yugabytedb,questdb,tidb   # only these engines of a profile (CI driver tests)
 
 python3 dev/ready.py down        # = docker compose -f dev/compose.yaml --profile all down -v
 python3 dev/ready.py check       # engines.json <-> compose.yaml consistency, no container started
 ```
 
-`ready.py up` runs `docker compose --profile <p> up -d`, then waits (default 15 min, `--timeout`) until every engine container is **healthy** and every seed container has **exited with 0**. On failure it prints the last log lines of the failing service and exits non-zero. Plain Compose also works (`docker compose -f dev/compose.yaml --profile core up -d --wait`): the healthchecks query the dataset's `nine_meta` marker, so "healthy" means "seeded". But `--wait` does not report a failed seed container, so prefer `ready.py`.
+`ready.py up` runs `docker compose --profile <p> up -d`, then waits (default 15 min, `--timeout`) until every engine container is **healthy** and every seed container has **exited with 0**. With `--engines id,id…` (`up` and `wait`) only those engines of the profile and their seed containers are started and waited for; an id outside the profile is an error. On failure it prints the last log lines of the failing service and exits non-zero. Plain Compose also works (`docker compose -f dev/compose.yaml --profile core up -d --wait`): the healthchecks query the dataset's `nine_meta` marker, so "healthy" means "seeded". But `--wait` does not report a failed seed container, so prefer `ready.py`.
 
 Seeding happens on the first start of a container. It takes a few seconds (PostgreSQL, ClickHouse) to a few minutes (YugabyteDB, Cassandra, Elasticsearch). Data lives in anonymous volumes: `down -v` deletes it, `stop` / `start` keeps it. Trino's `memory` catalog is rebuilt by `trino-seed` on every `up`.
 
