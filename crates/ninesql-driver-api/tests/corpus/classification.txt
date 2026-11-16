@@ -333,6 +333,134 @@ SELECT lo_unlink(1234)
 expect: sqlite=Unknown
 SELECT load_extension('/tmp/x.so')
 
+%% P5 security review L5: locks, waits, notifications and server files, which used to read as
+%% Read and so passed the production confirmation, the edit filter check and the export rule.
+
+## pg_advisory_lock
+expect: pg=Unknown
+SELECT pg_advisory_lock(42)
+
+## pg_advisory_xact_lock_shared
+expect: pg=Unknown
+SELECT pg_advisory_xact_lock_shared(1, 2)
+
+## pg_try_advisory_lock in a where clause
+expect: pg=Unknown
+SELECT * FROM t WHERE pg_try_advisory_lock(id)
+
+## pg_advisory_unlock_all
+expect: pg=Unknown
+SELECT pg_advisory_unlock_all()
+
+## pg_notify
+expect: pg=Unknown
+SELECT pg_notify('chan', 'payload')
+
+## pg_sleep schema-qualified
+expect: pg=Unknown
+SELECT pg_catalog.pg_sleep(10)
+
+## pg_sleep quoted and qualified
+expect: pg=Unknown
+SELECT "pg_catalog"."pg_sleep"(10)
+
+## pg_sleep_for with a comment before the parenthesis
+expect: pg=Unknown
+SELECT pg_sleep_for /* x */ ('5 minutes')
+
+## pg_sleep as a from-item
+expect: pg=Unknown
+SELECT * FROM pg_sleep(1)
+
+## pg_cancel_backend qualified
+expect: pg=Unknown
+SELECT pg_catalog.pg_cancel_backend(42)
+
+## pg_reload_conf
+expect: pg=Unknown
+SELECT pg_reload_conf()
+
+## pg_rotate_logfile
+expect: pg=Unknown
+SELECT pg_rotate_logfile()
+
+## lo_import quoted
+expect: pg=Unknown
+SELECT "lo_import"('/etc/passwd')
+
+## lo_export
+expect: pg=Unknown
+SELECT lo_export(1234, '/tmp/x')
+
+## dblink qualified
+expect: pg=Unknown
+SELECT * FROM public.dblink('dbname=x', 'SELECT 1') AS r(a int)
+
+## set_config qualified
+expect: pg=ChangesAccessMode
+SELECT pg_catalog.set_config('default_transaction_read_only', 'off', false)
+
+## column named like a side-effect function is a read
+expect: all=Read
+SELECT pg_sleep, pg_notify, pg_advisory_lock, sleep, benchmark, load_file, get_lock FROM t
+
+## qualified column named like a side-effect function is a read
+expect: all=Read
+SELECT t.pg_sleep, t.sleep FROM t WHERE t.get_lock = 1
+
+## mysql sleep
+expect: my=Unknown
+SELECT SLEEP(5)
+
+## mysql sleep lower case in a where clause
+expect: my=Unknown
+SELECT * FROM t WHERE sleep(1) = 0
+
+## mysql sleep quoted
+expect: my=Unknown
+SELECT `sleep`(5)
+
+## mysql benchmark
+expect: my=Unknown
+SELECT BENCHMARK(1000000, MD5('x'))
+
+## mysql get_lock quoted
+expect: my=Unknown
+SELECT `GET_LOCK`('a', 10)
+
+## mysql release_lock
+expect: my=Unknown
+SELECT RELEASE_LOCK('a')
+
+## mysql load_file
+expect: my=Unknown
+SELECT LOAD_FILE('/etc/passwd')
+
+## mysql master_pos_wait
+expect: my=Unknown
+SELECT MASTER_POS_WAIT('binlog.000001', 4)
+
+## mysql source_pos_wait
+expect: my=Unknown
+SELECT SOURCE_POS_WAIT('binlog.000001', 4, 10)
+
+## mariadb master_gtid_wait
+expect: my=Unknown
+SELECT MASTER_GTID_WAIT('0-1-100', 10)
+
+## mysql sleep with a space before the parenthesis
+expect: my=Unknown
+SELECT SLEEP (5)
+
+## mysql sleep in ansi_quotes mode
+expect: my=Unknown
+modes: ansi_quotes
+SELECT "sleep"(5)
+
+## sqlite load_extension quoted
+expect: sqlite=Unknown
+SELECT "load_extension"('/tmp/x.so')
+
 ## user function is a read (documented limit L4)
 expect: all=Read
 SELECT my_function_that_writes(1)

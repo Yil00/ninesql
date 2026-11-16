@@ -1552,6 +1552,7 @@ const SIDE_EFFECT_FUNCTIONS: &[&str] = &[
     "PG_LOG_BACKEND_MEMORY_CONTEXTS",
     "PG_IMPORT_SYSTEM_COLLATIONS",
     "PG_STAT_STATEMENTS_RESET",
+    "PG_NOTIFY",
     "LO_IMPORT",
     "LO_EXPORT",
     "LO_UNLINK",
@@ -1567,9 +1568,15 @@ const SIDE_EFFECT_FUNCTIONS: &[&str] = &[
 
 /// Prefixes of function families with side effects (F2): replication slots and origins,
 /// statistics resets, backups, WAL replay control, `dblink*`, `pg_create_*` (restore points,
-/// replication slots) and `pg_copy_*_replication_slot`. A few read-only members
-/// (`pg_replication_origin_oid`…) are over-classified, which only asks for confirmation.
+/// replication slots), `pg_copy_*_replication_slot`, advisory locks and unlocks
+/// (`pg_advisory_*`, `pg_try_advisory_*`: a session lock outlives the statement) and
+/// `pg_sleep*` (holds the session and its locks; P5 security review L5). A few read-only
+/// members (`pg_replication_origin_oid`…) are over-classified, which only asks for
+/// confirmation.
 const SIDE_EFFECT_PREFIXES: &[&str] = &[
+    "PG_ADVISORY_",
+    "PG_TRY_ADVISORY_",
+    "PG_SLEEP",
     "DBLINK",
     "PG_CREATE_",
     "PG_COPY_",

@@ -170,7 +170,11 @@ impl MyDialect {
 
 /// Functions of MySQL, MariaDB and TiDB with side effects a `SELECT` can call, on top of the
 /// shared list (which has `NEXTVAL` / `SETVAL`): sequence access (`LASTVAL` is over-classified
-/// with them) and user-level locks, which outlive the statement (security review L4).
+/// with them), user-level locks, which outlive the statement (security review L4), and, since
+/// the P5 security review (L5), functions that hold the session (`SLEEP`, `BENCHMARK`, the
+/// replication waits) or read a server file (`LOAD_FILE`). Matched as a word or a quoted
+/// identifier right before `(`, whatever the case; a qualified `db.sleep(…)` (a stored
+/// function) is over-classified with them.
 const MYSQL_SIDE_EFFECT_FUNCTIONS: &[&str] = &[
     "nextval",
     "setval",
@@ -178,6 +182,14 @@ const MYSQL_SIDE_EFFECT_FUNCTIONS: &[&str] = &[
     "get_lock",
     "release_lock",
     "release_all_locks",
+    "sleep",
+    "benchmark",
+    "load_file",
+    "master_pos_wait",
+    "source_pos_wait",
+    "master_gtid_wait",
+    "wait_for_executed_gtid_set",
+    "wait_until_sql_thread_after_gtids",
 ];
 
 /// `Unknown` when `text` calls one of [`MYSQL_SIDE_EFFECT_FUNCTIONS`] or reads a sequence with
@@ -187,15 +199,22 @@ fn side_effects(text: &str, rules: LexicalRules) -> StatementClass {
     let word = |i: usize, w: &str| toks.get(i).is_some_and(|t| t.is_word(text, w));
     let hit = (0..toks.len()).any(|i| {
         let t = &toks[i];
-        if t.kind != CodeTokenKind::Word {
-            return false;
-        }
+        let name = match t.kind {
+            CodeTokenKind::Word => t.text(text),
+            // `` `sleep`(1) `` calls the native function: strip the quotes. A name with a
+            // doubled quote inside matches none of the list.
+            CodeTokenKind::QuotedIdent => {
+                let q = t.text(text);
+                q.get(1..q.len().saturating_sub(1)).unwrap_or("")
+            }
+            _ => return false,
+        };
         let call = toks
             .get(i + 1)
             .is_some_and(|n| n.kind == CodeTokenKind::OpenParen)
             && MYSQL_SIDE_EFFECT_FUNCTIONS
                 .iter()
-                .any(|f| t.text(text).eq_ignore_ascii_case(f));
+                .any(|f| name.eq_ignore_ascii_case(f));
         call || (word(i, "NEXT") && word(i + 1, "VALUE") && word(i + 2, "FOR"))
             || (word(i, "NEXTVAL") && word(i + 1, "FOR"))
             || (word(i, "PREVIOUS") && word(i + 1, "VALUE") && word(i + 2, "FOR"))
