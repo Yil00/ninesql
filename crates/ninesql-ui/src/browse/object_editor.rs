@@ -24,8 +24,8 @@ use gpui_kit::*;
 use ninesql_core::driver_api::ObjectKind;
 use ninesql_core::driver_api::metadata::{ObjectDetails, ObjectInfo, ObjectPath};
 use ninesql_core::{
-    ConnectionId, InvalidationReason, MetadataEvent, MetadataService, NodeChildren, NodeKey,
-    ObjectDdl,
+    ConnectionId, InvalidationReason, InvalidationScope, MetadataEvent, MetadataService,
+    NodeChildren, NodeKey, ObjectDdl,
 };
 
 use super::generate::Template;
@@ -435,27 +435,50 @@ impl ObjectEditor {
         cx.notify();
     }
 
+    fn covers(&self, scope: &InvalidationScope) -> bool {
+        let related = |p: &ObjectPath| is_under(&self.path, p) || is_under(p, &self.path);
+        match scope {
+            InvalidationScope::Subtree(p) => related(p),
+            InvalidationScope::Node(k) => related(&k.parent),
+            // `Connection`, and scopes added later.
+            _ => true,
+        }
+    }
+
     fn on_metadata_event(&mut self, event: &MetadataEvent, cx: &mut Context<Self>) {
         let MetadataEvent::Invalidated {
-            connection, reason, ..
+            connection,
+            scope,
+            reason,
         } = event
         else {
             return;
         };
-        if *connection != self.connection {
+        if *connection != self.connection || !self.covers(scope) {
             return;
         }
-        // What is shown stays; the lists reload when their tab is shown again.
-        self.tasks.clear();
-        for section in self.sections.values_mut() {
-            section.loading = false;
-            section.children = None;
-            if *reason == InvalidationReason::SessionClosed {
-                section.error = Some("The session is closed: reconnect to load it.".into());
+        if *reason == InvalidationReason::SessionClosed {
+            // What is shown stays readable; nothing more can load.
+            self.tasks.clear();
+            for section in self.sections.values_mut() {
+                section.loading = false;
+                if section.children.is_none() {
+                    section.error = Some("The session is closed: reconnect, then Refresh.".into());
+                }
             }
+            if matches!(self.ddl, DdlState::Loading) {
+                self.ddl =
+                    DdlState::Failed("The session is closed: reconnect, then Refresh.".into());
+            }
+            cx.notify();
+            return;
         }
-        if matches!(self.ddl, DdlState::Loading) {
-            self.ddl = DdlState::NotLoaded;
+        // The lists shown so far reload (the DDL text stays until Refresh).
+        let kinds: Vec<ObjectKind> = self.sections.keys().copied().collect();
+        for kind in kinds {
+            self.tasks.remove(&TaskKey::List(kind));
+            self.sections.insert(kind, Section::default());
+            self.load_section(kind, cx);
         }
         cx.notify();
     }
@@ -674,6 +697,11 @@ impl ObjectEditor {
                 .into_any_element(),
         }
     }
+}
+
+/// `true` when `path` is `prefix` or lies under it.
+fn is_under(path: &ObjectPath, prefix: &ObjectPath) -> bool {
+    path.0.len() >= prefix.0.len() && path.0[..prefix.0.len()] == prefix.0[..]
 }
 
 fn yes_no(b: bool) -> &'static str {

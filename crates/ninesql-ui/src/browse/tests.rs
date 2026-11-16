@@ -446,6 +446,27 @@ fn the_object_editor_shows_what_the_metadata_provides(cx: &mut TestAppContext) {
     });
     let ddl = editor.read_with(&f.vcx, |e, _| e.ddl_text().map(str::to_owned));
     assert!(ddl.is_some_and(|d| d.starts_with("CREATE TABLE \"t001\"")));
+    // Refresh reloads what is shown (no list or DDL left waiting).
+    f.vcx
+        .update(|window, cx| editor.update(cx, |e, cx| e.refresh(window, cx)));
+    let e = editor.clone();
+    wait_until(&mut f.vcx, |vcx| {
+        e.read_with(vcx, |e, _| e.ddl_text().is_some())
+    });
+    f.vcx.update(|window, cx| {
+        editor.update(cx, |e, cx| e.activate(ObjectTab::Columns, window, cx));
+    });
+    let e = editor.clone();
+    wait_until(&mut f.vcx, |vcx| {
+        e.read_with(vcx, |e, _| {
+            e.section(ObjectKind::Column)
+                .and_then(|s| s.children.as_ref())
+                .is_some_and(|c| c.items.len() == 2)
+        })
+    });
+    f.vcx.update(|window, cx| {
+        editor.update(cx, |e, cx| e.activate(ObjectTab::Ddl, window, cx));
+    });
     // "Copy DDL" on the active object editor.
     f.ws.update_in(&mut f.vcx, |ws, window, cx| ws.copy_object_ddl(window, cx));
     let copied = f.vcx.read_from_clipboard().and_then(|c| c.text());

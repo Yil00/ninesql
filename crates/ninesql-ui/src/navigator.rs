@@ -27,6 +27,7 @@ use gpui_kit::base::actions::{
     SelectRight, SelectUp,
 };
 use gpui_kit::component::ActiveTheme as _;
+use gpui_kit::component::menu::{ContextMenuExt as _, PopupMenu};
 use gpui_kit::component::tooltip::Tooltip;
 use gpui_kit::component::{h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder as _;
@@ -37,6 +38,12 @@ use ninesql_core::{
     NodeKey,
 };
 
+use crate::actions::{
+    ConfigureNavigatorFilters, CopyObjectDdl, FindObject, GenerateDeleteSql, GenerateInsertSql,
+    GenerateSelectSql, GenerateUpdateSql, LoadMoreObjects, OpenObjectEditor, RefreshNavigatorNode,
+    ShowObjectDdl,
+};
+use crate::browse::generate::Template;
 use crate::browse::tree::{Effect, Group, MetaTree, RevealStep, Row, RowKey, RowKind, TreeEnv};
 use crate::browse::{is_table_like, kind_plural};
 use crate::connections::hub::{ConnectionHub, MetadataUpdate, hub_or_install_empty};
@@ -850,8 +857,80 @@ impl Navigator {
                     this.toggle(ix, cx);
                 }
             }))
+            .on_mouse_down(
+                MouseButton::Right,
+                cx.listener(move |this, _, window, cx| {
+                    this.focus.focus(window, cx);
+                    this.select_index(Some(ix), cx);
+                }),
+            )
             .child(content)
+            .context_menu(self.row_menu(row))
             .into_any_element()
+    }
+
+    /// The context menu of a row: the actions that apply to it (the same actions as the key
+    /// bindings and the palette, dispatched from the navigator).
+    fn row_menu(
+        &self,
+        row: &Row,
+    ) -> impl Fn(PopupMenu, &mut Window, &mut Context<PopupMenu>) -> PopupMenu + 'static {
+        let focus = self.focus.clone();
+        let hub = self.hub.clone();
+        let object = self
+            .tree
+            .object(row)
+            .map(|o| (MetaTree::connection_of(row), o.path.clone()));
+        let incomplete = MetaTree::group_of(row)
+            .and_then(|g| self.tree.group_state(g.connection, &g.key))
+            .and_then(|s| s.children.as_ref())
+            .is_some_and(|c| !c.complete);
+        let is_folder = matches!(row.kind, RowKind::Folder { .. });
+        move |menu, _window, cx| {
+            if is_folder {
+                return menu;
+            }
+            let mut menu = menu.action_context(focus.clone());
+            if let Some((connection, path)) = &object {
+                let kind = path.kind();
+                if kind.is_some_and(is_table_like) {
+                    menu = menu.menu("Open object editor", Box::new(OpenObjectEditor));
+                    menu = menu.separator();
+                    for (t, action) in [
+                        (
+                            Template::Select,
+                            Box::new(GenerateSelectSql) as Box<dyn Action>,
+                        ),
+                        (Template::Insert, Box::new(GenerateInsertSql)),
+                        (Template::Update, Box::new(GenerateUpdateSql)),
+                        (Template::Delete, Box::new(GenerateDeleteSql)),
+                    ] {
+                        if kind.is_some_and(|k| t.applies_to(k)) {
+                            menu = menu.menu(format!("Generate SQL: {}", t.label()), action);
+                        }
+                    }
+                }
+                let ddl = match (connection, kind, hub.read(cx).metadata()) {
+                    (Some(c), Some(k), Some(m)) => m.supports_ddl(*c, k),
+                    _ => false,
+                };
+                if ddl {
+                    menu = menu
+                        .menu("Show DDL", Box::new(ShowObjectDdl))
+                        .menu("Copy DDL", Box::new(CopyObjectDdl));
+                }
+                menu = menu.separator();
+            }
+            if incomplete {
+                menu = menu.menu("Load more objects", Box::new(LoadMoreObjects));
+            }
+            menu.menu("Refresh navigator node", Box::new(RefreshNavigatorNode))
+                .menu(
+                    "Configure navigator filters",
+                    Box::new(ConfigureNavigatorFilters),
+                )
+                .menu("Find object", Box::new(FindObject))
+        }
     }
 
     fn render_connection(&self, id: ConnectionId, cx: &App) -> AnyElement {
