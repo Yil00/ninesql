@@ -13,9 +13,11 @@
 //!   connection type.
 //!
 //!   **What this does not block**: the checks are lexical. A function call with side effects
-//!   that the dialect's classifier reads as a read passes (PostgreSQL `pg_advisory_lock`,
-//!   `pg_notify`, `pg_terminate_backend`, `set_config`, `dblink_exec`; MySQL `SLEEP`,
-//!   `BENCHMARK`, `GET_LOCK` where the dialect does not flag it; user functions that write).
+//!   that the dialect's classifier reads as a read passes: a user-defined function that
+//!   writes, or a built-in missing from the classifier's side-effect lists. The known
+//!   built-ins (`pg_advisory_lock`, `pg_notify`, `pg_sleep`, `pg_read_file`, `set_config`,
+//!   `dblink_exec`; MySQL `SLEEP`, `BENCHMARK`, `GET_LOCK`, `LOAD_FILE`) are `Unknown` and
+//!   therefore refused here.
 //!   On a read-only session the engine refuses writes (I3); elsewhere such a filter runs like
 //!   any statement the user types. Listing more functions is a classifier (driver-API) change.
 //! - Nothing here logs a value or the raw text; `Debug` shows counts only.
