@@ -944,3 +944,34 @@ fn leases_wait_for_running_commands_and_block_metadata() {
         assert!(!matches!(r, Err(MetadataError::SessionLeased)), "{r:?}");
     });
 }
+
+/// L7 (P5-C review of the P5-B integration): with the real pgwire dialect, the "SQL INSERT"
+/// export writes a text holding a backslash or a quote as an `E'…'` string, which reads the same
+/// whether `standard_conforming_strings` is on or off when the file is replayed.
+#[test]
+fn sql_insert_literals_survive_postgresql_lexical_modes() {
+    use ninesql_core::driver_api::arrow_array::{RecordBatch, StringArray};
+    use ninesql_core::driver_api::arrow_schema::{DataType, Field, Schema};
+    use ninesql_core::driver_api::{Driver, EngineId as ApiEngine};
+    use ninesql_core::transfer::{DialectSql, SqlLiteralRenderer};
+
+    let dialect = ninesql_driver_pgwire::PgWireDriver::new()
+        .dialect(&ApiEngine::POSTGRESQL)
+        .unwrap();
+    let sql = DialectSql::new(dialect);
+    let batch = RecordBatch::try_new(
+        Arc::new(Schema::new(vec![Field::new("v", DataType::Utf8, true)])),
+        vec![Arc::new(StringArray::from(vec![
+            Some("a\\'; --"),
+            Some("plain"),
+        ]))],
+    )
+    .unwrap();
+    let tuple = sql.row_values(&["t".into()], &batch, 0).unwrap();
+    // Backslash doubled inside `E'…'`, quote doubled: the same text in either mode.
+    assert_eq!(tuple, r"(E'a\\''; --')");
+    assert_eq!(
+        sql.row_values(&["t".into()], &batch, 1).unwrap(),
+        "('plain')"
+    );
+}
