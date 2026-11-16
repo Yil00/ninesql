@@ -15,6 +15,7 @@ mod error;
 pub mod execution;
 pub mod history;
 pub mod import;
+pub mod metadata;
 pub mod preferences;
 pub mod properties;
 pub mod registry;
@@ -43,6 +44,12 @@ pub use import::{
     ImportPreview, ImportReportFile, ImportSource, ImportStatus, Importer, PlanAction,
     PreviewWorkspace, ProjectPreview, SecretChange, SecretChangeKind, SecretToMove, TlsChange,
     TypeAction, TypePlan, UpdateDiff,
+};
+pub use metadata::{
+    CacheStats, CompletionSnapshot, ConnectionFilters, InvalidationReason, InvalidationScope,
+    KindFilter, MetadataConfig, MetadataError, MetadataEvent, MetadataEvents, MetadataRequest,
+    MetadataService, NodeChildren, NodeKey, ObjectDdl, Prefetch, PrefetchLimits, PrefetchSummary,
+    SearchHit, SearchRequest, SearchResults,
 };
 pub use preferences::{
     ConfirmationPreferences, ExecutionPreferences, HistoryPreferences, OnError, PreferenceChange,

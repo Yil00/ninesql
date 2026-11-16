@@ -965,6 +965,43 @@ impl Workspace {
         )?)
     }
 
+    /// Loads the navigator filters (`navigator.json`, F-NAV-04); a missing file means no
+    /// filter. Entries with an unknown kind or an invalid pattern are dropped and returned.
+    ///
+    /// # Errors
+    /// Storage errors (a newer `schema_version` included; the file is left untouched).
+    pub fn load_navigator_filters(
+        &self,
+    ) -> Result<
+        (
+            crate::metadata::NavigatorFilters,
+            Vec<crate::metadata::FilterIssue>,
+        ),
+        WorkspaceError,
+    > {
+        let path = self.project_paths.navigator_file();
+        Ok(
+            match document::load::<crate::metadata::NavigatorFile>(&path)? {
+                Some(loaded) => crate::metadata::NavigatorFilters::from_file(loaded.document),
+                None => Default::default(),
+            },
+        )
+    }
+
+    /// Atomically writes `navigator.json`.
+    ///
+    /// # Errors
+    /// Storage errors.
+    pub fn save_navigator_filters(
+        &self,
+        filters: &crate::metadata::NavigatorFilters,
+    ) -> Result<(), WorkspaceError> {
+        Ok(document::save(
+            &self.project_paths.navigator_file(),
+            &filters.to_file(),
+        )?)
+    }
+
     /// Creates a connection: each secret goes to `store` and the matching credential field of
     /// `connection` is pointed at it; then `connections.json` is saved.
     ///

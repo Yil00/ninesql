@@ -18,7 +18,9 @@
 //! 7. reads the execution preferences from `settings.toml` ([`crate::preferences`]), opens the
 //!    query history (`history.sqlite`, [`crate::history`]; a history that cannot be opened is
 //!    reported by [`CoreServices::history_error`], not an error) and builds the
-//!    [`ExecutionService`] (P3-C).
+//!    [`ExecutionService`] (P3-C);
+//! 8. builds the [`MetadataService`] (P4-B) with the project's navigator filters
+//!    (`navigator.json`).
 //!
 //! The UI holds the returned [`CoreServices`] (cheap to clone) and calls:
 //! - [`CoreServices::sessions`] / [`CoreServices::take_events`] to open sessions and read events;
@@ -30,7 +32,9 @@
 //!   (P2-B / P2-C, [`crate::import`]);
 //! - [`CoreServices::lock_watcher_status`] to say whether sleep / screen lock are watched;
 //! - [`CoreServices::execution`] to run statements and scripts, read the history and the
-//!   preferences; [`CoreServices::save_preferences`] to change them (P3-C).
+//!   preferences; [`CoreServices::save_preferences`] to change them (P3-C);
+//! - [`CoreServices::metadata`] for the navigator tree, DDL, filters, quick search and the
+//!   editor's completion data (P4-B).
 //!
 //! Every call that may block (store access, Argon2id, file I/O) runs on the runtime's blocking
 //! pool and answers through a [`Reply`]; nothing here blocks the caller, except
@@ -55,6 +59,7 @@ use crate::history::History;
 use crate::import::{
     ImportCancel, ImportChoices, ImportError, ImportOutcome, ImportPreview, ImportSource, Importer,
 };
+use crate::metadata::{MetadataConfig, MetadataService};
 use crate::preferences::{self, PreferenceChange, PreferenceIssue, Preferences, PreferencesError};
 use crate::registry::DriverRegistry;
 use crate::session::{
@@ -187,6 +192,8 @@ struct Inner {
     watcher_error: Option<String>,
     timer: Mutex<Option<JoinHandle<()>>>,
     execution: ExecutionService,
+    metadata: MetadataService,
+    navigator_issues: Vec<String>,
     history_error: Option<String>,
     preference_issues: Vec<PreferenceIssue>,
     paths: Paths,
@@ -405,6 +412,26 @@ impl CoreServices {
         };
         let execution = ExecutionService::new(manager.clone(), history, prefs);
 
+        // 8. Metadata service (P4-B), with the project's navigator filters. A filter file that
+        // cannot be read is reported, never fatal: the navigator then shows everything.
+        let (metadata, navigator_issues) = match MetadataService::with_workspace(
+            manager.clone(),
+            MetadataConfig::default(),
+            workspace.clone(),
+        ) {
+            Ok((service, issues)) => (
+                service,
+                issues.iter().map(|i| i.error.to_string()).collect(),
+            ),
+            Err(e) => {
+                tracing::warn!(error = %e, "navigator.json cannot be read; no navigator filter");
+                (
+                    MetadataService::new(manager.clone(), MetadataConfig::default()),
+                    vec![e.to_string()],
+                )
+            }
+        };
+
         Ok(Self {
             inner: Arc::new(Inner {
                 workspace,
@@ -420,6 +447,8 @@ impl CoreServices {
                 watcher_error,
                 timer: Mutex::new(Some(timer)),
                 execution,
+                metadata,
+                navigator_issues,
                 history_error,
                 preference_issues,
                 paths,
@@ -578,6 +607,20 @@ impl CoreServices {
     #[must_use]
     pub fn execution(&self) -> &ExecutionService {
         &self.inner.execution
+    }
+
+    /// The metadata service (P4-B): navigator nodes, DDL, filters, search and completion
+    /// snapshots ([`crate::metadata`]).
+    #[must_use]
+    pub fn metadata(&self) -> &MetadataService {
+        &self.inner.metadata
+    }
+
+    /// Navigator filter entries dropped at startup (invalid or unreadable `navigator.json`),
+    /// as presentable messages that never echo a pattern.
+    #[must_use]
+    pub fn navigator_filter_issues(&self) -> &[String] {
+        &self.inner.navigator_issues
     }
 
     /// The query history, when it could be opened ([`Self::history_error`] says why not).
