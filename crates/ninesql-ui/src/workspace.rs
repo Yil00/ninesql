@@ -1917,7 +1917,7 @@ impl Workspace {
         if which.writes() && self.session_is_read_only(connection, cx) {
             return Self::notify(READ_ONLY_TEMPLATES, window, cx);
         }
-        if !names_survive_editor(&path, &[]) {
+        if !names_survive_editor(&path, &TemplateInput::none()) {
             return Self::notify(UNSAFE_NAMES, window, cx);
         }
         let kinds = service.child_kinds(connection, &path).unwrap_or_default();
@@ -1993,7 +1993,7 @@ impl Workspace {
         }
         // The editor strips or rewrites control characters and line separators: a template
         // with such a name would target another object than the one shown (M2).
-        if !names_survive_editor(path, &input.columns) {
+        if !names_survive_editor(path, input) {
             return Self::notify(UNSAFE_NAMES, window, cx);
         }
         let dialect = session.dialect();
