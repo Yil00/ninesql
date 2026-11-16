@@ -8,6 +8,7 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
+use ninesql_core::dbeaver::export::ExportTarget;
 use ninesql_core::{
     Auth, ClientCertificate, Connection, ConnectionTypeId, ConnectionTypes, Connections, Endpoint,
     EngineId, HostKeyPolicy, SecretSlot, SecretSource, SshAuth, SshHop, SshTunnel, Workspace,
@@ -525,4 +526,73 @@ fn failed_load_still_removes_secrets_from_disk() {
     assert!(text.contains("bad host with spaces"), "{text}");
     assert!(text.contains("\"application_name\": \"NineSQL\""), "{text}");
     assert_private_tree(&env.root.join("data"));
+}
+
+/// P5-D core wiring: exporting connections with saved secrets to a new DBeaver file or project
+/// folder writes no secret there, nor in the NineSQL directories, nor in the logs (I1).
+#[test]
+fn dbeaver_export_never_writes_a_secret() {
+    let all = [DB_PASSWORD, SSH_PASSWORD, KEY_PASSPHRASE, TLS_PASSPHRASE];
+    without_secret_in_logs(&all, || {
+        let env = env();
+        let mut connections = Connections::default();
+        let id = env
+            .workspace
+            .create_connection(
+                &mut connections,
+                full_connection(),
+                secrets(),
+                StoreKind::Keyring,
+                &env.stores,
+            )
+            .unwrap();
+        env.workspace
+            .save_connection_types(&ConnectionTypes::default())
+            .unwrap();
+        let out = tempfile::tempdir().unwrap();
+        let roots = ninesql_core::DbeaverRoots::none();
+        let file = ninesql_core::dbeaver_export::export_dbeaver_blocking(
+            &env.workspace,
+            &roots,
+            &[id],
+            &ExportTarget::File(out.path().join("data-sources-ninesql.json")),
+        )
+        .unwrap();
+        assert_eq!(file.report.exported_count(), 1);
+        let folder = ninesql_core::dbeaver_export::export_dbeaver_blocking(
+            &env.workspace,
+            &roots,
+            &[id],
+            &ExportTarget::ProjectFolder(out.path().join("NineSQL export")),
+        )
+        .unwrap();
+        assert_eq!(folder.report.exported_count(), 1);
+        assert!(
+            folder
+                .written
+                .data_sources
+                .ends_with(".dbeaver/data-sources.json")
+        );
+        assert_no_secret_on_disk(out.path(), &all);
+        assert_no_secret_on_disk(&env.root, &all);
+        let debug = format!("{file:?} {folder:?}");
+        for s in all {
+            assert!(!debug.contains(s));
+        }
+        // An existing target is never overwritten, and the folder holds no credentials file.
+        assert!(matches!(
+            ninesql_core::dbeaver_export::export_dbeaver_blocking(
+                &env.workspace,
+                &roots,
+                &[id],
+                &ExportTarget::File(out.path().join("data-sources-ninesql.json")),
+            ),
+            Err(ninesql_core::DbeaverExportError::Write(_))
+        ));
+        assert!(
+            !out.path()
+                .join("NineSQL export/.dbeaver/credentials-config.json")
+                .exists()
+        );
+    });
 }

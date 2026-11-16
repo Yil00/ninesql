@@ -63,9 +63,13 @@
 //!   import. (ADR candidate: one confirmation for a bulk write.)
 //! - **Statements.** Rows are sent as parameterized multi-row `INSERT`s (at most
 //!   [`MAX_ROWS_PER_INSERT`] rows and [`MAX_PARAMS_PER_INSERT`] parameters each), built by an
-//!   [`InsertRenderer`] (the P5-B integration point, [`ninesql_transfer::sql`]). Values are
-//!   converted to typed parameters from the target column types; nothing is spliced into SQL
-//!   text.
+//!   [`InsertRenderer`] ([`ninesql_transfer::sql`], with the P5-B identifier checks and
+//!   self-check). Values are converted to typed parameters from the target column types;
+//!   nothing is spliced into SQL text.
+//! - **SQL `INSERT` export.** Each row is rendered by the P5-B DML renderer
+//!   (`ninesql_driver_api::dml::insert_preview`, typed by the result's fields): literals read
+//!   the same in every lexical mode of the engine, and a value the driver cut at the value budget
+//!   fails the export instead of being written cut.
 //! - **Transactions.** [`ImportTransaction::AllOrNothing`] (default) runs the whole import in
 //!   one transaction, rolled back on any error or cancel; [`ImportTransaction::CommitEvery`]
 //!   commits every N rows (rows committed before an error stay). Engines without transactions
@@ -214,6 +218,10 @@ impl<E> fmt::Debug for Job<E> {
 }
 
 impl<E> Job<E> {
+    pub(crate) fn new(events: mpsc::Receiver<E>, cancel: CancelToken) -> Self {
+        Self { events, cancel }
+    }
+
     /// Stops the transfer: the running statement is cancelled, an export's partial file is
     /// removed, an import's transaction is rolled back. Never blocks; idempotent.
     pub fn cancel(&self) {
@@ -1316,7 +1324,7 @@ const LEASE_WAIT: Duration = Duration::from_secs(2);
 
 /// Leases `session`, waiting up to [`LEASE_WAIT`] for it to become idle; `None` when another
 /// transfer holds it or it stays busy (a running or paused statement).
-async fn acquire_lease(session: &SessionHandle) -> Option<SessionLease> {
+pub(crate) async fn acquire_lease(session: &SessionHandle) -> Option<SessionLease> {
     let deadline = Instant::now() + LEASE_WAIT;
     loop {
         if let Some(lease) = session.lease() {
@@ -1764,7 +1772,7 @@ impl ImportTask {
     }
 }
 
-async fn tx_op(
+pub(crate) async fn tx_op(
     reply: Reply<Result<crate::session::TransactionState, CoreError>>,
 ) -> Result<(), TransferJobError> {
     match reply.await {
