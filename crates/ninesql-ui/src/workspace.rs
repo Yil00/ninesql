@@ -29,7 +29,7 @@ use crate::actions::{
     ShowObjectDdl,
 };
 use crate::appearance;
-use crate::browse::generate::{Template, TemplateColumn, template};
+use crate::browse::generate::{KeySource, Template, TemplateInput, names_survive_editor, template};
 use crate::browse::object_editor::{ObjectEditor, ObjectEditorEvent};
 use crate::browse::search::{FindChoice, SearchScope, open_find_object};
 use crate::browse::{is_table_like, kind_singular};
@@ -1604,6 +1604,14 @@ impl Workspace {
     }
 }
 
+/// Refusal of a write template on a read-only session (I8).
+pub const READ_ONLY_TEMPLATES: &str =
+    "This session is read-only: only the SELECT template is offered.";
+/// Refusal of a template whose names the SQL editor would change (P4-B review M2).
+pub const UNSAFE_NAMES: &str = "This object or one of its columns has a name with control or line-separator characters that the SQL editor would change, so a template could target another object. No template was opened.";
+/// Show DDL with text the SQL editor would change (P4-B review M2).
+pub const UNSAFE_DDL: &str = "This DDL contains control or line-separator characters that the SQL editor would change: it is shown read-only in the object editor instead.";
+
 /// Metadata browsing (P4-B): the navigator's actions, "Find object", the object editor and
 /// "Generate SQL".
 impl Workspace {
@@ -1906,28 +1914,66 @@ impl Workspace {
                 cx,
             );
         };
-        let lists_columns = service
-            .child_kinds(connection, &path)
-            .is_ok_and(|k| k.contains(&ObjectKind::Column));
-        let key = NodeKey::new(path.clone(), ObjectKind::Column);
-        if !lists_columns {
-            return self.open_template(connection, &path, which, &[], window, cx);
+        if which.writes() && self.session_is_read_only(connection, cx) {
+            return Self::notify(READ_ONLY_TEMPLATES, window, cx);
         }
-        if let Some(c) = service.cached_children(connection, &key) {
-            let columns = TemplateColumn::from_infos(&c.items);
-            return self.open_template(connection, &path, which, &columns, window, cx);
+        if !names_survive_editor(&path, &[]) {
+            return Self::notify(UNSAFE_NAMES, window, cx);
         }
-        let request = service.children(connection, key);
+        let kinds = service.child_kinds(connection, &path).unwrap_or_default();
+        let columns = kinds
+            .contains(&ObjectKind::Column)
+            .then(|| service.children(connection, NodeKey::new(path.clone(), ObjectKind::Column)));
+        let constraints = kinds.contains(&ObjectKind::Constraint).then(|| {
+            service.children(
+                connection,
+                NodeKey::new(path.clone(), ObjectKind::Constraint),
+            )
+        });
         cx.spawn_in(window, async move |this, cx| {
-            let columns = request
-                .await
-                .map(|c| TemplateColumn::from_infos(&c.items))
-                .unwrap_or_default();
+            let columns = match columns {
+                Some(r) => Some(r.await),
+                None => None,
+            };
+            let constraints = match constraints {
+                Some(r) => Some(r.await),
+                None => None,
+            };
+            let input = match (&columns, &constraints) {
+                // A list that failed to load is not trusted (M3).
+                (Some(Err(_)), _) => TemplateInput {
+                    columns: Vec::new(),
+                    columns_complete: false,
+                    key: KeySource::Unknown,
+                },
+                (cols, cons) => {
+                    let cols = cols.as_ref().and_then(|r| r.as_ref().ok());
+                    let mut input = TemplateInput::from_nodes(
+                        cols.map(AsRef::as_ref),
+                        cons.as_ref()
+                            .and_then(|r| r.as_ref().ok())
+                            .map(AsRef::as_ref),
+                    );
+                    if matches!(cons, Some(Err(_))) && !matches!(input.key, KeySource::Known(_)) {
+                        input.key = KeySource::Unknown;
+                    }
+                    input
+                }
+            };
             let _ = this.update_in(cx, |ws, window, cx| {
-                ws.open_template(connection, &path, which, &columns, window, cx);
+                ws.open_template(connection, &path, which, &input, window, cx);
             });
         })
         .detach();
+    }
+
+    /// Whether the open session of `connection` is read-only.
+    fn session_is_read_only(&self, connection: ConnectionId, cx: &App) -> bool {
+        self.hub
+            .read(cx)
+            .sessions(connection)
+            .first()
+            .is_some_and(|s| s.info().read_only)
     }
 
     fn open_template(
@@ -1935,15 +1981,23 @@ impl Workspace {
         connection: ConnectionId,
         path: &ObjectPath,
         which: Template,
-        columns: &[TemplateColumn],
+        input: &TemplateInput,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         let Some(session) = self.hub.read(cx).sessions(connection).first().cloned() else {
             return Self::notify("The connection is not open any more.", window, cx);
         };
+        if which.writes() && session.info().read_only {
+            return Self::notify(READ_ONLY_TEMPLATES, window, cx);
+        }
+        // The editor strips or rewrites control characters and line separators: a template
+        // with such a name would target another object than the one shown (M2).
+        if !names_survive_editor(path, &input.columns) {
+            return Self::notify(UNSAFE_NAMES, window, cx);
+        }
         let dialect = session.dialect();
-        let text = template(which, path, columns, &|i: &str| dialect.quote_identifier(i));
+        let text = template(which, path, input, &|i: &str| dialect.quote_identifier(i));
         let name = path
             .leaf()
             .map(|s| crate::browse::display_name(&s.name))
@@ -1969,6 +2023,16 @@ impl Workspace {
             window,
             cx,
             |ws, connection, path, text, window, cx| {
+                if ninesql_editor::hygiene::needs_sanitizing(text) {
+                    // The editor would change it: show it read-only, unchanged (M2).
+                    ws.open_object_editor(connection, path.clone(), None, window, cx);
+                    if let Some(editor) = ws.active_object_editor().cloned() {
+                        editor.update(cx, |e, cx| {
+                            e.activate(crate::browse::object_editor::ObjectTab::Ddl, window, cx);
+                        });
+                    }
+                    return Self::notify(UNSAFE_DDL, window, cx);
+                }
                 let name = path
                     .leaf()
                     .map(|s| crate::browse::display_name(&s.name))
@@ -2027,7 +2091,8 @@ impl Workspace {
             let _ = this.update_in(cx, |ws, window, cx| match result {
                 Ok(d) => then(ws, connection, &path, &d.text, window, cx),
                 Err(e) => window.push_notification(
-                    Notification::error(e.to_string()).title("DDL not loaded"),
+                    Notification::error(crate::browse::display_message(&e.to_string()))
+                        .title("DDL not loaded"),
                     cx,
                 ),
             });

@@ -256,7 +256,7 @@ impl FilterDialog {
                         d.saved = true;
                         window.close_dialog(cx);
                     }
-                    Some(Err(e)) => d.error = Some(e.to_string()),
+                    Some(Err(e)) => d.error = Some(super::display_message(&e.to_string())),
                     None => {
                         d.error =
                             Some("The filters were not saved: the application is closing.".into())
@@ -311,7 +311,7 @@ impl Render for FilterDialog {
             .gap_3()
             .child(div().text_sm().text_color(muted).child(format!(
                 "Objects of \"{}\" shown in the navigator. Patterns use * and ?, separated by commas; an object is shown when it matches an include pattern (or there is none) and no exclude pattern.",
-                self.connection_name
+                super::display_name(&self.connection_name)
             )))
             .when(self.rows.is_empty(), |el| {
                 el.child(

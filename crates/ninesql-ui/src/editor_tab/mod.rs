@@ -336,7 +336,10 @@ impl SqlEditorTab {
             else {
                 return;
             };
-            *slot.borrow_mut() = schema.leaf().map(|s| s.name.clone());
+            *slot.borrow_mut() = schema
+                .leaf()
+                .map(|s| s.name.clone())
+                .filter(|n| crate::browse::completion::insertable(n));
             // Held by this task: dropping the task (rebind, close) cancels the prefetch.
             let _summary = service.warm_schema(connection, schema).await;
         }));

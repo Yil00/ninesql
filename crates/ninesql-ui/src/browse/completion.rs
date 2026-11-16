@@ -39,6 +39,14 @@ impl MetadataCompletion {
     }
 }
 
+/// Whether a name can be offered: the editor would strip or rewrite a name with control
+/// characters or line separators, so the inserted text would name another object (P4-B review
+/// M2). Such names are not offered.
+#[must_use]
+pub fn insertable(name: &str) -> bool {
+    !ninesql_editor::hygiene::needs_sanitizing(name)
+}
+
 fn editor_kind(kind: CoreKind) -> Option<ObjectKind> {
     match kind {
         CoreKind::Table | CoreKind::Collection => Some(ObjectKind::Table),
@@ -51,7 +59,13 @@ fn editor_kind(kind: CoreKind) -> Option<ObjectKind> {
 impl MetadataProvider for MetadataCompletion {
     fn schemas(&self) -> Vec<String> {
         self.snapshot()
-            .map(|s| s.schemas().to_vec())
+            .map(|s| {
+                s.schemas()
+                    .iter()
+                    .filter(|n| insertable(n))
+                    .cloned()
+                    .collect()
+            })
             .unwrap_or_default()
     }
 
@@ -68,6 +82,7 @@ impl MetadataProvider for MetadataCompletion {
         snapshot
             .objects(schema)
             .iter()
+            .filter(|o| insertable(&o.name))
             .filter_map(|o| {
                 Some(ObjectEntry {
                     name: o.name.clone(),
@@ -90,6 +105,7 @@ impl MetadataProvider for MetadataCompletion {
         Some(
             columns
                 .iter()
+                .filter(|c| insertable(&c.name))
                 .map(|c| ColumnEntry {
                     name: c.name.clone(),
                     data_type: c.data_type.clone(),
@@ -132,4 +148,16 @@ pub async fn resolve_default_schema(
         parent = chosen.path.clone();
     }
     (!parent.0.is_empty()).then_some(parent)
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn names_the_editor_would_change_are_not_offered() {
+        assert!(super::insertable("orders"));
+        assert!(super::insertable("order items"));
+        for bad in ["orders\u{1}", "a\rb", "a\u{2028}b", "a\u{2029}"] {
+            assert!(!super::insertable(bad), "{bad:?}");
+        }
+    }
 }
