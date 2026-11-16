@@ -137,7 +137,7 @@ impl std::fmt::Debug for MySession {
 impl MySession {
     /// Sends a statement that passed the classify gate of `Session::execute` (this crate's
     /// tests also use it to skip the gate). Private: `class` is the dialect's classification.
-    async fn dispatch(
+    pub(crate) async fn dispatch(
         &mut self,
         statement: Statement,
         options: ExecOptions,
@@ -247,34 +247,85 @@ impl MySession {
 
     /// TiDB has no session read-only mode: `SET SESSION TRANSACTION READ ONLY` is a no-op
     /// that TiDB refuses by default (error 1235). A session is read-only only when the whole
-    /// instance refuses writes (`tidb_super_read_only` / `tidb_restricted_read_only`), read
-    /// back here and after every statement; anything else is refused, never faked (I3, I8).
-    /// Leaving read-only mode only clears the driver's flag: the instance stays as it is.
+    /// instance refuses writes (`tidb_super_read_only` / `tidb_restricted_read_only`) and the
+    /// refusal applies to this account: no `RESTRICTED_REPLICA_WRITER_ADMIN` / `SUPER` /
+    /// `ALL PRIVILEGES ON *.*` in `SHOW GRANTS`, and a write probe refused with 1836
+    /// ([`crate::tidb`]). The instance's mode and the active roles are read back after every
+    /// statement; anything else is refused, never faked (I3, I8). Leaving read-only mode only
+    /// clears the driver's flag: the instance stays as it is.
     async fn apply_tidb_read_only(&mut self, read_only: bool) -> DriverResult<()> {
+        let shared = Arc::clone(&self.link.shared);
         if !read_only {
-            self.link.shared.read_only.store(false, Ordering::SeqCst);
+            shared.read_only.store(false, Ordering::SeqCst);
+            *shared
+                .tidb_role
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
             return Ok(());
         }
-        let check = format!("SELECT {}", self.link.shared.ro_expr);
-        let value = self
+        let check = format!("SELECT {}, CURRENT_ROLE()", shared.ro_expr);
+        let row = self
             .run(&check)
             .await?
             .into_iter()
             .next()
-            .and_then(|r| r.into_iter().next())
-            .flatten();
-        if value.as_deref() == Some("1") {
-            self.link.shared.read_only.store(true, Ordering::SeqCst);
-            Ok(())
-        } else {
-            Err(DriverError::ReadOnly(
+            .unwrap_or_default();
+        if row.first().cloned().flatten().as_deref() != Some("1") {
+            return Err(DriverError::ReadOnly(
                 "TiDB has no session read-only mode (SET TRANSACTION READ ONLY is a no-op \
                  there), so a read-only session is refused unless the TiDB instance itself is \
                  read-only (tidb_super_read_only or tidb_restricted_read_only); use an account \
                  with SELECT privileges only, on a connection that is not read-only"
                     .into(),
-            ))
+            ));
         }
+        let Some(role) = row.get(1).cloned().flatten() else {
+            return Err(DriverError::ReadOnly(
+                "the TiDB session's active roles could not be read; read-only mode refused".into(),
+            ));
+        };
+        // The account's privileges, active roles expanded; a failed read is a refusal.
+        let grants = self
+            .link
+            .internal_limited("SHOW GRANTS", false, Some(64 * 1024), None)
+            .await
+            .map_err(|e| {
+                tracing::warn!(error = ?std::mem::discriminant(&e), "SHOW GRANTS failed");
+                DriverError::ReadOnly(
+                    "the account's privileges could not be read (SHOW GRANTS); read-only mode \
+                     refused"
+                        .into(),
+                )
+            })?;
+        if let Some(reason) = crate::tidb::grants_refusal(&grants) {
+            return Err(DriverError::ReadOnly(format!(
+                "{reason}, which lets it write while the TiDB instance is read-only, so a \
+                 read-only session is refused; use an account with SELECT privileges only"
+            )));
+        }
+        // The probe changes nothing whatever the account; only error 1836 proves the gate.
+        let probe = self.run(crate::tidb::WRITE_PROBE).await;
+        let gated = crate::tidb::probe_gated(&probe);
+        // A manual-commit session may count the failed statement as the start of a
+        // transaction: nothing was written, end it (no user transaction is open here:
+        // `set_read_only` refuses inside one, and connect has run no user statement yet).
+        if shared.in_transaction() {
+            self.run("ROLLBACK").await?;
+        }
+        if !gated {
+            return Err(DriverError::ReadOnly(
+                "the TiDB instance is read-only, but a write probe was not refused with \
+                 \"read-only mode\" for this account (it may hold a privilege that exempts it), \
+                 so a read-only session is refused; use an account with SELECT privileges only"
+                    .into(),
+            ));
+        }
+        *shared
+            .tidb_role
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(role);
+        shared.read_only.store(true, Ordering::SeqCst);
+        Ok(())
     }
 
     fn raw_stream(

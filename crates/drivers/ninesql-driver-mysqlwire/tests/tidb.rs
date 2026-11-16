@@ -240,6 +240,69 @@ async fn tidb_connects_and_other_engines_are_refused() {
     }
 }
 
+/// Dev-only password of the accounts created by the read-only test.
+const M1_PASSWORD: &str = "ninesql_m1_dev_only";
+
+/// Accounts for the read-only test (phase 4 review M1), created as `root` while the instance is
+/// writable. `ninesql_m1_repl` holds `RESTRICTED_REPLICA_WRITER_ADMIN`, with which TiDB lets it
+/// write on a read-only instance; `ninesql_m1_rolew` holds it through its default role;
+/// `ninesql_m1_dormant` has that role granted but not active; `ninesql_m1_super` holds `SUPER`.
+const M1_ACCOUNTS: &[&str] = &[
+    "DROP USER IF EXISTS ninesql_m1_repl, ninesql_m1_rolew, ninesql_m1_dormant, ninesql_m1_super",
+    "DROP ROLE IF EXISTS ninesql_m1_writer",
+    "CREATE ROLE ninesql_m1_writer",
+    "GRANT RESTRICTED_REPLICA_WRITER_ADMIN ON *.* TO ninesql_m1_writer",
+    "CREATE USER ninesql_m1_repl IDENTIFIED BY 'ninesql_m1_dev_only'",
+    "CREATE USER ninesql_m1_rolew IDENTIFIED BY 'ninesql_m1_dev_only'",
+    "CREATE USER ninesql_m1_dormant IDENTIFIED BY 'ninesql_m1_dev_only'",
+    "CREATE USER ninesql_m1_super IDENTIFIED BY 'ninesql_m1_dev_only'",
+    "GRANT SELECT, INSERT, DELETE ON nine.* TO ninesql_m1_repl, ninesql_m1_rolew, \
+     ninesql_m1_dormant, ninesql_m1_super",
+    "GRANT RESTRICTED_REPLICA_WRITER_ADMIN ON *.* TO ninesql_m1_repl",
+    "GRANT SUPER ON *.* TO ninesql_m1_super",
+    "GRANT ninesql_m1_writer TO ninesql_m1_rolew, ninesql_m1_dormant",
+    "SET DEFAULT ROLE ninesql_m1_writer TO ninesql_m1_rolew",
+];
+
+const M1_DROP: &[&str] = &[
+    "DROP USER IF EXISTS ninesql_m1_repl, ninesql_m1_rolew, ninesql_m1_dormant, ninesql_m1_super",
+    "DROP ROLE IF EXISTS ninesql_m1_writer",
+];
+
+fn m1_params(dev: &Dev, user: &str, read_only: bool) -> ConnectParams {
+    let mut p = params(dev);
+    p.auth = Auth::password(user, Some(Secret::new(M1_PASSWORD.into())));
+    p.read_only = read_only;
+    p
+}
+
+async fn run_all(p: ConnectParams, sqls: &[&str]) {
+    let mut s = connect(p).await;
+    for sql in sqls {
+        if let Err(e) = run(s.as_mut(), sql).await {
+            panic!("{sql:?}: {e}");
+        }
+    }
+    s.close().await.unwrap();
+}
+
+/// A read-only session must be refused for `user`, naming why.
+async fn assert_read_only_refused(p: ConnectParams, user: &str, reason: &str) {
+    match MySqlWireDriver::new().connect(p).await {
+        Err(DriverError::ReadOnly(m)) => {
+            assert!(m.contains(reason), "{user}: {m}");
+            assert!(
+                !m.contains(M1_PASSWORD) && !m.contains(ROOT_PASSWORD),
+                "{m}"
+            );
+        }
+        other => panic!(
+            "{user}: read-only session accepted for an account TiDB lets write: {:?}",
+            other.map(|_| ())
+        ),
+    }
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn read_only_needs_a_read_only_instance_and_is_enforced_engine_side() {
     let Some(dev) = dev() else { return };
@@ -263,6 +326,17 @@ async fn read_only_needs_a_read_only_instance_and_is_enforced_engine_side() {
             other.map(|_| ())
         ),
     }
+    // Fixtures and accounts, while the instance is writable.
+    run_all(params(&dev), BROWSE_FIXTURE).await;
+    run_all(
+        params(&dev),
+        &[
+            "DROP TABLE IF EXISTS ninesql_m1_written",
+            "CREATE TABLE ninesql_m1_written (a INT)",
+        ],
+    )
+    .await;
+    run_all(root_params(&dev), M1_ACCOUNTS).await;
     let body = async {
         set_instance_read_only(&dev, true).await;
         // Client-side refusals in a read-only session.
@@ -276,14 +350,8 @@ async fn read_only_needs_a_read_only_instance_and_is_enforced_engine_side() {
             .await
             .unwrap();
         assert_eq!(scalar(&c).as_deref(), Some("10000"));
-        // Metadata works on the read-only session.
-        let schema = ObjectPath::root().child(ObjectKind::Schema, &dev.database);
-        let tables = ro
-            .metadata()
-            .list(&schema, ObjectKind::Table, PageRequest::first())
-            .await
-            .unwrap();
-        assert!(tables.items.len() >= 6);
+        // The "nine" dataset browses fully on the read-only session (phase 4 exit criterion).
+        assert_nine_browses_read_only(ro.as_ref(), &dev).await;
         // Engine-side: a session not marked read-only cannot write either (error 1836).
         let mut rw = connect(params(&dev)).await;
         for sql in [
@@ -297,8 +365,72 @@ async fn read_only_needs_a_read_only_instance_and_is_enforced_engine_side() {
             );
         }
         rw.close().await.unwrap();
+
+        // Phase 4 review M1: accounts the instance's mode does not stop are refused.
+        // `RESTRICTED_REPLICA_WRITER_ADMIN` really writes on the read-only instance...
+        let mut repl = connect(m1_params(&dev, "ninesql_m1_repl", false)).await;
+        let c = run(repl.as_mut(), "INSERT INTO ninesql_m1_written VALUES (1)")
+            .await
+            .unwrap();
+        assert_eq!(c.counts, [Some(1)]);
+        run(repl.as_mut(), "DELETE FROM ninesql_m1_written")
+            .await
+            .unwrap();
+        repl.close().await.unwrap();
+        // ...so its read-only session is refused, directly or through an active role.
+        for user in ["ninesql_m1_repl", "ninesql_m1_rolew"] {
+            assert_read_only_refused(
+                m1_params(&dev, user, true),
+                user,
+                "RESTRICTED_REPLICA_WRITER_ADMIN",
+            )
+            .await;
+        }
+        // `SUPER` and `ALL PRIVILEGES ON *.*` (root) are refused too.
+        assert_read_only_refused(
+            m1_params(&dev, "ninesql_m1_super", true),
+            "ninesql_m1_super",
+            "SUPER",
+        )
+        .await;
+        let mut p = root_params(&dev);
+        p.read_only = true;
+        assert_read_only_refused(p, "root", "ALL PRIVILEGES").await;
+        // A role granted but not active: accepted, and it cannot be enabled.
+        let mut dormant = connect(m1_params(&dev, "ninesql_m1_dormant", true)).await;
+        assert!(dormant.is_read_only());
+        for sql in [
+            "SET ROLE ALL",
+            "SET ROLE ninesql_m1_writer",
+            "SET DEFAULT ROLE ALL TO ninesql_m1_dormant",
+            "GRANT RESTRICTED_REPLICA_WRITER_ADMIN ON *.* TO ninesql_m1_dormant",
+            "INSERT INTO ninesql_m1_written VALUES (1)",
+        ] {
+            assert!(
+                matches!(
+                    run(dormant.as_mut(), sql).await,
+                    Err(DriverError::ReadOnly(_))
+                ),
+                "{sql}"
+            );
+        }
+        let c = run(dormant.as_mut(), "SELECT CURRENT_ROLE()")
+            .await
+            .unwrap();
+        assert_eq!(scalar(&c).as_deref(), Some("NONE"));
+        dormant.close().await.unwrap();
+        // A manual-commit read-only session: the write probe leaves no transaction open.
+        let mut p = params(&dev);
+        p.read_only = true;
+        p.auto_commit = false;
+        let mut manual = connect(p).await;
+        assert!(manual.is_read_only());
+        assert!(!manual.in_transaction());
+        run(manual.as_mut(), "SELECT 1").await.unwrap();
+        manual.close().await.unwrap();
+
         // A privileged user lifts the instance's mode: the read-only session notices it after
-        // its next statement and closes.
+        // a statement run once the change has propagated, and closes.
         let mut root = connect(root_params(&dev)).await;
         run(root.as_mut(), "SET GLOBAL tidb_super_read_only = 0")
             .await
@@ -323,6 +455,16 @@ async fn read_only_needs_a_read_only_instance_and_is_enforced_engine_side() {
     };
     let outcome = std::panic::AssertUnwindSafe(body).catch_unwind().await;
     set_instance_read_only(&dev, false).await;
+    run_all(root_params(&dev), M1_DROP).await;
+    run_all(
+        params(&dev),
+        &[
+            "DROP SEQUENCE IF EXISTS ninesql_p4c_seq",
+            "DROP TABLE IF EXISTS ninesql_p4c_part",
+            "DROP TABLE IF EXISTS ninesql_m1_written",
+        ],
+    )
+    .await;
     if let Err(panic) = outcome {
         std::panic::resume_unwind(panic);
     }
@@ -550,22 +692,21 @@ fn names(items: &[ObjectInfo]) -> Vec<String> {
         .collect()
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn nine_dataset_browses_fully() {
-    let Some(dev) = dev() else { return };
-    let _shared = INSTANCE.read().await;
-    let mut w = connect(params(&dev)).await;
-    for sql in [
-        "DROP SEQUENCE IF EXISTS ninesql_p4c_seq",
-        "CREATE SEQUENCE ninesql_p4c_seq START WITH 10 INCREMENT BY 5",
-        "DROP TABLE IF EXISTS ninesql_p4c_part",
-        "CREATE TABLE ninesql_p4c_part (id INT, y INT) PARTITION BY RANGE (y) \
-         (PARTITION p0 VALUES LESS THAN (2000), PARTITION p1 VALUES LESS THAN MAXVALUE)",
-    ] {
-        run(w.as_mut(), sql).await.unwrap();
-    }
-    let caps = w.capabilities().clone();
-    let m = w.metadata();
+/// Objects the read-only browse expects besides the "nine" dataset, created while the
+/// instance is writable.
+const BROWSE_FIXTURE: &[&str] = &[
+    "DROP SEQUENCE IF EXISTS ninesql_p4c_seq",
+    "CREATE SEQUENCE ninesql_p4c_seq START WITH 10 INCREMENT BY 5",
+    "DROP TABLE IF EXISTS ninesql_p4c_part",
+    "CREATE TABLE ninesql_p4c_part (id INT, y INT) PARTITION BY RANGE (y) \
+     (PARTITION p0 VALUES LESS THAN (2000), PARTITION p1 VALUES LESS THAN MAXVALUE)",
+];
+
+/// Phase 4 exit criterion: the "nine" dataset browses fully on a read-only session (the
+/// instance read-only), every node and every declared DDL.
+async fn assert_nine_browses_read_only(ro: &dyn Session, dev: &Dev) {
+    assert!(ro.is_read_only());
+    let m = ro.metadata();
     assert_eq!(
         m.child_kinds(Some(ObjectKind::Schema)),
         vec![ObjectKind::Table, ObjectKind::View, ObjectKind::Sequence]
@@ -611,32 +752,13 @@ async fn nine_dataset_browses_fully() {
         names(&all(m.as_ref(), &part, ObjectKind::Partition).await),
         ["p0", "p1"]
     );
-    // Every declared kind of every object lists, and every declared DDL generates.
-    let mut visited = 0;
-    let mut stack = vec![schema.clone()];
-    while let Some(parent) = stack.pop() {
-        for kind in m.child_kinds(parent.kind()) {
-            assert!(caps.metadata.kinds.contains(&kind), "{kind:?}");
-            for item in all(m.as_ref(), &parent, kind).await {
-                visited += 1;
-                if caps.metadata.ddl.contains(&kind) {
-                    assert!(!m.ddl(&item.path).await.unwrap().is_empty());
-                }
-                if !m.child_kinds(Some(kind)).is_empty() {
-                    stack.push(item.path.clone());
-                }
-            }
-        }
-    }
-    assert!(visited > 40, "{visited}");
-    assert!(!m.ddl(&schema).await.unwrap().is_empty());
-    for sql in [
-        "DROP SEQUENCE ninesql_p4c_seq",
-        "DROP TABLE ninesql_p4c_part",
-    ] {
-        run(w.as_mut(), sql).await.unwrap();
-    }
-    w.close().await.unwrap();
+    // Every declared kind of every object lists, and every declared DDL generates (the
+    // schema's included).
+    let r = conformance::assert_read_only_browse(ro, schema, &|_| false).await;
+    assert!(r.visited > 40, "{r:?}");
+    assert!(r.count(ObjectKind::Partition) >= 2, "{r:?}");
+    assert!(r.count(ObjectKind::Sequence) >= 1, "{r:?}");
+    assert!(r.ddl >= 9, "{r:?}");
 }
 
 #[test]
@@ -671,6 +793,26 @@ fn tidb_dialect_overrides() {
         d.classify("SET GLOBAL tidb_restricted_read_only = OFF")
             >= StatementClass::ChangesAccessMode
     );
+    // Role and privilege changes are refused in a read-only session (phase 4 review M1: a
+    // role may hold RESTRICTED_REPLICA_WRITER_ADMIN, which TiDB's read-only mode exempts).
+    for sql in [
+        "SET ROLE ALL",
+        "SET ROLE DEFAULT",
+        "SET ROLE NONE",
+        "SET ROLE 'r'@'%'",
+        "set role `r`",
+        "SET DEFAULT ROLE ALL TO u",
+        "SET PASSWORD = 'x'",
+        "GRANT RESTRICTED_REPLICA_WRITER_ADMIN ON *.* TO u",
+        "GRANT r TO u",
+        "REVOKE SELECT ON *.* FROM u",
+        "CREATE ROLE r",
+        "DROP ROLE r",
+        "CREATE USER u",
+        "ALTER USER u ACCOUNT UNLOCK",
+    ] {
+        assert!(d.classify(sql).is_write(), "{sql}: {:?}", d.classify(sql));
+    }
     // Sequences and user-level locks: side effects a `SELECT` can carry (security review L4),
     // on every engine of the family.
     for d in [&d as &dyn Dialect, &my, &MyDialect::mariadb()] {

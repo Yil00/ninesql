@@ -25,7 +25,9 @@
 //!   by a read-back; after every statement `transaction_read_only` is read back and the session
 //!   is closed if it was lifted. TiDB has no session read-only mode: a read-only session needs
 //!   a read-only TiDB instance (`tidb_super_read_only` / `tidb_restricted_read_only`), read
-//!   back the same way, and is refused otherwise.
+//!   back the same way, and an account that mode covers (no `RESTRICTED_REPLICA_WRITER_ADMIN`
+//!   or `SUPER` in `SHOW GRANTS`, and a write probe refused with 1836; `tidb` module), and is
+//!   refused otherwise.
 //! - **Execute**: text protocol, one statement per call, parameters inlined as inert literals
 //!   (hexadecimal, digits, fixed date formats); results streamed as Arrow batches, values cut
 //!   to the budget while they are read.
@@ -40,6 +42,7 @@ mod dialect;
 mod metadata;
 mod proto;
 mod session;
+mod tidb;
 mod tls;
 mod types;
 

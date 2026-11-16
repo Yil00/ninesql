@@ -65,6 +65,9 @@ pub(crate) struct Shared {
     pub(crate) ro_expr: &'static str,
     /// TiDB: the read-only mode is the instance's, never set by the driver (P4-C).
     pub(crate) tidb: bool,
+    /// TiDB read-only session: `CURRENT_ROLE()` when read-only mode was checked; read back
+    /// after every statement, a change closes the session (`crate::tidb`).
+    pub(crate) tidb_role: Mutex<Option<String>>,
 }
 
 /// TiDB's access mode: `1` when the instance refuses writes from every user
@@ -82,6 +85,7 @@ impl Shared {
             read_only: AtomicBool::new(false),
             ro_expr,
             tidb,
+            tidb_role: Mutex::new(None),
         }
     }
 
@@ -427,10 +431,14 @@ impl Actor {
         if !read_only && !force {
             return Ok(());
         }
+        // TiDB read-only: the active roles too (a role may hold a privilege that exempts the
+        // account from the instance's read-only mode, `crate::tidb`).
+        let tidb_ro = read_only && self.shared.tidb;
         let sql = format!(
             "SELECT @@SESSION.sql_mode, @@SESSION.character_set_client, \
-             @@SESSION.character_set_connection, @@SESSION.character_set_results, {}",
-            self.shared.ro_expr
+             @@SESSION.character_set_connection, @@SESSION.character_set_results, {}{}",
+            self.shared.ro_expr,
+            if tidb_ro { ", CURRENT_ROLE()" } else { "" }
         );
         let mut rows = self.internal(&sql).await;
         // A late `KILL QUERY` can interrupt the read-back itself: try once more.
@@ -468,6 +476,20 @@ impl Actor {
                 "a statement turned the session's read-only mode off; the session was closed"
                     .into(),
             ));
+        }
+        if tidb_ro {
+            let expected = self
+                .shared
+                .tidb_role
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .clone();
+            if expected.is_none() || cell(5) != expected {
+                self.close_session("active roles changed");
+                return Err(DriverError::ReadOnly(
+                    "a statement changed the session's active roles; the session was closed".into(),
+                ));
+            }
         }
         if read_only && !self.shared.tidb {
             // (TiDB: no session mode to re-assert; the instance's mode was read back above.)
