@@ -796,12 +796,13 @@ async fn stop_during_the_implicit_commit_ends_it() {
         elapsed < Duration::from_secs(4),
         "the run took {elapsed:?} to end"
     );
-    match outcome {
-        Some(DriverError::Cancelled) => {}
-        // Closing the session is the allowed fail-closed outcome.
-        Some(DriverError::Closed(_)) => return,
-        other => panic!("unexpected outcome {other:?}"),
-    }
+    // On the dev engine the driver's cancel of the COMMIT lands: the run must end cancelled
+    // with the session kept. Closing the session would be the fail-closed outcome elsewhere,
+    // but here it would hide a cancel that never reached the server (security review L-1).
+    assert!(
+        matches!(outcome, Some(DriverError::Cancelled)),
+        "unexpected outcome {outcome:?}"
+    );
     // Usable and idle: the write was rolled back and nothing is left open.
     let c = run_when_idle(s.as_mut(), "SELECT count(*)::int8 FROM commit_wait")
         .await
