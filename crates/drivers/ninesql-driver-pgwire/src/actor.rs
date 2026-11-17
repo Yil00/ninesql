@@ -207,6 +207,9 @@ struct Exec {
     rows_seen: u64,
     /// The driver itself sent a cancel request (consumer gone during a round trip).
     self_cancelled: bool,
+    /// The driver cancelled the end round trip of its implicit transaction after a late
+    /// user cancel (security review M-1).
+    end_cancelled: bool,
     /// Bound on the rest of the execution once the consumer is gone.
     deadline: Option<Instant>,
 }
@@ -274,6 +277,10 @@ impl Exec {
 struct Watch<'a> {
     deadline: &'a mut Option<Instant>,
     self_cancelled: &'a mut bool,
+    /// Set for the end round trips of the driver's implicit transaction: a late user cancel
+    /// (after the gate of `ExecCancel::begin_end`) makes the driver cancel the round trip
+    /// itself, once, and bounds it by `DROP_GRACE`.
+    late: Option<(&'a ExecCancel, &'a mut bool)>,
 }
 
 impl Exec {
@@ -281,6 +288,16 @@ impl Exec {
         Watch {
             deadline: &mut self.deadline,
             self_cancelled: &mut self.self_cancelled,
+            late: None,
+        }
+    }
+
+    /// [`watch`](Self::watch) for an end round trip of the driver's implicit transaction.
+    fn end_watch(&mut self) -> Watch<'_> {
+        Watch {
+            deadline: &mut self.deadline,
+            self_cancelled: &mut self.self_cancelled,
+            late: Some((&*self.cancel, &mut self.end_cancelled)),
         }
     }
 }
@@ -802,6 +819,7 @@ impl Actor {
         let Watch {
             deadline,
             self_cancelled,
+            mut late,
         } = watch;
         let fut = conn.next(sink);
         tokio::pin!(fut);
@@ -820,6 +838,16 @@ impl Actor {
                     None => std::future::pending().await,
                 }
             };
+            let late_cancel = match &late {
+                Some((c, sent)) if !**sent => Some(*c),
+                _ => None,
+            };
+            let watch_late = async {
+                match late_cancel {
+                    Some(c) => c.late_requested().await,
+                    None => std::future::pending().await,
+                }
+            };
             tokio::select! {
                 biased;
                 r = &mut fut => return r,
@@ -833,9 +861,22 @@ impl Actor {
                     }
                     *deadline = Some(Instant::now() + DROP_GRACE);
                 }
+                () = watch_late => {
+                    if let Some((_, sent)) = late.as_mut() {
+                        **sent = true;
+                    }
+                    // The end round trip of the driver's implicit transaction is what runs
+                    // now (a blocked COMMIT): cancel it, awaited as above, and bound the rest.
+                    // A disturbed end is rolled back by the post-end check in `end`.
+                    let _ = target.send().await;
+                    let bound = Instant::now() + DROP_GRACE;
+                    *deadline = Some(deadline.map_or(bound, |d| d.min(bound)));
+                }
                 () = expired => {
                     return Err(DriverError::Closed(
-                        "the server did not confirm the end of a dropped statement in time".into(),
+                        "the server did not confirm the end of a cancelled or dropped statement \
+                         in time"
+                            .into(),
                     ));
                 }
             }
@@ -844,15 +885,26 @@ impl Actor {
 
     /// Sends the buffered messages and reads up to `ReadyForQuery`, collecting notices and the
     /// first error (no rows expected).
-    async fn fixed_round_trip(&mut self, ex: &mut Exec) -> DriverResult<Option<PgError>> {
+    /// `implicit_end`: an end round trip of the driver's implicit transaction, which a late
+    /// user cancel interrupts (see [`Watch::late`]).
+    async fn fixed_round_trip(
+        &mut self,
+        ex: &mut Exec,
+        implicit_end: bool,
+    ) -> DriverResult<Option<PgError>> {
         self.conn.flush().await?;
         let mut error = None;
         let mut none = None;
         loop {
+            let watch = if implicit_end {
+                ex.end_watch()
+            } else {
+                ex.watch()
+            };
             let msg = Self::read_watched(
                 &mut self.conn,
                 RowSink::Discard,
-                ex.watch(),
+                watch,
                 &mut none,
                 &self.cancel_target,
                 false,
@@ -950,6 +1002,7 @@ impl Actor {
             notices_dropped: 0,
             rows_seen: 0,
             self_cancelled: false,
+            end_cancelled: false,
             deadline: None,
         };
         // Lazy: nothing is sent before the consumer polls.
@@ -1186,6 +1239,7 @@ impl Actor {
             let watch = Watch {
                 deadline: &mut ex.deadline,
                 self_cancelled: &mut ex.self_cancelled,
+                late: None,
             };
             let msg = Self::read_watched(
                 &mut self.conn,
@@ -1362,8 +1416,14 @@ impl Actor {
         let cancelled = ex.cancelled();
         // A user cancel's request may still be on its way: if it reached the server during
         // the end round trip below, it would interrupt that round trip (Close, `ROLLBACK`)
-        // instead of the statement and leave the statement's transaction aborted. Wait for it;
-        // a cancel issued from now on sends no request (security review M1).
+        // instead of the statement and leave the statement's transaction aborted. Wait for it,
+        // within `SERVER_CANCEL_GRACE` (beyond it the post-end ROLLBACK check below applies).
+        // A cancel issued from now on sends no request itself (security review M1); during the
+        // end round trips of the implicit transaction the driver cancels them itself, once,
+        // and bounds them (M-1), so a blocked COMMIT still stops. The session checks after the
+        // end run outside the implicit transaction and are never cancelled by the driver: the
+        // only one inside a transaction, `SET TRANSACTION READ ONLY`, runs only in a
+        // transaction the user opened, and those round trips are not watched.
         ex.cancel.begin_end().await;
         let portal_open = ex.fetch == Fetch::Suspended;
         let mut end_error = None;
@@ -1379,32 +1439,44 @@ impl Actor {
             }
             push_fixed(out, if commit { "COMMIT" } else { "ROLLBACK" })?;
             frontend::sync(out);
-            end_error = self.fixed_round_trip(ex).await?;
+            end_error = self.fixed_round_trip(ex, true).await?;
         } else if portal_open && self.conn.txn_status == b'T' {
             let out = self.conn.out();
             frontend::close(b'P', "", out).map_err(|e| DriverError::Protocol(e.to_string()))?;
             frontend::sync(out);
-            end_error = self.fixed_round_trip(ex).await?;
+            // A transaction the user opened: never cancelled by the driver here (closing a
+            // portal runs nothing).
+            end_error = self.fixed_round_trip(ex, false).await?;
         }
         // Defence in depth (security review M1): the driver's implicit transaction never
         // outlives its statement, whatever interrupted the end round trip (a stray cancel
         // signal, a server-side timeout). One more plain `ROLLBACK`; if the session is still in
         // a transaction after it, the session is closed. A transaction the user opened is left
         // as it is.
-        let mut stuck = false;
+        let mut stuck = None;
         if ex.implicit_txn && self.conn.txn_status != b'I' {
             tracing::warn!("the driver's implicit transaction outlived its end: rolling it back");
             let out = self.conn.out();
             push_fixed(out, "ROLLBACK")?;
             frontend::sync(out);
-            if let Some(e) = self.fixed_round_trip(ex).await? {
+            let rollback_error = self.fixed_round_trip(ex, true).await?;
+            if let Some(e) = &rollback_error {
                 tracing::warn!(code = %e.code, "rollback of the implicit transaction failed");
             }
-            stuck = self.conn.txn_status != b'I';
+            if self.conn.txn_status != b'I' {
+                let first = end_error.as_ref().or(error.as_ref());
+                stuck = Some((
+                    sqlstate(first).to_owned(),
+                    sqlstate(rollback_error.as_ref()).to_owned(),
+                ));
+            }
         }
         let error = error.or(end_error);
+        // A late cancel that interrupted the end is the user's cancel; the COMMIT / ROLLBACK
+        // decision above used `cancelled` only.
+        let cancel_seen = cancelled || ex.end_cancelled;
         let mut terminal = match &error {
-            Some(e) => Some(statement_error(e, cancelled)),
+            Some(e) => Some(statement_error(e, cancel_seen)),
             None if cancelled => Some(DriverError::Cancelled),
             None => None,
         };
@@ -1430,13 +1502,12 @@ impl Actor {
                 ex.items.push(Ok(ResultItem::UpdateCount(tag_count(tag))));
             }
         }
-        if stuck {
+        if let Some((first, rollback)) = stuck {
             self.close_session("the driver's implicit transaction could not be ended");
-            terminal = Some(DriverError::Closed(
-                "the transaction NineSQL opened for the statement could not be ended; the \
-                 session was closed"
-                    .into(),
-            ));
+            terminal = Some(DriverError::Closed(format!(
+                "the transaction NineSQL opened for the statement could not be ended (end: \
+                 {first}, rollback: {rollback}); the session was closed"
+            )));
         } else if let Some(DriverError::Closed(_)) = &terminal {
             self.close_session("the server closed the connection");
         }
@@ -1448,6 +1519,18 @@ impl Actor {
         }
         self.finish(ex, reply, terminal);
         Ok(())
+    }
+}
+
+/// The SQLSTATE of a server error for a driver message: the code only (never server text),
+/// and only when it has the SQLSTATE shape (five ASCII letters or digits).
+fn sqlstate(e: Option<&PgError>) -> &str {
+    match e {
+        Some(e) if e.code.len() == 5 && e.code.bytes().all(|b| b.is_ascii_alphanumeric()) => {
+            &e.code
+        }
+        Some(_) => "unknown",
+        None => "none",
     }
 }
 
@@ -1503,6 +1586,22 @@ mod tests {
             IsNull::Yes
         ));
         assert_eq!(civil_from_days(19_000), (2022, 1, 8));
+    }
+
+    #[test]
+    fn sqlstate_is_code_only() {
+        let e = |code: &str| PgError {
+            severity: "ERROR".into(),
+            code: code.into(),
+            message: "password=hunter2".into(),
+            hint: None,
+            position: None,
+        };
+        assert_eq!(sqlstate(Some(&e("57014"))), "57014");
+        assert_eq!(sqlstate(Some(&e("25P02"))), "25P02");
+        assert_eq!(sqlstate(Some(&e("x'; --"))), "unknown");
+        assert_eq!(sqlstate(Some(&e(""))), "unknown");
+        assert_eq!(sqlstate(None), "none");
     }
 
     #[test]

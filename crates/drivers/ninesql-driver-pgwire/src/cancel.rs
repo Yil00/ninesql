@@ -65,6 +65,11 @@ pub(crate) struct ExecCancel {
     /// sees the request in flight and waits for it, or the request sees `ending` and is not
     /// sent, never neither.
     ending: AtomicBool,
+    /// A cancel came after `ending` (security review M-1): the connection task, which then
+    /// runs the end round trip of the driver's implicit transaction, cancels that round trip
+    /// itself, once, and bounds it.
+    late: AtomicBool,
+    late_notify: Notify,
 }
 
 impl ExecCancel {
@@ -83,15 +88,19 @@ impl ExecCancel {
     /// [`SERVER_CANCEL_GRACE`]. A request that reached the server during the end round trip
     /// would interrupt it instead of the statement, leaving the statement's transaction
     /// aborted. (It cannot reach the next statement: the session's `ExecutionTracker` keeps
-    /// the next one out until `cancel()` returned.) A cancel that comes after the gate closed
-    /// sends nothing.
+    /// the next one out until `cancel()` returned.) The wait is bounded: a request still on
+    /// its way after [`SERVER_CANCEL_GRACE`] may still hit the end round trip, and then the
+    /// post-end `ROLLBACK` check of the implicit transaction applies. A cancel that comes after
+    /// the gate closed sends nothing itself; it raises [`late_requested`](Self::late_requested)
+    /// for the connection task.
     pub(crate) async fn begin_end(&self) {
         self.ending.store(true, Ordering::SeqCst);
         self.requests_sent().await;
     }
 
     /// Waits until no cancel request of [`PgCancel::cancel`] is still on its way to the server,
-    /// bounded by [`SERVER_CANCEL_GRACE`] (see [`begin_end`](Self::begin_end)).
+    /// bounded by [`SERVER_CANCEL_GRACE`]; beyond it the post-end `ROLLBACK` check applies (see
+    /// [`begin_end`](Self::begin_end)).
     pub(crate) async fn requests_sent(&self) {
         let wait = async {
             loop {
@@ -116,6 +125,17 @@ impl ExecCancel {
         }
     }
 
+    /// Completes once a cancel came after [`begin_end`](Self::begin_end) closed the gate.
+    pub(crate) async fn late_requested(&self) {
+        loop {
+            let notified = self.late_notify.notified();
+            if self.late.load(Ordering::SeqCst) {
+                return;
+            }
+            notified.await;
+        }
+    }
+
     /// One user cancel (security review M1, L1): counted in flight, then the flag, then the
     /// server request through `send` unless the statement already began to end. The count is
     /// released by a drop guard, so a caller that drops the future mid-send (the driver API
@@ -132,7 +152,11 @@ impl ExecCancel {
         // Flag first: if the portal is idle, the connection task closes it at once.
         self.request();
         if self.ending.load(Ordering::SeqCst) {
-            tracing::debug!("cancel after the statement began to end: no server request sent");
+            // The end round trip may itself block (a deferred trigger, a synchronous standby
+            // that is down): the connection task, which knows what it runs, cancels it.
+            tracing::debug!("cancel after the statement began to end: left to the connection task");
+            self.late.store(true, Ordering::SeqCst);
+            self.late_notify.notify_waiters();
             return;
         }
         if let Err(e) = send().await {
@@ -334,9 +358,29 @@ mod tests {
         })
         .await;
         assert_eq!(sends.load(Ordering::SeqCst), 0);
-        // The flag is still raised; the count is released.
+        // The flag is still raised, the connection task is told; the count is released.
         assert!(exec.is_requested());
+        tokio::time::timeout(Duration::from_millis(1), exec.late_requested())
+            .await
+            .unwrap();
         assert_eq!(in_flight(&exec), 0);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_late_cancel_wakes_the_connection_task() {
+        let exec = Arc::new(ExecCancel::default());
+        exec.begin_end().await;
+        let waiter = tokio::spawn({
+            let exec = Arc::clone(&exec);
+            async move { exec.late_requested().await }
+        });
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(!waiter.is_finished());
+        exec.cancel_with(|| async { Ok(()) }).await;
+        tokio::time::timeout(Duration::from_millis(1), waiter)
+            .await
+            .unwrap()
+            .unwrap();
     }
 
     #[tokio::test(start_paused = true)]
@@ -366,8 +410,9 @@ mod tests {
         release.send(()).unwrap();
         end.await.unwrap();
         cancel.await.unwrap();
-        // The request that was already on its way was sent.
+        // The request that was already on its way was sent; it is not a late cancel.
         assert_eq!(sends.load(Ordering::SeqCst), 1);
+        assert!(!exec.late.load(Ordering::SeqCst));
     }
 
     /// Both orders of the gate, under real thread interleavings: a request is either sent and

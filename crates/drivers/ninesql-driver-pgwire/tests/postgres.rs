@@ -747,6 +747,69 @@ async fn stream_dropped_mid_statement_is_cancelled_by_the_driver() {
     assert!(started.elapsed() < Duration::from_secs(5));
 }
 
+/// Security review M-1: a Stop that comes while the driver commits its implicit transaction
+/// (here a deferred constraint trigger that sleeps in `COMMIT`, run by a read-class
+/// `SELECT` of a writing function) still stops it: the run ends within a few seconds, the
+/// write is rolled back and the session is usable and idle.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn stop_during_the_implicit_commit_ends_it() {
+    let Some(dev) = dev() else { return };
+    let mut s = connect(&dev).await;
+    for sql in [
+        "CREATE TEMP TABLE commit_wait (a int)",
+        "CREATE FUNCTION pg_temp.commit_wait_slow() RETURNS trigger LANGUAGE plpgsql AS \
+         $$ BEGIN PERFORM pg_sleep(30); RETURN NULL; END $$",
+        "CREATE CONSTRAINT TRIGGER commit_wait_trg AFTER INSERT ON commit_wait \
+         DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION pg_temp.commit_wait_slow()",
+        "CREATE FUNCTION pg_temp.commit_wait_write() RETURNS int LANGUAGE sql AS \
+         $$ INSERT INTO commit_wait VALUES (1) RETURNING 1 $$",
+    ] {
+        run(s.as_mut(), sql).await.unwrap();
+    }
+    let token = CancelToken::new();
+    let started = std::time::Instant::now();
+    let mut stream = s
+        .execute(
+            Statement::sql("SELECT pg_temp.commit_wait_write()"),
+            ExecOptions::default().with_cancel(token.clone()),
+        )
+        .await
+        .unwrap();
+    // The insert itself is instant; after a second the driver is in its `COMMIT`, waiting in
+    // the trigger (the row is delivered with the final chunk, after the end). Stop then.
+    let t = token.clone();
+    tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        t.cancel();
+    });
+    let mut outcome = None;
+    while let Some(item) = stream.next().await {
+        if let Err(e) = item {
+            outcome = Some(e);
+        }
+    }
+    drop(stream);
+    // Without the driver's own cancel of the end, the stream gives up only after the 5 s
+    // grace and the session stays busy.
+    let elapsed = started.elapsed();
+    assert!(
+        elapsed < Duration::from_secs(4),
+        "the run took {elapsed:?} to end"
+    );
+    match outcome {
+        Some(DriverError::Cancelled) => {}
+        // Closing the session is the allowed fail-closed outcome.
+        Some(DriverError::Closed(_)) => return,
+        other => panic!("unexpected outcome {other:?}"),
+    }
+    // Usable and idle: the write was rolled back and nothing is left open.
+    let c = run_when_idle(s.as_mut(), "SELECT count(*)::int8 FROM commit_wait")
+        .await
+        .unwrap();
+    assert_eq!(scalar(&c).as_deref(), Some("0"));
+    assert!(!s.in_transaction(), "a transaction is still open");
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn cancel_and_timeout_stop_running_statements() {
     let Some(dev) = dev() else { return };
