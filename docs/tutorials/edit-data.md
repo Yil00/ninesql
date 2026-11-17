@@ -51,7 +51,7 @@ UPDATE "public"."customers" SET "email" = 'ada@example.org' WHERE "customer_id" 
 
 The script box shows the whole script, never cut:
 - a size line, "N lines · M bytes";
-- one row per line with its line number; a line longer than the box wraps onto the next rows, each marked `↪` in place of a line number, so the `WHERE` at the end of a long `UPDATE` is always there to read;
+- one row per line with its line number; a line longer than the box wraps onto the next rows, each marked `↪` in place of a line number, so the `WHERE` at the end of a long `UPDATE` is always there to read. Rows wrap to the box's current width, so a narrower window wraps sooner; wide characters (CJK, emoji, flags, arrows) are counted generously, and if a glyph is still wider than expected the box scrolls sideways;
 - invisible, line-breaking and bidirectional characters shown as `�`, unusual spaces as `␣`, tabs as `→` (the navigator's rule), so the text cannot hide or reorder a clause;
 - under the box, when the script is longer than the box (16 rows) or its end may be out of sight, "Ends with:" and its last line.
 
