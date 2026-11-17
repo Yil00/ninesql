@@ -69,8 +69,8 @@ The import refuses a read-only session ("The session is read-only: an import wri
 On a connection typed production, or whose type confirms every write, "Import" first shows "Confirm the import: these rows are written to the database." with exactly what will happen:
 - "Connection": the name, with "(production)" when it applies;
 - "Table" and "Columns" as they will be sent;
-- "Statement": the `INSERT` for one row (the import sends the same with more rows);
-- "File": the resolved path and its size.
+- "File": the resolved path (invisible characters shown as markers) and its size;
+- "Statement": the `INSERT` for one row (the import sends the same with more rows), whole, in the same script box as the save confirmation: "N lines · M bytes", line numbers, long lines wrapped onto rows marked `↪` (never cut), invisible and bidirectional characters shown as markers, and "Ends with:" and its last line when the end may be out of sight ([Edit data](edit-data.md#3-preview-the-sql)).
 
 "Import" runs it; "Cancel" sends nothing. You confirm **once** for the whole file, not once per `INSERT`. The confirmation is bound to that file as it is now (if it is changed or replaced, NineSQL asks again), to the table, columns, mapping, commit mode and invalid-row choice, and expires after 10 minutes.
 

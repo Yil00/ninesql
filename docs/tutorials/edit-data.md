@@ -33,7 +33,7 @@ Select a cell (or rows) of the table's result, then:
 | "Insert row…" | `Alt+E` then `I` | Opens "Insert row": one field per column, each with a "NULL" box. "An empty field takes the column's default. Save to insert the row." Press "Add row" |
 | "Duplicate row" | `Alt+E` then `C` | Adds a copy of the focused row to insert ("Row duplicated: save to insert it.") |
 | "Delete rows" | `Alt+E` then `D` | Marks the selected rows for deletion |
-| "Revert row changes" | `Alt+E` then `R` | Drops the pending changes of the selected rows |
+| "Revert row changes" | `Alt+E` then `R` | Drops the pending changes of the selected rows. Refused while a save runs or waits for its confirmation, while a statement runs, or while an export or import holds the session ("A save waits for its confirmation.", "A save is running: wait for it to end."…), so the changes you confirm are the ones shown |
 | "Discard changes" | `Alt+E` then `X` | Drops every pending change ("Changes discarded.") |
 
 Nothing is sent yet: these are **pending changes**. The toolbar says "Editable (key: …) · N unsaved changes" with "Save" and "Discard" buttons. Cells with a pending value are marked in the grid. Inserted rows are not drawn in the grid: they exist only as pending changes until you save and the table is read again.
@@ -49,6 +49,14 @@ UPDATE "public"."customers" SET "email" = 'ada@example.org' WHERE "customer_id" 
 - Columns whose type has no reliable equality (PostgreSQL `json`, `xml`, geometric types; MySQL `JSON`, spatial types, `BIT`, `FLOAT`…) are left out of that check: "Concurrent changes to these columns are not detected: …".
 - What is sent is the same statement with every value bound as a parameter, never pasted into the text. The preview's literals mean the same in every session mode of the engine, so you can copy and run them elsewhere.
 
+The script box shows the whole script, never cut:
+- a size line, "N lines · M bytes";
+- one row per line with its line number; a line longer than the box wraps onto the next rows, each marked `↪` in place of a line number, so the `WHERE` at the end of a long `UPDATE` is always there to read;
+- invisible, line-breaking and bidirectional characters shown as `�`, unusual spaces as `␣`, tabs as `→` (the navigator's rule), so the text cannot hide or reorder a clause;
+- under the box, when the script is longer than the box (16 rows) or its end may be out of sight, "Ends with:" and its last line.
+
+Only the rows in sight are drawn, so a save of thousands of rows opens at once and scrolls.
+
 "Save changes" in the dialog saves; "Close" closes it.
 
 ## 4. Save
@@ -59,7 +67,7 @@ Run "Save changes" (`Alt+E` then `S`), or press "Save" in the toolbar. The statu
 - When it ends: "Saved N changes." in auto-commit mode (the save committed its own transaction). Run "Refresh table data" to see the rows as saved, inserted rows included.
 
 ## 5. Production and manual commit
-**Confirmation.** On a connection typed production, or whose type confirms every write, "Save changes" first opens "Confirm save", in the type's colour: "Save N changes to <table> on a production connection? They run in one transaction.", the counts, the unchecked columns and the exact script. "Save changes" saves exactly that; "Cancel", Escape or closing the dialog saves nothing ("Not saved: the changes were not confirmed. They are still pending."). You confirm once for the whole save, not once per row. If you change anything after the dialog appeared, or wait more than 10 minutes, the confirmation no longer matches and NineSQL asks again.
+**Confirmation.** On a connection typed production, or whose type confirms every write, "Save changes" first opens "Confirm save", in the type's colour: "Save N changes to <table> on a production connection? They run in one transaction.", the counts, the unchecked columns and the exact script in the same script box as the preview (section 3). "Save changes" saves exactly that; "Cancel", Escape or closing the dialog saves nothing ("Not saved: the changes were not confirmed. They are still pending."). You confirm once for the whole save, not once per row. If you change anything after the dialog appeared, or wait more than 10 minutes, the confirmation no longer matches and NineSQL asks again.
 
 **Manual commit** (production connections by default). The save runs inside the session's open transaction (it opens one if needed), under a savepoint, and leaves the transaction open: "Saved N changes in the open transaction: commit to keep them (Commit transaction), or roll back." The toolbar shows "Transaction open". Run "Commit transaction" (`Ctrl+K` then `Ctrl+C`) to keep the changes, or "Roll back transaction" (`Ctrl+K` then `Ctrl+R`) to drop them with everything else of the transaction ([Run SQL](run-sql.md#7-commit-and-roll-back)).
 - A failed save is undone on its own (back to the savepoint); your earlier uncommitted statements stay. If that undo itself fails, NineSQL rolls back the whole transaction and says so: "Not saved, and the session's whole transaction was rolled back: earlier uncommitted changes in this session were lost too."
@@ -81,7 +89,7 @@ These re-run the table's query with a `WHERE` or an `ORDER BY`, so they see ever
 - **"Filter table by selected value"** adds `column = value` for the focused cell (`IS NULL` for a NULL); the value is bound, never pasted into the SQL.
 - **"Recent filters"** in the dialog lists the filters used on this connection, newest first (up to 50). The list is kept in memory only and is empty after a restart. On production connections and types that do not log query text it keeps only the shape (columns, comparisons, order), never values or the typed `WHERE` text; then NineSQL says "Some values of this filter were not kept in the history: they were left out."
 
-Client-side sort and filter of the grid ("Sort loaded rows ascending" `Alt+S` then `A`, "Sort loaded rows descending" `Alt+S` then `D`, "Filter loaded rows" `Alt+S` then `F`, "Filter loaded rows by selected value" `Alt+S` then `V`, "Clear sort and filters" `Alt+S` then `C`) work on any result but only on the **loaded rows**; the grid says "Loaded rows only" while they apply. Text is compared by code point, so the order can differ from the engine's.
+Client-side sort and filter of the grid ("Sort loaded rows ascending" `Alt+S` then `A`, "Sort loaded rows descending" `Alt+S` then `D`, "Filter loaded rows" `Alt+S` then `F`, "Filter loaded rows by selected value" `Alt+S` then `V`, "Clear sort and filters" `Alt+S` then `C`) work on any result but only on the **loaded rows**; the grid says "Loaded rows only" while they apply. Text is compared by code point, so the order can differ from the engine's. The client-side sort stops at 200 000 loaded rows: above that it is refused, or dropped if more rows arrive while it applies, and the grid says "Not sorted: more than 200000 rows are loaded, over the client-side sort limit. Sort on the server ("Order by") instead." On a table tab, use "Sort table by column ascending" / "descending" (the palette finds them with "order by"); on a typed query, add an `ORDER BY`. Client-side filters have no such limit.
 
 ## 7. Follow foreign keys
 On a row of a tab opened with "Open table data":
@@ -103,7 +111,7 @@ For any result, not only table data:
 
 - **Record view**: one line per column (name, type, value) for the selected row, "Record N of M (Next record / Previous record)".
 - **Text view**: the loaded rows as fixed-width text, at most 10 000 rows and 4 MiB ("Text view: first N of M rows (bounded).").
-- **Value panel** ("Value"): the selected cell as text, JSON (indented, read-only; "Not valid JSON (at byte N): shown as text."), XML (indented, nothing resolved), hex, or an image (PNG, JPEG, GIF, with size and pixel limits). A long value shows its first part ("Showing the first N KiB of the value."); a value the driver cut says so.
+- **Value panel** ("Value"): the selected cell as text, JSON (indented, read-only; "Not valid JSON (at byte N): shown as text."), XML (indented, nothing resolved), hex, or an image preview (PNG and JPEG only, at most 16 MiB, 8 192 pixels a side and 4 096 × 4 096 pixels in all). GIF and animated PNG values are not previewed: the value panel offers hex only and says "GIF preview not supported; showing hex." or "Animated PNG preview not supported; showing hex.", because the GPU image decoder would decode every frame with no limit. A PNG whose chunks do not frame cleanly, or a JPEG without exactly one start-of-frame before its first start-of-scan (a JPEG with no start-of-scan included), is refused for preview. Previews you no longer show (another cell, viewer or result, the panel closed) are released from the GPU caches at the end of the frame. A long value shows its first part ("Showing the first N KiB of the value."); a value the driver cut says so.
 - **Aggregate panel** ("Aggregates"): count, sum, average, minimum and maximum of the selected cells per column, loaded rows only; sums of floats or decimals are approximate, text and dates get count, minimum and maximum only; it stops after 1 000 000 cells and says so.
 - **Metadata panel** ("Columns"): name, type, nullability and source of each column, as the driver reports them.
 
@@ -112,7 +120,7 @@ For any result, not only table data:
 - A filter history kept after a restart.
 - "Open table data" and the editing actions in the navigator's context menu.
 - Editing on YugabyteDB is not engine-tested yet; QuestDB declares no editing.
-- Value statistics in the metadata panel, folding in the JSON and XML viewers.
+- Value statistics in the metadata panel, folding in the JSON and XML viewers, GIF and animated PNG previews (shown as hex).
 - The visual pass of these screens (P6-F).
 
 ## Next
