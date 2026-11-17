@@ -228,6 +228,25 @@ fn import_previews_maps_and_confirms_on_production(cx: &mut TestAppContext) {
         "{}",
         script.shown_text()
     );
+    // The 720 px dialog measured its row box and wrapped the rows to it (phase 5 re-review
+    // M-A): the widest row fits the measured width.
+    l.vcx.run_until_parked();
+    l.vcx.update(|window, cx| window.simulate_next_frame(cx));
+    l.vcx.run_until_parked();
+    let (content, advance) = script
+        .measured()
+        .unwrap_or_else(|| panic!("the script box was measured"));
+    assert!(content > 300. && content < 720., "{content}");
+    // The test text system advances 0.6 em: the canvas sees the rows' 12 px text style.
+    assert!((advance - 7.2).abs() < 0.01, "{advance}");
+    let width =
+        crate::script_view::WrapWidth::measured(content, advance, 12., script.gutter_chars(), 8.);
+    assert_eq!(script.width(), width);
+    let widest = script.row_columns(script.widest_row()).unwrap_or(0);
+    let gutter = crate::script_view::WrapWidth::gutter_px(advance, 12., script.gutter_chars());
+    #[allow(clippy::cast_precision_loss)]
+    let needed = gutter + 8. + widest as f32 * advance;
+    assert!(needed <= content, "{needed} of {content}");
     // Cancel goes back to the preview; nothing ran.
     dialog.update(&mut l.vcx, |d, cx| d.decline(cx));
     assert!(dialog.read_with(&l.vcx, |d, _| matches!(d.stage(), ImportStage::Preview)));
