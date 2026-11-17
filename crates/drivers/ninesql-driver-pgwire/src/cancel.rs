@@ -59,6 +59,12 @@ pub(crate) struct ExecCancel {
     /// Cancel requests of [`PgCancel::cancel`] still on their way to the server.
     in_flight: AtomicUsize,
     sent: Notify,
+    /// The connection task began to end the statement (security review M1): a cancel that
+    /// comes later raises the flag but sends nothing to the server. With `in_flight`, a
+    /// Dekker-style pair (both stored, then the other loaded, all `SeqCst`): either the task
+    /// sees the request in flight and waits for it, or the request sees `ending` and is not
+    /// sent, never neither.
+    ending: AtomicBool,
 }
 
 impl ExecCancel {
@@ -71,10 +77,21 @@ impl ExecCancel {
         self.requested.load(Ordering::SeqCst)
     }
 
+    /// Called by the connection task before the end round trip of the statement (Close
+    /// portal, `COMMIT` / `ROLLBACK`, the session checks). Closes the gate, then waits until no
+    /// cancel request of [`PgCancel::cancel`] is still on its way to the server, bounded by
+    /// [`SERVER_CANCEL_GRACE`]. A request that reached the server during the end round trip
+    /// would interrupt it instead of the statement, leaving the statement's transaction
+    /// aborted. (It cannot reach the next statement: the session's `ExecutionTracker` keeps
+    /// the next one out until `cancel()` returned.) A cancel that comes after the gate closed
+    /// sends nothing.
+    pub(crate) async fn begin_end(&self) {
+        self.ending.store(true, Ordering::SeqCst);
+        self.requests_sent().await;
+    }
+
     /// Waits until no cancel request of [`PgCancel::cancel`] is still on its way to the server,
-    /// bounded by [`SERVER_CANCEL_GRACE`]. The connection task waits for it before it ends a
-    /// cancelled statement: a request that reached the server only after the end would
-    /// interrupt the next statement instead (a cancel arriving at an idle backend does nothing).
+    /// bounded by [`SERVER_CANCEL_GRACE`] (see [`begin_end`](Self::begin_end)).
     pub(crate) async fn requests_sent(&self) {
         let wait = async {
             loop {
@@ -98,6 +115,40 @@ impl ExecCancel {
             notified.await;
         }
     }
+
+    /// One user cancel (security review M1, L1): counted in flight, then the flag, then the
+    /// server request through `send` unless the statement already began to end. The count is
+    /// released by a drop guard, so a caller that drops the future mid-send (the driver API
+    /// bounds `cancel()` by [`SERVER_CANCEL_GRACE`]) never leaves it raised.
+    async fn cancel_with<F, Fut>(&self, send: F)
+    where
+        F: FnOnce() -> Fut,
+        Fut: Future<Output = DriverResult<()>>,
+    {
+        // Counted before the gate is read (the Dekker pair with `begin_end`) and before the
+        // flag, so the connection task, woken by the flag, waits for the request.
+        self.in_flight.fetch_add(1, Ordering::SeqCst);
+        let _in_flight = InFlight(self);
+        // Flag first: if the portal is idle, the connection task closes it at once.
+        self.request();
+        if self.ending.load(Ordering::SeqCst) {
+            tracing::debug!("cancel after the statement began to end: no server request sent");
+            return;
+        }
+        if let Err(e) = send().await {
+            tracing::warn!(error = %e, "cancel request failed");
+        }
+    }
+}
+
+/// Releases one in-flight cancel request, even when the cancel future is dropped.
+struct InFlight<'a>(&'a ExecCancel);
+
+impl Drop for InFlight<'_> {
+    fn drop(&mut self) {
+        self.0.in_flight.fetch_sub(1, Ordering::SeqCst);
+        self.0.sent.notify_waiters();
+    }
 }
 
 /// The session's unscoped engine cancel for one execution; the session scopes it with its
@@ -110,16 +161,7 @@ pub(crate) struct PgCancel {
 #[async_trait::async_trait]
 impl CancelHandle for PgCancel {
     async fn cancel(&self) -> DriverResult<()> {
-        // Counted before the flag, so the connection task, woken by the flag, waits for the
-        // request to reach the server before it ends the statement.
-        self.exec.in_flight.fetch_add(1, Ordering::SeqCst);
-        // Flag first: if the portal is idle, the connection task closes it at once.
-        self.exec.request();
-        if let Err(e) = self.target.send().await {
-            tracing::warn!(error = %e, "cancel request failed");
-        }
-        self.exec.in_flight.fetch_sub(1, Ordering::SeqCst);
-        self.exec.sent.notify_waiters();
+        self.exec.cancel_with(|| self.target.send()).await;
         Ok(())
     }
 
@@ -154,5 +196,217 @@ impl MetaGate {
     /// The statement ended.
     pub(crate) fn stop(&self) {
         self.running.store(false, Ordering::SeqCst);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::AtomicU32;
+    use std::time::Duration;
+    use tokio::sync::oneshot;
+
+    fn in_flight(exec: &ExecCancel) -> usize {
+        exec.in_flight.load(Ordering::SeqCst)
+    }
+
+    /// Lets spawned tasks run until `cond` holds (paused time: no real wait).
+    async fn until(cond: impl Fn() -> bool) {
+        for _ in 0..1000 {
+            if cond() {
+                return;
+            }
+            tokio::task::yield_now().await;
+        }
+        panic!("condition not reached");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn requests_sent_waits_for_an_in_flight_request() {
+        let exec = Arc::new(ExecCancel::default());
+        let (release, released) = oneshot::channel::<()>();
+        let sends = Arc::new(AtomicU32::new(0));
+        let cancel = tokio::spawn({
+            let exec = Arc::clone(&exec);
+            let sends = Arc::clone(&sends);
+            async move {
+                exec.cancel_with(|| async move {
+                    let _ = released.await;
+                    sends.fetch_add(1, Ordering::SeqCst);
+                    Ok(())
+                })
+                .await;
+            }
+        });
+        until(|| in_flight(&exec) == 1).await;
+        assert!(exec.is_requested());
+        let waiter = tokio::spawn({
+            let exec = Arc::clone(&exec);
+            async move { exec.requests_sent().await }
+        });
+        // Still waiting while the request is on its way.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(!waiter.is_finished());
+        release.send(()).unwrap();
+        waiter.await.unwrap();
+        cancel.await.unwrap();
+        assert_eq!(sends.load(Ordering::SeqCst), 1);
+        assert_eq!(in_flight(&exec), 0);
+        // Nothing in flight: immediate.
+        let started = tokio::time::Instant::now();
+        exec.requests_sent().await;
+        assert_eq!(started.elapsed(), Duration::ZERO);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn requests_sent_is_bounded() {
+        let exec = Arc::new(ExecCancel::default());
+        let cancel = tokio::spawn({
+            let exec = Arc::clone(&exec);
+            async move {
+                exec.cancel_with(std::future::pending::<DriverResult<()>>)
+                    .await;
+            }
+        });
+        until(|| in_flight(&exec) == 1).await;
+        let started = tokio::time::Instant::now();
+        exec.requests_sent().await;
+        let waited = started.elapsed();
+        assert!(
+            waited >= SERVER_CANCEL_GRACE && waited < SERVER_CANCEL_GRACE * 2,
+            "{waited:?}"
+        );
+        assert_eq!(in_flight(&exec), 1);
+        cancel.abort();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_dropped_cancel_releases_its_count() {
+        let exec = Arc::new(ExecCancel::default());
+        // The driver API's bound drops the future mid-send.
+        let r = tokio::time::timeout(
+            Duration::from_millis(10),
+            exec.cancel_with(std::future::pending::<DriverResult<()>>),
+        )
+        .await;
+        assert!(r.is_err());
+        assert!(exec.is_requested());
+        assert_eq!(in_flight(&exec), 0);
+        let started = tokio::time::Instant::now();
+        exec.requests_sent().await;
+        assert_eq!(started.elapsed(), Duration::ZERO);
+
+        // A waiter blocked on the count is woken by the drop.
+        let exec = Arc::new(ExecCancel::default());
+        let cancel = tokio::spawn({
+            let exec = Arc::clone(&exec);
+            async move {
+                exec.cancel_with(std::future::pending::<DriverResult<()>>)
+                    .await;
+            }
+        });
+        until(|| in_flight(&exec) == 1).await;
+        let waiter = tokio::spawn({
+            let exec = Arc::clone(&exec);
+            async move {
+                let started = tokio::time::Instant::now();
+                exec.requests_sent().await;
+                started.elapsed()
+            }
+        });
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        cancel.abort();
+        let waited = waiter.await.unwrap();
+        assert!(waited < SERVER_CANCEL_GRACE, "{waited:?}");
+        assert_eq!(in_flight(&exec), 0);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_cancel_after_the_end_began_sends_nothing() {
+        let exec = ExecCancel::default();
+        let started = tokio::time::Instant::now();
+        exec.begin_end().await;
+        assert_eq!(started.elapsed(), Duration::ZERO);
+        let sends = AtomicU32::new(0);
+        exec.cancel_with(|| async {
+            sends.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        })
+        .await;
+        assert_eq!(sends.load(Ordering::SeqCst), 0);
+        // The flag is still raised; the count is released.
+        assert!(exec.is_requested());
+        assert_eq!(in_flight(&exec), 0);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn the_end_waits_for_a_cancel_sent_before_it() {
+        let exec = Arc::new(ExecCancel::default());
+        let (release, released) = oneshot::channel::<()>();
+        let sends = Arc::new(AtomicU32::new(0));
+        let cancel = tokio::spawn({
+            let exec = Arc::clone(&exec);
+            let sends = Arc::clone(&sends);
+            async move {
+                exec.cancel_with(|| async move {
+                    let _ = released.await;
+                    sends.fetch_add(1, Ordering::SeqCst);
+                    Ok(())
+                })
+                .await;
+            }
+        });
+        until(|| in_flight(&exec) == 1).await;
+        let end = tokio::spawn({
+            let exec = Arc::clone(&exec);
+            async move { exec.begin_end().await }
+        });
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(!end.is_finished(), "the end did not wait for the request");
+        release.send(()).unwrap();
+        end.await.unwrap();
+        cancel.await.unwrap();
+        // The request that was already on its way was sent.
+        assert_eq!(sends.load(Ordering::SeqCst), 1);
+    }
+
+    /// Both orders of the gate, under real thread interleavings: a request is either sent and
+    /// awaited by the end, or not sent; never sent after the end stopped waiting.
+    #[test]
+    fn the_ending_gate_holds_across_threads() {
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_time()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            for _ in 0..2000 {
+                let exec = Arc::new(ExecCancel::default());
+                let ended = Arc::new(AtomicBool::new(false));
+                let late = Arc::new(AtomicBool::new(false));
+                let cancel = tokio::spawn({
+                    let exec = Arc::clone(&exec);
+                    let ended = Arc::clone(&ended);
+                    let late = Arc::clone(&late);
+                    async move {
+                        exec.cancel_with(|| async move {
+                            tokio::task::yield_now().await;
+                            if ended.load(Ordering::SeqCst) {
+                                late.store(true, Ordering::SeqCst);
+                            }
+                            Ok(())
+                        })
+                        .await;
+                    }
+                });
+                exec.begin_end().await;
+                ended.store(true, Ordering::SeqCst);
+                cancel.await.unwrap();
+                assert!(
+                    !late.load(Ordering::SeqCst),
+                    "a request was sent after the end"
+                );
+            }
+        });
     }
 }

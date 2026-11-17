@@ -1356,12 +1356,15 @@ impl Actor {
                 ),
             ))));
         }
+        // Read before the gate: the statement's own messages are all read, so a 57014 it got
+        // came from a cancel whose flag was already raised; a later cancel came too late to
+        // stop it, and a statement that completed is not reported cancelled.
         let cancelled = ex.cancelled();
-        if ex.cancel.is_requested() {
-            // A user cancel's request may still be on its way: once it reaches the server it
-            // must find this statement, never the next one.
-            ex.cancel.requests_sent().await;
-        }
+        // A user cancel's request may still be on its way: if it reached the server during
+        // the end round trip below, it would interrupt that round trip (Close, `ROLLBACK`)
+        // instead of the statement and leave the statement's transaction aborted. Wait for it;
+        // a cancel issued from now on sends no request (security review M1).
+        ex.cancel.begin_end().await;
         let portal_open = ex.fetch == Fetch::Suspended;
         let mut end_error = None;
         if ex.implicit_txn && self.conn.txn_status != b'I' {
@@ -1382,6 +1385,22 @@ impl Actor {
             frontend::close(b'P', "", out).map_err(|e| DriverError::Protocol(e.to_string()))?;
             frontend::sync(out);
             end_error = self.fixed_round_trip(ex).await?;
+        }
+        // Defence in depth (security review M1): the driver's implicit transaction never
+        // outlives its statement, whatever interrupted the end round trip (a stray cancel
+        // signal, a server-side timeout). One more plain `ROLLBACK`; if the session is still in
+        // a transaction after it, the session is closed. A transaction the user opened is left
+        // as it is.
+        let mut stuck = false;
+        if ex.implicit_txn && self.conn.txn_status != b'I' {
+            tracing::warn!("the driver's implicit transaction outlived its end: rolling it back");
+            let out = self.conn.out();
+            push_fixed(out, "ROLLBACK")?;
+            frontend::sync(out);
+            if let Some(e) = self.fixed_round_trip(ex).await? {
+                tracing::warn!(code = %e.code, "rollback of the implicit transaction failed");
+            }
+            stuck = self.conn.txn_status != b'I';
         }
         let error = error.or(end_error);
         let mut terminal = match &error {
@@ -1411,7 +1430,14 @@ impl Actor {
                 ex.items.push(Ok(ResultItem::UpdateCount(tag_count(tag))));
             }
         }
-        if let Some(DriverError::Closed(_)) = &terminal {
+        if stuck {
+            self.close_session("the driver's implicit transaction could not be ended");
+            terminal = Some(DriverError::Closed(
+                "the transaction NineSQL opened for the statement could not be ended; the \
+                 session was closed"
+                    .into(),
+            ));
+        } else if let Some(DriverError::Closed(_)) = &terminal {
             self.close_session("the server closed the connection");
         }
         // The access mode and the client encoding are checked after every statement.
