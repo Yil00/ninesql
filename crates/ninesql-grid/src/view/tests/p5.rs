@@ -222,7 +222,8 @@ fn preview_images_are_evicted_and_outputs_cached(cx: &mut TestAppContext) {
     let first = view
         .read_with(&vcx, |v, _| v.held_images())
         .0
-        .expect("first image");
+        .expect("first image")
+        .image();
     assert!(vcx.update(|_, cx| first.is_asset_cached(cx)));
     // The viewer output is cached: the same Rc until the focus moves.
     let o1 = view.update(&mut vcx, |v, cx| {
@@ -238,13 +239,171 @@ fn preview_images_are_evicted_and_outputs_cached(cx: &mut TestAppContext) {
     select_cell(&view, &mut vcx, 1, 0);
     vcx.run_until_parked();
     let (second, stale) = view.read_with(&vcx, |v, _| v.held_images());
-    let second = second.expect("second image");
+    let second = second.expect("second image").image();
     assert_eq!(stale, 0);
     assert!(!vcx.update(|_, cx| first.is_asset_cached(cx)));
     assert!(vcx.update(|_, cx| second.is_asset_cached(cx)));
     // Closing the panel evicts the shown image too.
     vcx.simulate_keystrokes("alt-v");
     vcx.run_until_parked();
-    assert_eq!(view.read_with(&vcx, |v, _| v.held_images()), (None, 0));
+    let (held, stale) = view.read_with(&vcx, |v, _| v.held_images());
+    assert!(held.is_none());
+    assert_eq!(stale, 0);
     assert!(!vcx.update(|_, cx| second.is_asset_cached(cx)));
+}
+
+/// A valid PNG (`side` × `side`, 8-bit grey, stored deflate blocks), so GPUI decodes it and
+/// paints it into the sprite atlas.
+fn valid_png(side: u32) -> Vec<u8> {
+    fn crc32(bytes: &[u8]) -> u32 {
+        let mut crc = !0u32;
+        for b in bytes {
+            crc ^= u32::from(*b);
+            for _ in 0..8 {
+                crc = if crc & 1 == 1 {
+                    (crc >> 1) ^ 0xEDB8_8320
+                } else {
+                    crc >> 1
+                };
+            }
+        }
+        !crc
+    }
+    fn chunk(out: &mut Vec<u8>, kind: &[u8; 4], data: &[u8]) {
+        out.extend_from_slice(&u32::try_from(data.len()).unwrap().to_be_bytes());
+        let mut body = kind.to_vec();
+        body.extend_from_slice(data);
+        out.extend_from_slice(&body);
+        out.extend_from_slice(&crc32(&body).to_be_bytes());
+    }
+    let mut raw = Vec::new();
+    for _ in 0..side {
+        raw.push(0); // filter: none
+        raw.extend(std::iter::repeat_n(0x80u8, side as usize));
+    }
+    let (mut a, mut b) = (1u32, 0u32);
+    for x in &raw {
+        a = (a + u32::from(*x)) % 65_521;
+        b = (b + a) % 65_521;
+    }
+    let len = u16::try_from(raw.len()).unwrap();
+    let mut zlib = vec![0x78, 0x01, 0x01];
+    zlib.extend_from_slice(&len.to_le_bytes());
+    zlib.extend_from_slice(&(!len).to_le_bytes());
+    zlib.extend_from_slice(&raw);
+    zlib.extend_from_slice(&((b << 16) | a).to_be_bytes());
+    let mut ihdr = side.to_be_bytes().to_vec();
+    ihdr.extend_from_slice(&side.to_be_bytes());
+    ihdr.extend_from_slice(&[8, 0, 0, 0, 0]);
+    let mut out = b"\x89PNG\r\n\x1a\n".to_vec();
+    chunk(&mut out, b"IHDR", &ihdr);
+    chunk(&mut out, b"IDAT", &zlib);
+    chunk(&mut out, b"IEND", &[]);
+    out
+}
+
+/// Holds a results view that a test can drop while the window stays open.
+struct Holder(Option<gpui::Entity<ResultsView>>);
+
+impl gpui::Render for Holder {
+    fn render(
+        &mut self,
+        _: &mut gpui::Window,
+        _: &mut gpui::Context<Self>,
+    ) -> impl gpui::IntoElement {
+        use gpui::{ParentElement as _, Styled as _};
+        gpui::div().size_full().children(self.0.clone())
+    }
+}
+
+/// A view closed while its preview image is shown takes the image out of the sprite atlas of
+/// every window, not only out of GPUI's asset cache (phase 5 re-review M-B, I6).
+#[gpui::test]
+fn closing_the_view_drops_a_shown_image_from_the_atlas(cx: &mut TestAppContext) {
+    use ninesql_core::driver_api::ResultSetHeader;
+    use ninesql_core::driver_api::arrow_array::{BinaryArray, RecordBatch};
+    use ninesql_core::driver_api::arrow_schema::{DataType, Field, Schema};
+
+    use gpui::AppContext as _;
+
+    super::init(cx);
+    let window = cx.add_window(|_, cx| {
+        let view = cx.new(|cx| ResultsView::new(small_budget(), cx));
+        Holder(Some(view))
+    });
+    let holder = window.root(cx).unwrap();
+    let mut vcx = VisualTestContext::from_window(window.into(), cx);
+    let view = holder.read_with(&vcx, |h, _| h.0.clone()).unwrap();
+    let schema = Arc::new(Schema::new(vec![Field::new("b", DataType::Binary, true)]));
+    let png = valid_png(4);
+    let rows = RecordBatch::try_new(
+        schema.clone(),
+        vec![Arc::new(BinaryArray::from(vec![Some(png.as_slice())]))],
+    )
+    .unwrap();
+    send(
+        &view,
+        &mut vcx,
+        vec![
+            ExecutionEvent::Started,
+            item(
+                0,
+                ResultItem::ResultSet(ResultSetHeader::tabular(0, schema)),
+            ),
+            item(0, ResultItem::Rows(rows)),
+        ],
+    );
+    vcx.simulate_keystrokes("alt-v");
+    select_cell(&view, &mut vcx, 0, 0);
+    vcx.run_until_parked();
+    // Another frame once the decode is in: the image is painted.
+    vcx.update(|window, _| window.refresh());
+    vcx.run_until_parked();
+    let cached = view
+        .read_with(&vcx, |v, _| v.held_images())
+        .0
+        .expect("shown image");
+    let image = cached.image();
+    let render = cached
+        .render()
+        .expect("the decoded image is kept once shown");
+    drop(cached);
+    assert!(vcx.update(|window, _| window.has_image_atlas_entry(&render)));
+    assert!(vcx.update(|_, cx| image.is_asset_cached(cx)));
+    // Close the view while the image is shown.
+    drop(view);
+    vcx.update(|_, cx| {
+        holder.update(cx, |h, cx| {
+            h.0 = None;
+            cx.notify();
+        });
+    });
+    vcx.run_until_parked();
+    assert!(!vcx.update(|_, cx| image.is_asset_cached(cx)));
+    assert!(!vcx.update(|window, _| window.has_image_atlas_entry(&render)));
+}
+
+/// An image no frame laid out is evicted without a decode being started for it, while one
+/// that was laid out is looked up in GPUI's cache (phase 5 re-review L-B).
+#[gpui::test]
+fn an_image_never_shown_starts_no_decode_when_evicted(cx: &mut TestAppContext) {
+    use crate::view::panels::CachedImage;
+
+    let (_view, _, mut vcx) = open(cx, small_budget());
+    let image = Arc::new(gpui::Image::from_bytes(
+        gpui::ImageFormat::Png,
+        valid_png(2),
+    ));
+    let never_shown = CachedImage::new(image.clone());
+    assert!(
+        vcx.update(|window, cx| never_shown.take_decoded(Some(window), cx))
+            .is_none()
+    );
+    assert!(!vcx.update(|_, cx| image.is_asset_cached(cx)));
+    // The same check sees a lookup: a shown image asks GPUI's cache.
+    let shown = CachedImage::new(image.clone());
+    shown.mark_shown();
+    let _ = vcx.update(|window, cx| shown.take_decoded(Some(window), cx));
+    assert!(vcx.update(|_, cx| image.is_asset_cached(cx)));
+    vcx.update(|_, cx| image.clone().remove_asset(cx));
 }

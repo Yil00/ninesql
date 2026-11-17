@@ -4,6 +4,7 @@
 //! Every computation reads the rows the grid holds (I6) and is cached per (result tab, rows
 //! version, loaded rows), so a frame never recomputes a panel.
 
+use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 use std::sync::Arc;
 
@@ -11,8 +12,9 @@ use gpui_kit::component::input::{Input, InputEvent, InputState};
 use gpui_kit::component::{ActiveTheme as _, WindowExt as _, h_flex, v_flex};
 use gpui_kit::{
     AnyElement, AppContext as _, ClipboardItem, Context, Entity, Image, ImageFormat,
-    InteractiveElement, IntoElement, ParentElement, SharedString, StatefulInteractiveElement,
-    Styled, Window, div, img, prelude::FluentBuilder, px, uniform_list,
+    InteractiveElement, IntoElement, ParentElement, RenderImage, SharedString,
+    StatefulInteractiveElement, Styled, Window, canvas, div, img, prelude::FluentBuilder, px,
+    uniform_list,
 };
 use ninesql_core::driver_api::Dialect;
 
@@ -66,12 +68,108 @@ pub(super) struct PanelCache {
     aggregates: Option<(CacheKey, Aggregates)>,
     text: Option<(CacheKey, Rc<TextView>)>,
     output: Option<(CacheKey, Focus, ViewerKind, Rc<ViewerOutput>)>,
-    image: Option<(CacheKey, Focus, Arc<Image>)>,
+    image: Option<(CacheKey, Focus, CachedImage)>,
     /// The cached image was asked for during the current frame.
     image_used: bool,
     /// Images replaced or no longer shown, removed from GPUI's asset cache and sprite atlas at
     /// the end of the next frame ([`ResultsView::evict_images`]).
-    stale_images: Vec<Arc<Image>>,
+    stale_images: Vec<CachedImage>,
+}
+
+/// A preview image and what GPUI made of it.
+///
+/// `shown` is set when a frame laid the image out (so GPUI's asset cache holds its decode), and
+/// `render` keeps the decoded image once a frame has it, so it can be removed from the sprite
+/// atlas of every window even when the view goes away with no window at hand (I6).
+#[derive(Clone)]
+pub(super) struct CachedImage {
+    image: Arc<Image>,
+    shown: Rc<Cell<bool>>,
+    render: Rc<RefCell<Option<Arc<RenderImage>>>>,
+}
+
+impl CachedImage {
+    pub(super) fn new(image: Arc<Image>) -> Self {
+        Self {
+            image,
+            shown: Rc::new(Cell::new(false)),
+            render: Rc::new(RefCell::new(None)),
+        }
+    }
+
+    /// The source image (tests).
+    #[cfg(test)]
+    pub(super) fn image(&self) -> Arc<Image> {
+        self.image.clone()
+    }
+
+    /// Marks the image as laid out by a frame (tests).
+    #[cfg(test)]
+    pub(super) fn mark_shown(&self) {
+        self.shown.set(true);
+    }
+
+    /// The decoded image, once a frame had it (tests).
+    #[cfg(test)]
+    pub(super) fn render(&self) -> Option<Arc<RenderImage>> {
+        self.render.borrow().clone()
+    }
+
+    /// Keeps the decoded image if GPUI has it. Called only after the image was laid out in
+    /// this frame, so this reads GPUI's asset cache and never starts a decode.
+    fn capture(&self, window: &mut Window, cx: &mut gpui_kit::App) {
+        self.shown.set(true);
+        if self.render.borrow().is_none()
+            && let Some(render) = self.image.clone().get_render_image(window, cx)
+        {
+            *self.render.borrow_mut() = Some(render);
+        }
+    }
+
+    /// The preview element: the image, then a zero-size canvas that records, after the image
+    /// was laid out and after it was painted, that it was shown and what it decoded to.
+    fn element(&self) -> AnyElement {
+        let at_prepaint = self.clone();
+        let at_paint = self.clone();
+        div()
+            .relative()
+            .child(img(self.image.clone()).max_w(px(320.)).max_h(px(480.)))
+            .child(
+                canvas(
+                    move |_, window, cx| at_prepaint.capture(window, cx),
+                    move |_, (), window, cx| at_paint.capture(window, cx),
+                )
+                .absolute()
+                .size_0(),
+            )
+            .into_any_element()
+    }
+
+    /// Removes the image from GPUI's asset cache and from the sprite atlas of every window.
+    /// An image no frame laid out has no decode to look up: none is started (review L-B).
+    fn evict(self, mut window: Option<&mut Window>, cx: &mut gpui_kit::App) {
+        if let Some(render) = self.take_decoded(window.as_deref_mut(), cx) {
+            cx.drop_image(render, window);
+        }
+        self.image.remove_asset(cx);
+    }
+
+    /// The decoded image to remove from the sprite atlas: the one kept, or, for an image a
+    /// frame laid out, GPUI's cached decode. Never starts a decode.
+    pub(super) fn take_decoded(
+        &self,
+        window: Option<&mut Window>,
+        cx: &mut gpui_kit::App,
+    ) -> Option<Arc<RenderImage>> {
+        let kept = self.render.borrow_mut().take();
+        match (kept, window) {
+            (Some(render), _) => Some(render),
+            (None, Some(window)) if self.shown.get() => {
+                self.image.clone().get_render_image(window, cx)
+            }
+            (None, _) => None,
+        }
+    }
 }
 
 /// The P5-A state of the results view.
@@ -589,7 +687,11 @@ impl ResultsView {
         }
     }
 
-    fn image(&mut self, inspection: &CellInspection, cx: &gpui_kit::App) -> Option<Arc<Image>> {
+    pub(super) fn image(
+        &mut self,
+        inspection: &CellInspection,
+        cx: &gpui_kit::App,
+    ) -> Option<CachedImage> {
         let key = self.cache_key(cx)?;
         let focused = self.active_delegate(cx, GridDelegate::focused_cell)?;
         if let Some((k, f, i)) = &self.p5.cache.image
@@ -609,10 +711,10 @@ impl ResultsView {
             ImageKind::Png => ImageFormat::Png,
             ImageKind::Jpeg => ImageFormat::Jpeg,
         };
-        let image = Arc::new(Image::from_bytes(
+        let image = CachedImage::new(Arc::new(Image::from_bytes(
             format,
             inspection.bytes.as_deref()?.to_vec(),
-        ));
+        )));
         self.p5.cache.image = Some((key, focused, image.clone()));
         self.p5.cache.image_used = true;
         Some(image)
@@ -645,7 +747,7 @@ impl ResultsView {
 
     /// Number of decoded preview images this view still holds or has yet to evict (tests).
     #[cfg(test)]
-    pub(super) fn held_images(&self) -> (Option<Arc<Image>>, usize) {
+    pub(super) fn held_images(&self) -> (Option<CachedImage>, usize) {
         (
             self.p5.cache.image.as_ref().map(|(_, _, i)| i.clone()),
             self.p5.cache.stale_images.len(),
@@ -667,23 +769,20 @@ impl ResultsView {
             self.p5.cache.stale_images.push(old);
         }
         for old in std::mem::take(&mut self.p5.cache.stale_images) {
-            // Every image here was handed to `img` in an earlier frame, so its asset is loading
-            // or loaded: this reads the cache, it does not start a decode.
-            if let Some(render) = old.clone().get_render_image(window, cx) {
-                cx.drop_image(render, Some(window));
-            }
-            old.remove_asset(cx);
+            old.evict(Some(window), cx);
         }
     }
 
-    /// Drops every cached image when the view goes away (no window: asset cache only).
+    /// Drops every cached image when the view goes away. There is no window here, so the
+    /// decoded image kept at the frame that showed it is removed from the sprite atlas of every
+    /// window ([`gpui_kit::App::drop_image`]), and the image from GPUI's asset cache.
     pub(super) fn release_images(&mut self, cx: &mut gpui_kit::App) {
         let held = self.p5.cache.image.take().map(|(_, _, i)| i);
         for old in held
             .into_iter()
             .chain(std::mem::take(&mut self.p5.cache.stale_images))
         {
-            old.remove_asset(cx);
+            old.evict(None, cx);
         }
     }
 
@@ -895,9 +994,7 @@ impl ResultsView {
                     .iter()
                     .map(|n| div().text_xs().text_color(theme.warning).child(n.clone())),
             )
-            .when_some(image, |d, image| {
-                d.child(img(image).max_w(px(320.)).max_h(px(480.)))
-            })
+            .when_some(image, |d, image| d.child(image.element()))
             .when(!output.text.is_empty(), |d| {
                 d.child(
                     div()
