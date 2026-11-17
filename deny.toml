@@ -21,6 +21,11 @@ ignore = [
     { id = "RUSTSEC-2026-0371", reason = "zbus_names: D-Bus stack of gpui-pre-linux (portals, AT-SPI accessibility)" },
     { id = "RUSTSEC-2026-0370", reason = "zvariant: D-Bus stack of gpui-pre-linux (portals, AT-SPI accessibility)" },
     { id = "RUSTSEC-2026-0372", reason = "zvariant_derive: D-Bus stack of gpui-pre-linux (portals, AT-SPI accessibility)" },
+    # 2026-11-17: "unmaintained" notice with no maintained release to move to; not a known
+    # vulnerability. chrono is not a direct dependency of any NineSQL crate: it comes through
+    # arrow-array 60 (Arrow result types, ADR-0004) and the pinned GPUI pair. Re-evaluate on
+    # every Arrow bump and every `chore(ui): bump gpui`.
+    { id = "RUSTSEC-2026-0543", reason = "chrono: via arrow-array 60 and gpui-pre 0.3.12 / gpui-kit 0.9.1; no maintained replacement upstream" },
 ]
 
 [licenses]
