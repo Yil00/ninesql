@@ -5,7 +5,7 @@
 
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use bytes::BytesMut;
 use ninesql_driver_api::{CancelHandle, DriverResult, SERVER_CANCEL_GRACE};
@@ -56,6 +56,9 @@ impl CancelTarget {
 pub(crate) struct ExecCancel {
     requested: AtomicBool,
     notify: Notify,
+    /// Cancel requests of [`PgCancel::cancel`] still on their way to the server.
+    in_flight: AtomicUsize,
+    sent: Notify,
 }
 
 impl ExecCancel {
@@ -66,6 +69,23 @@ impl ExecCancel {
 
     pub(crate) fn is_requested(&self) -> bool {
         self.requested.load(Ordering::SeqCst)
+    }
+
+    /// Waits until no cancel request of [`PgCancel::cancel`] is still on its way to the server,
+    /// bounded by [`SERVER_CANCEL_GRACE`]. The connection task waits for it before it ends a
+    /// cancelled statement: a request that reached the server only after the end would
+    /// interrupt the next statement instead (a cancel arriving at an idle backend does nothing).
+    pub(crate) async fn requests_sent(&self) {
+        let wait = async {
+            loop {
+                let sent = self.sent.notified();
+                if self.in_flight.load(Ordering::SeqCst) == 0 {
+                    return;
+                }
+                sent.await;
+            }
+        };
+        let _ = tokio::time::timeout(SERVER_CANCEL_GRACE, wait).await;
     }
 
     /// Completes once a cancel was requested.
@@ -90,11 +110,16 @@ pub(crate) struct PgCancel {
 #[async_trait::async_trait]
 impl CancelHandle for PgCancel {
     async fn cancel(&self) -> DriverResult<()> {
+        // Counted before the flag, so the connection task, woken by the flag, waits for the
+        // request to reach the server before it ends the statement.
+        self.exec.in_flight.fetch_add(1, Ordering::SeqCst);
         // Flag first: if the portal is idle, the connection task closes it at once.
         self.exec.request();
         if let Err(e) = self.target.send().await {
             tracing::warn!(error = %e, "cancel request failed");
         }
+        self.exec.in_flight.fetch_sub(1, Ordering::SeqCst);
+        self.exec.sent.notify_waiters();
         Ok(())
     }
 

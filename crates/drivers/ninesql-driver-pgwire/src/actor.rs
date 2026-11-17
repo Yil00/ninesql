@@ -1357,6 +1357,11 @@ impl Actor {
             ))));
         }
         let cancelled = ex.cancelled();
+        if ex.cancel.is_requested() {
+            // A user cancel's request may still be on its way: once it reaches the server it
+            // must find this statement, never the next one.
+            ex.cancel.requests_sent().await;
+        }
         let portal_open = ex.fetch == Fetch::Suspended;
         let mut end_error = None;
         if ex.implicit_txn && self.conn.txn_status != b'I' {
