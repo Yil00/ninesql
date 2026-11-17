@@ -1,6 +1,6 @@
 # ADR-0027: Phase 5 editing, transfer and export decisions
 
-- **Status**: Proposed (2026-11-16, to be accepted by the maintainer). It builds on [ADR-0004](0004-driver-api-runtime-and-results.md) (driver API, streamed results under a budget), [ADR-0006](0006-dbeaver-interoperability.md) §7 (export to DBeaver), [ADR-0008](0008-workspace-and-config-storage.md) §1 (a new machine-owned file in the project, §4.1 below, without editing it) and [ADR-0020](0020-phase-1-driver-decisions.md) §2 (MySQL literals: rule unchanged, spelling noted there). The confirmation rules of phase 5 are a separate [ADR-0007 amendment](0007-production-safety-model.md#amendment-phase-5-2026-11-16), also proposed.
+- **Status**: Accepted (maintainer, 2026-11-17; proposed 2026-11-16). It builds on [ADR-0004](0004-driver-api-runtime-and-results.md) (driver API, streamed results under a budget), [ADR-0006](0006-dbeaver-interoperability.md) §7 (export to DBeaver), [ADR-0008](0008-workspace-and-config-storage.md) §1 (a new machine-owned file in the project, §4.1 below, without editing it) and [ADR-0020](0020-phase-1-driver-decisions.md) §2 (MySQL literals: rule unchanged, spelling noted there). The confirmation rules of phase 5 are a separate [ADR-0007 amendment](0007-production-safety-model.md#amendment-phase-5-2026-11-16), also accepted (maintainer, 2026-11-17).
 - **Date**: 2026-11-16
 
 ## Context
