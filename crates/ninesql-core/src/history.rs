@@ -43,7 +43,8 @@
 //! bounded queue without waiting: when the queue is full (a disk that does not keep up), the
 //! entry is dropped and counted ([`History::dropped`]). Queries, deletes and pruning go through
 //! the same queue and answer through a [`Reply`]. Retention ([`HistoryPreferences::retention`])
-//! is applied at start, every [`PRUNE_EVERY`] entries and when it changes.
+//! is applied at start, every [`PRUNE_EVERY`] entries and when it changes (after the inserts
+//! queued before the change).
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{self, SyncSender, TrySendError};
@@ -292,7 +293,9 @@ impl History {
                 .shared
                 .retention_changed
                 .store(true, Ordering::SeqCst);
-            // A full queue still holds jobs: the writer sees the flag at the next one.
+            // The `Wake` queues behind the inserts sent before the change, so they are pruned
+            // too. A full queue drops it: the writer then acts on the flag at the next job that
+            // is not an insert, and the periodic prune meanwhile reads the new retention.
             let _ = self.inner.jobs.try_send(Job::Wake);
         }
     }

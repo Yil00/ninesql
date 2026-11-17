@@ -124,31 +124,23 @@ pub struct ScriptRows {
     preview: StatementPreview,
 }
 
-/// Whether `c` may take more than one column in a monospace font: East Asian wide, emoji,
-/// regional indicators, symbols and dingbats, arrows and the markers this view draws, which
-/// may come from a fallback font. Conservative: over-counting only wraps a row earlier.
+/// Whether `c` may take more than one column in a monospace font: everything outside the
+/// scripts listed below, the markers this view draws included (they may come from a fallback
+/// font). Conservative: over-counting only wraps a row earlier.
 fn is_wide(c: char) -> bool {
-    matches!(
+    // Only the scripts a monospace font reliably draws at one advance (ASCII, Latin, IPA,
+    // Greek, Cyrillic, general punctuation, currency and letter-like symbols) count as one
+    // column. Everything else (CJK, emoji, arrows, symbols, and any script that may come from
+    // a proportional fallback font: Hebrew, Arabic, Devanagari, Georgian, Ethiopic…) counts
+    // wide: over-counting is safe, under-counting can push text out of sight (security review
+    // round 3, Low 1).
+    !matches!(
         c,
-        '\u{1100}'..='\u{115F}'
-            | '\u{2190}'..='\u{21FF}'
-            | '\u{2300}'..='\u{23FF}'
-            | '\u{2400}'..='\u{24FF}'
-            | '\u{25A0}'..='\u{27BF}'
-            | '\u{2B00}'..='\u{2BFF}'
-            | '\u{2E80}'..='\u{A4CF}'
-            | '\u{A960}'..='\u{A97F}'
-            | '\u{AC00}'..='\u{D7FF}'
-            | '\u{F900}'..='\u{FAFF}'
-            | '\u{FE10}'..='\u{FE19}'
-            | '\u{FE30}'..='\u{FE4F}'
-            | '\u{FF00}'..='\u{FF60}'
-            | '\u{FFE0}'..='\u{FFE6}'
-            | '\u{FFFC}'..='\u{FFFD}'
-            | '\u{16FE0}'..='\u{18AFF}'
-            | '\u{1B000}'..='\u{1B2FF}'
-            | '\u{1F000}'..='\u{1FAFF}'
-            | '\u{20000}'..='\u{3FFFD}'
+        '\u{0000}'..='\u{052F}'
+            | '\u{1E00}'..='\u{1FFF}'
+            | '\u{2000}'..='\u{206F}'
+            | '\u{20A0}'..='\u{20CF}'
+            | '\u{2100}'..='\u{214F}'
     )
 }
 
@@ -576,6 +568,13 @@ mod tests {
             '\u{1FAFF}',
             '\u{3000}',
             '\u{AC00}',
+            // Scripts a mono font may draw from a proportional fallback (review round 3, Low 1).
+            '\u{05D0}',
+            '\u{0627}',
+            '\u{0915}',
+            '\u{10D0}',
+            '\u{1200}',
+            '\u{0E01}',
         ] {
             assert!(is_wide(c), "{c:?}");
         }
