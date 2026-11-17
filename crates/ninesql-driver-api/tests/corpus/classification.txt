@@ -532,6 +532,82 @@ SELECT pg_ls_waldir, t.pg_file_unlink, brin_summarize_range, t.gin_clean_pending
 expect: all=Read
 SELECT t.pg_switch_wal, t.pg_promote, t.pg_create_restore_point, t.nextval FROM t WHERE t.pg_file_write = 1
 
+## pg_log_standby_snapshot writes a WAL record
+expect: pg=Unknown
+SELECT pg_log_standby_snapshot()
+
+## pg_sync_replication_slots qualified
+expect: pg=Unknown
+SELECT pg_catalog.pg_sync_replication_slots()
+
+## pg_truncate_visibility_map (pg_visibility)
+expect: pg=Unknown
+SELECT pg_truncate_visibility_map('t'::regclass)
+
+## pg_truncate_visibility_map quoted and qualified
+expect: pg=Unknown
+SELECT "public"."pg_truncate_visibility_map"('t')
+
+## autoprewarm_dump_now
+expect: pg=Unknown
+SELECT autoprewarm_dump_now()
+
+## autoprewarm_start_worker quoted
+expect: pg=Unknown
+SELECT "autoprewarm_start_worker"()
+
+## pg_prewarm
+expect: pg=Unknown
+SELECT pg_prewarm('t', 'buffer')
+
+## pg_buffercache_evict
+expect: pg=Unknown
+SELECT pg_buffercache_evict(bufferid) FROM pg_buffercache
+
+## pg_buffercache_evict_relation qualified
+expect: pg=Unknown
+SELECT * FROM public.pg_buffercache_evict_relation('t')
+
+## pg_buffercache_evict_all
+expect: pg=Unknown
+SELECT * FROM pg_buffercache_evict_all()
+
+## heap_force_kill (pg_surgery)
+expect: pg=Unknown
+SELECT heap_force_kill('t'::regclass, ARRAY['(0, 1)']::tid[])
+
+## heap_force_freeze quoted
+expect: pg=Unknown
+SELECT "heap_force_freeze"('t'::regclass, ARRAY['(0, 1)']::tid[])
+
+## pg_restore_relation_stats
+expect: pg=Unknown
+SELECT pg_restore_relation_stats('schemaname', 'public', 'relname', 't', 'reltuples', 1::real)
+
+## pg_clear_attribute_stats qualified
+expect: pg=Unknown
+SELECT pg_catalog.pg_clear_attribute_stats('public', 't', 'a', false)
+
+## pg_stat_statements_reset
+expect: pg=Unknown
+SELECT pg_stat_statements_reset()
+
+## pg_stat_reset_shared quoted
+expect: pg=Unknown
+SELECT "pg_stat_reset_shared"('bgwriter')
+
+## columns named like the second-review functions are reads
+expect: all=Read
+SELECT pg_log_standby_snapshot, t.pg_sync_replication_slots, pg_truncate_visibility_map, t.autoprewarm_dump_now, autoprewarm_start_worker, pg_prewarm, t.pg_buffercache_evict, heap_force_kill, t.pg_clear_relation_stats FROM t
+
+## read-only pg_visibility and pg_buffercache functions are reads
+expect: pg=Read
+SELECT * FROM pg_visibility_map('t'), pg_check_visible('t'), pg_buffercache_summary(), pg_visibility_map_summary('t')
+
+## names that only start like a side-effect function are reads
+expect: all=Read
+SELECT pg_prewarm_status(1), pg_buffercache_evicted(1), heap_force_kill_count(1) FROM t
+
 ## dblink qualified
 expect: pg=Unknown
 SELECT * FROM public.dblink('dbname=x', 'SELECT 1') AS r(a int)

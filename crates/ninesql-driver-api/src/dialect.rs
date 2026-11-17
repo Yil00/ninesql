@@ -1577,6 +1577,26 @@ const SIDE_EFFECT_FUNCTIONS: &[&str] = &[
     "LO_TRUNCATE64",
     "LOWRITE",
     "LOAD_EXTENSION",
+    // WAL, replication and maintenance side effects (second P5 security review): a WAL record
+    // for the standby snapshot (PostgreSQL 16), failover slot sync on a standby (17), the
+    // pg_visibility map truncation (WAL-logged), the autoprewarm worker and dump file, the
+    // buffer cache loads and evictions of pg_prewarm and pg_buffercache (17, 18), pg_surgery's
+    // heap writes and the statistics writers of PostgreSQL 18.
+    "PG_LOG_STANDBY_SNAPSHOT",
+    "PG_SYNC_REPLICATION_SLOTS",
+    "PG_TRUNCATE_VISIBILITY_MAP",
+    "AUTOPREWARM_DUMP_NOW",
+    "AUTOPREWARM_START_WORKER",
+    "PG_PREWARM",
+    "PG_BUFFERCACHE_EVICT",
+    "PG_BUFFERCACHE_EVICT_RELATION",
+    "PG_BUFFERCACHE_EVICT_ALL",
+    "HEAP_FORCE_KILL",
+    "HEAP_FORCE_FREEZE",
+    "PG_RESTORE_RELATION_STATS",
+    "PG_RESTORE_ATTRIBUTE_STATS",
+    "PG_CLEAR_RELATION_STATS",
+    "PG_CLEAR_ATTRIBUTE_STATS",
 ];
 
 /// Prefixes of function families with side effects (F2): replication slots and origins,
