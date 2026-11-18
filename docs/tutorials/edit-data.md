@@ -120,7 +120,7 @@ For any result, not only table data:
 - Editing a cell in place in the grid, drawing inserted rows before a refresh.
 - A filter history kept after a restart.
 - "Open table data" and the editing actions in the navigator's context menu.
-- Editing on YugabyteDB is not engine-tested yet; QuestDB declares no editing.
+- QuestDB declares no editing.
 - Value statistics in the metadata panel, folding in the JSON and XML viewers, GIF and animated PNG previews (shown as hex).
 - The visual pass of these screens (P6-F).
 
