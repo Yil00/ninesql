@@ -62,7 +62,7 @@ use ninesql_core::{
 use ninesql_editor::completion::{CompletionEngine, KeywordSet, MetadataProvider, NoMetadata};
 use ninesql_editor::execution::{ExecutionRequest, StatementError};
 use ninesql_editor::params::ParameterStyle;
-use ninesql_editor::script::ScriptPath;
+use ninesql_editor::script::{FileStamp, ScriptPath};
 use ninesql_editor::split::DialectSplitter;
 use ninesql_editor::{DirtyChanged, EditorSetup, SqlEditor};
 use ninesql_grid::{ExecutionEvent, GridBudget, ResultsView};
@@ -241,6 +241,9 @@ pub struct SqlEditorTab {
     /// using (F-WS-06), kept while the tab has no session: never connected automatically, the
     /// toolbar offers "Connect" through the normal flow.
     linked: Option<ConnectionId>,
+    /// The script file as it was when loaded or last saved here: "Save" asks before replacing
+    /// a file that changed since (another window, another program).
+    script_stamp: Option<FileStamp>,
     _tasks: Vec<Task<()>>,
     _subscriptions: Vec<Subscription>,
 }
@@ -329,6 +332,7 @@ impl SqlEditorTab {
             warming: None,
             table: table::TableState::default(),
             linked: connection,
+            script_stamp: None,
             _tasks: vec![requests, dropped],
             _subscriptions: subscriptions,
         }
@@ -404,6 +408,17 @@ impl SqlEditorTab {
     #[must_use]
     pub fn is_dirty(&self, cx: &App) -> bool {
         self.editor.read(cx).is_dirty()
+    }
+
+    /// The script file as loaded or last saved here.
+    #[must_use]
+    pub fn script_stamp(&self) -> Option<FileStamp> {
+        self.script_stamp
+    }
+
+    /// Records the script file as just loaded or saved.
+    pub fn set_script_stamp(&mut self, stamp: Option<FileStamp>) {
+        self.script_stamp = stamp;
     }
 
     /// The connection the script runs on: the session's, else the linked one (not connected).

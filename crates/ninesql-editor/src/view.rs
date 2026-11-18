@@ -256,6 +256,12 @@ impl SqlEditor {
         match self.editor.read(cx).line_height() {
             Some(height) => {
                 self.pending_scroll = None;
+                // A restored position past the end (the file is shorter, or the session file
+                // was edited) is clamped to the last line.
+                let last = crate::text::LineIndex::new(&self.text(cx))
+                    .line_count()
+                    .saturating_sub(1);
+                let line = line.min(last);
                 let y = -(f32::from(height) * line as f32);
                 self.editor.update(cx, |s, cx| {
                     s.set_scroll_offset(point(px(0.), px(y)), cx);

@@ -28,6 +28,8 @@ use ninesql_core::storage::fs::ensure_private_dir;
 use ninesql_editor::script::{EditorSession, SessionTab};
 use serde::{Deserialize, Serialize};
 
+#[cfg(test)]
+use super::store::WriteMode;
 use super::store::{LoadedScript, ScriptFileError, ScriptStore};
 use crate::layout::LayoutSnapshot;
 
@@ -37,6 +39,12 @@ pub const MAX_RESTORED_WINDOWS: usize = 8;
 pub const MAX_RESTORED_TABS: usize = 64;
 /// Most script bytes read for one restore (every window together).
 pub const MAX_RESTORED_BYTES: u64 = 64 * 1024 * 1024;
+/// Most tabs of the session file looked at in one restore (every window together), whether
+/// they reopen or not: a hostile or broken file cannot make the restore stat thousands of
+/// paths. Per window, at most [`MAX_RESTORED_TABS`] tabs are looked at.
+pub const MAX_TRIED_TABS: usize = 256;
+/// Most notices listed after a restore; the rest are counted ("… and N more").
+pub const MAX_NOTICES: usize = 20;
 
 /// The session file.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -102,10 +110,36 @@ pub struct WindowPlan {
 pub struct RestorePlan {
     /// Windows with at least one tab to reopen.
     pub windows: Vec<WindowPlan>,
-    /// Scripts skipped and other problems, for one notice.
+    /// Scripts skipped and other problems, for one notice (at most [`MAX_NOTICES`]).
     pub notices: Vec<String>,
+    /// Problems not listed in `notices`.
+    pub more_notices: usize,
     /// The session file must not be overwritten at quit (written by a newer NineSQL).
     pub keep_file: bool,
+}
+
+impl RestorePlan {
+    fn notice(&mut self, text: String) {
+        if self.notices.len() < MAX_NOTICES {
+            self.notices.push(text);
+        } else {
+            self.more_notices += 1;
+        }
+    }
+
+    /// The notice text: the listed problems, then "… and N more".
+    #[must_use]
+    pub fn notice_text(&self) -> Option<String> {
+        if self.notices.is_empty() {
+            return None;
+        }
+        let mut lines: Vec<String> = self.notices.iter().take(MAX_NOTICES).cloned().collect();
+        let more = self.more_notices + self.notices.len().saturating_sub(MAX_NOTICES);
+        if more > 0 {
+            lines.push(format!("… and {more} more."));
+        }
+        Some(lines.join("\n"))
+    }
 }
 
 /// Reads the session file and every script it names. **Blocking.**
@@ -141,15 +175,25 @@ pub fn read_plan(path: &Path, store: &ScriptStore, project: &str) -> RestorePlan
         return plan;
     }
     let mut budget = MAX_RESTORED_BYTES;
+    let mut tried = 0usize;
+    let windows = file.windows.len();
+    if windows > MAX_RESTORED_WINDOWS {
+        plan.notice(format!(
+            "Only the first {MAX_RESTORED_WINDOWS} windows of the previous session were looked at."
+        ));
+    }
     for window in file.windows.into_iter().take(MAX_RESTORED_WINDOWS) {
         let mut tabs = Vec::new();
         for (index, tab) in window.editor.tabs.iter().enumerate() {
-            if tabs.len() >= MAX_RESTORED_TABS {
-                plan.notices.push(format!(
-                    "Only the first {MAX_RESTORED_TABS} scripts of a window were reopened."
+            // Every tab looked at counts, whether it reopens or not.
+            if index >= MAX_RESTORED_TABS || tried >= MAX_TRIED_TABS {
+                plan.notice(format!(
+                    "{} more script(s) of the previous session were not looked at (at most {MAX_RESTORED_TABS} per window and {MAX_TRIED_TABS} in all).",
+                    window.editor.tabs.len() - index
                 ));
                 break;
             }
+            tried += 1;
             match read_tab(store, tab, &mut budget) {
                 Ok(script) => tabs.push(RestoredTab {
                     index,
@@ -158,7 +202,7 @@ pub fn read_plan(path: &Path, store: &ScriptStore, project: &str) -> RestorePlan
                     cursor: (tab.cursor_line, tab.cursor_column),
                     scroll_line: tab.scroll_line,
                 }),
-                Err(why) => plan.notices.push(why),
+                Err(why) => plan.notice(why),
             }
         }
         if !tabs.is_empty() {
@@ -192,7 +236,8 @@ fn read_tab(
     if now.len > *budget {
         return Err(skipped("too much script text to reopen at once."));
     }
-    let script = match store.read(&tab.script) {
+    // The tab's connection comes from the session file: `scripts.json` is not read per tab.
+    let script = match store.read_unlinked(&tab.script) {
         Ok(s) => s,
         Err(ScriptFileError::NotFound(_)) => return Err(skipped("the file is missing.")),
         Err(e) => return Err(skipped(&e.to_string())),
@@ -296,7 +341,12 @@ mod tests {
         let c = ConnectionId::new_random();
         for name in ["a.sql", "dir/b.sql", "c.sql"] {
             store
-                .write(&ScriptPath::new(name).unwrap(), "SELECT 1;", None, true)
+                .write(
+                    &ScriptPath::new(name).unwrap(),
+                    "SELECT 1;",
+                    None,
+                    WriteMode::CreateNew,
+                )
                 .unwrap();
         }
         let file = session(vec![
@@ -317,7 +367,7 @@ mod tests {
                 &ScriptPath::new("c.sql").unwrap(),
                 "SELECT 22;",
                 None,
-                false,
+                WriteMode::Replace(None),
             )
             .unwrap();
         let plan = read_plan(&p.session_file(), &store, "General");
@@ -346,6 +396,88 @@ mod tests {
                 .windows
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn a_hostile_session_file_is_bounded() {
+        let tmp = tempfile::tempdir().unwrap();
+        let p = paths(tmp.path());
+        let store = ScriptStore::new(
+            &p.project(&ProjectName::default_project()),
+            DbeaverRoots::none(),
+        );
+        store
+            .write(
+                &ScriptPath::new("real.sql").unwrap(),
+                "SELECT 1;",
+                None,
+                WriteMode::CreateNew,
+            )
+            .unwrap();
+        // 20 windows of 1 000 missing scripts each, one real script at the end of each.
+        let window = |w: usize| {
+            let mut tabs: Vec<SessionTab> = (0..1_000)
+                .map(|i| tab(&format!("w{w}/missing-{i}.sql"), None))
+                .collect();
+            tabs.push(tab("real.sql", None));
+            WindowSession {
+                editor: EditorSession::new(tabs, None),
+                layout: LayoutSnapshot::Pane {
+                    tabs: (0..1_001).collect(),
+                    active: 0,
+                    focused: true,
+                },
+                navigator_visible: true,
+            }
+        };
+        let file = SessionFile {
+            project: "General".to_owned(),
+            windows: (0..20).map(window).collect(),
+        };
+        // Written as is (no stamps), as a hand-made file would be.
+        fs::create_dir_all(p.state_dir()).unwrap();
+        document::save(&p.session_file(), &file).unwrap();
+        let plan = read_plan(&p.session_file(), &store, "General");
+        assert!(plan.windows.is_empty(), "the real script is past every cap");
+        assert_eq!(plan.notices.len(), MAX_NOTICES);
+        // 8 windows looked at, 64 tries per window, capped at 256 in all.
+        let tried_failures = MAX_TRIED_TABS;
+        let cap_notices = 1 + MAX_RESTORED_WINDOWS; // windows cap + one "not looked at" each
+        assert_eq!(
+            plan.notices.len() + plan.more_notices,
+            tried_failures + cap_notices
+        );
+        let text = plan.notice_text().unwrap();
+        assert_eq!(text.lines().count(), MAX_NOTICES + 1);
+        assert!(text.ends_with(&format!("… and {} more.", plan.more_notices)));
+    }
+
+    #[test]
+    fn script_paths_leaving_the_folder_are_refused_in_the_session_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let p = paths(tmp.path());
+        let store = ScriptStore::new(
+            &p.project(&ProjectName::default_project()),
+            DbeaverRoots::none(),
+        );
+        fs::create_dir_all(p.state_dir()).unwrap();
+        for bad in [
+            "../../outside.sql",
+            "/etc/x.sql",
+            "a/../../x.sql",
+            ".hidden.sql",
+        ] {
+            let json = format!(
+                r#"{{"schema_version": 1, "project": "General", "windows": [
+                {{"editor": {{"schema_version": 1, "tabs": [{{"script": {bad:?}}}]}},
+                  "layout": {{"kind": "pane", "tabs": [0]}}}}]}}"#
+            );
+            fs::write(p.session_file(), json).unwrap();
+            let plan = read_plan(&p.session_file(), &store, "General");
+            assert!(plan.windows.is_empty(), "{bad}");
+            assert_eq!(plan.notices.len(), 1, "{bad}");
+            assert!(plan.notices[0].contains("could not be read"), "{bad}");
+        }
     }
 
     #[test]

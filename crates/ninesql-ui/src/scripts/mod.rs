@@ -455,6 +455,9 @@ pub struct SessionState {
     quit_confirmed: bool,
     /// Waits for the hub to start before restoring.
     _hub_observer: Option<Subscription>,
+    /// The project's scripts, kept from the restore: the stamps written at quit use the
+    /// session manager's DBeaver roots even once the hub has shut down.
+    store: Option<ScriptStore>,
 }
 
 impl Global for SessionState {}
@@ -528,11 +531,23 @@ impl SessionState {
     }
 }
 
-/// Turns session restore on for the application: restores the previous session once the hub
-/// has started, and writes the session when NineSQL quits.
-pub fn install(cx: &mut App) {
-    cx.default_global::<SessionState>().enabled = true;
+/// Registers the quit handler that writes the session file. Called before the hub's own
+/// shutdown handler, so the session is taken while the hub (and its session manager's DBeaver
+/// roots) is still there.
+pub fn install_quit_handler(cx: &mut App) {
+    let state = cx.default_global::<SessionState>();
+    if state.enabled {
+        return;
+    }
+    state.enabled = true;
     cx.on_app_quit(write_on_quit).detach();
+}
+
+/// Turns session restore on for the application: restores the previous session once the hub
+/// has started, and writes the session when NineSQL quits ([`install_quit_handler`], if not
+/// registered yet).
+pub fn install(cx: &mut App) {
+    install_quit_handler(cx);
     let Some(hub) = Hub::get(cx) else {
         return;
     };
@@ -569,6 +584,7 @@ pub fn start_restore(cx: &mut App) {
         // No project: nothing to restore, and nothing is written at quit (no `restored`).
         return;
     };
+    cx.default_global::<SessionState>().store = Some(store.clone());
     let read = cx.background_spawn(async move { session::read_plan(&path, &store, &project) });
     cx.spawn(async move |cx| {
         let plan = read.await;
@@ -581,6 +597,8 @@ pub fn start_restore(cx: &mut App) {
 /// windows. A notice lists what was skipped.
 pub fn apply_plan(plan: RestorePlan, cx: &mut App) {
     SessionState::mark_restored(plan.keep_file, cx);
+    // Bounded: at most `MAX_NOTICES` lines, then "… and N more".
+    let notice = plan.notice_text();
     let mut first_window = None;
     for (i, window_plan) in plan.windows.into_iter().enumerate() {
         let target = if i == 0 {
@@ -601,16 +619,15 @@ pub fn apply_plan(plan: RestorePlan, cx: &mut App) {
         });
         first_window.get_or_insert(handle);
     }
-    if plan.notices.is_empty() {
+    let Some(text) = notice else {
         return;
-    }
+    };
     let handle = first_window.or_else(|| {
         SessionState::workspaces(cx)
             .first()
             .map(|w| w.read(cx).window_handle())
     });
     if let Some(handle) = handle {
-        let text = plan.notices.join("\n");
         let _ = handle.update(cx, |_, window, cx| {
             window.push_notification(
                 Notification::warning(text)
@@ -631,7 +648,11 @@ fn write_on_quit(cx: &mut App) -> impl std::future::Future<Output = ()> + use<> 
             let file = SessionState::current(cx)?;
             let hub = Hub::get(cx)?;
             let hub = hub.read(cx);
-            Some((hub.session_file()?, store_of(hub), file))
+            let store = cx
+                .try_global::<SessionState>()
+                .and_then(|s| s.store.clone())
+                .or_else(|| store_of(hub));
+            Some((hub.session_file()?, store, file))
         })
         .flatten();
     let task = job.map(|(path, store, file)| {

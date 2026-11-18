@@ -120,6 +120,9 @@ pub fn run(registry: ninesql_core::DriverRegistry) {
         // The core (workspace, secret stores, vault, lock watcher, driver runtime) starts off
         // the UI thread; windows open at once and the hub fills in when it is ready.
         crate::connections::hub::start(registry, cx);
+        // Before the hub's shutdown below: quit handlers run in the order they were added, and
+        // the session is written while the hub and its DBeaver roots are still there.
+        crate::scripts::install_quit_handler(cx);
         cx.on_app_quit(|cx| {
             if let Some(hub) = crate::connections::hub::Hub::get(cx) {
                 hub.update(cx, |hub, _| hub.shutdown(std::time::Duration::from_secs(2)));

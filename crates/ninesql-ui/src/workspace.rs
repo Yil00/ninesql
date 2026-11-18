@@ -56,6 +56,7 @@ use crate::keymap::EffectiveKeymap;
 use crate::layout::{EditorLayout, Node, PaneId, SplitAxis, TabId};
 use crate::navigator::Navigator;
 use crate::navigator::{NavigatorEvent, Selection};
+use crate::scripts::store::{ScriptFileError, WriteMode};
 use crate::scripts::{SessionState, UnsavedChoice};
 use crate::services::Services;
 use crate::settings::SettingsState;
@@ -896,27 +897,20 @@ impl Workspace {
                 warnings,
             } => {
                 self.active_connection = Some(*connection);
-                // The active editor without a connection takes the session just opened, and so
-                // does every editor of this window linked to that connection (a script, a
-                // restored tab); never one with a run going on (its run stays on the session it
-                // started on), nor one linked to another connection.
-                if let Some(session) = self.hub.read(cx).sessions(*connection).last().cloned() {
-                    let active = self.active_editor().map(Entity::entity_id);
-                    let takers: Vec<Entity<SqlEditorTab>> = self
-                        .tabs
-                        .values()
-                        .filter(|e| {
-                            let t = e.read(cx);
-                            let linked = t.linked_not_connected();
-                            !t.is_running()
-                                && t.session().is_none()
-                                && (linked == Some(*connection)
-                                    || (linked.is_none() && active == Some(e.entity_id())))
-                        })
-                        .cloned()
-                        .collect();
-                    for editor in takers {
-                        let session = session.clone();
+                // Only the active editor takes the session just opened: when it has no session,
+                // no run going on, and no link to another connection. Other editors linked to
+                // this connection (scripts, restored tabs) stay "not connected" with their
+                // Connect button: a session, production ones included, only reaches an editor
+                // the user is looking at (ADR-0007), never tabs in the background.
+                if let Some(editor) = self.active_editor().cloned()
+                    && let Some(session) = self.hub.read(cx).sessions(*connection).last().cloned()
+                {
+                    let t = editor.read(cx);
+                    let linked = t.linked_not_connected();
+                    if !t.is_running()
+                        && t.session().is_none()
+                        && (linked.is_none() || linked == Some(*connection))
+                    {
                         editor.update(cx, |e, cx| e.set_session(Some(session), cx));
                     }
                 }
@@ -2773,13 +2767,13 @@ impl Workspace {
         let start = self.next_script;
         let task = cx.background_spawn(async move {
             let path = store.free_name(start)?;
-            let (_, problem) = store.write(&path, "", link, true)?;
-            Ok::<_, crate::scripts::store::ScriptFileError>((path, problem))
+            let (stamp, problem) = store.write(&path, "", link, WriteMode::CreateNew)?;
+            Ok::<_, crate::scripts::store::ScriptFileError>((path, stamp, problem))
         });
         cx.spawn_in(window, async move |this, cx| {
             let result = task.await;
             let _ = this.update_in(cx, |ws, window, cx| match result {
-                Ok((path, problem)) => {
+                Ok((path, stamp, problem)) => {
                     ws.next_script += 1;
                     let session = ws.default_session(cx);
                     let id = ws.create_tab_with(path.file_name(), session, window, cx);
@@ -2787,6 +2781,7 @@ impl Workspace {
                         editor.update(cx, |e, cx| {
                             e.editor()
                                 .update(cx, |ed, cx| ed.mark_saved(path.clone(), "", cx));
+                            e.set_script_stamp(Some(stamp));
                             if e.session().is_none() {
                                 e.set_linked(link, cx);
                             }
@@ -2895,6 +2890,7 @@ impl Workspace {
                 e.editor().update(cx, |ed, cx| {
                     ed.load_script(&loaded.text, loaded.path.clone(), window, cx);
                 });
+                e.set_script_stamp(Some(loaded.stamp));
                 if e.session().is_none() {
                     e.set_linked(loaded.link, cx);
                 }
@@ -2946,8 +2942,12 @@ impl Workspace {
                 },
             ) as AfterSave
         });
+        let stamp = editor.read(cx).script_stamp();
         match editor.read(cx).script(cx) {
-            Some(script) => self.save_tab_to(tab, script, false, after, window, cx),
+            Some(script) => {
+                let mode = WriteMode::Replace(stamp);
+                self.save_tab_to(tab, script, mode, after, window, cx);
+            }
             None => self.prompt_save_as(tab, after, window, cx),
         }
     }
@@ -2963,6 +2963,7 @@ impl Workspace {
             return;
         };
         let current = editor.read(cx).script(cx);
+        let stamp = editor.read(cx).script_stamp();
         let initial = current.as_ref().map_or_else(
             || format!("{}.sql", editor.read(cx).title()),
             |s| s.as_path().to_string_lossy().into_owned(),
@@ -2972,10 +2973,16 @@ impl Workspace {
         crate::scripts::open_save_as(
             &initial,
             Rc::new(move |path, window, cx| {
-                let create_new = current.as_ref() != Some(&path);
+                // Under its own name: a "Save" (checked against the file as loaded); a new
+                // name must not exist yet.
+                let mode = if current.as_ref() == Some(&path) {
+                    WriteMode::Replace(stamp)
+                } else {
+                    WriteMode::CreateNew
+                };
                 let after = after.borrow_mut().take();
                 let _ = weak.update(cx, |ws, cx| {
-                    ws.save_tab_to(tab, path, create_new, after, window, cx)
+                    ws.save_tab_to(tab, path, mode, after, window, cx)
                 });
             }),
             window,
@@ -2984,12 +2991,14 @@ impl Workspace {
     }
 
     /// Writes a tab's text to `script` off the UI thread (atomic, `0600`) and records its
-    /// connection in `scripts.json`. `create_new` refuses an existing file ("Save as…").
+    /// connection in `scripts.json`. [`WriteMode::CreateNew`] refuses an existing file ("Save
+    /// as…"); [`WriteMode::Replace`] with the tab's stamp asks before replacing a file that
+    /// changed on disk since it was loaded or saved here ("Overwrite" or Cancel).
     pub fn save_tab_to(
         &mut self,
         tab: TabId,
         script: ScriptPath,
-        create_new: bool,
+        mode: WriteMode,
         after: Option<AfterSave>,
         window: &mut Window,
         cx: &mut Context<Self>,
@@ -3004,13 +3013,13 @@ impl Workspace {
         let link = editor.read(cx).script_connection();
         let written = text.clone();
         let path = script.clone();
-        let task =
-            cx.background_spawn(async move { store.write(&path, &written, link, create_new) });
+        let task = cx.background_spawn(async move { store.write(&path, &written, link, mode) });
         cx.spawn_in(window, async move |this, cx| {
             let result = task.await;
             let _ = this.update_in(cx, |ws, window, cx| match result {
-                Ok((_, problem)) => {
+                Ok((stamp, problem)) => {
                     editor.update(cx, |e, cx| {
+                        e.set_script_stamp(Some(stamp));
                         e.set_title(script.file_name(), cx);
                         e.editor()
                             .update(cx, |ed, cx| ed.mark_saved(script.clone(), &text, cx));
@@ -3023,6 +3032,28 @@ impl Workspace {
                         after(ws, window, cx);
                     }
                 }
+                Err(ScriptFileError::Changed(name)) => {
+                    let weak = cx.entity().downgrade();
+                    let after = Rc::new(std::cell::RefCell::new(after));
+                    let script = script.clone();
+                    crate::scripts::open_unsaved_confirmation(
+                        "Script changed on disk",
+                        format!(
+                            "\"{name}\" changed on disk since it was opened or saved here (in another window or another program). Overwrite it with this editor's text?"
+                        ),
+                        false,
+                        "Overwrite",
+                        Rc::new(move |_, window, cx| {
+                            let after = after.borrow_mut().take();
+                            let script = script.clone();
+                            let _ = weak.update(cx, |ws, cx| {
+                                ws.save_tab_to(tab, script, WriteMode::Replace(None), after, window, cx);
+                            });
+                        }),
+                        window,
+                        cx,
+                    );
+                }
                 Err(e) => window.push_notification(
                     Notification::error(e.to_string()).title("Script not saved"),
                     cx,
@@ -3033,14 +3064,23 @@ impl Workspace {
     }
 
     /// "Connect script connection": opens the active editor's linked connection through the
-    /// normal connect flow (secrets, confirmations); the editor takes the session when it opens.
+    /// normal connect flow (secrets, confirmations), or gives the active editor the session
+    /// already open on it; the editor takes the session when it opens.
     pub fn connect_script_connection(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let linked = self
             .active_editor()
             .and_then(|e| e.read(cx).linked_not_connected());
         match linked {
             Some(id) if self.hub.read(cx).connection(id).is_some() => {
-                self.connect(id, Purpose::Open, window, cx);
+                // Already connected (from another tab or the navigator): this editor, which the
+                // user is looking at, takes that session; otherwise the normal connect flow.
+                let open = self.hub.read(cx).sessions(id).last().cloned();
+                match (open, self.active_editor().cloned()) {
+                    (Some(session), Some(editor)) => {
+                        editor.update(cx, |e, cx| e.set_session(Some(session), cx));
+                    }
+                    _ => self.connect(id, Purpose::Open, window, cx),
+                }
             }
             Some(_) => Self::notify(
                 "The connection of this script was deleted: choose another one with Choose editor connection.",
@@ -3160,6 +3200,7 @@ impl Workspace {
                         ed.set_cursor_line_column(restored.cursor.0, restored.cursor.1, cx);
                         ed.set_scroll_line(restored.scroll_line, cx);
                     });
+                    e.set_script_stamp(Some(script.stamp));
                     e.set_linked(restored.connection, cx);
                 });
             }

@@ -34,7 +34,9 @@ use std::sync::{Mutex, PoisonError};
 use std::time::UNIX_EPOCH;
 
 use ninesql_core::DbeaverRoots;
-use ninesql_core::storage::fs::{ensure_private_dir, read_limited, read_private, write_atomic};
+use ninesql_core::storage::fs::{
+    ensure_private_dir, read_limited, read_private, write_atomic, write_new_atomic,
+};
 use ninesql_core::storage::{ProjectPaths, StorageError};
 use ninesql_editor::script::{FileStamp, MAX_SCRIPT_PATH_DEPTH, ScriptLinks, ScriptPath};
 
@@ -98,6 +100,11 @@ pub enum ScriptFileError {
     /// Save as: the name is taken.
     #[error("\"{0}\" already exists: choose another name.")]
     Exists(String),
+    /// "Save": the file changed (or disappeared) since it was loaded or last saved here.
+    #[error(
+        "\"{0}\" changed on disk since it was opened or saved here (another window or another program)."
+    )]
+    Changed(String),
     /// `scripts.json` written by a newer NineSQL, or invalid.
     #[error("scripts.json cannot be used ({0}): the script's connection is not remembered.")]
     Links(String),
@@ -135,6 +142,19 @@ fn storage_err(path: &ScriptPath, e: StorageError) -> ScriptFileError {
             detail: other.to_string(),
         },
     }
+}
+
+/// How [`ScriptStore::write`] treats the file already at the path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WriteMode {
+    /// "Save as…", "New script": the file must not exist; created atomically without ever
+    /// replacing one (`renameat2(RENAME_NOREPLACE)`, through `write_new_atomic`).
+    CreateNew,
+    /// "Save": replaces the file. With `Some(stamp)`, only while the file is still the one
+    /// loaded or last saved (same size and modification time), else
+    /// [`ScriptFileError::Changed`]; `None` overwrites whatever is there (the user confirmed).
+    /// The check and the write are separate steps (a narrow race with another writer).
+    Replace(Option<FileStamp>),
 }
 
 /// A script read from disk.
@@ -268,6 +288,21 @@ impl ScriptStore {
     /// # Errors
     /// See [`ScriptFileError`].
     pub fn read(&self, script: &ScriptPath) -> Result<LoadedScript, ScriptFileError> {
+        let mut loaded = self.read_unlinked(script)?;
+        // A missing or unreadable `scripts.json` only loses the link.
+        loaded.link = self
+            .load_links()
+            .ok()
+            .and_then(|l| l.connection_for(script));
+        Ok(loaded)
+    }
+
+    /// Reads a script without looking up its link (`link` is `None`): the session restore
+    /// reads many scripts and takes each tab's connection from the session file.
+    ///
+    /// # Errors
+    /// See [`ScriptFileError`].
+    pub fn read_unlinked(&self, script: &ScriptPath) -> Result<LoadedScript, ScriptFileError> {
         let path = self.resolve(script, false)?;
         let bytes = read_limited(&path, MAX_SCRIPT_BYTES)
             .map_err(|e| storage_err(script, e))?
@@ -276,37 +311,52 @@ impl ScriptStore {
             .map(|m| stamp_of(&m))
             .map_err(|e| io_err(script, &e))?;
         let text = String::from_utf8(bytes).map_err(|_| ScriptFileError::NotUtf8(shown(script)))?;
-        // A missing or unreadable `scripts.json` only loses the link.
-        let link = self
-            .load_links()
-            .ok()
-            .and_then(|l| l.connection_for(script));
         Ok(LoadedScript {
             path: script.clone(),
             text,
             stamp,
-            link,
+            link: None,
         })
     }
 
-    /// Writes a script atomically (`0600`) and records its link. With `create_new`, an
-    /// existing file is refused ("Save as…"). A failure to record the link does not undo the
-    /// write: it is returned as `Ok(Some(problem))`.
+    /// Writes a script atomically (`0600`) and records its link; see [`WriteMode`]. A failure
+    /// to record the link does not undo the write: it is returned as `Ok((_, Some(problem)))`.
     ///
     /// # Errors
-    /// See [`ScriptFileError`]; the file is unchanged on error.
+    /// See [`ScriptFileError`] ([`ScriptFileError::Exists`], [`ScriptFileError::Changed`]); the
+    /// file is unchanged on error.
     pub fn write(
         &self,
         script: &ScriptPath,
         text: &str,
         link: Option<ninesql_core::ConnectionId>,
-        create_new: bool,
+        mode: WriteMode,
     ) -> Result<(FileStamp, Option<String>), ScriptFileError> {
         let path = self.resolve(script, true)?;
-        if create_new && fs::symlink_metadata(&path).is_ok() {
-            return Err(ScriptFileError::Exists(shown(script)));
+        match mode {
+            WriteMode::CreateNew => {
+                write_new_atomic(&path, text.as_bytes()).map_err(|e| match e {
+                    StorageError::Io { source, .. }
+                        if source.kind() == io::ErrorKind::AlreadyExists =>
+                    {
+                        ScriptFileError::Exists(shown(script))
+                    }
+                    other => storage_err(script, other),
+                })?;
+            }
+            WriteMode::Replace(expected) => {
+                if let Some(expected) = expected {
+                    let now = fs::symlink_metadata(&path)
+                        .ok()
+                        .filter(fs::Metadata::is_file)
+                        .map(|m| stamp_of(&m));
+                    if now != Some(expected) {
+                        return Err(ScriptFileError::Changed(shown(script)));
+                    }
+                }
+                write_atomic(&path, text.as_bytes()).map_err(|e| storage_err(script, e))?;
+            }
         }
-        write_atomic(&path, text.as_bytes()).map_err(|e| storage_err(script, e))?;
         let stamp = fs::symlink_metadata(&path)
             .map(|m| stamp_of(&m))
             .map_err(|e| io_err(script, &e))?;
@@ -474,7 +524,12 @@ mod tests {
         let s = store(tmp.path(), DbeaverRoots::none());
         let c = ConnectionId::new_random();
         let (stamp, problem) = s
-            .write(&sp("reports/monthly.sql"), "SELECT 1;\n", Some(c), true)
+            .write(
+                &sp("reports/monthly.sql"),
+                "SELECT 1;\n",
+                Some(c),
+                WriteMode::CreateNew,
+            )
             .unwrap();
         assert!(problem.is_none());
         assert_eq!(stamp.len, 10);
@@ -488,13 +543,40 @@ mod tests {
         assert_eq!(loaded.stamp, stamp);
         // "Save as" refuses a taken name; "Save" overwrites.
         assert!(matches!(
-            s.write(&sp("reports/monthly.sql"), "x", None, true),
+            s.write(&sp("reports/monthly.sql"), "x", None, WriteMode::CreateNew),
             Err(ScriptFileError::Exists(_))
         ));
-        s.write(&sp("reports/monthly.sql"), "SELECT 2;", None, false)
-            .unwrap();
+        s.write(
+            &sp("reports/monthly.sql"),
+            "SELECT 2;",
+            None,
+            WriteMode::Replace(None),
+        )
+        .unwrap();
         let loaded = s.read(&sp("reports/monthly.sql")).unwrap();
         assert_eq!(loaded.text, "SELECT 2;");
+        // "Save" checked against the stamp: refused once the file changed, allowed when not.
+        assert!(matches!(
+            s.write(
+                &sp("reports/monthly.sql"),
+                "x",
+                None,
+                WriteMode::Replace(Some(stamp))
+            ),
+            Err(ScriptFileError::Changed(_))
+        ));
+        let (now, _) = s
+            .write(
+                &sp("reports/monthly.sql"),
+                "SELECT 2;",
+                None,
+                WriteMode::Replace(Some(loaded.stamp)),
+            )
+            .unwrap();
+        assert!(matches!(
+            s.write(&sp("gone.sql"), "x", None, WriteMode::Replace(Some(now))),
+            Err(ScriptFileError::Changed(_))
+        ));
         assert_eq!(loaded.link, None, "unlinked on save without a connection");
         let (list, cut) = s.list().unwrap();
         assert_eq!(list, vec![sp("reports/monthly.sql")]);
@@ -506,7 +588,8 @@ mod tests {
             .collect();
         assert_eq!(names.len(), 1);
         assert_eq!(s.free_name(1).unwrap(), sp("Script-1.sql"));
-        s.write(&sp("Script-1.sql"), "", None, true).unwrap();
+        s.write(&sp("Script-1.sql"), "", None, WriteMode::CreateNew)
+            .unwrap();
         assert_eq!(s.free_name(1).unwrap(), sp("Script-2.sql"));
     }
 
@@ -528,7 +611,7 @@ mod tests {
             );
             assert!(
                 matches!(
-                    s.write(&sp(p), "DROP TABLE t;", None, false),
+                    s.write(&sp(p), "DROP TABLE t;", None, WriteMode::Replace(None)),
                     Err(ScriptFileError::Symlink(_))
                 ),
                 "{p}"
@@ -540,7 +623,10 @@ mod tests {
             "nothing written through a link"
         );
         assert!(!outside.join("new.sql").exists());
-        assert!(s.write(&sp("evil/new.sql"), "x", None, true).is_err());
+        assert!(
+            s.write(&sp("evil/new.sql"), "x", None, WriteMode::CreateNew)
+                .is_err()
+        );
         assert!(!outside.join("new.sql").exists());
         // Links are not listed.
         assert!(s.list().unwrap().0.is_empty());
@@ -550,7 +636,10 @@ mod tests {
         fs::create_dir_all(s2.dir().parent().unwrap()).unwrap();
         std::os::unix::fs::symlink(&outside, s2.dir()).unwrap();
         assert!(s2.read(&sp("x.sql")).is_err());
-        assert!(s2.write(&sp("y.sql"), "x", None, true).is_err());
+        assert!(
+            s2.write(&sp("y.sql"), "x", None, WriteMode::CreateNew)
+                .is_err()
+        );
         assert!(!outside.join("y.sql").exists());
     }
 
@@ -577,7 +666,7 @@ mod tests {
         roots.add(tmp.path().join("data"));
         let s = store(tmp.path(), roots);
         assert!(matches!(
-            s.write(&sp("a.sql"), "SELECT 1;", None, true),
+            s.write(&sp("a.sql"), "SELECT 1;", None, WriteMode::CreateNew),
             Err(ScriptFileError::InsideDbeaver(_))
         ));
         assert!(!s.dir().join("a.sql").exists());
@@ -591,7 +680,7 @@ mod tests {
         let tmp2 = tempfile::tempdir().unwrap();
         let s2 = store(&tmp2.path().join("DBeaverData"), DbeaverRoots::none());
         assert!(matches!(
-            s2.write(&sp("a.sql"), "SELECT 1;", None, true),
+            s2.write(&sp("a.sql"), "SELECT 1;", None, WriteMode::CreateNew),
             Err(ScriptFileError::InsideDbeaver(_))
         ));
     }
@@ -641,7 +730,7 @@ mod tests {
                 &sp("a.sql"),
                 "SELECT 1;",
                 Some(ConnectionId::new_random()),
-                true,
+                WriteMode::CreateNew,
             )
             .unwrap();
         assert!(problem.is_some_and(|p| p.contains("newer")));

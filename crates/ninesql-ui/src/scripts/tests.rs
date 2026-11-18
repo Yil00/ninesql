@@ -18,7 +18,7 @@ use ninesql_core::{
 use ninesql_editor::script::ScriptPath;
 
 use super::session::{self, SessionFile};
-use super::store::ScriptStore;
+use super::store::{ScriptStore, WriteMode};
 use super::{SessionState, parse_script_path};
 use crate::app;
 use crate::connections::hub::{ConnectionHub, HubConfig, install, registry_with};
@@ -155,7 +155,7 @@ fn close_dialog(vcx: &mut VisualTestContext) {
 fn save_to(ws: &Entity<Workspace>, tab: TabId, path: &str, vcx: &mut VisualTestContext) {
     let path = sp(path);
     ws.update_in(vcx, |ws, window, cx| {
-        ws.save_tab_to(tab, path, true, None, window, cx);
+        ws.save_tab_to(tab, path, WriteMode::CreateNew, None, window, cx);
     });
     vcx.run_until_parked();
 }
@@ -306,7 +306,7 @@ fn loading_normalises_line_ends_and_shows_the_file_as_changed(cx: &mut TestAppCo
         &sp("crlf.sql"),
         "SELECT 1;\r\nSELECT\u{7}2;\r\n",
         None,
-        true,
+        WriteMode::CreateNew,
     )
     .unwrap_or_else(|e| panic!("{e}"));
     let task = ws.update_in(&mut vcx, |ws, window, cx| {
@@ -395,7 +395,7 @@ fn symlinked_and_dbeaver_scripts_are_refused_in_the_ui(cx: &mut TestAppContext) 
     set_text(&ws, tab, "DROP TABLE t;", &mut vcx);
     let path = sp("link.sql");
     ws.update_in(&mut vcx, |ws, window, cx| {
-        ws.save_tab_to(tab, path, false, None, window, cx);
+        ws.save_tab_to(tab, path, WriteMode::Replace(None), None, window, cx);
     });
     vcx.run_until_parked();
     assert_eq!(
@@ -515,10 +515,10 @@ fn restore_reopens_saved_scripts_without_connecting(cx: &mut TestAppContext) {
         &sp("a.sql"),
         "SELECT 1;\nSELECT 22;\n",
         Some(connection),
-        true,
+        WriteMode::CreateNew,
     )
     .unwrap_or_else(|e| panic!("{e}"));
-    s.write(&sp("b.sql"), "SELECT 'b';", None, true)
+    s.write(&sp("b.sql"), "SELECT 'b';", None, WriteMode::CreateNew)
         .unwrap_or_else(|e| panic!("{e}"));
     let tab = |script: &str, connection: Option<ConnectionId>| ninesql_editor::script::SessionTab {
         script: sp(script),
@@ -602,4 +602,122 @@ fn restore_reopens_saved_scripts_without_connecting(cx: &mut TestAppContext) {
     assert_eq!(hub.read_with(&vcx, |h, _| h.open_sessions().len()), 1);
     // The session file is written at quit from now on.
     assert!(vcx.update(|_, cx| SessionState::current(cx)).is_some());
+}
+
+#[gpui::test]
+fn save_asks_before_replacing_a_file_changed_on_disk(cx: &mut TestAppContext) {
+    let tmp = tempfile::tempdir().unwrap_or_else(|e| panic!("{e}"));
+    init(cx, tmp.path(), Vec::new());
+    let (ws, mut vcx) = open(cx);
+    let s = store(tmp.path());
+    s.write(&sp("shared.sql"), "SELECT 1;", None, WriteMode::CreateNew)
+        .unwrap_or_else(|e| panic!("{e}"));
+    let task = ws.update_in(&mut vcx, |ws, window, cx| {
+        ws.open_script_path(sp("shared.sql"), window, cx)
+    });
+    vcx.run_until_parked();
+    let Some(tab) = vcx.foreground_executor().block_test(task) else {
+        panic!("opened");
+    };
+    // Another window or program writes the file meanwhile.
+    let file = s.dir().join("shared.sql");
+    std::fs::write(&file, "SELECT 'from elsewhere';").unwrap_or_else(|e| panic!("{e}"));
+    set_text(&ws, tab, "SELECT 2;", &mut vcx);
+    vcx.simulate_keystrokes("ctrl-s");
+    vcx.run_until_parked();
+    assert!(has_dialog(&mut vcx), "asks: overwrite or cancel");
+    assert_eq!(
+        std::fs::read_to_string(&file).ok().as_deref(),
+        Some("SELECT 'from elsewhere';"),
+        "nothing replaced before the answer"
+    );
+    assert!(is_dirty(&ws, tab, &vcx));
+    // Cancel keeps the other text; "Overwrite" writes the editor's.
+    close_dialog(&mut vcx);
+    let path = sp("shared.sql");
+    ws.update_in(&mut vcx, |ws, window, cx| {
+        ws.save_tab_to(tab, path, WriteMode::Replace(None), None, window, cx);
+    });
+    vcx.run_until_parked();
+    assert_eq!(
+        std::fs::read_to_string(&file).ok().as_deref(),
+        Some("SELECT 2;")
+    );
+    assert!(!is_dirty(&ws, tab, &vcx));
+    // The new stamp is the one checked next: a plain save goes through.
+    set_text(&ws, tab, "SELECT 3;", &mut vcx);
+    vcx.simulate_keystrokes("ctrl-s");
+    vcx.run_until_parked();
+    assert!(!has_dialog(&mut vcx));
+    assert_eq!(
+        std::fs::read_to_string(&file).ok().as_deref(),
+        Some("SELECT 3;")
+    );
+    // "Save as" onto an existing name is refused, never replaced.
+    s.write(
+        &sp("taken.sql"),
+        "SELECT 'taken';",
+        None,
+        WriteMode::CreateNew,
+    )
+    .unwrap_or_else(|e| panic!("{e}"));
+    save_to(&ws, tab, "taken.sql", &mut vcx);
+    assert_eq!(
+        std::fs::read_to_string(s.dir().join("taken.sql"))
+            .ok()
+            .as_deref(),
+        Some("SELECT 'taken';")
+    );
+}
+
+#[gpui::test]
+fn opening_a_production_connection_binds_only_the_active_editor(cx: &mut TestAppContext) {
+    let tmp = tempfile::tempdir().unwrap_or_else(|e| panic!("{e}"));
+    let c = mock_connection("Prod", ConnectionTypeId::prod(), Auth::None);
+    let connection = c.id;
+    let hub = init(cx, tmp.path(), vec![c]);
+    let s = store(tmp.path());
+    for name in ["one.sql", "two.sql"] {
+        s.write(
+            &sp(name),
+            "SELECT 1;",
+            Some(connection),
+            WriteMode::CreateNew,
+        )
+        .unwrap_or_else(|e| panic!("{e}"));
+    }
+    let (ws, mut vcx) = open(cx);
+    let mut tabs = Vec::new();
+    for name in ["one.sql", "two.sql"] {
+        let task = ws.update_in(&mut vcx, |ws, window, cx| {
+            ws.open_script_path(sp(name), window, cx)
+        });
+        vcx.run_until_parked();
+        let Some(tab) = vcx.foreground_executor().block_test(task) else {
+            panic!("opened");
+        };
+        tabs.push(tab);
+    }
+    let (one, two) = (tabs[0], tabs[1]);
+    let linked = |tab: TabId, vcx: &VisualTestContext| {
+        ws.read_with(vcx, |ws, cx| {
+            ws.editor(tab).map(|e| {
+                let e = e.read(cx);
+                (e.session().is_some(), e.linked_not_connected())
+            })
+        })
+    };
+    assert_eq!(linked(two, &vcx), Some((false, Some(connection))));
+    // "two.sql" is active: connecting gives it the production session…
+    vcx.simulate_keystrokes("ctrl-k ctrl-shift-o");
+    wait_until(&mut vcx, |vcx| linked(two, vcx) == Some((true, None)));
+    // …and nothing else: "one.sql" stays "not connected" in the background.
+    vcx.run_until_parked();
+    assert_eq!(linked(one, &vcx), Some((false, Some(connection))));
+    // Connecting there is again the user's choice; it takes the open session.
+    ws.update_in(&mut vcx, |ws, window, cx| ws.activate_tab(one, window, cx));
+    vcx.simulate_keystrokes("ctrl-k ctrl-shift-o");
+    vcx.run_until_parked();
+    assert_eq!(linked(one, &vcx), Some((true, None)));
+    assert_eq!(hub.read_with(&vcx, |h, _| h.open_sessions().len()), 1);
 }
