@@ -1,6 +1,6 @@
 # ADR-0005: Secrets storage
 
-- **Status**: Accepted. Partially superseded by [ADR-0012](0012-secret-service-client-and-msrv.md) for the client crate (`secret-service` 6 instead of `keyring`) and the Secret Service item attributes; everything else stands. Note (P1-D, 2026-11-14): the vault of §2 is implemented as format v1; its bounds and known limits are documented in the rustdoc of `ninesql_secrets::vault` and in [docs/05](../05-security.md#vault-format-v1). Amended (P1-D wiring, 2026-11-15) by the [section](#amendment-p1-d-wiring-2026-11-15) below: locking on sleep and screen lock in default builds, and the Flatpak permissions it needs; the decision above is unchanged. A further amendment, [lock watcher reconnect (2026-11-18)](#amendment-lock-watcher-reconnect-2026-11-18), is **Proposed**: it changes point 4 of the P1-D wiring amendment.
+- **Status**: Accepted. Partially superseded by [ADR-0012](0012-secret-service-client-and-msrv.md) for the client crate (`secret-service` 6 instead of `keyring`) and the Secret Service item attributes; everything else stands. Note (P1-D, 2026-11-14): the vault of §2 is implemented as format v1; its bounds and known limits are documented in the rustdoc of `ninesql_secrets::vault` and in [docs/05](../05-security.md#vault-format-v1). Amended (P1-D wiring, 2026-11-15) by the [section](#amendment-p1-d-wiring-2026-11-15) below: locking on sleep and screen lock in default builds, and the Flatpak permissions it needs; the decision above is unchanged. A further amendment, [lock watcher reconnect (2026-11-18)](#amendment-lock-watcher-reconnect-2026-11-18), is **Accepted (maintainer, 2026-11-18)**: it changes point 4 of the P1-D wiring amendment. Note on §3 (["ask every time", 2026-11-18](#note-on-3-ask-every-time-2026-11-18)): an "ask every time" secret is asked at every connect and never cached in memory; the decision is unchanged.
 - **Date**: 2026-11-14
 
 ## Context
@@ -41,14 +41,14 @@ Approved by the maintainer. It adds to the decision above and changes none of it
 - Default builds lock secrets on sleep and screen lock without enabling the Secret Service backend, which is not validated yet (ADR-0012).
 - Default builds open a system-bus connection to logind. That is local D-Bus traffic, not network traffic, so I2 is unaffected.
 - On a system without logind, or in a Flatpak without the logind permission, only the idle lock and the explicit `CoreServices::lock_now` apply. The UI can tell from `lock_watcher_status`.
-- A watcher that lost the bus is not restarted until the next start of the application (ROADMAP follow-up). Changed by the proposed [lock watcher reconnect amendment](#amendment-lock-watcher-reconnect-2026-11-18).
+- A watcher that lost the bus is not restarted until the next start of the application (ROADMAP follow-up). Changed by the accepted [lock watcher reconnect amendment](#amendment-lock-watcher-reconnect-2026-11-18).
 
 **Rejected alternatives.**
 - **Keep the watcher behind `secret-service`**: default builds would get no sleep or screen-lock locking until the Secret Service backend is validated.
 - **Make `secret-service` default-on to get the watcher**: contradicts ADR-0012, which keeps the release-candidate client off until the desktop round trip and the stable 6.x.
 
 ## Amendment (lock watcher reconnect, 2026-11-18)
-**Status: Proposed** (to be accepted by the maintainer). It changes point 4 of the [P1-D wiring amendment](#amendment-p1-d-wiring-2026-11-15) ("When it loses the bus connection, it locks once and stops (fail-closed). It is not restarted.", and the list of bus calls) and its last consequence; points 1 to 3, 5 and 6 are unchanged. Raised by the Phase 1 follow-up "Wave 3 (secrets)" and its security review. Behaviour as implemented: `crates/ninesql-secrets/src/lock_signals.rs` (`supervise`, `BusLink::watch_signals`, `RECONNECT_FIRST`, `RECONNECT_MAX`, `WatcherState`), `CoreServices::lock_watcher_status`, [docs/02](../02-architecture.md#secrets-adr-0005-p1-d) and [docs/05](../05-security.md#vault-format-v1).
+**Status: Accepted (maintainer, 2026-11-18).** It changes point 4 of the [P1-D wiring amendment](#amendment-p1-d-wiring-2026-11-15) ("When it loses the bus connection, it locks once and stops (fail-closed). It is not restarted.", and the list of bus calls) and its last consequence; points 1 to 3, 5 and 6 are unchanged. Raised by the Phase 1 follow-up "Wave 3 (secrets)" and its security review. Behaviour as implemented: `crates/ninesql-secrets/src/lock_signals.rs` (`supervise`, `BusLink::watch_signals`, `RECONNECT_FIRST`, `RECONNECT_MAX`, `WatcherState`), `CoreServices::lock_watcher_status`, [docs/02](../02-architecture.md#secrets-adr-0005-p1-d) and [docs/05](../05-security.md#vault-format-v1).
 
 **Context.** A watcher that lost the system bus locked once and stopped for the rest of the session, leaving only the idle lock even after the bus came back (a `dbus-broker` / `dbus-daemon` restart). A logind that left the bus was waited for, but nothing was locked meanwhile, and events missed during either outage were never looked for.
 
@@ -70,3 +70,6 @@ Approved by the maintainer. It adds to the decision above and changes none of it
 - **Stop after the first loss** (the previous behaviour): leaves default builds without sleep and screen-lock locking for the rest of the session after a transient bus restart.
 - **A fixed retry interval**: too short loads the bus daemon while it is down, too long leaves a returned bus unnoticed.
 - **Treat an unreadable `LockedHint` as unlocked**: fails open on exactly the case the check is for.
+
+## Note on §3 ("ask every time", 2026-11-18)
+Decided by the maintainer on 2026-11-18; it records a decision and changes none of the points above. A secret saved as "ask every time" is asked at **every** connect and is never cached in memory between connects: the connect flow does not use the `SessionSecretCache`, and NineSQL keeps no answer for a later connect (`SessionManager::reconnect`, not offered by the UI yet, holds the answers only while it runs and drops them on a secrets lock). "For the session only" in point 3 is read that way. This is a final decision, not a missing feature; caching answers for the application's lifetime would need a new ADR. Raised by the Phase 1 follow-up "Wave 3 (core)" ([ROADMAP](../ROADMAP.md#phase-1-follow-ups)).

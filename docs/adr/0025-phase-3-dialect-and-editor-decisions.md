@@ -1,6 +1,6 @@
 # ADR-0025: Phase 3 dialect, editor and UI decisions
 
-- **Status**: Accepted (maintainer, 2026-11-15). It adds to [ADR-0007](0007-production-safety-model.md) §3 and to its [classifier amendment](0007-production-safety-model.md#amendment-classifier-2026-11-15) (§1 below: conditional comments, triggers, rules and events; §1.4 records that `MERGE` and upsert forms stay `Write` as §3 says) and builds on [ADR-0004](0004-driver-api-runtime-and-results.md) (I6: a run is never awaited on the UI thread) and [ADR-0008](0008-workspace-and-config-storage.md) §1 (the session file in `$XDG_STATE_HOME/ninesql`, §4 below). It does not rewrite their decisions. The execution, history, preferences and results decisions of the phase are in [ADR-0024](0024-phase-3-execution-history-and-preferences-decisions.md).
+- **Status**: Accepted (maintainer, 2026-11-15). It adds to [ADR-0007](0007-production-safety-model.md) §3 and to its [classifier amendment](0007-production-safety-model.md#amendment-classifier-2026-11-15) (§1 below: conditional comments, triggers, rules and events; §1.4 records that `MERGE` and upsert forms stay `Write` as §3 says) and builds on [ADR-0004](0004-driver-api-runtime-and-results.md) (I6: a run is never awaited on the UI thread) and [ADR-0008](0008-workspace-and-config-storage.md) §1 (the session file in `$XDG_STATE_HOME/ninesql`, §4 below). It does not rewrite their decisions. A [dated note on §4.3](#note-on-43-script-files-and-session-restore-wired-2026-11-18) (2026-11-18) records the wiring of script files and session restore. The execution, history, preferences and results decisions of the phase are in [ADR-0024](0024-phase-3-execution-history-and-preferences-decisions.md).
 - **Date**: 2026-11-15
 
 ## Context
@@ -30,6 +30,14 @@ Invariants involved: I1 (no secret on disk), I3 (production confirmations: what 
 1. The editor session model (F-WS-06) holds script paths relative to the project's `scripts/`, connection ids and cursor positions: never editor text.
 2. An unsaved, untitled tab is **not restored** after a restart: its text could hold a password typed in a statement, and I1 forbids writing it anywhere the user did not choose. DBeaver autosaves scratch scripts; doing the same needs a new ADR (where, how protected, how purged).
 3. Script paths are validated (relative, inside `scripts/`, no `..`, `.sql` only). Neither model is wired into the shell yet.
+
+#### Note on §4.3 (script files and session restore wired, 2026-11-18)
+Both models are now wired into the shell (P3-A follow-up, F-SQL-11, F-WS-06; [docs/02](../02-architecture.md#storage), [tutorial](../tutorials/run-sql.md#12-script-files-and-session-restore)); the decisions of §4 are unchanged.
+- `session.json` (`$XDG_STATE_HOME/ninesql`) and the project's `scripts.json` (script path → linked connection) are ADR-0008-style documents with `schema_version` 1; a file written by a newer NineSQL is refused and left as it is.
+- Unsaved tabs, and the unsaved edits of a saved script, are never written to `session.json` nor restored (I1); closing a tab, a window or NineSQL with unsaved text asks first.
+- Restore never connects: a restored tab shows its connection "(not connected)" and connects through the normal connect flow. When a connection opens, only the active editor takes the new session; other editors linked to it stay not connected, so a production session never reaches a tab in the background.
+- "Save script" replaces a file only while its size and modification time match the stamp recorded when the tab loaded or last saved it, otherwise it asks; "Save script as…" and "New script" never replace an existing file (`write_new_atomic`, `renameat2(RENAME_NOREPLACE)`).
+- A script read is capped at 8 MiB (`MAX_SCRIPT_BYTES`). Restore is bounded: at most 8 windows, 64 tabs per window, 256 tabs tried in total and 64 MiB of script text; a script missing or changed since the quit is skipped with a notice.
 
 ### 5. Editor actions and key bindings
 1. With a selection, **"Execute statement" runs the selection** (and "Execute script" runs the selection, not the whole buffer). "Execute selection" without a selection does nothing and says why.

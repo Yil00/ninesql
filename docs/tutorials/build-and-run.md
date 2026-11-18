@@ -2,7 +2,7 @@
 
 NineSQL has no release yet: you build it from the repository. This page covers Linux (Debian, Ubuntu), the platforms NineSQL targets, and macOS, which is kept compiling so contributors on a Mac can iterate on the interface ([docs/10](../10-supported-platforms.md)).
 
-What you get today: the main window (navigator, editor tabs and splits, status bar, several windows), the command palette, themes, the connection dialog, sessions to PostgreSQL, MySQL, MariaDB, SQLite, TimescaleDB, YugabyteDB, QuestDB and TiDB, the DBeaver import, the SQL editor with its results grid, the navigator's object tree and object editor, and data editing, export and import with the export of connections to DBeaver ([Edit data](edit-data.md), [Export and import data](export-import.md)). Not built yet: in-cell editing, script files, packages (phase 6).
+What you get today: the main window (navigator, editor tabs and splits, status bar, several windows), the command palette, themes, the connection dialog, sessions to PostgreSQL, MySQL, MariaDB, SQLite, TimescaleDB, YugabyteDB, QuestDB and TiDB, the DBeaver import, the SQL editor with its results grid, the navigator's object tree and object editor, data editing, export and import with the export of connections to DBeaver ([Edit data](edit-data.md), [Export and import data](export-import.md)), and script files with session restore ([Run SQL](run-sql.md#12-script-files-and-session-restore)). Not built yet: in-cell editing, packages (phase 6).
 
 ## 1. Install the toolchain
 

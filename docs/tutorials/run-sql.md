@@ -162,6 +162,8 @@ close_with_open_transaction = true   # always asked for production connections
 - Editor and grid key bindings are overridden under `[keybindings]` with their full names, for example `"ninesql_editor::ExecuteStatement" = "f9"` or `"ninesql_grid::FetchAllRows" = ["alt-end", "ctrl-shift-end"]`.
 
 ## 11. Format SQL and snippets
+Both actions are in the command palette; their keys work in the SQL editor since 2026-11-18 (before, from the palette only).
+
 **"Format SQL"** (`Ctrl+Shift+F`) formats the selection, or the whole script when nothing is selected, with the dialect of the editor's connection: keywords in upper case and one clause per line with a 2-space indent. It never changes what the statement means: only the case of words reserved in every dialect and the blanks between tokens change; strings, quoted names, numbers, operators and comments stay byte for byte, a compound statement body (with `;` inside) or a MySQL executable comment keeps its layout, and a statement holding `[` is left as it is. `AND` / `OR` are not broken onto lines, and the layout has no settings yet. It is refused during a run ("Wait for the run to end before formatting.") and while a table result has unsaved changes.
 
 **"Insert snippet"** (`Ctrl+K` then `Ctrl+J`) lists the project's snippets usable with the connection's engine ("Insert snippet"), asks for their placeholders ("Snippet: <name>", "Values are inserted as typed. Nothing runs until you run the statement."), and inserts the text at the cursor with "Insert". Nothing runs: you read and run the text like any other statement, with its confirmations.

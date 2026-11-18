@@ -8,7 +8,7 @@ This tutorial moves data in and out of NineSQL (phase 5: P5-C, P5-D, P5-A; featu
 - NineSQL builds and runs ([Build and run](build-and-run.md)), the dev databases are up (`make dev-up`, [Start the dev databases](dev-databases.md)) and a `nine-pg` connection is open ([Create your first connection](first-connection.md)).
 - You know how to run a query ([Run SQL and read results](run-sql.md)) and select a table in the navigator ([Browse a database](browse-database.md)).
 
-Every action below is in the command palette (`Ctrl+Shift+P` or `F1`): the transfer actions under "Data", the copy actions under "Results", the DBeaver export under "Connections".
+Every action below is in the command palette (`Ctrl+Shift+P` or `F1`): the transfer actions under "Data", the copy actions under "Results", the DBeaver export under "Connections". Their key bindings work from the SQL editor and the rest of the window; until 2026-11-18 they were not handled, and these actions were reachable from the palette only.
 
 ## 1. Export a result or a table
 | Action | Default keys | Exports |

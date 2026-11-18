@@ -23,7 +23,7 @@ Each target also runs alone (`make clippy`, `make md-links`…). To fix formatti
 
 Requirements: the [build requirements](build-and-run.md#1-install-the-toolchain) (clippy and the tests build GPUI), [`cargo-deny`](https://github.com/EmbarkStudios/cargo-deny) (`cargo install cargo-deny --locked`; CI uses 0.20.2), Python 3.11 or newer for `verify-patches`. The long cargo commands stop after `TIMEOUT` seconds (900 by default; `make check TIMEOUT=1800` on a slow machine).
 
-In `make test`, the integration tests of PostgreSQL, MySQL, MariaDB, TimescaleDB, YugabyteDB, QuestDB, TiDB and SSH **skip themselves** when their engine is not reachable. That is why the next step exists.
+In `make test`, the integration tests of PostgreSQL, MySQL, MariaDB, TimescaleDB, YugabyteDB, QuestDB, TiDB and SSH **skip themselves** when their engine is not reachable. That is why the next step exists. The `ninesql-secrets` tests of the sleep and screen-lock watcher run on a private D-Bus bus and skip themselves too when `dbus-daemon` is not installed (`sudo apt-get install dbus-daemon`); CI installs it and sets `NINESQL_REQUIRE_DBUS=1`, so they fail there instead of skipping. Run `NINESQL_REQUIRE_DBUS=1 make test` to do the same locally.
 
 ## 2. The driver integration tests
 ```bash

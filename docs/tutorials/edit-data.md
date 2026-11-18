@@ -8,7 +8,7 @@ This tutorial opens a table's rows and changes them (phase 5: P5-A, P5-B; featur
 - NineSQL builds and runs ([Build and run](build-and-run.md)), the dev databases are up (`make dev-up`, [Start the dev databases](dev-databases.md)) and a `nine-pg` connection is saved and open ([Create your first connection](first-connection.md)). Use a **dev** connection to try this: the rows really change.
 - You know how to run SQL and read the grid ([Run SQL and read results](run-sql.md)) and how to select a table in the navigator ([Browse a database](browse-database.md)).
 
-Every action below is in the command palette (`Ctrl+Shift+P` or `F1`): the table actions under "Data" and "Data editing", the grid's under "Results". They are not in the navigator's context menu yet: use the palette or the keys.
+Every action below is in the command palette (`Ctrl+Shift+P` or `F1`): the table actions under "Data" and "Data editing", the grid's under "Results". They are not in the navigator's context menu yet: use the palette or the keys. Their key bindings work from the SQL editor and the rest of the window; until 2026-11-18 they were not handled, and these actions were reachable from the palette only.
 
 ## 1. Open table data
 1. Select a table in the navigator, for example `public.customers`.
