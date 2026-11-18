@@ -92,12 +92,16 @@ fn set(
 }
 
 fn mock_manager(dir: &std::path::Path) -> SessionManager {
+    mock_manager_with(dir, MockDriver::new())
+}
+
+fn mock_manager_with(dir: &std::path::Path, driver: MockDriver) -> SessionManager {
     let mut config = ManagerConfig::with_known_hosts(KnownHostsFiles {
         own: dir.join("known_hosts"),
         user: None,
     });
     config.workers = 1;
-    let registry = registry_with(vec![Arc::new(MockDriver::new())]);
+    let registry = registry_with(vec![Arc::new(driver)]);
     match SessionManager::new(config, registry, SecretStores::new()) {
         Ok(m) => m,
         Err(e) => panic!("{e}"),
@@ -159,7 +163,17 @@ pub(crate) fn mock_hub_with_transfer(
     dir: &std::path::Path,
     connections: Vec<Connection>,
 ) -> Entity<ConnectionHub> {
-    let manager = mock_manager(dir);
+    mock_hub_with_transfer_driver(cx, dir, connections, MockDriver::new())
+}
+
+/// [`mock_hub_with_transfer`] on a mock driver of the caller's (other capabilities).
+pub(crate) fn mock_hub_with_transfer_driver(
+    cx: &mut TestAppContext,
+    dir: &std::path::Path,
+    connections: Vec<Connection>,
+    driver: MockDriver,
+) -> Entity<ConnectionHub> {
+    let manager = mock_manager_with(dir, driver);
     let root = dir.join("ninesql");
     let paths = ninesql_core::storage::Paths::new(&ninesql_core::storage::XdgDirs {
         config_home: root.join("config"),

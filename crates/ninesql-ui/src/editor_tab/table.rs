@@ -1409,9 +1409,9 @@ pub fn save_failed_text(e: &EditError) -> String {
             "Not saved, and the session's whole transaction was rolled back: earlier uncommitted changes in this session were lost too. {}",
             edit_text(e)
         ),
-        EditError::UndoFailed { .. } => format!(
-            "Not saved, and the save could not be undone: roll back the transaction (Roll back transaction) or close the session before anything else. {}",
-            edit_text(e)
+        EditError::UndoFailed { source } => format!(
+            "Not saved, and the save could not be undone, so NineSQL closed the session: the server rolled back its transaction, so earlier uncommitted changes in this session were lost too. Connect again to go on. Cause: {}",
+            edit_text(source)
         ),
         _ => format!("Not saved: {} The changes are still pending.", edit_text(e)),
     }

@@ -102,6 +102,9 @@ pub fn warning_text(w: ExportWarning) -> &'static str {
         ExportWarning::ReadOnlyTransactionFailed => {
             "The export could not open a read-only transaction: it ran without one."
         }
+        ExportWarning::NoReadOnlyTransaction => {
+            "This engine (TiDB) has no engine-side read-only transaction: the export ran without one, protected only by NineSQL's check that the statement reads. Export from a read-only connection to have the engine enforce it."
+        }
         _ => "The export reported a warning.",
     }
 }

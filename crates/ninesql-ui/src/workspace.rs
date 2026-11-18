@@ -2298,6 +2298,7 @@ impl Workspace {
                     session,
                     transfer,
                     crate::transfer::table_parts(&path),
+                    Some(path.clone()),
                     targets,
                     window,
                     cx,

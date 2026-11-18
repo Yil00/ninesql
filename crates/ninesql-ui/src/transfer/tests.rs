@@ -174,6 +174,7 @@ fn import_previews_maps_and_confirms_on_production(cx: &mut TestAppContext) {
             session,
             transfer,
             vec!["people".into()],
+            None,
             targets,
             window,
             cx,
@@ -217,8 +218,36 @@ fn import_previews_maps_and_confirms_on_production(cx: &mut TestAppContext) {
     });
     assert_eq!(lines[0], ("Connection".into(), "Live (production)".into()));
     assert_eq!(lines[2], ("Columns".into(), "id, label".into()));
-    assert_eq!(lines.len(), 4, "{lines:?}");
     assert_eq!(lines[3].0, "File");
+    // The commit mode, and what "Roll back" cannot undo on a manual-commit session (M4).
+    assert_eq!(
+        lines[4],
+        (
+            "Commits".into(),
+            "All or nothing: one transaction, committed at the end".into()
+        )
+    );
+    let manual = !l.session.transaction_state().auto_commit;
+    let mut expected = 5;
+    if manual {
+        assert_eq!(
+            lines[5],
+            (
+                "Note".into(),
+                "Rows are committed by the import (at the end); Roll back cannot undo them.".into()
+            )
+        );
+        expected += 1;
+    }
+    assert_eq!(
+        lines.len(),
+        expected,
+        "the mock table rolls back: {lines:?}"
+    );
+    // The core's answer about the table came back off the UI thread: all or nothing allowed.
+    assert!(dialog.read_with(&l.vcx, |d, _| {
+        d.target().is_some_and(|t| t.all_or_nothing_allowed())
+    }));
     // The statement is shown whole in the script view, never cut.
     let script = dialog
         .read_with(&l.vcx, |d, _| d.confirmation_script())
@@ -376,4 +405,99 @@ fn navigator_transfers_avoid_the_metadata_session_and_busy_ones(cx: &mut TestApp
     tab.update_in(&mut vcx, |t, window, cx| t.cancel_run(window, cx));
     wait_until(&mut vcx, |vcx| !tab.read_with(vcx, |t, _| t.is_running()));
     assert_eq!(pick(&ws, &vcx), Some(newest.id()));
+}
+
+#[gpui::test]
+fn import_without_transactions_offers_only_commit_every_n_rows(cx: &mut TestAppContext) {
+    use ninesql_core::ImportTransaction;
+    use ninesql_core::driver_api::mock::{MockDriver, full_capabilities};
+
+    let tmp = tempfile::tempdir().unwrap_or_else(|e| panic!("{e}"));
+    let mut caps = full_capabilities();
+    caps.transactions.manual_commit = false;
+    caps.transactions.savepoints = false;
+    let c = mock_connection("NoTx", ConnectionTypeId::dev(), Auth::None);
+    let id: ConnectionId = c.id;
+    let hub = crate::connections::tests::mock_hub_with_transfer_driver(
+        cx,
+        tmp.path(),
+        vec![c],
+        MockDriver::new().with_capabilities(caps),
+    );
+    let (ws, mut vcx) = open_live(cx);
+    ws.update_in(&mut vcx, |ws, window, cx| {
+        ws.connect(id, Purpose::Open, window, cx);
+    });
+    wait_until(&mut vcx, |vcx| hub.read_with(vcx, |h, _| h.is_open(id)));
+    let session = hub
+        .read_with(&vcx, |h, _| h.sessions(id).first().cloned())
+        .unwrap_or_else(|| panic!("a session"));
+    let transfer = hub
+        .read_with(&vcx, |h, _| h.transfer())
+        .unwrap_or_else(|| panic!("a transfer service"));
+    let path = ninesql_core::driver_api::metadata::ObjectPath::root()
+        .child(ninesql_core::driver_api::ObjectKind::Catalog, "nine")
+        .child(ninesql_core::driver_api::ObjectKind::Schema, "public")
+        .child(ninesql_core::driver_api::ObjectKind::Table, "t000");
+    let parts = super::table_parts(&path);
+    let dialog: Entity<ImportCsvDialog> = vcx.update(|window, cx| {
+        open_import_dialog(
+            session,
+            transfer,
+            parts,
+            Some(path),
+            vec![TargetColumn::new("id", "bigint")],
+            window,
+            cx,
+        )
+    });
+    wait_until(&mut vcx, |vcx| {
+        dialog.read_with(vcx, |d, _| d.target().is_some())
+    });
+    let (mode, refusal) =
+        dialog.read_with(&vcx, |d, _| (d.transaction(), d.all_or_nothing_refusal()));
+    assert_eq!(
+        mode,
+        ImportTransaction::CommitEvery(super::import::COMMIT_EVERY_ROWS)
+    );
+    let refusal = refusal.unwrap_or_else(|| panic!("refused"));
+    assert!(refusal.contains("no transactions"), "{refusal}");
+    // Choosing "All or nothing" is refused with the reason; the mode stays.
+    dialog.update(&mut vcx, |d, cx| {
+        d.set_transaction(ImportTransaction::AllOrNothing, cx);
+    });
+    let (mode, stage) = dialog.read_with(&vcx, |d, _| {
+        (
+            d.transaction(),
+            match d.stage() {
+                ImportStage::Failed(why) => why.clone(),
+                _ => String::new(),
+            },
+        )
+    });
+    assert_eq!(
+        mode,
+        ImportTransaction::CommitEvery(super::import::COMMIT_EVERY_ROWS)
+    );
+    assert_eq!(stage, refusal);
+}
+
+#[test]
+fn new_transfer_errors_and_the_tidb_warning_have_texts() {
+    use ninesql_core::{ExportWarning, TransferJobError};
+    let w = super::export::warning_text(ExportWarning::NoReadOnlyTransaction);
+    assert!(w.contains("no engine-side read-only transaction"), "{w}");
+    assert_ne!(w, "The export reported a warning.");
+    for (e, needle) in [
+        (TransferJobError::NonTransactionalTable, "cannot roll back"),
+        (TransferJobError::TableStorageUnknown, "could not be read"),
+        (
+            TransferJobError::NoReadOnlyTransaction,
+            "read-only connection",
+        ),
+    ] {
+        let text = super::error_text(&e);
+        assert!(text.contains(needle), "{text}");
+        assert!(text.contains("commit every N rows") || needle == "read-only connection");
+    }
 }

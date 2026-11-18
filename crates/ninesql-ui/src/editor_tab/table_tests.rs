@@ -520,7 +520,14 @@ fn a_rolled_back_transaction_is_said_plainly() {
     let text = super::table::save_failed_text(&EditError::UndoFailed {
         source: Box::new(EditError::Cancelled),
     });
-    assert!(text.contains("Roll back transaction"), "{text}");
+    // The session is already closed (P5-E L2): say so, and connect again; no rollback offered.
+    assert!(text.contains("closed the session"), "{text}");
+    assert!(text.contains("Connect again"), "{text}");
+    assert!(!text.contains("Roll back transaction"), "{text}");
+    assert!(
+        text.ends_with("Cause: cancelled; nothing was saved"),
+        "{text}"
+    );
     let text = super::table::save_failed_text(&EditError::TooManyChanges { max: 10_000 });
     assert!(text.contains("still pending"), "{text}");
 }
