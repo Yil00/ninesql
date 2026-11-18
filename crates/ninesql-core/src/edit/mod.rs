@@ -47,7 +47,8 @@
 //!     uncommitted work of the session survives a failed save; when undoing the save alone
 //!     fails and the whole transaction had to be rolled back, the save fails with
 //!     [`EditError::TransactionRolledBack`] so the UI can say that earlier work was lost too
-//!     ([`EditError::UndoFailed`] when even that rollback failed). A driver without savepoints
+//!     ([`EditError::UndoFailed`] when even that rollback failed: the session is then closed,
+//!     which rolls its transaction back, so no half save can be committed). A driver without savepoints
 //!     refuses saves in manual-commit mode ([`EditError::NoSavepoints`]).
 //!
 //!   `UPDATE` / `DELETE` carry the original values of the edited columns
@@ -216,10 +217,12 @@ pub enum EditError {
         /// Why the save failed.
         source: Box<EditError>,
     },
-    /// The save failed and could not be undone: the session's transaction may still hold part
-    /// of it. Roll the transaction back (or close the session, which rolls back).
+    /// The save failed and could not be undone (neither `ROLLBACK TO SAVEPOINT` nor the
+    /// fallback `ROLLBACK` worked): the session's transaction could still hold part of it, so
+    /// the service **closed the session**, which rolls its transaction back on the server
+    /// (P5-E L2, fail-closed). Earlier uncommitted work of the session is lost too.
     #[error(
-        "{source}; the save could not be undone: roll back the session's transaction (or close the session) before doing anything else"
+        "{source}; the save could not be undone, so the session was closed, which rolls back its transaction (earlier uncommitted changes are lost too): connect again"
     )]
     UndoFailed {
         /// Why the save failed.
@@ -1038,6 +1041,17 @@ impl SaveTask {
                     }
                 }
                 if not_undone {
+                    // Fail closed (P5-E L2): part of the save may still sit in the session's
+                    // open transaction, and nothing could roll it back. Closing the session
+                    // rolls it back on the server, so a later commit can never keep half a
+                    // save. Closing works while the lease is held.
+                    tracing::warn!(
+                        session = %self.session.id(),
+                        "a failed save could not be undone; closing the session"
+                    );
+                    if let Some(Err(ce)) = self.session.close().await {
+                        tracing::warn!(kind = ce.kind(), "closing the session failed");
+                    }
                     SaveEvent::Failed(EditError::UndoFailed {
                         source: Box::new(e),
                     })

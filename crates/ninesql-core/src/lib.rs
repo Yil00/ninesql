@@ -87,7 +87,8 @@ pub use sql_format::{FormatOptions, KeywordCase, format_sql};
 pub use transfer::{
     CsvPreviewRequest, ExportEvent, ExportJob, ExportRequest, ExportSource, ExportSummary,
     ExportWarning, ImportConfirmation, ImportEnd, ImportEvent, ImportJob, ImportRequest,
-    ImportSummary, ImportToken, ImportTransaction, Job, TransferJobError, TransferService,
+    ImportSummary, ImportTarget, ImportToken, ImportTransaction, Job, TransferJobError,
+    TransferService,
 };
 pub use workspace::{
     ConnectionTypesFile, Connections, ConnectionsFile, LoadIssue, LoadedConnections, MarkerClear,

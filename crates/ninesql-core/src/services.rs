@@ -441,7 +441,8 @@ impl CoreServices {
         };
 
         // 9. Transfer service (P5-C).
-        let transfer = TransferService::new(manager.clone(), &paths);
+        let transfer =
+            TransferService::new(manager.clone(), &paths).with_metadata(metadata.clone());
 
         // 10. Edit service (P5-A core): row editing, filtered queries, foreign-key navigation.
         let edit = EditService::new(manager.clone(), metadata.clone(), execution.clone());

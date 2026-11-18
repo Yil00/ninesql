@@ -21,10 +21,14 @@
 //!   [`StatementClass::Read`]: an export runs the statement again, so a write is never run by an
 //!   export ([`TransferJobError::NotARead`]). When the session has no open transaction and is not
 //!   read-only already, the export runs inside an engine-side read-only transaction (PostgreSQL
-//!   family `BEGIN READ ONLY`, MySQL family `START TRANSACTION READ ONLY`, rolled back at the end;
-//!   SQLite and engines without transactions: none), so a function with side effects that the
-//!   classifier reads as a read is refused by the engine. If it cannot be opened, the export
-//!   fails on production and confirm-every-write connections and goes on without it elsewhere.
+//!   family `BEGIN READ ONLY`, MySQL and MariaDB `START TRANSACTION READ ONLY`, rolled back at
+//!   the end; SQLite and engines without transactions: none), so a function with side effects
+//!   that the classifier reads as a read is refused by the engine. If it cannot be opened, the
+//!   export fails on production and confirm-every-write connections and goes on without it
+//!   elsewhere. TiDB has none (its read-only transaction forms are no-ops): a TiDB export that
+//!   is not on a read-only session is refused on production and confirm-every-write
+//!   connections ([`TransferJobError::NoReadOnlyTransaction`]) and warned about elsewhere
+//!   ([`ExportWarning::NoReadOnlyTransaction`]).
 //!   The statements go through the session task, so the session's read-only mode and safety
 //!   rules still apply.
 //! - **Exclusive session.** An export and an import lease their session for their whole run:
@@ -49,13 +53,20 @@
 //! # Import
 //! - **Refusals before anything is sent:** a read-only session (I3), a driver without bind
 //!   parameters (I8), a session with an open transaction (the import would mix into it), an
-//!   all-or-nothing import on an engine without transactions, an invalid mapping, a file that is
-//!   not a regular file or is over [`CsvLimits::max_file_bytes`], a file inside NineSQL's own
-//!   storage.
+//!   all-or-nothing import on an engine without transactions or into a table whose storage
+//!   engine cannot roll back (or, on the MySQL family, is unknown; ADR-0027 §1.6), an invalid
+//!   mapping, a file that is not a regular file or is over [`CsvLimits::max_file_bytes`], a file
+//!   inside NineSQL's own storage.
+//! - **Target table.** [`TransferService::import_target`] (and every import, before its
+//!   lease) reads the table's `TableInfo::transactional` through the metadata service: on a
+//!   non-transactional table only "commit every N rows" runs, every row sent stays whatever
+//!   the end, and the confirmation and the summary say rows cannot be rolled back
+//!   ([`ImportTarget`], [`ImportSummary::transactional`]).
 //! - **Confirmation (ADR-0007).** An import is a write. On a connection typed production, or
 //!   whose type confirms every write, the first call ends with
 //!   [`ImportEvent::NeedsConfirmation`] and a single-use [`ImportToken`] bound to the session,
-//!   the file, the table and the mapped columns (ten minutes). The UI shows it and calls
+//!   the file, the table, the mapped columns, the transaction mode, the CSV syntax and value
+//!   options and what the target can promise about rolling back (ten minutes). The UI shows it and calls
 //!   [`TransferService::import_csv`] again with [`ImportRequest::confirmed`]. Once confirmed,
 //!   the per-statement confirmation the session asks for each `INSERT` (types that confirm every
 //!   write) is answered by the service for the confirmed statement shape only: a statement whose
@@ -73,7 +84,10 @@
 //! - **Transactions.** [`ImportTransaction::AllOrNothing`] (default) runs the whole import in
 //!   one transaction, rolled back on any error or cancel; [`ImportTransaction::CommitEvery`]
 //!   commits every N rows (rows committed before an error stay). Engines without transactions
-//!   support only `CommitEvery` (each statement commits on its own).
+//!   support only `CommitEvery` (each statement commits on its own). The import commits its
+//!   own rows even on a session in manual-commit mode, unlike a grid save (ADR-0007 phase 5
+//!   amendment, note of 2026-11-18): the session's "Roll back" cannot undo an import
+//!   ([`ImportConfirmation::session_manual_commit`]).
 //! - **Invalid rows.** A row that cannot be read or converted stops the import, unless
 //!   [`ImportRequest::skip_invalid_rows`]: it is then skipped and reported. The summary keeps the
 //!   first [`MAX_REPORTED_ISSUES`] issues (line, column, reason; never a value) and the total.
@@ -89,7 +103,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
-use ninesql_driver_api::{CancelToken, FetchBudget, Param, ResultItem, StatementClass};
+use ninesql_driver_api::metadata::{ObjectDetails, ObjectPath};
+use ninesql_driver_api::{CancelToken, FetchBudget, ObjectKind, Param, ResultItem, StatementClass};
 use ninesql_storage::Paths;
 use tokio::sync::mpsc;
 use uuid::Uuid;
@@ -97,6 +112,7 @@ use uuid::Uuid;
 use crate::dbeaver_roots::DbeaverRoots;
 // The formats, options, CSV and mapping types, so the UI needs only `ninesql_core::transfer`.
 use crate::error::CoreError;
+use crate::metadata::{MetadataConfig, MetadataService, NodeChildren, NodeKey};
 use crate::session::{
     ExecEvent, ExecuteRequest, Next, Reply, SessionHandle, SessionLease, SessionManager,
 };
@@ -125,6 +141,10 @@ const CONFIRMATION_TTL: Duration = Duration::from_secs(10 * 60);
 const MAX_PENDING_CONFIRMATIONS: usize = 16;
 /// Least time between two progress events.
 const PROGRESS_INTERVAL: Duration = Duration::from_millis(200);
+/// Longest wait for the import target's metadata (then its storage counts as unknown).
+const TARGET_READ_TIMEOUT: Duration = Duration::from_secs(60);
+/// Pages loaded beyond the first while looking for an import target in its parent's listing.
+const TARGET_MAX_PAGES: usize = 16;
 
 fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     m.lock().unwrap_or_else(PoisonError::into_inner)
@@ -155,6 +175,24 @@ pub enum TransferJobError {
     /// A transaction is open on the session.
     #[error("a transaction is open on this session: commit or roll back first")]
     PendingTransaction,
+    /// The target table's storage engine cannot roll back (MyISAM, MEMORY, ARCHIVE, Aria…):
+    /// an all-or-nothing import could not undo the rows written before an error.
+    #[error(
+        "the target table's storage engine cannot roll back rows: choose \"commit every N rows\" (rows written stay written)"
+    )]
+    NonTransactionalTable,
+    /// On an engine whose storage engines differ per table (the MySQL family), the target
+    /// table's storage engine could not be read: an all-or-nothing import is refused.
+    #[error(
+        "whether the target table can roll back rows could not be read (its storage engine is unknown): choose \"commit every N rows\" (rows written may stay written)"
+    )]
+    TableStorageUnknown,
+    /// The engine has no read-only transaction for an export (TiDB), and the connection type
+    /// requires one: export from a read-only session instead.
+    #[error(
+        "this engine has no read-only transaction for the export, which this connection type requires: export from a read-only connection"
+    )]
+    NoReadOnlyTransaction,
     /// A row could not be read or converted (and invalid rows are not skipped).
     #[error("invalid row: {0}")]
     InvalidRow(String),
@@ -185,6 +223,9 @@ impl TransferJobError {
             Self::NoParameters => "no-parameters",
             Self::NoTransactions => "no-transactions",
             Self::PendingTransaction => "pending-transaction",
+            Self::NonTransactionalTable => "non-transactional-table",
+            Self::TableStorageUnknown => "table-storage-unknown",
+            Self::NoReadOnlyTransaction => "no-read-only-transaction",
             Self::InvalidRow(_) => "invalid-row",
             Self::SessionBusy => "session-busy",
             Self::InvalidConfirmation => "invalid-confirmation",
@@ -407,6 +448,11 @@ pub enum ExportWarning {
     TransactionAlreadyOpen,
     /// The engine refused the read-only transaction: the export ran without it.
     ReadOnlyTransactionFailed,
+    /// The engine has no engine-side read-only transaction (TiDB, whose read-only transaction
+    /// forms are no-ops): the export ran with the read-only classifier check only, so a
+    /// function with side effects that the classifier reads as a read was not stopped by the
+    /// engine. Not raised on a read-only session (enforced engine-side by the driver).
+    NoReadOnlyTransaction,
 }
 
 /// Event of an export. Exactly one of [`ExportEvent::Done`] or [`ExportEvent::Failed`] ends it.
@@ -454,6 +500,12 @@ pub struct ImportRequest {
     pub path: PathBuf,
     /// Target table (qualified name parts).
     pub table: Vec<String>,
+    /// The target table's navigator path, used to read its [`TableInfo::transactional`]
+    /// through the metadata service; its DML name parts must equal [`Self::table`]. `None`:
+    /// the path is found from the name parts (catalogs and schemas by name).
+    ///
+    /// [`TableInfo::transactional`]: ninesql_driver_api::TableInfo::transactional
+    pub table_path: Option<ObjectPath>,
     /// Columns of the target table (from the metadata service).
     pub targets: Vec<TargetColumn>,
     /// File fields to target columns.
@@ -489,6 +541,7 @@ impl ImportRequest {
         Self {
             path: path.into(),
             table,
+            table_path: None,
             targets,
             mapping,
             format: CsvFormat::default(),
@@ -500,6 +553,13 @@ impl ImportRequest {
             statement_timeout: None,
             confirmation: None,
         }
+    }
+
+    /// Sets the target table's navigator path ([`Self::table_path`]).
+    #[must_use]
+    pub fn with_table_path(mut self, path: ObjectPath) -> Self {
+        self.table_path = Some(path);
+        self
     }
 
     /// Sets the CSV syntax.
@@ -573,6 +633,111 @@ pub struct ImportConfirmation {
     pub file: PathBuf,
     /// Its size in bytes.
     pub file_bytes: u64,
+    /// The transaction mode, as confirmed (the token is bound to it).
+    pub transaction: ImportTransaction,
+    /// What the import can promise about rolling back rows (the token is bound to it).
+    pub target: ImportTarget,
+    /// The session is in manual-commit mode: the import still commits its own rows (at the
+    /// end, or every N rows), which the session's "Roll back" cannot undo.
+    pub session_manual_commit: bool,
+}
+
+impl ImportConfirmation {
+    /// The transaction mode the import will use (all or nothing, or a commit every N rows).
+    #[must_use]
+    pub fn transaction(&self) -> ImportTransaction {
+        self.transaction
+    }
+
+    /// What the import can promise about rolling back rows in the target table.
+    #[must_use]
+    pub fn target(&self) -> ImportTarget {
+        self.target
+    }
+
+    /// `true` when rows written cannot be rolled back (a non-transactional table, an unknown
+    /// storage engine on the MySQL family, or an engine without transactions): an error or a
+    /// cancel leaves every row sent so far in the table.
+    #[must_use]
+    pub fn non_transactional(&self) -> bool {
+        !self.target.rows_can_be_rolled_back()
+    }
+
+    /// `true` when the session is in manual-commit mode: the import commits its own rows anyway
+    /// (at the end with all or nothing, every N rows otherwise), and "Roll back" on the session
+    /// cannot undo them.
+    #[must_use]
+    pub fn session_manual_commit(&self) -> bool {
+        self.session_manual_commit
+    }
+}
+
+/// What an import into a table can promise about rolling back rows, from the session's
+/// capabilities and the table's [`TableInfo::transactional`] (ADR-0027 §1.6), as
+/// [`TransferService::import_target`] reads it before an import.
+///
+/// [`TableInfo::transactional`]: ninesql_driver_api::TableInfo::transactional
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub struct ImportTarget {
+    /// The session has transactions (manual commit).
+    pub transactions: bool,
+    /// The table's storage engine rolls back (`Some(true)`), does not (`Some(false)`: MyISAM,
+    /// MEMORY, ARCHIVE, Aria…), or is unknown (`None`; also when the session has no
+    /// transactions, or the table was not found in the metadata).
+    pub table_transactional: Option<bool>,
+    /// Rows not committed yet can be rolled back: the session has transactions and the table's
+    /// storage is transactional (or unknown on an engine whose tables are always
+    /// transactional: PostgreSQL family, SQLite).
+    pub rollback_safe: bool,
+}
+
+impl ImportTarget {
+    fn new(engine: &ninesql_driver_api::EngineId, transactions: bool, table: Option<bool>) -> Self {
+        let rollback_safe = transactions
+            && match table {
+                Some(t) => t,
+                None => !crate::edit::key::reports_transactional(engine),
+            };
+        Self {
+            transactions,
+            table_transactional: table,
+            rollback_safe,
+        }
+    }
+
+    /// Rows not committed yet can be rolled back on an error or a cancel.
+    #[must_use]
+    pub fn rows_can_be_rolled_back(&self) -> bool {
+        self.rollback_safe
+    }
+
+    /// `true` when [`ImportTransaction::AllOrNothing`] is allowed (the same as
+    /// [`Self::rows_can_be_rolled_back`]); otherwise only "commit every N rows" is.
+    #[must_use]
+    pub fn all_or_nothing_allowed(&self) -> bool {
+        self.rollback_safe
+    }
+
+    /// Why [`ImportTransaction::AllOrNothing`] is refused, if it is.
+    #[must_use]
+    pub fn all_or_nothing_refusal(&self) -> Option<TransferJobError> {
+        if self.rollback_safe {
+            None
+        } else if !self.transactions {
+            Some(TransferJobError::NoTransactions)
+        } else if self.table_transactional == Some(false) {
+            Some(TransferJobError::NonTransactionalTable)
+        } else {
+            Some(TransferJobError::TableStorageUnknown)
+        }
+    }
+
+    /// The table's storage engine as the metadata reports it ([`Self::table_transactional`]).
+    #[must_use]
+    pub fn table_transactional(&self) -> Option<bool> {
+        self.table_transactional
+    }
 }
 
 /// How an import ended.
@@ -599,7 +764,9 @@ pub struct ImportSummary {
     pub rows_read: u64,
     /// Rows the database accepted.
     pub rows_inserted: u64,
-    /// Rows committed and kept (with all-or-nothing: all of them, or none).
+    /// Rows committed and kept (with all-or-nothing: all of them, or none). On a table that
+    /// cannot roll back ([`Self::transactional`] `false`), every row the database accepted:
+    /// they stay whatever the end.
     pub rows_committed: u64,
     /// Invalid rows skipped.
     pub rows_skipped: u64,
@@ -611,8 +778,13 @@ pub struct ImportSummary {
     pub statements: u64,
     /// Commits.
     pub commits: u64,
-    /// The import ran in transactions.
+    /// Rows not committed could be rolled back: the import ran in transactions **and** the
+    /// table's storage engine rolls back ([`ImportTarget::rows_can_be_rolled_back`]). When
+    /// `false`, an import that stopped early left every row it sent in the table, and
+    /// [`Self::rows_committed`] counts them.
     pub transactional: bool,
+    /// What the import could promise about rolling back rows in the target table.
+    pub target: ImportTarget,
     /// Bytes of the file read.
     pub bytes_read: u64,
     /// Wall-clock time.
@@ -697,6 +869,12 @@ struct ImportKey {
     mapping: Vec<(usize, usize)>,
     transaction: ImportTransaction,
     skip_invalid_rows: bool,
+    /// CSV syntax: delimiter, quote, header on or off (review L5).
+    format: CsvFormat,
+    /// NULL text, empty fields, trimming (review L5).
+    values: ValueOptions,
+    /// What the confirmation promised about rolling back rows (P5-E M1).
+    target: ImportTarget,
 }
 
 /// `(device, inode, length, modification time)` of an opened import file (`fstat`).
@@ -727,6 +905,8 @@ struct PendingImport {
 #[derive(Clone)]
 pub struct TransferService {
     manager: SessionManager,
+    /// Reads the import target's [`TableInfo::transactional`](ninesql_driver_api::TableInfo).
+    metadata: MetadataService,
     roots: DbeaverRoots,
     /// NineSQL's own directories and `~/.ssh`, resolved at every check.
     protected: Arc<Vec<(PathBuf, &'static str)>>,
@@ -741,7 +921,8 @@ impl fmt::Debug for TransferService {
 
 impl TransferService {
     /// A service over `manager`'s sessions, refusing NineSQL's own directories of `paths` and
-    /// the manager's DBeaver roots.
+    /// the manager's DBeaver roots. It reads import targets through a metadata service of its
+    /// own (no navigator filter); [`Self::with_metadata`] shares the application's.
     #[must_use]
     pub fn new(manager: SessionManager, paths: &Paths) -> Self {
         let mut protected: Vec<(PathBuf, &'static str)> =
@@ -754,10 +935,19 @@ impl TransferService {
         }
         Self {
             roots: manager.dbeaver_roots().clone(),
+            metadata: MetadataService::new(manager.clone(), MetadataConfig::default()),
             manager,
             protected: Arc::new(protected),
             pending: Arc::new(Mutex::new(Vec::new())),
         }
+    }
+
+    /// Reads import targets through `metadata` (the application's, shared with the navigator
+    /// and the edit service; a table its navigator filters hide counts as not found).
+    #[must_use]
+    pub fn with_metadata(mut self, metadata: MetadataService) -> Self {
+        self.metadata = metadata;
+        self
     }
 
     /// Why `dir` (a resolved directory) or one of its ancestors is refused: it is, or lies
@@ -924,6 +1114,174 @@ impl TransferService {
         };
         self.manager.runtime().spawn(task.run());
         Job { events: rx, cancel }
+    }
+
+    /// What an import into `table` on `session` can promise about rolling back rows: the
+    /// session's transactions and the table's [`TableInfo::transactional`] read through the
+    /// metadata service (as the edit service does, ADR-0027 §1.6). The UI shows it before an
+    /// import and offers "All or nothing" only when [`ImportTarget::all_or_nothing_allowed`].
+    /// `table_path` is the navigator path when known (its DML name parts must equal `table`),
+    /// else the path is found from the name parts. A table not found, or metadata that cannot
+    /// be read, counts as unknown storage. Dropping the reply stops the reads.
+    ///
+    /// # Errors
+    /// [`TransferJobError::Transfer`] when `table_path` does not name `table`.
+    ///
+    /// [`TableInfo::transactional`]: ninesql_driver_api::TableInfo::transactional
+    pub fn import_target(
+        &self,
+        session: &SessionHandle,
+        table: Vec<String>,
+        table_path: Option<ObjectPath>,
+    ) -> Reply<Result<ImportTarget, TransferJobError>> {
+        let (tx, reply) = Reply::channel();
+        let service = self.clone();
+        let info = session.info().clone();
+        self.manager.runtime().spawn(async move {
+            let result = service
+                .read_import_target(&info, &table, table_path.as_ref())
+                .await;
+            let _ = tx.send(result);
+        });
+        reply
+    }
+
+    async fn read_import_target(
+        &self,
+        info: &crate::session::SessionInfo,
+        table: &[String],
+        table_path: Option<&ObjectPath>,
+    ) -> Result<ImportTarget, TransferJobError> {
+        if let Some(path) = table_path
+            && crate::edit::table_parts(path) != table
+        {
+            return Err(TransferError::InvalidOption(
+                "the table's navigator path does not name the target table".into(),
+            )
+            .into());
+        }
+        let transactions = info.capabilities.transactions.manual_commit;
+        let table_transactional = if transactions {
+            match tokio::time::timeout(
+                TARGET_READ_TIMEOUT,
+                self.table_transactional(info.connection, table, table_path),
+            )
+            .await
+            {
+                Ok(Ok(t)) => t,
+                Ok(Err(e)) => {
+                    tracing::info!(
+                        kind = e.kind(),
+                        "the import target's storage could not be read"
+                    );
+                    None
+                }
+                Err(_) => {
+                    tracing::info!("reading the import target's storage timed out");
+                    None
+                }
+            }
+        } else {
+            None
+        };
+        Ok(ImportTarget::new(
+            &info.capabilities.engine,
+            transactions,
+            table_transactional,
+        ))
+    }
+
+    /// The table's [`TableInfo::transactional`](ninesql_driver_api::TableInfo) from its parent's
+    /// listing (`None` when it is not found there).
+    async fn table_transactional(
+        &self,
+        connection: crate::connection::ConnectionId,
+        table: &[String],
+        table_path: Option<&ObjectPath>,
+    ) -> Result<Option<bool>, crate::metadata::MetadataError> {
+        let path = match table_path {
+            Some(p) => p.clone(),
+            None => match self.resolve_table_path(connection, table).await? {
+                Some(p) => p,
+                None => return Ok(None),
+            },
+        };
+        let Some((leaf, parents)) = path.0.split_last() else {
+            return Ok(None);
+        };
+        let parent = ObjectPath(parents.to_vec());
+        let found = self
+            .find_child(connection, NodeKey::new(parent, leaf.kind), &leaf.name)
+            .await?;
+        Ok(found.and_then(|o| match o.details {
+            ObjectDetails::Table(t) => t.transactional,
+            _ => None,
+        }))
+    }
+
+    /// Finds the table's navigator path from its DML name parts: each leading part is a
+    /// catalog or a schema found by name under the previous one, the last part a table.
+    async fn resolve_table_path(
+        &self,
+        connection: crate::connection::ConnectionId,
+        table: &[String],
+    ) -> Result<Option<ObjectPath>, crate::metadata::MetadataError> {
+        let Some((leaf, containers)) = table.split_last() else {
+            return Ok(None);
+        };
+        let mut path = ObjectPath::root();
+        for name in containers {
+            let kinds = self.metadata.child_kinds(connection, &path)?;
+            let mut next = None;
+            for kind in kinds
+                .into_iter()
+                .filter(|k| matches!(k, ObjectKind::Catalog | ObjectKind::Schema))
+            {
+                if self
+                    .find_child(connection, NodeKey::new(path.clone(), kind), name)
+                    .await?
+                    .is_some()
+                {
+                    next = Some(path.child(kind, name.clone()));
+                    break;
+                }
+            }
+            let Some(next) = next else {
+                return Ok(None);
+            };
+            path = next;
+        }
+        if !self
+            .metadata
+            .child_kinds(connection, &path)?
+            .contains(&ObjectKind::Table)
+        {
+            return Ok(None);
+        }
+        Ok(Some(path.child(ObjectKind::Table, leaf.clone())))
+    }
+
+    /// The child named `name` of a node, loading at most [`TARGET_MAX_PAGES`] more pages of
+    /// an incomplete listing.
+    async fn find_child(
+        &self,
+        connection: crate::connection::ConnectionId,
+        key: NodeKey,
+        name: &str,
+    ) -> Result<Option<ninesql_driver_api::metadata::ObjectInfo>, crate::metadata::MetadataError>
+    {
+        let find = |node: &NodeChildren| node.items.iter().find(|o| o.name() == name).cloned();
+        let mut node = self.metadata.children(connection, key.clone()).await?;
+        for _ in 0..TARGET_MAX_PAGES {
+            if let Some(o) = find(&node) {
+                return Ok(Some(o));
+            }
+            if node.complete {
+                return Ok(None);
+            }
+            node = self.metadata.load_more(connection, key.clone()).await?;
+        }
+        Ok(find(&node))
     }
 
     fn issue_confirmation(&self, key: ImportKey) -> ImportToken {
@@ -1231,9 +1589,13 @@ impl Drop for ExportLease {
 impl ExportTask {
     /// Opens an engine-side read-only transaction around the export when the session is not
     /// read-only already and the driver has transactions (review L7): PostgreSQL family
-    /// `BEGIN READ ONLY`, MySQL family `START TRANSACTION READ ONLY`; SQLite and engines without
-    /// transactions need or allow none.
+    /// `BEGIN READ ONLY`, MySQL and MariaDB `START TRANSACTION READ ONLY`; SQLite and engines
+    /// without transactions need or allow none.
     ///
+    /// - TiDB has no read-only transaction (its forms are no-ops): none is opened; the export
+    ///   is refused with [`TransferJobError::NoReadOnlyTransaction`] on a production or
+    ///   confirm-every-write connection unless the session is read-only, and runs with
+    ///   [`ExportWarning::NoReadOnlyTransaction`] elsewhere (P5-E M3).
     /// - A transaction already open: refused with [`TransferJobError::PendingTransaction`] on a
     ///   production or confirm-every-write connection; elsewhere the export runs in it, with
     ///   [`ExportWarning::TransactionAlreadyOpen`] (review R3).
@@ -1252,6 +1614,20 @@ impl ExportTask {
         let info = self.session.info();
         let strict = info.policy.production || info.policy.confirm_every_write;
         if info.read_only || !info.capabilities.transactions.manual_commit {
+            return Ok(());
+        }
+        // TiDB treats the read-only transaction forms as no-ops: refused with error 1235, or
+        // accepted without effect when `tidb_enable_noop_functions` is on (P5-E M3). The
+        // export has the classifier check only: refused on strict types (a read-only TiDB
+        // session, enforced engine-side by the driver, returned above), a warning elsewhere.
+        if info.capabilities.engine == ninesql_driver_api::EngineId::TIDB {
+            if strict {
+                return Err(TransferJobError::NoReadOnlyTransaction);
+            }
+            warnings.push(ExportWarning::NoReadOnlyTransaction);
+            if self.session.transaction_state().in_transaction {
+                warnings.push(ExportWarning::TransactionAlreadyOpen);
+            }
             return Ok(());
         }
         if self.session.transaction_state().in_transaction {
@@ -1437,6 +1813,8 @@ impl ImportTask {
         if !info.capabilities.parameters {
             return ImportEvent::Failed(TransferJobError::NoParameters);
         }
+        // The import opens and commits transactions when the session has them; whether rows can
+        // be rolled back also depends on the table's storage engine (P5-E M1, ADR-0027 §1.6).
         let transactional = info.capabilities.transactions.manual_commit;
         if request.transaction == ImportTransaction::AllOrNothing && !transactional {
             return ImportEvent::Failed(TransferJobError::NoTransactions);
@@ -1457,6 +1835,28 @@ impl ImportTask {
                 TransferError::InvalidOption("no target table".into()).into(),
             );
         }
+        // Read before the lease (the metadata service refuses a leased session).
+        let target = tokio::select! {
+            biased;
+            () = self.cancel.cancelled() => {
+                return ImportEvent::Failed(TransferJobError::Cancelled);
+            }
+            t = self.service.read_import_target(
+                &info,
+                &request.table,
+                request.table_path.as_ref(),
+            ) => t,
+        };
+        let target = match target {
+            Ok(t) => t,
+            Err(e) => return ImportEvent::Failed(e),
+        };
+        if request.transaction == ImportTransaction::AllOrNothing
+            && let Some(refusal) = target.all_or_nothing_refusal()
+        {
+            return ImportEvent::Failed(refusal);
+        }
+        let rollback_safe = target.rows_can_be_rolled_back();
         let service = self.service.clone();
         let path = request.path.clone();
         let limits = request.limits;
@@ -1494,6 +1894,9 @@ impl ImportTask {
                     .collect(),
                 transaction: request.transaction,
                 skip_invalid_rows: request.skip_invalid_rows,
+                format: request.format,
+                values: request.values.clone(),
+                target,
             };
             match request.confirmation {
                 None => {
@@ -1507,6 +1910,9 @@ impl ImportTask {
                         statement: template,
                         file,
                         file_bytes,
+                        transaction: request.transaction,
+                        target,
+                        session_manual_commit: !self.session.transaction_state().auto_commit,
                     });
                 }
                 Some(token) => {
@@ -1645,9 +2051,13 @@ impl ImportTask {
                 c.statements += 1;
                 c.rows_inserted += n as u64;
                 c.since_commit += n as u64;
-                if !transactional {
+                if !rollback_safe {
+                    // Kept whatever happens next: no rollback can undo them.
                     c.rows_committed += n as u64;
-                } else if let ImportTransaction::CommitEvery(every) = request.transaction
+                }
+                // Without transactions, each statement commits on its own.
+                if transactional
+                    && let ImportTransaction::CommitEvery(every) = request.transaction
                     && c.since_commit >= every
                 {
                     tx_op(tx.lease.commit()).await?;
@@ -1706,7 +2116,8 @@ impl ImportTask {
             issues_total: c.issues_total,
             statements: c.statements,
             commits: c.commits,
-            transactional,
+            transactional: rollback_safe,
+            target,
             bytes_read: c.bytes_read,
             elapsed: started.elapsed(),
         })
@@ -1795,6 +2206,37 @@ mod tests {
     use crate::connection_type::{ConnectionTypeId, ConnectionTypes};
     use crate::registry::DriverRegistry;
     use crate::session::{KnownHostsFiles, ManagerConfig, OpenOutcome, OpenRequest};
+
+    /// P5-E M1: what an import can promise, from the session's transactions, the engine and
+    /// the table's `transactional` (ADR-0027 §1.6).
+    #[test]
+    fn import_target_follows_the_table_storage() {
+        use ninesql_driver_api::EngineId as E;
+        let t = ImportTarget::new(&E::MYSQL, true, Some(false));
+        assert!(!t.rows_can_be_rolled_back());
+        assert!(matches!(
+            t.all_or_nothing_refusal(),
+            Some(TransferJobError::NonTransactionalTable)
+        ));
+        for engine in [E::MYSQL, E::MARIADB, E::TIDB] {
+            let t = ImportTarget::new(&engine, true, None);
+            assert!(!t.all_or_nothing_allowed());
+            assert!(matches!(
+                t.all_or_nothing_refusal(),
+                Some(TransferJobError::TableStorageUnknown)
+            ));
+            assert!(ImportTarget::new(&engine, true, Some(true)).all_or_nothing_allowed());
+        }
+        for engine in [E::POSTGRESQL, E::SQLITE] {
+            assert!(ImportTarget::new(&engine, true, None).all_or_nothing_allowed());
+            assert!(!ImportTarget::new(&engine, true, Some(false)).all_or_nothing_allowed());
+        }
+        let t = ImportTarget::new(&E::POSTGRESQL, false, None);
+        assert!(matches!(
+            t.all_or_nothing_refusal(),
+            Some(TransferJobError::NoTransactions)
+        ));
+    }
 
     /// R4: an import dropped mid-way (its task gone) still rolls its transaction back and
     /// releases the session.

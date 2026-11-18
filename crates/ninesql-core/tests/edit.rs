@@ -344,6 +344,48 @@ fn a_save_that_lost_the_sessions_transaction_says_so() {
     });
 }
 
+/// P5-E L2: when neither `ROLLBACK TO SAVEPOINT` nor the fallback `ROLLBACK` works, part of the
+/// save could stay in the session's open transaction: the service closes the session (which
+/// rolls back) instead of leaving it for a later commit.
+#[test]
+fn a_save_that_cannot_be_undone_closes_the_session() {
+    let dir = tempfile::tempdir().unwrap();
+    let wrap = Wrap::new(mock_driver());
+    let (manager, _) = manager(Arc::new(wrap.clone()), dir.path());
+    let edit = service(&manager);
+    ui(async {
+        let h = open_ok(
+            &manager,
+            mock_connection(ConnectionTypeId::dev()),
+            &ConnectionTypes::default(),
+        )
+        .await;
+        let (p, _) = edits(&h).await;
+        h.set_auto_commit(false).await.unwrap().unwrap();
+        h.begin().await.unwrap().unwrap();
+        *wrap.fail_prefixes.lock().unwrap() = vec!["UPDATE".into(), "ROLLBACK TO".into()];
+        wrap.fail_rollback
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        match end(edit.save(&h, &p, SaveOptions::default())).await {
+            SaveEvent::Failed(e @ EditError::UndoFailed { .. }) => {
+                assert_eq!(e.kind(), "undo-failed");
+                assert!(e.to_string().contains("the session was closed"));
+            }
+            other => panic!("{other:?}"),
+        }
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while !h.is_closed() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the session was not closed"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        // Nothing can run on it any more, a commit included.
+        assert!(h.commit().await.is_none_or(|r| r.is_err()));
+    });
+}
+
 #[test]
 fn manual_commit_without_savepoints_is_refused_and_saves_are_bounded() {
     let dir = tempfile::tempdir().unwrap();

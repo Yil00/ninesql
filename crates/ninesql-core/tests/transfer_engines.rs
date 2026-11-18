@@ -3,7 +3,12 @@
 //! in bounded memory, and imports a 100 000-line CSV into the dev PostgreSQL, the dev MySQL and
 //! a SQLite file.
 //!
-//! PostgreSQL and MySQL need `python3 dev/ready.py up core`; they are skipped (not failed) when
+//! Also (P5-E): imports into a MyISAM table on MySQL and MariaDB ("All or nothing" refused, rows
+//! written reported as kept), and the export's read-only transaction on MySQL (used: a writing
+//! function is refused by the engine) and on TiDB (none: a warning, refused on strict types).
+//!
+//! PostgreSQL, MySQL and MariaDB need `python3 dev/ready.py up core`, TiDB
+//! `python3 dev/ready.py up sql --engines tidb`; they are skipped (not failed) when
 //! unreachable, unless `NINESQL_REQUIRE_ENGINES` lists them (AGENTS.md). SQLite always runs.
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::print_stderr)] // Tests may panic (AGENTS.md).
 
@@ -73,7 +78,7 @@ fn dev(engine: &str) -> Option<Dev> {
         !required(engine),
         "{engine} is required but unreachable at {addr}"
     );
-    eprintln!("skipped: {engine} unreachable at {addr} (python3 dev/ready.py up core)");
+    eprintln!("skipped: {engine} unreachable at {addr} (python3 dev/ready.py up core / sql)");
     None
 }
 
@@ -399,5 +404,361 @@ fn sqlite_100k_import() {
         )
         .await;
         assert_eq!(count(&h, "people").await, IMPORT_ROWS as i64);
+    });
+}
+
+// ---------------------------------------------------------------------------------------------
+// P5-E M1: non-transactional tables.
+
+enum Outcome {
+    Confirm(ninesql_core::ImportConfirmation),
+    Refused(ninesql_core::TransferJobError),
+    Done(ninesql_core::ImportSummary),
+}
+
+async fn import_outcome(mut job: Job<ImportEvent>) -> Outcome {
+    loop {
+        match tokio::time::timeout(Duration::from_secs(120), job.next())
+            .await
+            .unwrap()
+        {
+            Some(ImportEvent::Done(s)) => return Outcome::Done(s),
+            Some(ImportEvent::Failed(e)) => return Outcome::Refused(e),
+            Some(ImportEvent::NeedsConfirmation(c)) => return Outcome::Confirm(c),
+            Some(_) => {}
+            None => panic!("ended"),
+        }
+    }
+}
+
+/// 10 000 rows whose id 5 000 appears again at line 5 051 (a duplicate key the engine refuses).
+fn write_duplicate_csv(dir: &Path) -> PathBuf {
+    let path = dir.join("duplicate.csv");
+    let mut f = std::io::BufWriter::new(std::fs::File::create(&path).unwrap());
+    writeln!(f, "id,label").unwrap();
+    for i in 0..10_000 {
+        let id = if i == 5_050 { 5_000 } else { i };
+        writeln!(f, "{id},row {i}").unwrap();
+    }
+    f.flush().unwrap();
+    path
+}
+
+fn small_targets() -> Vec<TargetColumn> {
+    vec![
+        TargetColumn::new("id", "bigint").with_nullable(false),
+        TargetColumn::new("label", "varchar(200)"),
+    ]
+}
+
+async fn myisam_import(engine: &str, driver: Arc<dyn Driver>) {
+    use ninesql_core::TransferJobError;
+    let Some(dev) = dev(engine) else { return };
+    let tmp = tempfile::tempdir().unwrap();
+    let (manager, _) = manager(driver, tmp.path());
+    let transfer = TransferService::new(manager.clone(), &paths(&tmp.path().join("ninesql")));
+    let out = tempfile::tempdir().unwrap();
+    let h = open_with(&manager, tcp_connection(&dev, engine), Some(&dev.password)).await;
+    let myisam = format!("p5e_myisam_{}", std::process::id());
+    let innodb = format!("p5e_innodb_{}", std::process::id());
+    for (t, e) in [(&myisam, "MyISAM"), (&innodb, "InnoDB")] {
+        exec_ok(&h, &format!("DROP TABLE IF EXISTS {t}")).await;
+        exec_ok(
+            &h,
+            &format!("CREATE TABLE {t} (id bigint PRIMARY KEY, label varchar(200)) ENGINE={e}"),
+        )
+        .await;
+    }
+    let file = write_duplicate_csv(out.path());
+    let mapping = ColumnMapping::by_position(2, &small_targets());
+    let request = |t: &str| {
+        ImportRequest::new(
+            &file,
+            vec![dev.database.clone(), t.to_owned()],
+            small_targets(),
+            mapping.clone(),
+        )
+        .with_rows_per_insert(100)
+    };
+
+    // The target as the UI reads it, found from the name parts.
+    let target = transfer
+        .import_target(&h, vec![dev.database.clone(), myisam.clone()], None)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(target.table_transactional(), Some(false), "{engine}");
+    assert!(!target.all_or_nothing_allowed());
+    let target = transfer
+        .import_target(&h, vec![dev.database.clone(), innodb.clone()], None)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(target.table_transactional(), Some(true), "{engine}");
+    assert!(target.all_or_nothing_allowed());
+    // A single-part name is not found: unknown storage on the MySQL family.
+    let target = transfer
+        .import_target(&h, vec![myisam.clone()], None)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(target.table_transactional(), None);
+    assert!(matches!(
+        target.all_or_nothing_refusal(),
+        Some(TransferJobError::TableStorageUnknown)
+    ));
+
+    // "All or nothing" into MyISAM is refused before anything is sent.
+    match import_outcome(transfer.import_csv(&h, request(&myisam))).await {
+        Outcome::Refused(TransferJobError::NonTransactionalTable) => {}
+        _ => panic!("{engine}: all or nothing into MyISAM must be refused"),
+    }
+    assert_eq!(count(&h, &myisam).await, 0);
+
+    // "Commit every N rows" runs, fails at the duplicate, and reports the rows as kept.
+    let s = match import_outcome(transfer.import_csv(
+        &h,
+        request(&myisam).with_transaction(ImportTransaction::CommitEvery(1_000)),
+    ))
+    .await
+    {
+        Outcome::Done(s) => s,
+        _ => panic!("{engine}: not run"),
+    };
+    assert_eq!(s.end, ImportEnd::Failed, "{engine}");
+    assert!(!s.transactional, "{engine}: MyISAM cannot roll back");
+    assert_eq!(s.target.table_transactional(), Some(false));
+    assert_eq!(s.rows_inserted, 5_000, "{engine}");
+    assert_eq!(s.rows_committed, s.rows_inserted, "{engine}");
+    let kept = count(&h, &myisam).await;
+    // The failed multi-row INSERT may have written its rows before the duplicate too.
+    assert!(kept >= 5_000, "{engine}: {kept} rows kept");
+    assert!(!h.transaction_state().in_transaction);
+
+    // InnoDB: "All or nothing" rolls everything back, and says so.
+    let s = match import_outcome(transfer.import_csv(&h, request(&innodb))).await {
+        Outcome::Done(s) => s,
+        _ => panic!("{engine}: not run"),
+    };
+    assert_eq!(s.end, ImportEnd::Failed);
+    assert!(s.transactional);
+    assert_eq!(s.rows_committed, 0);
+    assert_eq!(count(&h, &innodb).await, 0);
+
+    // Production: the confirmation says rows cannot be rolled back and the import commits
+    // them by itself on the manual-commit session.
+    let mut c = tcp_connection(&dev, engine);
+    c.connection_type = ConnectionTypeId::prod();
+    let prod = open_with(&manager, c, Some(&dev.password)).await;
+    match import_outcome(transfer.import_csv(
+        &prod,
+        request(&myisam).with_transaction(ImportTransaction::CommitEvery(1_000)),
+    ))
+    .await
+    {
+        Outcome::Confirm(c) => {
+            assert!(c.non_transactional());
+            assert_eq!(c.transaction(), ImportTransaction::CommitEvery(1_000));
+            assert!(c.session_manual_commit());
+        }
+        _ => panic!("{engine}: production asks first"),
+    }
+    match import_outcome(transfer.import_csv(&prod, request(&innodb))).await {
+        Outcome::Confirm(c) => {
+            assert!(!c.non_transactional());
+            assert_eq!(c.transaction(), ImportTransaction::AllOrNothing);
+        }
+        _ => panic!("{engine}: production asks first"),
+    }
+    drop(prod);
+    for t in [&myisam, &innodb] {
+        exec_ok(&h, &format!("DROP TABLE {t}")).await;
+    }
+}
+
+#[test]
+fn myisam_import_mysql() {
+    ui(myisam_import(
+        "mysql",
+        Arc::new(ninesql_driver_mysqlwire::MySqlWireDriver::new()),
+    ));
+}
+
+#[test]
+fn myisam_import_mariadb() {
+    ui(myisam_import(
+        "mariadb",
+        Arc::new(ninesql_driver_mysqlwire::MySqlWireDriver::new()),
+    ));
+}
+
+// ---------------------------------------------------------------------------------------------
+// P5-E M3: the export's read-only transaction on MySQL and TiDB.
+
+async fn export_outcome(
+    transfer: &TransferService,
+    h: &SessionHandle,
+    request: ExportRequest,
+) -> Result<ninesql_core::ExportSummary, ninesql_core::TransferJobError> {
+    let mut job = transfer.export(h, request);
+    let result = loop {
+        match tokio::time::timeout(Duration::from_secs(60), job.next())
+            .await
+            .unwrap()
+        {
+            Some(ExportEvent::Done(s)) => break Ok(s),
+            Some(ExportEvent::Failed(e)) => break Err(e),
+            Some(_) => {}
+            None => panic!("ended"),
+        }
+    };
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while h.is_leased() || h.transaction_state().in_transaction {
+        assert!(Instant::now() < deadline, "the export left its transaction");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    result
+}
+
+#[test]
+fn export_read_only_transaction_mysql_and_tidb() {
+    use ninesql_core::{ExportWarning, TransferJobError};
+    let tmp = tempfile::tempdir().unwrap();
+    let (manager, _) = manager(
+        Arc::new(ninesql_driver_mysqlwire::MySqlWireDriver::new()),
+        tmp.path(),
+    );
+    let transfer = TransferService::new(manager.clone(), &paths(&tmp.path().join("ninesql")));
+    let out = tempfile::tempdir().unwrap();
+    let csv = || ExportOptions::new(ExportFormat::Csv);
+    ui(async {
+        if let Some(dev) = dev("mysql") {
+            let h = open_with(&manager, tcp_connection(&dev, "mysql"), Some(&dev.password)).await;
+            // A function that writes, which the classifier reads as a read: the engine refuses
+            // it inside the export's read-only transaction (error 1792).
+            let probe = format!("p5e_probe_{}", std::process::id());
+            let func = format!("p5e_side_effect_{}", std::process::id());
+            exec_ok(&h, &format!("DROP TABLE IF EXISTS {probe}")).await;
+            exec_ok(&h, &format!("CREATE TABLE {probe} (id INT)")).await;
+            exec_ok(&h, &format!("DROP FUNCTION IF EXISTS {func}")).await;
+            exec_ok(
+                &h,
+                &format!(
+                    "CREATE FUNCTION {func}() RETURNS INT READS SQL DATA \
+                     BEGIN INSERT INTO {probe} VALUES (1); RETURN 1; END"
+                ),
+            )
+            .await;
+            let side_effect = format!("SELECT {func}() AS x");
+            assert_eq!(
+                h.dialect().classify(&side_effect),
+                ninesql_core::driver_api::StatementClass::Read
+            );
+            let e = export_outcome(
+                &transfer,
+                &h,
+                ExportRequest::statement(&side_effect, out.path().join("m1.csv"), csv()),
+            )
+            .await
+            .unwrap_err();
+            assert!(e.to_string().contains("READ ONLY"), "{e}");
+            assert_eq!(count(&h, &probe).await, 0);
+            // A plain export works, without warning, also on production.
+            let mut c = tcp_connection(&dev, "mysql");
+            c.connection_type = ConnectionTypeId::prod();
+            let prod = open_with(&manager, c, Some(&dev.password)).await;
+            for session in [&h, &prod] {
+                let s = export_outcome(
+                    &transfer,
+                    session,
+                    ExportRequest::statement(
+                        "SELECT 1 AS x",
+                        out.path().join(format!("m-{}.csv", session.id())),
+                        csv(),
+                    ),
+                )
+                .await
+                .unwrap();
+                assert!(s.warnings.is_empty(), "{:?}", s.warnings);
+            }
+            assert!(
+                export_outcome(
+                    &transfer,
+                    &prod,
+                    ExportRequest::statement(&side_effect, out.path().join("m2.csv"), csv()),
+                )
+                .await
+                .is_err()
+            );
+            assert_eq!(count(&h, &probe).await, 0);
+            exec_ok(&h, &format!("DROP FUNCTION {func}")).await;
+            exec_ok(&h, &format!("DROP TABLE {probe}")).await;
+        }
+
+        if let Some(dev) = dev("tidb") {
+            // No read-only transaction is sent (TiDB would refuse it with error 1235, or
+            // accept it as a no-op): a warning on dev, a refusal on strict types.
+            let h = open_with(&manager, tcp_connection(&dev, "tidb"), Some(&dev.password)).await;
+            let s = export_outcome(
+                &transfer,
+                &h,
+                ExportRequest::statement("SELECT 1 AS x", out.path().join("t1.csv"), csv()),
+            )
+            .await
+            .unwrap();
+            assert_eq!(s.warnings, vec![ExportWarning::NoReadOnlyTransaction]);
+            assert_eq!(
+                std::fs::read_to_string(out.path().join("t1.csv")).unwrap(),
+                "x\n1\n"
+            );
+            // Also with `tidb_enable_noop_functions` on, where the no-op would be accepted.
+            exec_ok(&h, "SET SESSION tidb_enable_noop_functions = ON").await;
+            let s = export_outcome(
+                &transfer,
+                &h,
+                ExportRequest::statement("SELECT 1 AS x", out.path().join("t2.csv"), csv()),
+            )
+            .await
+            .unwrap();
+            assert_eq!(s.warnings, vec![ExportWarning::NoReadOnlyTransaction]);
+
+            let mut c = tcp_connection(&dev, "tidb");
+            c.connection_type = ConnectionTypeId::prod();
+            let prod = open_with(&manager, c, Some(&dev.password)).await;
+            assert!(matches!(
+                export_outcome(
+                    &transfer,
+                    &prod,
+                    ExportRequest::statement("SELECT 1 AS x", out.path().join("t3.csv"), csv()),
+                )
+                .await,
+                Err(TransferJobError::NoReadOnlyTransaction)
+            ));
+            assert!(!out.path().join("t3.csv").exists());
+            // A custom type that confirms every write is strict too.
+            let mut types = ConnectionTypes::default();
+            let mut confirm = ninesql_core::ConnectionType::development();
+            confirm.id = ninesql_core::ConnectionTypeId::new("p5e-confirm").unwrap();
+            confirm.name = "Confirm".into();
+            confirm.confirm_every_write = true;
+            types.upsert(confirm.clone());
+            let mut c = tcp_connection(&dev, "tidb");
+            c.connection_type = confirm.id.clone();
+            let mut request = OpenRequest::new(c, &types);
+            request =
+                request.with_secret(SecretSlot::Auth, SecretString::from(dev.password.clone()));
+            let OpenOutcome::Opened(strict) = open(&manager, request).await.unwrap() else {
+                panic!("not opened");
+            };
+            assert!(matches!(
+                export_outcome(
+                    &transfer,
+                    &strict,
+                    ExportRequest::statement("SELECT 1 AS x", out.path().join("t4.csv"), csv()),
+                )
+                .await,
+                Err(TransferJobError::NoReadOnlyTransaction)
+            ));
+        }
     });
 }

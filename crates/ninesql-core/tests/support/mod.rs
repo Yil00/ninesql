@@ -49,6 +49,8 @@ pub struct Wrap {
     /// Statements starting with one of these prefixes (ASCII case ignored) fail with a query
     /// error, as an engine error would.
     pub fail_prefixes: Arc<Mutex<Vec<String>>>,
+    /// The driver's `rollback()` fails (the transaction stays open), as a lost link would.
+    pub fail_rollback: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl Wrap {
@@ -60,6 +62,7 @@ impl Wrap {
             ignore_dbeaver_flag: false,
             busy_until: Arc::default(),
             fail_prefixes: Arc::default(),
+            fail_rollback: Arc::default(),
         }
     }
 
@@ -117,6 +120,7 @@ impl Driver for Wrap {
             inner,
             busy_until: Arc::clone(&self.busy_until),
             fail_prefixes: Arc::clone(&self.fail_prefixes),
+            fail_rollback: Arc::clone(&self.fail_rollback),
         }))
     }
 }
@@ -125,6 +129,7 @@ pub struct WrapSession {
     inner: Box<dyn Session>,
     busy_until: Arc<Mutex<Option<Instant>>>,
     fail_prefixes: Arc<Mutex<Vec<String>>>,
+    fail_rollback: Arc<std::sync::atomic::AtomicBool>,
 }
 
 #[async_trait::async_trait]
@@ -185,6 +190,13 @@ impl Session for WrapSession {
         self.inner.commit().await
     }
     async fn rollback(&mut self) -> DriverResult<()> {
+        if self.fail_rollback.load(std::sync::atomic::Ordering::SeqCst) {
+            return Err(DriverError::Query {
+                code: Some("XX000".into()),
+                message: "injected rollback failure".into(),
+                position: None,
+            });
+        }
         self.inner.rollback().await
     }
     fn is_read_only(&self) -> bool {

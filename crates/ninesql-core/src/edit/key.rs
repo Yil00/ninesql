@@ -133,7 +133,7 @@ pub fn table_parts(path: &ObjectPath) -> Vec<String> {
 
 /// Engines whose driver reports [`TableInfo::transactional`] per table (the MySQL family, where
 /// storage engines differ): there an unknown value means not editable.
-fn reports_transactional(engine: &EngineId) -> bool {
+pub(crate) fn reports_transactional(engine: &EngineId) -> bool {
     *engine == EngineId::MYSQL || *engine == EngineId::MARIADB || *engine == EngineId::TIDB
 }
 
