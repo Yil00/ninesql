@@ -21,6 +21,8 @@ if [ -s "$dir/ca.crt" ] && [ -s "$dir/$name.crt" ] && [ -s "$dir/$name.key" ]; t
 fi
 mkdir -p "$dir"
 cd "$dir"
+# Never leave the CA key or the scratch files behind, even when a step fails.
+trap 'rm -f ca.key ca.srl server.csr server.ext' EXIT
 rm -f ca.crt "$name.crt" "$name.key"
 openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes -days 3650 \
   -subj "/CN=NineSQL dev test CA" -keyout ca.key -out ca.crt \

@@ -1212,7 +1212,12 @@ impl TransferService {
         };
         let parent = ObjectPath(parents.to_vec());
         let found = self
-            .find_child(connection, NodeKey::new(parent, leaf.kind), &leaf.name)
+            .find_child(
+                connection,
+                NodeKey::new(parent, leaf.kind),
+                &leaf.name,
+                true,
+            )
             .await?;
         Ok(found.and_then(|o| match o.details {
             ObjectDetails::Table(t) => t.transactional,
@@ -1239,7 +1244,7 @@ impl TransferService {
                 .filter(|k| matches!(k, ObjectKind::Catalog | ObjectKind::Schema))
             {
                 if self
-                    .find_child(connection, NodeKey::new(path.clone(), kind), name)
+                    .find_child(connection, NodeKey::new(path.clone(), kind), name, false)
                     .await?
                     .is_some()
                 {
@@ -1266,12 +1271,16 @@ impl TransferService {
     /// an incomplete listing. When a complete listing does not hold the name, the node is
     /// refreshed once and searched again: a cached listing predates a table created since
     /// (for example by the user just before an import), which would otherwise read as
-    /// unknown storage and refuse "All or nothing" on the MySQL family.
+    /// unknown storage and refuse "All or nothing" on the MySQL family. Only the table level
+    /// is refreshed (`refresh`): refreshing a container (the schema list) would discard the
+    /// whole loaded navigator tree for a mistyped schema name (review of the pre-phase-6
+    /// follow-ups, Low 3); a missing container still resolves to unknown storage.
     async fn find_child(
         &self,
         connection: crate::connection::ConnectionId,
         key: NodeKey,
         name: &str,
+        refresh: bool,
     ) -> Result<Option<ninesql_driver_api::metadata::ObjectInfo>, crate::metadata::MetadataError>
     {
         let find = |node: &NodeChildren| node.items.iter().find(|o| o.name() == name).cloned();
@@ -1283,7 +1292,7 @@ impl TransferService {
                 return Ok(Some(o));
             }
             if node.complete {
-                if refreshed {
+                if refreshed || !refresh {
                     return Ok(None);
                 }
                 refreshed = true;

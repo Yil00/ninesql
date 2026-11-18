@@ -626,7 +626,8 @@ async fn verify_full_against_the_dev_ca_and_refusals() {
         assert_eq!(on_tls(s.as_mut()).await.as_deref(), Some("true"), "{id}");
         s.close().await.unwrap();
         // A tunnel-style endpoint: connect to 127.0.0.1, verify the name "localhost". The
-        // session is on TLS, and cancel requests travel over TLS as well.
+        // session is on TLS, and a timeout's cancel works on it (the transport of the cancel
+        // connection itself is not observed: both dev servers also accept plain TCP).
         let mut p = make();
         p.tls.ca_file = Some(ca_path.clone());
         p.tls.server_name = Some("localhost".into());
