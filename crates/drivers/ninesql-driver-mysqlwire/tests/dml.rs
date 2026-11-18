@@ -1070,8 +1070,13 @@ async fn index_flags_and_transactional_tables() {
 }
 
 /// Key comparisons use the column's collation (P5-B re-review M-a): a `latin1` unique key
-/// holding `u` and `ü`, and an accent- and case-sensitive primary key holding `a` and `A`, each
-/// match exactly one row through the bound form and through the preview.
+/// holding `u` and `ü`, and an accent- and case-sensitive primary key holding `a`, `A` and `á`,
+/// each match exactly one row through the bound form and through the preview.
+///
+/// TiDB (v8.5, new collations on) has no `_as_cs` collation: it refuses
+/// `utf8mb4_0900_as_cs` ("Unsupported collation", checked below so that the test notices when
+/// it gains one), and its accent- and case-sensitive key is the binary `utf8mb4_0900_bin`
+/// (docs/08).
 #[tokio::test]
 async fn key_comparisons_use_the_column_collation() {
     for engine in ENGINES {
@@ -1084,6 +1089,22 @@ async fn key_comparisons_use_the_column_collation() {
             _ => ("latin1_bin", "utf8mb4_0900_bin"),
         };
         sql(s, "DROP TABLE IF EXISTS p5b_coll1, p5b_coll2").await;
+        if engine == "tidb" {
+            let refused = exec(
+                s,
+                Statement::sql(
+                    "CREATE TABLE p5b_coll2 (k VARCHAR(10) CHARACTER SET utf8mb4 \
+                     COLLATE utf8mb4_0900_as_cs PRIMARY KEY, v INT)",
+                ),
+            )
+            .await;
+            match refused {
+                Err(e) => assert!(e.to_string().contains("Unsupported collation"), "tidb: {e}"),
+                Ok(_) => panic!(
+                    "tidb now accepts utf8mb4_0900_as_cs: test it as the key collation (docs/08)"
+                ),
+            }
+        }
         sql(
             s,
             &format!(
