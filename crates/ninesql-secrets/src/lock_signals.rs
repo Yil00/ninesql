@@ -180,6 +180,9 @@ struct Status {
     session_watched: AtomicBool,
     /// A session's screen lock was watched at some point (sticky).
     had_session: AtomicBool,
+    /// logind is back but the session could not be looked up again: the path watched is the
+    /// one found on an earlier connection and may not exist any more (re-review N1).
+    session_unconfirmed: AtomicBool,
     /// The current connection's unique bus name (tests send unicast signals to it).
     #[cfg_attr(not(test), allow(dead_code))]
     unique_name: Mutex<String>,
@@ -245,13 +248,16 @@ impl DesktopLockWatcher {
         )
     }
 
-    /// Whether the session's screen lock was watched before and is not any more (its lookup
-    /// failed after an outage and no earlier session is known): only sleep locks the secrets
-    /// then, a degraded state the application should report.
+    /// Whether the session's screen lock was watched before and may not be any more: logind is
+    /// back after an outage, but the session could not be looked up again (its retries
+    /// included), so the path still watched is the one from an earlier connection and may no
+    /// longer exist; or no session is watched at all. Only sleep is then sure to lock the
+    /// secrets, a degraded state the application should report. Cleared when a lookup succeeds.
     #[must_use]
     pub fn session_lock_lost(&self) -> bool {
         self.status.had_session.load(Ordering::SeqCst)
-            && !self.status.session_watched.load(Ordering::SeqCst)
+            && (!self.status.session_watched.load(Ordering::SeqCst)
+                || self.status.session_unconfirmed.load(Ordering::SeqCst))
     }
 
     /// The current connection's unique bus name.
@@ -607,16 +613,23 @@ struct TimerShared {
 /// It ends when dropped. A dropped wait stays in its list until its deadline (at most 60 s).
 struct TimerThread {
     shared: Arc<TimerShared>,
+    /// The thread, so tests can check it ends on drop.
+    #[cfg(test)]
+    handle: Option<std::thread::JoinHandle<()>>,
 }
 
 impl TimerThread {
     fn start() -> std::io::Result<Self> {
         let shared = Arc::new(TimerShared::default());
         let t = Arc::clone(&shared);
-        std::thread::Builder::new()
+        let _handle = std::thread::Builder::new()
             .name("ninesql-lock-timer".into())
             .spawn(move || timer_loop(&t))?;
-        Ok(Self { shared })
+        Ok(Self {
+            shared,
+            #[cfg(test)]
+            handle: Some(_handle),
+        })
     }
 
     /// Resolves after `d`.
@@ -709,11 +722,25 @@ fn hint_request(conn: &Connection, path: &str) -> BoxFuture<'static, bool> {
 
 type Relookup = BoxFuture<'static, Option<(String, Vec<MessageStream>)>>;
 
+/// First wait before looking the session up again after a failed lookup (logind may answer
+/// its first calls before it has restored its sessions).
+const RELOOKUP_RETRY_FIRST: Duration = if cfg!(test) {
+    Duration::from_millis(50)
+} else {
+    Duration::from_secs(1)
+};
+/// Retries of a failed session lookup once logind is back (waits: 1 s, then 2 s).
+const RELOOKUP_RETRIES: u32 = 2;
+
 /// Looks the session up again and subscribes to its lock signals (logind is back and the
-/// session is unknown, or known only from an earlier connection).
-fn relookup_request(conn: &Connection) -> Relookup {
+/// session is unknown, or known only from an earlier connection), after `wait` when it is a
+/// retry.
+fn relookup_request(conn: &Connection, wait: Option<BoxFuture<'static, ()>>) -> Relookup {
     let c = conn.clone();
     Box::pin(async move {
+        if let Some(w) = wait {
+            w.await;
+        }
         let path = own_session(&c).await?;
         match session_streams(&c, &path).await {
             Ok(streams) => Some((path, streams)),
@@ -1062,6 +1089,7 @@ impl Link for BusLink {
             .sleep_delay
             .store(self.inhibitor.is_some(), Ordering::SeqCst);
         status.set_session_watched(self.session_path.is_some());
+        status.session_unconfirmed.store(false, Ordering::SeqCst);
         self.unique.clone_into(
             &mut status
                 .unique_name
@@ -1116,9 +1144,11 @@ impl BusLink {
         // known for sure (looked up again when it is unknown or from an earlier connection).
         let mut hint: Option<BoxFuture<'static, bool>> = None;
         let mut relookup: Option<Relookup> = None;
+        // Failed lookups since logind (re)appeared (re-review N2).
+        let mut relookup_failures: u32 = 0;
         let check_missed_lock = |session_path: &Option<String>, session_stale: bool| {
             if lookup && (session_path.is_none() || session_stale) {
-                (None, Some(relookup_request(&conn)))
+                (None, Some(relookup_request(&conn, None)))
             } else {
                 (
                     session_path.as_deref().map(|p| hint_request(&conn, p)),
@@ -1180,11 +1210,29 @@ impl BusLink {
                         streams.extend(new_streams);
                         session_path = Some(path);
                         session_stale = false;
+                        relookup_failures = 0;
                         status.set_session_watched(true);
+                        status.session_unconfirmed.store(false, Ordering::SeqCst);
+                        hint = session_path.as_deref().map(|p| hint_request(&conn, p));
+                    } else {
+                        relookup_failures += 1;
+                        // Reported at once, cleared if a retry succeeds (re-review N1).
+                        status.session_unconfirmed.store(true, Ordering::SeqCst);
+                        if relookup_failures == 1 {
+                            // The earlier session (if any) stays watched; its hint is read
+                            // anyway, and an unreadable hint locks.
+                            hint = session_path.as_deref().map(|p| hint_request(&conn, p));
+                        }
+                        if relookup_failures <= RELOOKUP_RETRIES {
+                            let wait = RELOOKUP_RETRY_FIRST * (1 << (relookup_failures - 1));
+                            tracing::debug!(retry_in = ?wait, "session lookup failed: retrying");
+                            relookup = Some(relookup_request(&conn, Some(clocks.sleep(wait))));
+                        } else {
+                            tracing::warn!(
+                                "the session could not be found again: its screen lock may not be watched"
+                            );
+                        }
                     }
-                    // Not found: the earlier session (if any) stays watched; its hint is read
-                    // anyway, and an unreadable hint locks.
-                    hint = session_path.as_deref().map(|p| hint_request(&conn, p));
                 }
                 Next::LockedHint(locked) => {
                     hint = None;
@@ -1237,6 +1285,7 @@ impl BusLink {
                                         run_hook(&*hook, LockTrigger::Sleep);
                                     }
                                     // A lock missed while logind was away or restarting.
+                                    relookup_failures = 0;
                                     (hint, relookup) =
                                         check_missed_lock(&session_path, session_stale);
                                 } else {
@@ -1411,6 +1460,8 @@ mod tests {
         inhibitors: Arc<StdMutex<Vec<UnixStream>>>,
         /// The session's `LockedHint`, as answered to `Get` ([`Hint`] as `u8`).
         hint: Arc<AtomicU8>,
+        /// `GetUser` calls received (the session lookup through the user).
+        user_lookups: Arc<std::sync::atomic::AtomicUsize>,
     }
 
     /// How the fake answers a `Get` of the session's `LockedHint`.
@@ -1439,6 +1490,15 @@ mod tests {
 
         /// Like [`Self::start_refusing`], answering `LockedHint` as `hint` says.
         fn start_with(address: &str, refuse: usize, hint: Hint) -> Self {
+            Self::start_full(address, refuse, hint, 0)
+        }
+
+        /// Like [`Self::start_with`], failing the first `fail_lookups` `GetUser` calls (the
+        /// session cannot be found).
+        fn start_full(address: &str, refuse: usize, hint: Hint, fail_lookups: usize) -> Self {
+            let user_lookups = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let lookups = Arc::clone(&user_lookups);
+            let lookup_failures = Arc::new(std::sync::atomic::AtomicUsize::new(fail_lookups));
             let hint_mode = Arc::new(AtomicU8::new(hint as u8));
             let hint = Arc::clone(&hint_mode);
             let conn = connect_to(address);
@@ -1482,6 +1542,16 @@ mod tests {
                                 )
                                 .await
                                 .unwrap();
+                            }
+                            Some("GetUser")
+                                if {
+                                    lookups.fetch_add(1, Ordering::SeqCst);
+                                    take_one(&lookup_failures)
+                                } =>
+                            {
+                                c.reply_error(&h, "org.freedesktop.login1.NoSuchUser", &"no user")
+                                    .await
+                                    .unwrap();
                             }
                             Some("GetUser") => {
                                 let p = OwnedObjectPath::try_from(USER_PATH).unwrap();
@@ -1527,6 +1597,7 @@ mod tests {
                 conn,
                 inhibitors,
                 hint: hint_mode,
+                user_lookups,
             }
         }
 
@@ -2195,6 +2266,129 @@ mod tests {
         );
         assert!(w.watches_session_lock());
         drop(w);
+    }
+
+    /// Brings the bus at `socket` down and back up without logind, with a watcher that found
+    /// its session through the user before: returns the new bus once the watcher reconnected.
+    fn bus_back_before_logind(
+        socket: &std::path::Path,
+        bus: Bus,
+        logind: FakeLogind,
+        w: &DesktopLockWatcher,
+        recorder: &Recorder,
+    ) -> Bus {
+        drop(logind);
+        drop(bus);
+        assert_eq!(recorder.wait_for(1), [LockTrigger::Requested]);
+        let _ = std::fs::remove_file(socket);
+        let bus = private_bus_at(Some(socket)).unwrap();
+        wait("reconnected without logind", || {
+            w.state() == WatcherState::LogindAbsent
+        });
+        bus
+    }
+
+    /// Re-review N1 / N2: logind is back but the session cannot be looked up again, retries
+    /// included: the stale session is reported as possibly lost, and nothing is retried after
+    /// the last attempt.
+    #[test]
+    fn a_session_not_found_again_after_retries_is_reported_lost() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("bus");
+        let Some(bus) = private_bus_at(Some(&socket)) else {
+            eprintln!("dbus-daemon not available: skipped");
+            return;
+        };
+        let logind = FakeLogind::start(&bus.address);
+        let recorder = Arc::new(Recorder::default());
+        let suspended = Arc::default();
+        let w = watcher_at(&socket, SessionChoice::Lookup, recorder.clone(), &suspended);
+        let bus = bus_back_before_logind(&socket, bus, logind, &w, &recorder);
+        assert!(!w.session_lock_lost(), "not known yet while logind is away");
+
+        let logind = FakeLogind::start_full(&bus.address, 0, Hint::Unlocked, usize::MAX);
+        wait("watching again", || w.is_running());
+        wait("reported lost", || w.session_lock_lost());
+        wait("first lookup and two retries", || {
+            logind.user_lookups.load(Ordering::SeqCst) == 1 + RELOOKUP_RETRIES as usize
+        });
+        std::thread::sleep(RELOOKUP_RETRY_FIRST * 8);
+        assert_eq!(
+            logind.user_lookups.load(Ordering::SeqCst),
+            1 + RELOOKUP_RETRIES as usize,
+            "no retry after the last"
+        );
+        assert!(w.session_lock_lost());
+        assert!(w.is_running(), "sleep is still watched");
+        drop(w);
+    }
+
+    /// Re-review N2: a lookup that fails once succeeds on its retry, and the report clears.
+    #[test]
+    fn a_failed_session_lookup_is_retried_and_the_report_clears() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("bus");
+        let Some(bus) = private_bus_at(Some(&socket)) else {
+            eprintln!("dbus-daemon not available: skipped");
+            return;
+        };
+        let logind = FakeLogind::start(&bus.address);
+        let recorder = Arc::new(Recorder::default());
+        let suspended = Arc::default();
+        let w = watcher_at(&socket, SessionChoice::Lookup, recorder.clone(), &suspended);
+        let bus = bus_back_before_logind(&socket, bus, logind, &w, &recorder);
+
+        let logind = FakeLogind::start_full(&bus.address, 0, Hint::Unlocked, 1);
+        wait("retried", || {
+            logind.user_lookups.load(Ordering::SeqCst) == 2
+        });
+        wait("report cleared", || !w.session_lock_lost());
+        assert!(w.watches_session_lock());
+        std::thread::sleep(Duration::from_millis(200));
+        logind.emit(OUR_SESSION, SESSION, "Lock", None);
+        assert_eq!(
+            recorder.wait_for(2),
+            [LockTrigger::Requested, LockTrigger::SessionLock]
+        );
+        drop(w);
+    }
+
+    /// Re-review N3: waits fire in deadline order, not in the order they were asked for, and
+    /// the thread ends when the timer is dropped.
+    #[test]
+    fn the_timer_thread_fires_in_order_and_ends_on_drop() {
+        let mut timer = TimerThread::start().unwrap();
+        let fired: Arc<StdMutex<Vec<usize>>> = Arc::default();
+        let started = Instant::now();
+        let waiters: Vec<_> = [300_u64, 100, 200, 0]
+            .into_iter()
+            .enumerate()
+            .map(|(i, ms)| {
+                let wait = timer.sleep(Duration::from_millis(ms));
+                let fired = Arc::clone(&fired);
+                std::thread::spawn(move || {
+                    zbus::block_on(wait);
+                    let elapsed = started.elapsed();
+                    assert!(elapsed >= Duration::from_millis(ms), "{i}: {elapsed:?}");
+                    fired.lock().unwrap().push(i);
+                })
+            })
+            .collect();
+        for w in waiters {
+            w.join().unwrap();
+        }
+        assert_eq!(*fired.lock().unwrap(), [3, 1, 2, 0]);
+
+        // A pending wait does not keep the thread alive.
+        let _pending = timer.sleep(Duration::from_secs(3600));
+        let handle = timer.handle.take().unwrap();
+        drop(timer);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !handle.is_finished() {
+            assert!(Instant::now() < deadline, "the timer thread did not end");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        handle.join().unwrap();
     }
 
     /// Security review M1: no session could be found while logind was absent; it is looked up
