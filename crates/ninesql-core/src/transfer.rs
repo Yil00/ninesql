@@ -2090,11 +2090,19 @@ impl ImportTask {
             Ok(()) => (ImportEnd::Completed, None),
             Err(e) => {
                 if tx.in_tx {
-                    // A failed rollback leaves the transaction to the session (closing it rolls
-                    // back); it is reported through the session's transaction state.
                     tx.in_tx = false;
                     if let Err(re) = tx_op(tx.lease.rollback()).await {
-                        tracing::warn!(kind = re.kind(), "rollback after a failed import failed");
+                        // Fail closed, as a save whose undo failed (P5-E L2): part of the
+                        // import may still sit in the open transaction, and a later commit
+                        // would keep it. Closing the session rolls it back on the server.
+                        // Closing works while the lease is held.
+                        tracing::warn!(
+                            kind = re.kind(),
+                            "rollback after a failed import failed; closing the session"
+                        );
+                        if let Some(Err(ce)) = self.session.close().await {
+                            tracing::warn!(kind = ce.kind(), "closing the session failed");
+                        }
                     }
                 }
                 let end = if matches!(e, TransferJobError::Cancelled) {

@@ -1088,3 +1088,54 @@ fn import_confirmation_states_the_commit_mode_and_binds_csv_options() {
         assert_eq!(s.rows_committed, 10);
     });
 }
+
+#[test]
+fn an_import_whose_rollback_fails_closes_the_session() {
+    // Security review of the P5-E fixes, Low 2: as a save whose undo failed, a failed import
+    // whose rollback also fails must not leave part of the import in an open transaction.
+    let tmp = tempfile::tempdir().unwrap();
+    let wrap = Wrap::new(mock_driver());
+    let (manager, _) = manager(Arc::new(wrap.clone()), tmp.path());
+    let transfer = TransferService::new(manager.clone(), &paths(&tmp.path().join("ninesql")));
+    let data = tempfile::tempdir().unwrap();
+    ui(async {
+        let h = open_ok(
+            &manager,
+            mock_connection(ConnectionTypeId::dev()),
+            &ConnectionTypes::default(),
+        )
+        .await;
+        let bad = write_csv(data.path(), 1200, Some(700));
+        let mapping = transfer
+            .preview_csv(CsvPreviewRequest::new(&bad, targets()))
+            .await
+            .unwrap()
+            .unwrap()
+            .mapping;
+        wrap.fail_rollback
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let s = done(
+            finish_import(transfer.import_csv(
+                &h,
+                ImportRequest::new(
+                    &bad,
+                    vec!["public".to_owned(), "people".to_owned()],
+                    targets(),
+                    mapping,
+                ),
+            ))
+            .await,
+        );
+        assert_eq!(s.end, ImportEnd::Failed);
+        assert_eq!(s.rows_committed, 0);
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while !h.is_closed() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the session was not closed"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(h.commit().await.is_none_or(|r| r.is_err()));
+    });
+}

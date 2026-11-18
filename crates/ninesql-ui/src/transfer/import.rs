@@ -487,6 +487,14 @@ impl ImportCsvDialog {
                 ImportTransaction::AllOrNothing => {
                     "Cancelled: the import's transaction is rolled back.".into()
                 }
+                _ if self
+                    .target
+                    .as_ref()
+                    .is_some_and(|t| !t.rows_can_be_rolled_back()) =>
+                {
+                    "Cancelled: every row sent so far stays in the table (it cannot roll back)."
+                        .into()
+                }
                 _ => "Cancelled: rows of the batches already committed stay in the table.".into(),
             });
             cx.notify();
