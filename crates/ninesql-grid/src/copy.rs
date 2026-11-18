@@ -7,9 +7,16 @@
 //!   field.
 //! - The text is bounded by [`MAX_COPY_BYTES`]: copy stops at a row boundary and reports it, so a
 //!   copy never doubles the result's memory unboundedly (I6).
+//! - **Formula guard** (on by default, [`CopyOptions::formula_guard`]): a header or a text
+//!   value that a spreadsheet would run as a formula ([`needs_formula_guard`], the P5-C
+//!   exporter's rule) gets a `'` in front, as in a CSV / TSV export (ADR-0027 §3.2). Values of a
+//!   number column that read as numbers are never changed, so `-5` stays a number.
 //! - Values of a column the driver cut (`ninesql.truncated`) are copied as their kept prefix;
 //!   [`CopyOutput::cut_values`] says so, and the UI tells the user.
 
+use ninesql_core::transfer::export::needs_formula_guard;
+
+use crate::format::ValueKind;
 use crate::model::ResultSetModel;
 use crate::rows::RowView;
 use crate::selection::{ColumnOrder, GridSelection};
@@ -44,16 +51,19 @@ pub struct CopyOptions {
     pub headers: bool,
     /// Size bound of the text.
     pub max_bytes: usize,
+    /// Spreadsheet formula guard ("CSV injection"; see the [module documentation](self)).
+    pub formula_guard: bool,
 }
 
 impl CopyOptions {
-    /// TSV or CSV, with or without headers, bounded by [`MAX_COPY_BYTES`].
+    /// TSV or CSV, with or without headers, bounded by [`MAX_COPY_BYTES`], formula guard on.
     #[must_use]
     pub fn new(format: CopyFormat, headers: bool) -> Self {
         Self {
             format,
             headers,
             max_bytes: MAX_COPY_BYTES,
+            formula_guard: true,
         }
     }
 }
@@ -103,6 +113,7 @@ pub fn copy_selection_in(
         return None;
     }
     let delim = options.format.delimiter();
+    let guard = options.formula_guard;
     let mut text = String::new();
     let mut field = String::new();
     let cut_values = cols.iter().any(|&c| model.columns()[c].truncated_values);
@@ -113,7 +124,7 @@ pub fn copy_selection_in(
                 text.push(delim);
             }
             first = false;
-            push_field(text, f, delim);
+            push_field(text, f, delim, guard && needs_formula_guard(f));
         }
         text.push('\n');
     };
@@ -135,7 +146,11 @@ pub fn copy_selection_in(
             }
             field.clear();
             model.write_cell_copy(&mut field, row, c, "");
-            push_field(&mut line, &field, delim);
+            let guarded = guard
+                && needs_formula_guard(&field)
+                && !(model.columns()[c].kind == ValueKind::Number
+                    && field.trim().parse::<f64>().is_ok());
+            push_field(&mut line, &field, delim, guarded);
         }
         line.push('\n');
         if text.len() + line.len() > options.max_bytes {
@@ -158,9 +173,14 @@ pub fn copy_selection_in(
     })
 }
 
-fn push_field(out: &mut String, value: &str, delim: char) {
+/// Appends `value`, quoted when needed, with the formula guard's `'` in front when `guard`
+/// (inside the quotes, as the exporter writes it).
+fn push_field(out: &mut String, value: &str, delim: char, guard: bool) {
     if value.contains([delim, '"', '\n', '\r']) {
         out.push('"');
+        if guard {
+            out.push('\'');
+        }
         for ch in value.chars() {
             if ch == '"' {
                 out.push('"');
@@ -169,6 +189,9 @@ fn push_field(out: &mut String, value: &str, delim: char) {
         }
         out.push('"');
     } else {
+        if guard {
+            out.push('\'');
+        }
         out.push_str(value);
     }
 }
@@ -286,5 +309,95 @@ mod tests {
                 .cut_values
         );
         assert!(copy_selection(&m, &order, &GridSelection::None, &opts).is_none());
+    }
+
+    #[test]
+    fn formula_guard_is_on_by_default_for_text_and_headers() {
+        use ninesql_core::driver_api::arrow_array::Int64Array;
+        let s = Arc::new(Schema::new(vec![
+            Field::new("=name", DataType::Utf8, true),
+            Field::new("n", DataType::Int64, true),
+        ]));
+        let b = RecordBatch::try_new(
+            s.clone(),
+            vec![
+                Arc::new(StringArray::from(vec![
+                    Some("=1+2"),
+                    Some("  @SUM(A1)"),
+                    Some("\u{FF0B}x"),
+                    Some("-a\tb"),
+                    Some("plain"),
+                    None,
+                ])),
+                Arc::new(Int64Array::from(vec![
+                    Some(-5),
+                    Some(1),
+                    Some(2),
+                    Some(3),
+                    Some(-4),
+                    None,
+                ])),
+            ],
+        )
+        .unwrap();
+        let mut m = ResultSetModel::new(0, 0, s, 1);
+        m.push_batch(b).unwrap();
+        let order = ColumnOrder::identity(2);
+        let opts = CopyOptions::new(CopyFormat::Tsv, true);
+        assert!(opts.formula_guard, "on by default");
+        let out = copy_selection(&m, &order, &GridSelection::All, &opts).unwrap();
+        assert_eq!(
+            out.text,
+            "'=name\tn\n'=1+2\t-5\n'  @SUM(A1)\t1\n'\u{FF0B}x\t2\n\"'-a\tb\"\t3\nplain\t-4\n\t\n"
+        );
+        // A single cell is guarded too (pasted into a spreadsheet, it would run).
+        let one = copy_selection(
+            &m,
+            &order,
+            &GridSelection::cell(0, 0),
+            &CopyOptions::new(CopyFormat::Tsv, false),
+        )
+        .unwrap();
+        assert_eq!(one.text, "'=1+2");
+        // CSV through this path gets the same guard; off, nothing changes.
+        let csv = copy_selection(
+            &m,
+            &order,
+            &GridSelection::cell(0, 0),
+            &CopyOptions::new(CopyFormat::Csv, false),
+        )
+        .unwrap();
+        assert_eq!(csv.text, "'=1+2");
+        let mut raw = CopyOptions::new(CopyFormat::Tsv, true);
+        raw.formula_guard = false;
+        let out = copy_selection(&m, &order, &GridSelection::All, &raw).unwrap();
+        assert!(out.text.starts_with("=name\tn\n=1+2\t-5\n"), "{}", out.text);
+    }
+
+    #[test]
+    fn number_kind_text_is_guarded_unless_it_reads_as_a_number() {
+        use std::collections::HashMap;
+        // A text column the engine types as numeric (ValueKind::Number from `ninesql.type`).
+        let field = Field::new("v", DataType::Utf8, true).with_metadata(HashMap::from([(
+            ninesql_core::driver_api::ENGINE_TYPE_METADATA_KEY.to_owned(),
+            "numeric".to_owned(),
+        )]));
+        let s = Arc::new(Schema::new(vec![field]));
+        let b = RecordBatch::try_new(
+            s.clone(),
+            vec![Arc::new(StringArray::from(vec!["-12.50", "=HYPERLINK(1)"]))],
+        )
+        .unwrap();
+        let mut m = ResultSetModel::new(0, 0, s, 1);
+        m.push_batch(b).unwrap();
+        assert_eq!(m.columns()[0].kind, ValueKind::Number);
+        let out = copy_selection(
+            &m,
+            &ColumnOrder::identity(1),
+            &GridSelection::All,
+            &CopyOptions::new(CopyFormat::Tsv, false),
+        )
+        .unwrap();
+        assert_eq!(out.text, "-12.50\n'=HYPERLINK(1)\n");
     }
 }

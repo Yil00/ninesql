@@ -381,6 +381,83 @@ fn pending_edits_block_a_new_run(cx: &mut TestAppContext) {
     assert!(!l.tab.read_with(&l.vcx, |t, _| t.has_pending_edits()));
 }
 
+/// The rows loaded in the table tab's first result.
+fn loaded_rows(l: &Live) -> usize {
+    l.tab.read_with(&l.vcx, |t, cx| {
+        match t.results().read(cx).results().tabs().first() {
+            Some(ninesql_grid::ResultTab::Table(m)) => m.borrow().row_count(),
+            _ => 0,
+        }
+    })
+}
+
+#[gpui::test]
+fn a_paged_table_saves_after_stop_fetching_and_keeps_its_edits(cx: &mut TestAppContext) {
+    use ninesql_grid::FetchState;
+
+    let tmp = tempfile::tempdir().unwrap_or_else(|e| panic!("{e}"));
+    let mut l = live(cx, ConnectionTypeId::dev(), tmp.path());
+    // A table larger than one page: the read pauses after its first page, its run stays open.
+    open_with_text(&mut l, "SELECT * FROM numbers(1000000)");
+    let tab = l.tab.clone();
+    wait_until(&mut l.vcx, |vcx| {
+        tab.read_with(vcx, |t, cx| {
+            t.table_state().describing.is_none()
+                && matches!(
+                    t.results().read(cx).results().tabs().first(),
+                    Some(ninesql_grid::ResultTab::Table(m)) if m.borrow().state() == FetchState::Idle
+                )
+        })
+    });
+    assert!(
+        tab.read_with(&l.vcx, |t, _| t.is_running()),
+        "paused, not ended"
+    );
+    l.vcx
+        .update(|_, cx| tab.update(cx, |t, cx| t.set_description(Ok(keyed_table()), cx)));
+    assert!(tab.read_with(&l.vcx, |t, _| t.editing().is_some()));
+    rename_first_row(&mut l);
+    let loaded = loaded_rows(&l);
+    assert!(loaded > 0 && loaded < 1_000_000, "{loaded}");
+
+    // Refused while paging, with the way out named.
+    l.vcx
+        .update(|window, cx| tab.update(cx, |t, cx| t.save_changes(window, cx)));
+    let label = tab.read_with(&l.vcx, |t, _| t.cancel_label());
+    let message = tab
+        .read_with(&l.vcx, |t, _| t.message().map(|m| m.text.to_string()))
+        .unwrap_or_default();
+    assert_eq!(message, super::table::save_blocked_by_run_text(label));
+    assert!(message.contains(&format!("\"{label}\"")), "{message}");
+    assert!(tab.read_with(&l.vcx, |t, _| t.has_pending_edits()));
+    assert!(!tab.read_with(&l.vcx, |t, _| t.table_state().saving));
+
+    // "Stop fetching" / "Cancel": the run ends, the rows and the pending edit stay.
+    l.vcx
+        .update(|window, cx| tab.update(cx, |t, cx| t.cancel_run(window, cx)));
+    wait_until(&mut l.vcx, |vcx| !tab.read_with(vcx, |t, _| t.is_running()));
+    assert_eq!(loaded_rows(&l), loaded, "the loaded rows are kept");
+    assert!(tab.read_with(&l.vcx, |t, _| t.has_pending_edits()));
+    assert!(tab.read_with(&l.vcx, |t, _| t.editing().is_some()));
+
+    // Now the save goes through.
+    l.vcx
+        .update(|window, cx| tab.update(cx, |t, cx| t.save_changes(window, cx)));
+    wait_until(&mut l.vcx, |vcx| {
+        tab.read_with(vcx, |t, _| {
+            !t.table_state().saving && !t.has_pending_edits()
+        })
+    });
+    let message = tab
+        .read_with(&l.vcx, |t, _| t.message().map(|m| m.text.to_string()))
+        .unwrap_or_default();
+    assert!(message.starts_with("Saved 1 changes."), "{message}");
+    // The refresh after the save pages again: end it.
+    l.vcx
+        .update(|window, cx| tab.update(cx, |t, cx| t.cancel_run(window, cx)));
+    wait_until(&mut l.vcx, |vcx| !tab.read_with(vcx, |t, _| t.is_running()));
+}
+
 #[gpui::test]
 fn result_not_matching_the_query_provenance_is_read_only(cx: &mut TestAppContext) {
     // An aliased column: the result's names are not the table's, whatever the query said.

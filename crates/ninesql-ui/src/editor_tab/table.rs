@@ -261,15 +261,37 @@ impl SqlEditorTab {
         self.editing().is_some_and(|e| !e.pending.is_empty())
     }
 
-    /// Why a table action cannot run now, if so (I8).
-    fn table_action_problem(&self) -> Option<&'static str> {
+    /// Whether the tab's run is only the edited result waiting for a pull (a table larger than
+    /// one page, paused after a page): its loaded rows can be edited, but the run (and its
+    /// stream on the session) lasts until the result ends or "Stop fetching" / "Cancel".
+    #[must_use]
+    pub fn is_paused_on_edited_result(&self, cx: &App) -> bool {
+        if !self.is_running() || self.awaiting_confirmation() {
+            return false;
+        }
+        let Some(ix) = self.editing().map(|e| e.tab) else {
+            return false;
+        };
+        matches!(
+            self.results.read(cx).results().tabs().get(ix),
+            Some(ninesql_grid::ResultTab::Table(m))
+                if m.borrow().state() == ninesql_grid::FetchState::Idle
+        )
+    }
+
+    /// Why a table action cannot run now, if so (I8). `edit`: the action only changes the
+    /// pending edits (edit, insert, delete, revert), which a paused result allows
+    /// ([`Self::is_paused_on_edited_result`]).
+    fn table_action_problem(&self, edit: bool, cx: &App) -> Option<&'static str> {
         let Some(session) = self.session() else {
             return Some("No open connection for this editor.");
         };
         if session.is_leased() {
             Some("A save, export or import is using this session: wait for it to end.")
-        } else if self.is_running() {
-            Some("Wait for the run to end.")
+        } else if self.is_running() && !(edit && self.is_paused_on_edited_result(cx)) {
+            Some(
+                "Wait for the run to end, or end it with \"Cancel\" / \"Stop fetching\" in the toolbar: the rows already loaded are kept.",
+            )
         } else if self.table.saving {
             Some("A save is running: wait for it to end.")
         } else if self.table.confirmation.is_some() {
@@ -332,7 +354,7 @@ impl SqlEditorTab {
     /// Runs the source's query (the initial one first): the editor shows the statement and the
     /// core gets its parameters. Refused with pending edits.
     pub fn run_source(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
-        if let Some(why) = self.table_action_problem() {
+        if let Some(why) = self.table_action_problem(false, cx) {
             self.say(why, true, cx);
             return false;
         }
@@ -513,7 +535,7 @@ impl SqlEditorTab {
         &mut self,
         cx: &mut Context<Self>,
     ) -> Option<std::rc::Rc<std::cell::RefCell<ResultSetModel>>> {
-        if let Some(why) = self.table_action_problem() {
+        if let Some(why) = self.table_action_problem(true, cx) {
             self.say(why, true, cx);
             return None;
         }
@@ -691,8 +713,8 @@ impl SqlEditorTab {
     /// "Revert row changes": the selected rows' edits and deletions are dropped.
     pub fn revert_selected_rows(&mut self, cx: &mut Context<Self>) {
         // Not while a save, its confirmation, a run or a lease holds the pending changes: the
-        // confirmed script must stay the one shown.
-        if let Some(why) = self.table_action_problem() {
+        // confirmed script must stay the one shown. A paused result holds none of these.
+        if let Some(why) = self.table_action_problem(true, cx) {
             return self.say(why, true, cx);
         }
         let Some(ix) = self.editing().map(|e| e.tab) else {
@@ -896,8 +918,18 @@ impl SqlEditorTab {
         if self.table.saving || (token.is_none() && self.table.confirmation.is_some()) {
             return self.say("A save is going on: wait for it to end.", true, cx);
         }
+        if self.awaiting_confirmation() {
+            return self.say(
+                "A statement of this tab waits for its confirmation: answer it before saving.",
+                true,
+                cx,
+            );
+        }
         if self.is_running() {
-            return self.say("Wait for the run to end before saving.", true, cx);
+            // A result still being paged keeps its run (and its stream on the session) open:
+            // name the way out, which keeps the loaded rows and the pending edits.
+            let text = save_blocked_by_run_text(self.cancel_label());
+            return self.say(text, true, cx);
         }
         let Some(session) = self.session().cloned() else {
             return self.say("No open connection for this editor.", true, cx);
@@ -1403,4 +1435,14 @@ pub fn save_done_text(summary: &SaveSummary) -> String {
         ));
     }
     text
+}
+
+/// Why "Save changes" is refused while the tab's run lasts, a result still being paged
+/// included, and the way out: the toolbar's `cancel_label` button ("Cancel" / "Stop fetching")
+/// or "Cancel execution" ends the run and keeps the loaded rows and the pending changes.
+#[must_use]
+pub fn save_blocked_by_run_text(cancel_label: &str) -> String {
+    format!(
+        "Not saved yet: the table's result is still open (more rows can be fetched, or the statement is running). Press \"{cancel_label}\" in the toolbar (or run \"Cancel execution\") to end it: the rows already loaded and your pending changes are kept. Then save again."
+    )
 }

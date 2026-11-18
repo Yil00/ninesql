@@ -322,3 +322,58 @@ fn table_parts_follow_the_core_naming() {
     let p = ObjectPath::root().child(ObjectKind::Table, "t");
     assert_eq!(super::table_parts(&p), vec!["t"]);
 }
+
+#[gpui::test]
+fn navigator_transfers_avoid_the_metadata_session_and_busy_ones(cx: &mut TestAppContext) {
+    let tmp = tempfile::tempdir().unwrap_or_else(|e| panic!("{e}"));
+    let c = mock_connection("Live", ConnectionTypeId::dev(), Auth::None);
+    let id: ConnectionId = c.id;
+    let hub = mock_hub_with_transfer(cx, tmp.path(), vec![c]);
+    let (ws, mut vcx) = open_live(cx);
+    let pick = |ws: &Entity<crate::workspace::Workspace>, vcx: &VisualTestContext| {
+        ws.read_with(vcx, |ws, cx| ws.transfer_session(id, cx).map(|s| s.id()))
+    };
+    assert_eq!(pick(&ws, &vcx), None, "no session: none");
+
+    for n in 1..=2 {
+        ws.update_in(&mut vcx, |ws, window, cx| {
+            ws.connect(id, Purpose::Open, window, cx);
+        });
+        wait_until(&mut vcx, |vcx| {
+            hub.read_with(vcx, |h, _| h.sessions(id).len() == n)
+                && !ws.read_with(vcx, |ws, cx| ws.flow().read(cx).is_busy())
+        });
+    }
+    let (oldest, newest) = hub.read_with(&vcx, |h, _| {
+        let s = h.sessions(id);
+        (s[0].clone(), s[1].clone())
+    });
+    let tab = ws
+        .read_with(&vcx, |ws, _| ws.active_editor().cloned())
+        .unwrap_or_else(|| panic!("an editor tab"));
+    // The active editor took the first session: that one, the user's choice.
+    assert_eq!(
+        tab.read_with(&vcx, |t, _| t.session().map(|s| s.id())),
+        Some(oldest.id())
+    );
+    assert_eq!(pick(&ws, &vcx), Some(oldest.id()));
+
+    // An editor with no session: the newest, never the metadata service's oldest one.
+    tab.update(&mut vcx, |t, cx| t.set_session(None, cx));
+    assert_eq!(pick(&ws, &vcx), Some(newest.id()));
+
+    // An editor paging a result on the newest: that session is busy, the oldest is free.
+    tab.update(&mut vcx, |t, cx| t.set_session(Some(newest.clone()), cx));
+    let editor = tab.read_with(&vcx, |t, _| t.editor().clone());
+    vcx.update(|window, cx| {
+        editor.update(cx, |e, cx| {
+            e.set_text("SELECT * FROM numbers(1000000)", window, cx);
+            e.execute(ExecutionKind::Statement, window, cx);
+        });
+    });
+    wait_until(&mut vcx, |vcx| tab.read_with(vcx, |t, _| t.is_running()));
+    assert_eq!(pick(&ws, &vcx), Some(oldest.id()));
+    tab.update_in(&mut vcx, |t, window, cx| t.cancel_run(window, cx));
+    wait_until(&mut vcx, |vcx| !tab.read_with(vcx, |t, _| t.is_running()));
+    assert_eq!(pick(&ws, &vcx), Some(newest.id()));
+}
