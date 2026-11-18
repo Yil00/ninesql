@@ -4720,6 +4720,7 @@ dependencies = [
  "serde_json",
  "tempfile",
  "thiserror 2.0.21",
+ "tokio",
  "tracing",
  "zbus 6.3.0",
  "zeroize",

@@ -52,3 +52,5 @@ desktop-lock = ["dep:zbus"]
 serde_json.workspace = true
 proptest.workspace = true
 tempfile.workspace = true
+# Paused time for the reconnect tests of `DesktopLockWatcher` (no real bus, no real waits).
+tokio = { workspace = true, features = ["rt", "time", "sync", "macros", "test-util"] }

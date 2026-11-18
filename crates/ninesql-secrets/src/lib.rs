@@ -42,7 +42,10 @@ pub use backend::{SecretServiceAvailability, detect_secret_service};
 pub use error::SecretError;
 pub use lock_events::{LockHook, LockHooks, LockTrigger};
 #[cfg(feature = "desktop-lock")]
-pub use lock_signals::{DesktopLockWatcher, LockWatchError, WATCHER_SETUP_TIMEOUT};
+pub use lock_signals::{
+    DesktopLockWatcher, LockWatchError, RECONNECT_FIRST, RECONNECT_MAX, WATCHER_SETUP_TIMEOUT,
+    WatcherState,
+};
 #[cfg(any(test, feature = "memory-store"))]
 pub use memory::MemoryStore;
 pub use project::InvalidProjectId;

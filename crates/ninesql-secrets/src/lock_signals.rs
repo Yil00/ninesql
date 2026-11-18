@@ -20,18 +20,26 @@
 //! checked on receipt: no destination header, sender equal to the logind name's current unique
 //! owner (`GetNameOwner` at setup, followed through `NameOwnerChanged`), then member, interface
 //! and path.
-//! On the bus the watcher only calls logind (the session lookup and `Inhibit`) and the bus
-//! itself (`GetNameOwner` for the logind name).
+//! On the bus the watcher only calls logind (the session lookup, `Inhibit`, and the session's
+//! `LockedHint` after an outage) and the bus itself (`GetNameOwner` for the logind name).
 //!
-//! Fail closed: a panicking hook is logged and the watcher goes on; when the bus connection is
-//! lost, the hook is called once with [`LockTrigger::Requested`] and the watcher stops
-//! ([`DesktopLockWatcher::is_running`]). Dropping the watcher stops its thread, during setup too.
+//! Fail closed: a panicking hook is logged and the watcher goes on. When logind leaves the bus,
+//! the hook is called once with [`LockTrigger::Requested`] and the watcher waits for a new
+//! owner ([`WatcherState::LogindAbsent`]). When the bus connection itself is lost, the hook is
+//! called once with [`LockTrigger::Requested`] and the watcher reconnects with a bounded
+//! exponential back-off ([`WatcherState::Reconnecting`]: [`RECONNECT_FIRST`] doubling to
+//! [`RECONNECT_MAX`]), subscribing again to every signal above. Back on the bus (or when logind
+//! returns), a session whose `LockedHint` is already `true` locks at once, and a suspend that
+//! happened while the bus was gone (`CLOCK_BOOTTIME` ahead of `CLOCK_MONOTONIC` by more than
+//! before) locks too, since its `PrepareForSleep` was never seen. [`DesktopLockWatcher::state`]
+//! and [`DesktopLockWatcher::is_running`] report all this live. Dropping the watcher stops its
+//! thread, during setup, a back-off wait or a reconnect attempt too.
 
 use std::collections::HashMap;
 use std::future::{Future, poll_fn};
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::pin::{Pin, pin};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex, PoisonError, mpsc};
 use std::task::{Context, Poll, Waker};
 use std::time::Duration;
@@ -108,11 +116,75 @@ impl Stop {
     }
 }
 
+/// First wait before reconnecting to a lost system bus. A bus daemon that restarts (rare: a
+/// `dbus-broker` or `dbus-daemon` upgrade) is usually back within a second; waiting that long
+/// first avoids hammering a socket that is being re-created.
+pub const RECONNECT_FIRST: Duration = Duration::from_secs(1);
+/// Longest wait between two reconnect attempts (the back-off doubles up to this bound: 1, 2, 4,
+/// 8, 16, 32, 60, 60… s). It bounds the time during which a returned bus goes unnoticed to a
+/// minute, at the cost of one local connection attempt a minute while the bus stays away.
+pub const RECONNECT_MAX: Duration = Duration::from_secs(60);
+/// A connection that stayed up this long resets the back-off to [`RECONNECT_FIRST`]; one that
+/// is lost sooner keeps doubling it, so a flapping bus is not retried every second.
+const RECONNECT_STABLE: Duration = Duration::from_secs(60);
+/// More suspended time than this during a bus outage counts as a missed sleep (the two clock
+/// reads are not atomic; any real suspend is longer).
+const MISSED_SLEEP_SLACK: Duration = Duration::from_secs(2);
+
+/// What the watcher does now.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum WatcherState {
+    /// Listening to logind: sleep (and the session's screen lock when one was found) locks the
+    /// secrets.
+    Watching,
+    /// Connected to the system bus, but `org.freedesktop.login1` has no owner: nothing is
+    /// watched until logind (re)appears. When it left while watched, the secrets were locked
+    /// then.
+    LogindAbsent,
+    /// The system-bus connection was lost: the secrets were locked, and the watcher reconnects
+    /// with a bounded back-off.
+    Reconnecting,
+    /// The watcher thread ended (dropped, or it could not run).
+    Stopped,
+}
+
+impl WatcherState {
+    const fn to_u8(self) -> u8 {
+        match self {
+            Self::Stopped => 0,
+            Self::Watching => 1,
+            Self::LogindAbsent => 2,
+            Self::Reconnecting => 3,
+        }
+    }
+
+    const fn from_u8(v: u8) -> Self {
+        match v {
+            1 => Self::Watching,
+            2 => Self::LogindAbsent,
+            3 => Self::Reconnecting,
+            _ => Self::Stopped,
+        }
+    }
+}
+
 /// State shared with the watcher thread.
 #[derive(Default)]
 struct Status {
-    running: AtomicBool,
+    state: AtomicU8,
     sleep_delay: AtomicBool,
+    session_watched: AtomicBool,
+}
+
+impl Status {
+    fn set_state(&self, state: WatcherState) {
+        self.state.store(state.to_u8(), Ordering::SeqCst);
+    }
+
+    fn state(&self) -> WatcherState {
+        WatcherState::from_u8(self.state.load(Ordering::SeqCst))
+    }
 }
 
 /// Clears the status when the watcher thread ends, panic included.
@@ -120,7 +192,7 @@ struct RunningGuard(Arc<Status>);
 
 impl Drop for RunningGuard {
     fn drop(&mut self) {
-        self.0.running.store(false, Ordering::SeqCst);
+        self.0.set_state(WatcherState::Stopped);
         self.0.sleep_delay.store(false, Ordering::SeqCst);
     }
 }
@@ -129,8 +201,7 @@ impl Drop for RunningGuard {
 pub struct DesktopLockWatcher {
     stop: Arc<Stop>,
     status: Arc<Status>,
-    session_watched: bool,
-    /// The watcher connection's unique bus name (tests send unicast signals to it).
+    /// The watcher connection's unique bus name at start (tests send unicast signals to it).
     #[cfg_attr(not(test), allow(dead_code))]
     unique_name: String,
 }
@@ -138,8 +209,8 @@ pub struct DesktopLockWatcher {
 impl std::fmt::Debug for DesktopLockWatcher {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("DesktopLockWatcher")
-            .field("session_watched", &self.session_watched)
-            .field("running", &self.is_running())
+            .field("state", &self.state())
+            .field("session_watched", &self.watches_session_lock())
             .finish_non_exhaustive()
     }
 }
@@ -150,7 +221,8 @@ impl DesktopLockWatcher {
     ///
     /// # Errors
     /// [`LockWatchError`] when there is no system bus or it does not answer; the application
-    /// then relies on the idle timers and its own lock action.
+    /// then relies on the idle timers and its own lock action. (Only a bus lost *after* a
+    /// successful start is reconnected to.)
     pub fn start(hook: Arc<dyn LockHook>) -> Result<Self, LockWatchError> {
         Self::start_with(
             Target::System,
@@ -160,18 +232,28 @@ impl DesktopLockWatcher {
         )
     }
 
-    /// Whether the current session's screen lock is watched (`false`: no logind session was
-    /// found for this process; only sleep is watched).
+    /// Whether the screen lock of the session is watched on the current (or, while
+    /// reconnecting, the last) bus connection (`false`: no logind session was found for this
+    /// process; only sleep is watched).
     #[must_use]
     pub fn watches_session_lock(&self) -> bool {
-        self.session_watched
+        self.status.session_watched.load(Ordering::SeqCst)
     }
 
-    /// Whether the watcher still listens. `false` once the bus connection was lost (the hook
-    /// was then called with [`LockTrigger::Requested`]); the application may start a new one.
+    /// What the watcher does now. Read live: it changes when the bus or logind goes away and
+    /// comes back.
+    #[must_use]
+    pub fn state(&self) -> WatcherState {
+        self.status.state()
+    }
+
+    /// Whether the watcher listens to logind now ([`WatcherState::Watching`]). `false` while
+    /// logind is away or the bus connection is being re-established (the hook was then called
+    /// with [`LockTrigger::Requested`]), and once the watcher stopped; `true` again once it is
+    /// back.
     #[must_use]
     pub fn is_running(&self) -> bool {
-        self.status.running.load(Ordering::SeqCst)
+        self.state() == WatcherState::Watching
     }
 
     /// Whether a logind sleep delay inhibitor is held now (`false` when logind refused it, and
@@ -197,8 +279,7 @@ impl DesktopLockWatcher {
             .spawn(move || {
                 let _running = RunningGuard(Arc::clone(&thread_status));
                 zbus::block_on(watch(
-                    target,
-                    session,
+                    BusDialer { target, session },
                     hook,
                     thread_stop,
                     thread_status,
@@ -207,10 +288,9 @@ impl DesktopLockWatcher {
             })
             .map_err(|e| LockWatchError::Bus(format!("cannot start the watcher thread: {e}")))?;
         match ready_rx.recv_timeout(setup_timeout) {
-            Ok(Ok((session_watched, unique_name))) => Ok(Self {
+            Ok(Ok(unique_name)) => Ok(Self {
                 stop,
                 status,
-                session_watched,
                 unique_name,
             }),
             Ok(Err(e)) => Err(e),
@@ -232,6 +312,7 @@ impl Drop for DesktopLockWatcher {
     }
 }
 
+#[derive(Debug, Clone)]
 enum Target {
     System,
     #[cfg(test)]
@@ -316,6 +397,33 @@ async fn take_sleep_delay(conn: &Connection) -> Option<OwnedFd> {
         .inspect_err(|e| tracing::info!(error = %e, "no sleep delay inhibitor"))
         .ok()?;
     reply.body().deserialize::<OwnedFd>().ok()
+}
+
+/// Whether the session's `LockedHint` is `true` now. `false` when logind does not answer (the
+/// secrets were already locked when the bus or logind went away).
+async fn session_locked(conn: &Connection, path: &str) -> bool {
+    let reply = match conn
+        .call_method(
+            Some(LOGIND),
+            path,
+            Some(PROPERTIES),
+            "Get",
+            &(SESSION, "LockedHint"),
+        )
+        .await
+    {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::debug!(error = %e, "cannot read the session's LockedHint");
+            return false;
+        }
+    };
+    reply
+        .body()
+        .deserialize::<OwnedVariant>()
+        .ok()
+        .and_then(|v| bool::try_from(&v).ok())
+        .unwrap_or(false)
 }
 
 async fn subscribe(
@@ -444,7 +552,9 @@ const INHIBIT_RETRY_MAX: Duration = if cfg!(test) {
 };
 
 /// Resolves after `d`. A helper thread sleeps and wakes the task, so no async runtime is needed
-/// (the watcher runs on `zbus::block_on`). When the thread cannot be spawned it resolves at once.
+/// (the watcher runs on `zbus::block_on`). When the thread cannot be spawned, the first poll
+/// sleeps on the caller's thread (the watcher's own) instead of resolving at once, so a retry
+/// loop never spins; the watcher then reacts to signals and to a stop only after that sleep.
 fn delay(d: Duration) -> impl Future<Output = ()> + Send {
     let shared: Arc<Mutex<(bool, Option<Waker>)>> = Arc::default();
     let timer = Arc::clone(&shared);
@@ -460,8 +570,12 @@ fn delay(d: Duration) -> impl Future<Output = ()> + Send {
         })
         .is_ok();
     poll_fn(move |cx| {
+        if !spawned {
+            std::thread::sleep(d);
+            return Poll::Ready(());
+        }
         let mut g = shared.lock().unwrap_or_else(PoisonError::into_inner);
-        if !spawned || g.0 {
+        if g.0 {
             Poll::Ready(())
         } else {
             g.1 = Some(cx.waker().clone());
@@ -470,7 +584,8 @@ fn delay(d: Duration) -> impl Future<Output = ()> + Send {
     })
 }
 
-type Retake = Pin<Box<dyn Future<Output = Option<OwnedFd>> + Send>>;
+type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
+type Retake = BoxFuture<'static, Option<OwnedFd>>;
 
 /// An `Inhibit` call, after `wait` when it is a retry.
 fn inhibit_request(conn: &Connection, wait: Option<Duration>) -> Retake {
@@ -481,6 +596,12 @@ fn inhibit_request(conn: &Connection, wait: Option<Duration>) -> Retake {
         }
         take_sleep_delay(&c).await
     })
+}
+
+/// A `LockedHint` read of `path`.
+fn hint_request(conn: &Connection, path: &str) -> BoxFuture<'static, bool> {
+    let (c, p) = (conn.clone(), path.to_owned());
+    Box::pin(async move { session_locked(&c, &p).await })
 }
 
 /// Calls the hook; a panic inside it is logged, never propagated.
@@ -502,173 +623,406 @@ async fn until_stopped<F: Future>(stop: &Stop, fut: F) -> Option<F::Output> {
     .await
 }
 
+/// Runs `fut` until it ends (`Some`), or `None` once `timer` fired first.
+async fn within<F: Future>(fut: F, mut timer: BoxFuture<'static, ()>) -> Option<F::Output> {
+    let mut fut = pin!(fut);
+    poll_fn(|cx| {
+        if let Poll::Ready(v) = fut.as_mut().poll(cx) {
+            return Poll::Ready(Some(v));
+        }
+        timer.as_mut().poll(cx).map(|()| None)
+    })
+    .await
+}
+
+/// Time source of the reconnect loop: the system's in the application, paused tokio time in
+/// tests.
+trait Clocks: Send + Sync {
+    /// Resolves after `d`.
+    fn sleep(&self, d: Duration) -> BoxFuture<'static, ()>;
+    /// Time since an arbitrary origin (suspend not counted).
+    fn now(&self) -> Duration;
+    /// Time the machine has spent suspended since boot.
+    fn suspended(&self) -> Duration;
+}
+
+struct SystemClocks {
+    origin: std::time::Instant,
+}
+
+impl Clocks for SystemClocks {
+    fn sleep(&self, d: Duration) -> BoxFuture<'static, ()> {
+        Box::pin(delay(d))
+    }
+
+    fn now(&self) -> Duration {
+        self.origin.elapsed()
+    }
+
+    fn suspended(&self) -> Duration {
+        suspended_since_boot()
+    }
+}
+
+/// `CLOCK_BOOTTIME` minus `CLOCK_MONOTONIC`: the time spent suspended since boot (Linux; zero
+/// elsewhere, where there is no logind to watch anyway).
+fn suspended_since_boot() -> Duration {
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    {
+        use rustix::time::{ClockId, clock_gettime};
+        let read = |id: ClockId| {
+            let ts = clock_gettime(id);
+            Duration::new(
+                u64::try_from(ts.tv_sec).unwrap_or(0),
+                u32::try_from(ts.tv_nsec).unwrap_or(0).min(999_999_999),
+            )
+        };
+        read(ClockId::Boottime).saturating_sub(read(ClockId::Monotonic))
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
+    {
+        Duration::ZERO
+    }
+}
+
+/// Opens a bus connection with its subscriptions (seam: a fake in tests).
+trait Dialer: Send {
+    type Link: Link;
+    fn dial(&mut self) -> BoxFuture<'_, Result<Self::Link, LockWatchError>>;
+}
+
+/// One live bus connection with its subscriptions.
+trait Link: Send + 'static {
+    /// Publishes what this connection watches (state, sleep delay, session lock).
+    fn publish(&self, status: &Status);
+    /// Watches until the connection is lost. `after_outage`: it replaces a lost connection, so
+    /// a session that locked meanwhile is looked for (`LockedHint`).
+    fn run(
+        self,
+        hook: Arc<dyn LockHook>,
+        status: Arc<Status>,
+        after_outage: bool,
+    ) -> BoxFuture<'static, ()>;
+}
+
+/// The thread body: the first connection (its result goes to `start`), then [`supervise`].
 async fn watch(
-    target: Target,
-    session: SessionChoice,
+    mut dialer: BusDialer,
     hook: Arc<dyn LockHook>,
     stop: Arc<Stop>,
     status: Arc<Status>,
-    ready: mpsc::Sender<Result<(bool, String), LockWatchError>>,
+    ready: mpsc::Sender<Result<String, LockWatchError>>,
 ) {
-    let setup = async {
-        let conn = connect(target).await?;
-        let session_path = match session {
-            SessionChoice::Lookup => own_session(&conn).await,
-            #[cfg(test)]
-            SessionChoice::Path(p) => Some(p),
-        };
-        // The owner stream comes first and is always polled first: after a logind restart, the
-        // `NameOwnerChanged` naming the new owner is handled before any signal the new owner
-        // sends, so its first real signal is not dropped as coming from an unknown sender.
-        // Subscribed before the owner lookup below, so an owner change in between is not
-        // missed.
-        let mut streams = vec![
-            subscribe(&conn, owner_rule()).await?,
-            subscribe(&conn, signal_rule(MANAGER, "PrepareForSleep", LOGIND_PATH)).await?,
-        ];
-        if let Some(p) = &session_path {
-            streams.push(subscribe(&conn, signal_rule(SESSION, "Lock", p)).await?);
-            let props = MatchRule::builder()
-                .msg_type(MessageType::Signal)
-                .sender(LOGIND)
-                .interface(PROPERTIES)
-                .member("PropertiesChanged")
-                .path(p.clone())
-                .arg(0, SESSION)
-                .build()
-                .map(|r| r.to_owned());
-            streams.push(subscribe(&conn, props).await?);
+    let link = match until_stopped(&stop, dialer.dial()).await {
+        None => return,
+        Some(Ok(l)) => l,
+        Some(Err(e)) => {
+            let _ = ready.send(Err(e));
+            return;
         }
-        let owner = logind_owner(&conn).await;
-        let inhibitor = take_sleep_delay(&conn).await;
-        let unique = conn
-            .unique_name()
-            .map(|n| n.as_str().to_owned())
-            .unwrap_or_default();
-        Ok::<_, LockWatchError>((conn, session_path, streams, owner, inhibitor, unique))
     };
-    let (conn, session_path, mut streams, mut owner, mut inhibitor, unique) =
-        match until_stopped(&stop, setup).await {
-            None => return,
-            Some(Ok(v)) => v,
-            Some(Err(e)) => {
-                let _ = ready.send(Err(e));
-                return;
-            }
-        };
-    if session_path.is_none() {
+    if link.session_path.is_none() {
         tracing::info!("no logind session found: only sleep locks the secrets");
     }
-    status.running.store(true, Ordering::SeqCst);
-    status
-        .sleep_delay
-        .store(inhibitor.is_some(), Ordering::SeqCst);
-    if ready.send(Ok((session_path.is_some(), unique))).is_err() {
+    link.publish(&status);
+    if ready.send(Ok(link.unique.clone())).is_err() {
         // `start` gave up waiting.
         return;
     }
-    // The `Inhibit` call after a resume or an owner change runs alongside the streams, so
-    // signals are handled while logind answers. A refused or unanswered call is retried with a
-    // bounded back-off while logind is on the bus, no inhibitor is held and no sleep is under way
-    // (review P1-D wiring, L1).
-    let mut asleep = false;
-    let mut backoff = INHIBIT_RETRY_FIRST;
-    let mut retake: Option<Retake> = None;
-    if inhibitor.is_none() && owner.is_some() {
-        retake = Some(inhibit_request(&conn, Some(backoff)));
-        backoff = (backoff * 2).min(INHIBIT_RETRY_MAX);
-    }
+    let clocks = SystemClocks {
+        origin: std::time::Instant::now(),
+    };
+    supervise(dialer, link, hook, &stop, &status, &clocks).await;
+}
+
+/// Runs `first`, and after each lost connection locks once and reconnects with a bounded
+/// back-off, until stopped.
+async fn supervise<D: Dialer>(
+    mut dialer: D,
+    first: D::Link,
+    hook: Arc<dyn LockHook>,
+    stop: &Stop,
+    status: &Arc<Status>,
+    clocks: &dyn Clocks,
+) {
+    let mut link = first;
+    let mut after_outage = false;
+    let mut backoff = RECONNECT_FIRST;
     loop {
-        let next = poll_fn(|cx| {
-            if stop.poll_stopped(cx) {
-                return Poll::Ready(Next::Stopped);
+        link.publish(status);
+        let up_since = clocks.now();
+        let run = link.run(Arc::clone(&hook), Arc::clone(status), after_outage);
+        if until_stopped(stop, run).await.is_none() {
+            return;
+        }
+        status.set_state(WatcherState::Reconnecting);
+        status.sleep_delay.store(false, Ordering::SeqCst);
+        tracing::warn!("system bus connection lost: locking secrets, then reconnecting");
+        run_hook(&*hook, LockTrigger::Requested);
+        let suspended_at_loss = clocks.suspended();
+        if clocks.now().saturating_sub(up_since) >= RECONNECT_STABLE {
+            backoff = RECONNECT_FIRST;
+        }
+        link = loop {
+            tracing::debug!(retry_in = ?backoff, "reconnecting to the system bus");
+            if until_stopped(stop, clocks.sleep(backoff)).await.is_none() {
+                return;
             }
-            if let Some(f) = retake.as_mut()
-                && let Poll::Ready(fd) = f.as_mut().poll(cx)
-            {
-                return Poll::Ready(Next::Inhibitor(fd));
-            }
-            for s in &mut streams {
-                if let Poll::Ready(m) = Pin::new(s).poll_next(cx) {
-                    return Poll::Ready(Next::Message(m));
+            backoff = (backoff * 2).min(RECONNECT_MAX);
+            let attempt = within(dialer.dial(), clocks.sleep(WATCHER_SETUP_TIMEOUT));
+            match until_stopped(stop, attempt).await {
+                None => return,
+                Some(Some(Ok(l))) => break l,
+                Some(Some(Err(e))) => {
+                    tracing::debug!(error = %e, "system bus still unavailable");
                 }
+                Some(None) => tracing::debug!("the system bus did not answer in time"),
             }
-            Poll::Pending
-        })
-        .await;
-        match next {
-            Next::Stopped => break,
-            Next::Inhibitor(fd) => {
-                retake = None;
-                inhibitor = fd;
-                status
-                    .sleep_delay
-                    .store(inhibitor.is_some(), Ordering::SeqCst);
-                if inhibitor.is_some() {
-                    backoff = INHIBIT_RETRY_FIRST;
-                } else if owner.is_some() && !asleep {
-                    tracing::debug!(retry_in = ?backoff, "sleep delay inhibitor refused: retrying");
-                    retake = Some(inhibit_request(&conn, Some(backoff)));
-                    backoff = (backoff * 2).min(INHIBIT_RETRY_MAX);
+        };
+        tracing::info!("system bus connection back: sleep and screen lock watched again");
+        after_outage = true;
+        // A suspend while the bus was away was never announced: lock now, in case secrets were
+        // unlocked during the outage.
+        if clocks.suspended().saturating_sub(suspended_at_loss) > MISSED_SLEEP_SLACK {
+            tracing::info!("the machine slept while the system bus was away: locking secrets");
+            run_hook(&*hook, LockTrigger::Sleep);
+        }
+    }
+}
+
+/// Dials the system bus (or a test bus) and subscribes.
+struct BusDialer {
+    target: Target,
+    session: SessionChoice,
+}
+
+impl Dialer for BusDialer {
+    type Link = BusLink;
+
+    fn dial(&mut self) -> BoxFuture<'_, Result<BusLink, LockWatchError>> {
+        Box::pin(dial_bus(self.target.clone(), self.session.clone()))
+    }
+}
+
+/// A live system-bus connection with its subscriptions.
+struct BusLink {
+    conn: Connection,
+    session_path: Option<String>,
+    streams: Vec<MessageStream>,
+    owner: Option<String>,
+    inhibitor: Option<OwnedFd>,
+    unique: String,
+}
+
+async fn dial_bus(target: Target, session: SessionChoice) -> Result<BusLink, LockWatchError> {
+    let conn = connect(target).await?;
+    let session_path = match session {
+        SessionChoice::Lookup => own_session(&conn).await,
+        #[cfg(test)]
+        SessionChoice::Path(p) => Some(p),
+    };
+    // The owner stream comes first and is always polled first: after a logind restart, the
+    // `NameOwnerChanged` naming the new owner is handled before any signal the new owner
+    // sends, so its first real signal is not dropped as coming from an unknown sender.
+    // Subscribed before the owner lookup below, so an owner change in between is not missed.
+    let mut streams = vec![
+        subscribe(&conn, owner_rule()).await?,
+        subscribe(&conn, signal_rule(MANAGER, "PrepareForSleep", LOGIND_PATH)).await?,
+    ];
+    if let Some(p) = &session_path {
+        streams.push(subscribe(&conn, signal_rule(SESSION, "Lock", p)).await?);
+        let props = MatchRule::builder()
+            .msg_type(MessageType::Signal)
+            .sender(LOGIND)
+            .interface(PROPERTIES)
+            .member("PropertiesChanged")
+            .path(p.clone())
+            .arg(0, SESSION)
+            .build()
+            .map(|r| r.to_owned());
+        streams.push(subscribe(&conn, props).await?);
+    }
+    let owner = logind_owner(&conn).await;
+    let inhibitor = if owner.is_some() {
+        take_sleep_delay(&conn).await
+    } else {
+        None
+    };
+    let unique = conn
+        .unique_name()
+        .map(|n| n.as_str().to_owned())
+        .unwrap_or_default();
+    Ok(BusLink {
+        conn,
+        session_path,
+        streams,
+        owner,
+        inhibitor,
+        unique,
+    })
+}
+
+impl Link for BusLink {
+    fn publish(&self, status: &Status) {
+        status.set_state(if self.owner.is_some() {
+            WatcherState::Watching
+        } else {
+            WatcherState::LogindAbsent
+        });
+        status
+            .sleep_delay
+            .store(self.inhibitor.is_some(), Ordering::SeqCst);
+        status
+            .session_watched
+            .store(self.session_path.is_some(), Ordering::SeqCst);
+    }
+
+    fn run(
+        self,
+        hook: Arc<dyn LockHook>,
+        status: Arc<Status>,
+        after_outage: bool,
+    ) -> BoxFuture<'static, ()> {
+        Box::pin(self.watch_signals(hook, status, after_outage))
+    }
+}
+
+impl BusLink {
+    /// The signal loop of one connection; returns when the connection is lost (the stop flag is
+    /// checked by [`supervise`]). The inhibitor is released when this future ends or is dropped.
+    async fn watch_signals(self, hook: Arc<dyn LockHook>, status: Arc<Status>, after_outage: bool) {
+        let Self {
+            conn,
+            session_path,
+            mut streams,
+            mut owner,
+            mut inhibitor,
+            unique: _,
+        } = self;
+        // The `Inhibit` call after a resume or an owner change runs alongside the streams, so
+        // signals are handled while logind answers. A refused or unanswered call is retried with
+        // a bounded back-off while logind is on the bus, no inhibitor is held and no sleep is
+        // under way (review P1-D wiring, L1).
+        let mut asleep = false;
+        let mut backoff = INHIBIT_RETRY_FIRST;
+        let mut retake: Option<Retake> = None;
+        if inhibitor.is_none() && owner.is_some() {
+            retake = Some(inhibit_request(&conn, Some(backoff)));
+            backoff = (backoff * 2).min(INHIBIT_RETRY_MAX);
+        }
+        // Back from an outage: a screen lock missed meanwhile is read from `LockedHint`.
+        let mut hint: Option<BoxFuture<'static, bool>> = match (&session_path, &owner) {
+            (Some(p), Some(_)) if after_outage => Some(hint_request(&conn, p)),
+            _ => None,
+        };
+        loop {
+            let next = poll_fn(|cx| {
+                if let Some(f) = retake.as_mut()
+                    && let Poll::Ready(fd) = f.as_mut().poll(cx)
+                {
+                    return Poll::Ready(Next::Inhibitor(fd));
                 }
-            }
-            Next::Message(Some(Ok(msg))) => {
-                match classify(&msg, session_path.as_deref(), owner.as_deref()) {
-                    Some(Event::SleepStarting) => {
-                        run_hook(&*hook, LockTrigger::Sleep);
-                        // Secrets are gone: let the suspend go on.
-                        asleep = true;
-                        retake = None;
-                        inhibitor = None;
-                        status.sleep_delay.store(false, Ordering::SeqCst);
+                if let Some(f) = hint.as_mut()
+                    && let Poll::Ready(locked) = f.as_mut().poll(cx)
+                {
+                    return Poll::Ready(Next::LockedHint(locked));
+                }
+                for s in &mut streams {
+                    if let Poll::Ready(m) = Pin::new(s).poll_next(cx) {
+                        return Poll::Ready(Next::Message(m));
                     }
-                    Some(Event::Resumed) => {
-                        asleep = false;
-                        if inhibitor.is_none() {
-                            // A pending back-off retry is replaced by an immediate request.
-                            backoff = INHIBIT_RETRY_FIRST;
-                            retake = Some(inhibit_request(&conn, None));
-                        }
+                }
+                Poll::Pending
+            })
+            .await;
+            match next {
+                Next::Inhibitor(fd) => {
+                    retake = None;
+                    inhibitor = fd;
+                    status
+                        .sleep_delay
+                        .store(inhibitor.is_some(), Ordering::SeqCst);
+                    if inhibitor.is_some() {
+                        backoff = INHIBIT_RETRY_FIRST;
+                    } else if owner.is_some() && !asleep {
+                        tracing::debug!(retry_in = ?backoff, "sleep delay inhibitor refused: retrying");
+                        retake = Some(inhibit_request(&conn, Some(backoff)));
+                        backoff = (backoff * 2).min(INHIBIT_RETRY_MAX);
                     }
-                    Some(Event::SessionLocked) => run_hook(&*hook, LockTrigger::SessionLock),
-                    Some(Event::LogindOwner(new)) => {
-                        tracing::info!(present = new.is_some(), "logind owner changed");
-                        if new != owner {
-                            // An inhibitor taken from the previous owner protects nothing any
-                            // more: drop it, and take one from the new logind when it appears.
+                }
+                Next::LockedHint(locked) => {
+                    hint = None;
+                    if locked {
+                        tracing::info!(
+                            "the session locked while it was not watched: locking secrets"
+                        );
+                        run_hook(&*hook, LockTrigger::SessionLock);
+                    }
+                }
+                Next::Message(Some(Ok(msg))) => {
+                    match classify(&msg, session_path.as_deref(), owner.as_deref()) {
+                        Some(Event::SleepStarting) => {
+                            run_hook(&*hook, LockTrigger::Sleep);
+                            // Secrets are gone: let the suspend go on.
+                            asleep = true;
                             retake = None;
                             inhibitor = None;
-                            asleep = false;
-                            backoff = INHIBIT_RETRY_FIRST;
                             status.sleep_delay.store(false, Ordering::SeqCst);
-                            if new.is_some() {
+                        }
+                        Some(Event::Resumed) => {
+                            asleep = false;
+                            if inhibitor.is_none() {
+                                // A pending back-off retry is replaced by an immediate request.
+                                backoff = INHIBIT_RETRY_FIRST;
                                 retake = Some(inhibit_request(&conn, None));
                             }
                         }
-                        owner = new;
+                        Some(Event::SessionLocked) => run_hook(&*hook, LockTrigger::SessionLock),
+                        Some(Event::LogindOwner(new)) => {
+                            tracing::info!(present = new.is_some(), "logind owner changed");
+                            if new != owner {
+                                // An inhibitor taken from the previous owner protects nothing any
+                                // more: drop it, and take one from the new logind when it appears.
+                                retake = None;
+                                inhibitor = None;
+                                asleep = false;
+                                backoff = INHIBIT_RETRY_FIRST;
+                                status.sleep_delay.store(false, Ordering::SeqCst);
+                                if new.is_some() {
+                                    status.set_state(WatcherState::Watching);
+                                    retake = Some(inhibit_request(&conn, None));
+                                    // A lock missed while logind was away or restarting.
+                                    hint = session_path.as_deref().map(|p| hint_request(&conn, p));
+                                } else {
+                                    // Nothing is watched until logind returns: fail closed.
+                                    hint = None;
+                                    status.set_state(WatcherState::LogindAbsent);
+                                    if owner.is_some() {
+                                        tracing::warn!(
+                                            "logind left the system bus: locking secrets"
+                                        );
+                                        run_hook(&*hook, LockTrigger::Requested);
+                                    }
+                                }
+                            }
+                            owner = new;
+                        }
+                        None => {}
                     }
-                    None => {}
                 }
-            }
-            Next::Message(Some(Err(e))) => {
-                tracing::debug!(error = %e, "bad message on the system bus");
-            }
-            Next::Message(None) => {
-                tracing::warn!(
-                    "system bus connection lost: locking secrets; sleep and lock no longer watched"
-                );
-                run_hook(&*hook, LockTrigger::Requested);
-                break;
+                Next::Message(Some(Err(e))) => {
+                    tracing::debug!(error = %e, "bad message on the system bus");
+                }
+                Next::Message(None) => return,
             }
         }
     }
-    drop(inhibitor);
 }
 
-/// What woke the watcher loop.
+/// What woke the signal loop.
 enum Next {
-    Stopped,
     Inhibitor(Option<OwnedFd>),
+    LockedHint(bool),
     Message(Option<zbus::Result<Message>>),
 }
 
@@ -754,8 +1108,22 @@ mod tests {
 
     /// `None` when `dbus-daemon` is not installed: the bus tests are skipped.
     fn private_bus() -> Option<Bus> {
+        private_bus_at(None)
+    }
+
+    /// A private bus listening on `socket` when given (so it can be restarted at the same
+    /// address).
+    fn private_bus_at(socket: Option<&std::path::Path>) -> Option<Bus> {
+        let mut args = vec![
+            "--session".to_owned(),
+            "--nofork".to_owned(),
+            "--print-address=1".to_owned(),
+        ];
+        if let Some(p) = socket {
+            args.push(format!("--address=unix:path={}", p.display()));
+        }
         let mut child = Command::new("dbus-daemon")
-            .args(["--session", "--nofork", "--print-address=1"])
+            .args(&args)
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
             .spawn()
@@ -782,6 +1150,8 @@ mod tests {
     struct FakeLogind {
         conn: Connection,
         inhibitors: Arc<StdMutex<Vec<UnixStream>>>,
+        /// The session's `LockedHint`, as answered to `Get`.
+        locked: Arc<AtomicBool>,
     }
 
     const OUR_SESSION: &str = "/org/freedesktop/login1/session/_31";
@@ -795,6 +1165,13 @@ mod tests {
 
         /// Like [`Self::start`], refusing the first `refuse` `Inhibit` calls.
         fn start_refusing(address: &str, refuse: usize) -> Self {
+            Self::start_with(address, refuse, false)
+        }
+
+        /// Like [`Self::start_refusing`], answering `locked` for the session's `LockedHint`.
+        fn start_with(address: &str, refuse: usize, locked: bool) -> Self {
+            let locked = Arc::new(AtomicBool::new(locked));
+            let hint = Arc::clone(&locked);
             let conn = connect_to(address);
             let refusals = Arc::new(std::sync::atomic::AtomicUsize::new(refuse));
             let inhibitors: Arc<StdMutex<Vec<UnixStream>>> = Arc::default();
@@ -841,6 +1218,15 @@ mod tests {
                                 let p = OwnedObjectPath::try_from(USER_PATH).unwrap();
                                 c.reply(&h, &p).await.unwrap();
                             }
+                            Some("Get")
+                                if msg
+                                    .body()
+                                    .deserialize::<(String, String)>()
+                                    .is_ok_and(|(i, p)| i == SESSION && p == "LockedHint") =>
+                            {
+                                let v = zbus::Variant::from(hint.load(Ordering::SeqCst));
+                                c.reply(&h, &v).await.unwrap();
+                            }
                             Some("Get") => {
                                 let p = OwnedObjectPath::try_from(OUR_SESSION).unwrap();
                                 let v = zbus::Variant::from(("31".to_owned(), p));
@@ -856,7 +1242,11 @@ mod tests {
             // to the owner change at once (`Inhibit`) must find the fake answering
             // (review P1-D wiring, M1).
             zbus::block_on(conn.request_name(LOGIND)).unwrap();
-            Self { conn, inhibitors }
+            Self {
+                conn,
+                inhibitors,
+                locked,
+            }
         }
 
         fn inhibit_calls(&self) -> usize {
@@ -1028,16 +1418,25 @@ mod tests {
         );
         // logind restarts: the old owner leaves, a new connection takes the name.
         zbus::block_on(first.conn.release_name(LOGIND)).unwrap();
+        // logind leaving locks once (fail-closed) and is reported.
+        assert_eq!(recorder.wait_for(1), [LockTrigger::Requested]);
+        wait("logind absent", || w.state() == WatcherState::LogindAbsent);
+        assert!(!w.is_running());
         let second = FakeLogind::start(&bus.address);
+        wait("watching again", || w.is_running());
         std::thread::sleep(Duration::from_millis(200));
         first.emit(OUR_SESSION, SESSION, "Lock", None);
         std::thread::sleep(Duration::from_millis(300));
-        assert!(
-            recorder.got().is_empty(),
+        assert_eq!(
+            recorder.got(),
+            [LockTrigger::Requested],
             "the old owner is not trusted any more"
         );
         second.emit(OUR_SESSION, SESSION, "Lock", None);
-        assert_eq!(recorder.wait_for(1), [LockTrigger::SessionLock]);
+        assert_eq!(
+            recorder.wait_for(2),
+            [LockTrigger::Requested, LockTrigger::SessionLock]
+        );
         drop(w);
     }
 
@@ -1071,7 +1470,10 @@ mod tests {
         // A new logind takes the name and at once announces a suspend.
         let second = FakeLogind::start(&bus.address);
         second.emit(LOGIND_PATH, MANAGER, "PrepareForSleep", Some(true));
-        assert_eq!(recorder.wait_for(1), [LockTrigger::Sleep]);
+        assert_eq!(
+            recorder.wait_for(2),
+            [LockTrigger::Requested, LockTrigger::Sleep]
+        );
         // Resume: an inhibitor is (re)taken from the new logind.
         second.emit(LOGIND_PATH, MANAGER, "PrepareForSleep", Some(false));
         wait("inhibitor taken from the new logind", || {
@@ -1103,7 +1505,8 @@ mod tests {
             second.inhibit_calls() == 1
         });
         wait("delay flag set", || w.holds_sleep_delay());
-        assert!(recorder.got().is_empty());
+        assert!(w.is_running());
+        assert_eq!(recorder.got(), [LockTrigger::Requested]);
         drop(w);
         wait("released on drop", || second.inhibitor_released(0));
     }
@@ -1131,7 +1534,7 @@ mod tests {
         wait("delay flag set", || w.holds_sleep_delay());
         std::thread::sleep(Duration::from_millis(600));
         assert_eq!(second.inhibit_calls(), 1, "no request once one is held");
-        assert!(recorder.got().is_empty());
+        assert_eq!(recorder.got(), [LockTrigger::Requested]);
         drop(w);
     }
 
@@ -1213,7 +1616,15 @@ mod tests {
         drop(bus);
         let got = recorder.wait_for(3);
         assert_eq!(got.get(2), Some(&LockTrigger::Requested), "{got:?}");
-        wait("watcher stopped", || !w.is_running());
+        wait("watcher reconnecting", || {
+            w.state() == WatcherState::Reconnecting
+        });
+        assert!(!w.is_running());
+        assert!(!w.holds_sleep_delay());
+        // Locked once, not once per failed reconnect attempt.
+        std::thread::sleep(RECONNECT_FIRST + Duration::from_millis(500));
+        assert_eq!(recorder.got().len(), 3, "{:?}", recorder.got());
+        drop(w);
     }
 
     #[test]
@@ -1304,5 +1715,409 @@ mod tests {
                 Err(e) => panic!("the setup thread still holds the connection: {e}"),
             }
         }
+    }
+
+    /// The bus goes away and comes back at the same address: the watcher locked once,
+    /// reconnects, subscribes again (signals work), takes the inhibitor again and, since the
+    /// session is locked by then, locks at once.
+    #[test]
+    fn a_restarted_bus_is_reconnected_resubscribed_and_a_locked_session_locks() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("bus");
+        let Some(bus) = private_bus_at(Some(&socket)) else {
+            eprintln!("dbus-daemon not available: skipped");
+            return;
+        };
+        let logind = FakeLogind::start(&bus.address);
+        let recorder = Arc::new(Recorder::default());
+        // The address without the printed `guid=`: the restarted bus has another GUID (as the
+        // system bus address the application uses has none).
+        let w = DesktopLockWatcher::start_with(
+            Target::Address(format!("unix:path={}", socket.display())),
+            SessionChoice::Path(OUR_SESSION.into()),
+            recorder.clone(),
+            WATCHER_SETUP_TIMEOUT,
+        )
+        .unwrap();
+        assert!(w.is_running());
+        assert!(w.holds_sleep_delay());
+
+        drop(logind);
+        drop(bus);
+        assert_eq!(recorder.wait_for(1), [LockTrigger::Requested]);
+        wait("reconnecting", || w.state() == WatcherState::Reconnecting);
+        assert!(!w.holds_sleep_delay());
+
+        let _ = std::fs::remove_file(&socket);
+        let bus = private_bus_at(Some(&socket)).unwrap();
+        let logind = FakeLogind::start_with(&bus.address, 0, true);
+        wait("watching again", || w.is_running());
+        assert!(w.watches_session_lock());
+        assert_eq!(
+            recorder.wait_for(2),
+            [LockTrigger::Requested, LockTrigger::SessionLock],
+            "LockedHint was true on reconnect"
+        );
+        wait("inhibitor taken again", || w.holds_sleep_delay());
+        assert_eq!(logind.inhibit_calls(), 1);
+
+        // Subscribed again: the new bus's signals reach the hook.
+        logind.locked.store(false, Ordering::SeqCst);
+        logind.emit(OUR_SESSION, SESSION, "Lock", None);
+        assert_eq!(recorder.wait_for(3).len(), 3);
+        logind.emit(LOGIND_PATH, MANAGER, "PrepareForSleep", Some(true));
+        assert_eq!(
+            recorder.wait_for(4),
+            [
+                LockTrigger::Requested,
+                LockTrigger::SessionLock,
+                LockTrigger::SessionLock,
+                LockTrigger::Sleep
+            ]
+        );
+        drop(w);
+        wait("released on drop", || logind.inhibitor_released(0));
+    }
+
+    #[test]
+    fn a_lock_missed_while_logind_was_away_locks_when_it_returns() {
+        let Some(bus) = private_bus() else {
+            eprintln!("dbus-daemon not available: skipped");
+            return;
+        };
+        let first = FakeLogind::start(&bus.address);
+        let recorder = Arc::new(Recorder::default());
+        let w = watcher(
+            &bus,
+            SessionChoice::Path(OUR_SESSION.into()),
+            recorder.clone(),
+        );
+        zbus::block_on(first.conn.release_name(LOGIND)).unwrap();
+        assert_eq!(recorder.wait_for(1), [LockTrigger::Requested]);
+        wait("logind absent", || w.state() == WatcherState::LogindAbsent);
+        let _second = FakeLogind::start_with(&bus.address, 0, true);
+        assert_eq!(
+            recorder.wait_for(2),
+            [LockTrigger::Requested, LockTrigger::SessionLock]
+        );
+        wait("watching again", || w.is_running());
+        drop(w);
+    }
+
+    // ---- Reconnect loop without a bus: fake dialer, paused tokio time. ----
+
+    struct TokioClocks {
+        origin: tokio::time::Instant,
+        suspended: Arc<StdMutex<Duration>>,
+    }
+
+    impl Clocks for TokioClocks {
+        fn sleep(&self, d: Duration) -> BoxFuture<'static, ()> {
+            Box::pin(tokio::time::sleep(d))
+        }
+
+        fn now(&self) -> Duration {
+            self.origin.elapsed()
+        }
+
+        fn suspended(&self) -> Duration {
+            *self.suspended.lock().unwrap()
+        }
+    }
+
+    /// The fake system bus: up or down, or never answering.
+    #[derive(Default)]
+    struct Net {
+        up: AtomicBool,
+        hang: AtomicBool,
+        /// When each dial was attempted (time since the harness started).
+        dials: StdMutex<Vec<Duration>>,
+        /// `after_outage` of each link run.
+        runs: StdMutex<Vec<bool>>,
+        /// Ends the running link (the connection is lost).
+        lose: tokio::sync::Notify,
+    }
+
+    struct FakeDialer {
+        net: Arc<Net>,
+        origin: tokio::time::Instant,
+    }
+
+    impl Dialer for FakeDialer {
+        type Link = FakeLink;
+
+        fn dial(&mut self) -> BoxFuture<'_, Result<FakeLink, LockWatchError>> {
+            self.net.dials.lock().unwrap().push(self.origin.elapsed());
+            let net = Arc::clone(&self.net);
+            Box::pin(async move {
+                if net.hang.load(Ordering::SeqCst) {
+                    std::future::pending::<()>().await;
+                }
+                if net.up.load(Ordering::SeqCst) {
+                    Ok(FakeLink { net })
+                } else {
+                    Err(LockWatchError::Bus("no bus".into()))
+                }
+            })
+        }
+    }
+
+    struct FakeLink {
+        net: Arc<Net>,
+    }
+
+    impl Link for FakeLink {
+        fn publish(&self, status: &Status) {
+            status.set_state(WatcherState::Watching);
+            status.sleep_delay.store(true, Ordering::SeqCst);
+            status.session_watched.store(true, Ordering::SeqCst);
+        }
+
+        fn run(
+            self,
+            _hook: Arc<dyn LockHook>,
+            _status: Arc<Status>,
+            after_outage: bool,
+        ) -> BoxFuture<'static, ()> {
+            self.net.runs.lock().unwrap().push(after_outage);
+            Box::pin(async move { self.net.lose.notified().await })
+        }
+    }
+
+    struct Harness {
+        net: Arc<Net>,
+        stop: Arc<Stop>,
+        status: Arc<Status>,
+        recorder: Arc<Recorder>,
+        suspended: Arc<StdMutex<Duration>>,
+        task: tokio::task::JoinHandle<()>,
+    }
+
+    impl Harness {
+        /// A watcher whose first connection is up.
+        async fn start() -> Self {
+            let origin = tokio::time::Instant::now();
+            let net = Arc::new(Net::default());
+            net.up.store(true, Ordering::SeqCst);
+            let stop = Arc::new(Stop::default());
+            let status = Arc::new(Status::default());
+            let recorder = Arc::new(Recorder::default());
+            let suspended: Arc<StdMutex<Duration>> = Arc::default();
+            let first = FakeLink {
+                net: Arc::clone(&net),
+            };
+            let dialer = FakeDialer {
+                net: Arc::clone(&net),
+                origin,
+            };
+            let clocks = TokioClocks {
+                origin,
+                suspended: Arc::clone(&suspended),
+            };
+            let (s, st, hook) = (
+                Arc::clone(&stop),
+                Arc::clone(&status),
+                Arc::clone(&recorder) as Arc<dyn LockHook>,
+            );
+            let task = tokio::spawn(async move {
+                supervise(dialer, first, hook, &s, &st, &clocks).await;
+            });
+            let h = Self {
+                net,
+                stop,
+                status,
+                recorder,
+                suspended,
+                task,
+            };
+            settle().await;
+            assert_eq!(h.status.state(), WatcherState::Watching);
+            h
+        }
+
+        /// The connection drops; the bus is `up` afterwards or not.
+        async fn lose(&self, up: bool) {
+            self.net.up.store(up, Ordering::SeqCst);
+            self.net.lose.notify_one();
+            settle().await;
+        }
+
+        fn dial_secs(&self) -> Vec<u64> {
+            self.net
+                .dials
+                .lock()
+                .unwrap()
+                .iter()
+                .map(Duration::as_secs)
+                .collect()
+        }
+    }
+
+    /// Lets the supervisor run without moving the paused clock.
+    async fn settle() {
+        for _ in 0..20 {
+            tokio::task::yield_now().await;
+        }
+    }
+
+    async fn sleep_secs(s: u64) {
+        tokio::time::sleep(Duration::from_secs(s)).await;
+        settle().await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_lost_bus_locks_once_backs_off_within_bounds_and_recovery_clears_the_problem() {
+        let h = Harness::start().await;
+        assert_eq!(*h.net.runs.lock().unwrap(), [false]);
+        h.lose(false).await;
+        assert_eq!(h.recorder.got(), [LockTrigger::Requested]);
+        assert_eq!(h.status.state(), WatcherState::Reconnecting);
+        assert!(!h.status.sleep_delay.load(Ordering::SeqCst));
+
+        sleep_secs(600).await;
+        // 1 s doubling to 60 s, never faster, never slower.
+        assert_eq!(
+            h.dial_secs(),
+            [1, 3, 7, 15, 31, 63, 123, 183, 243, 303, 363, 423, 483, 543]
+        );
+        assert_eq!(h.recorder.got(), [LockTrigger::Requested], "locked once");
+        assert_eq!(h.status.state(), WatcherState::Reconnecting);
+
+        // The bus is back: the next attempt (at 603 s) subscribes again and the state clears.
+        h.net.up.store(true, Ordering::SeqCst);
+        sleep_secs(3).await;
+        assert_eq!(*h.dial_secs().last().unwrap(), 603);
+        assert_eq!(h.status.state(), WatcherState::Watching);
+        assert!(h.status.sleep_delay.load(Ordering::SeqCst));
+        assert_eq!(*h.net.runs.lock().unwrap(), [false, true]);
+        assert_eq!(h.recorder.got(), [LockTrigger::Requested]);
+        sleep_secs(600).await;
+        assert_eq!(h.dial_secs().len(), 15, "no attempt while connected");
+        h.stop.stop();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_reconnect_that_hangs_times_out_and_is_retried() {
+        let h = Harness::start().await;
+        h.net.hang.store(true, Ordering::SeqCst);
+        h.lose(false).await;
+        sleep_secs(100).await;
+        // Each attempt is cut after WATCHER_SETUP_TIMEOUT (5 s), then the back-off applies.
+        assert_eq!(h.dial_secs(), [1, 8, 17, 30, 51, 88]);
+        assert_eq!(h.status.state(), WatcherState::Reconnecting);
+        h.net.hang.store(false, Ordering::SeqCst);
+        h.net.up.store(true, Ordering::SeqCst);
+        sleep_secs(60).await;
+        assert_eq!(h.dial_secs(), [1, 8, 17, 30, 51, 88, 153]);
+        assert_eq!(h.status.state(), WatcherState::Watching);
+        assert_eq!(h.recorder.got(), [LockTrigger::Requested]);
+        h.stop.stop();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_flapping_bus_keeps_the_back_off_and_a_stable_one_resets_it() {
+        let h = Harness::start().await;
+        h.lose(true).await;
+        sleep_secs(1).await;
+        assert_eq!(h.status.state(), WatcherState::Watching);
+        // Lost again at once: the next wait is 2 s, then 4 s, not 1 s every time.
+        h.lose(true).await;
+        sleep_secs(2).await;
+        h.lose(true).await;
+        sleep_secs(4).await;
+        assert_eq!(h.dial_secs(), [1, 3, 7]);
+        // Up for a minute: the back-off starts again at 1 s.
+        sleep_secs(60).await;
+        h.lose(true).await;
+        sleep_secs(1).await;
+        assert_eq!(h.dial_secs(), [1, 3, 7, 68]);
+        assert_eq!(h.status.state(), WatcherState::Watching);
+        // One lock per loss.
+        assert_eq!(h.recorder.got(), [LockTrigger::Requested; 4]);
+        h.stop.stop();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_sleep_missed_during_the_outage_locks_on_reconnect() {
+        let h = Harness::start().await;
+        // A second of drift between the clocks is not a suspend.
+        h.lose(true).await;
+        *h.suspended.lock().unwrap() += Duration::from_secs(1);
+        sleep_secs(1).await;
+        assert_eq!(h.status.state(), WatcherState::Watching);
+        assert_eq!(h.recorder.got(), [LockTrigger::Requested]);
+        // The machine slept 30 s while the bus was away.
+        h.lose(false).await;
+        *h.suspended.lock().unwrap() += Duration::from_secs(30);
+        h.net.up.store(true, Ordering::SeqCst);
+        sleep_secs(2).await;
+        assert_eq!(h.status.state(), WatcherState::Watching);
+        assert_eq!(
+            h.recorder.got(),
+            [
+                LockTrigger::Requested,
+                LockTrigger::Requested,
+                LockTrigger::Sleep
+            ]
+        );
+        h.stop.stop();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn shutdown_stops_the_retry_loop() {
+        // During a back-off wait.
+        let h = Harness::start().await;
+        h.lose(false).await;
+        sleep_secs(10).await;
+        let attempts = h.dial_secs().len();
+        h.stop.stop();
+        settle().await;
+        assert!(h.task.is_finished());
+        sleep_secs(600).await;
+        assert_eq!(h.dial_secs().len(), attempts);
+
+        // During a reconnect attempt that never answers.
+        let h = Harness::start().await;
+        h.net.hang.store(true, Ordering::SeqCst);
+        h.lose(false).await;
+        sleep_secs(1).await;
+        assert_eq!(h.dial_secs(), [1]);
+        h.stop.stop();
+        settle().await;
+        assert!(h.task.is_finished());
+
+        // While connected.
+        let h = Harness::start().await;
+        h.stop.stop();
+        settle().await;
+        assert!(h.task.is_finished());
+        assert!(h.recorder.got().is_empty(), "a stop is not a loss");
+    }
+
+    #[test]
+    fn the_state_round_trips_and_the_guard_clears_it() {
+        for s in [
+            WatcherState::Watching,
+            WatcherState::LogindAbsent,
+            WatcherState::Reconnecting,
+            WatcherState::Stopped,
+        ] {
+            assert_eq!(WatcherState::from_u8(s.to_u8()), s);
+        }
+        let status = Arc::new(Status::default());
+        assert_eq!(status.state(), WatcherState::Stopped);
+        status.set_state(WatcherState::Watching);
+        status.sleep_delay.store(true, Ordering::SeqCst);
+        drop(RunningGuard(Arc::clone(&status)));
+        assert_eq!(status.state(), WatcherState::Stopped);
+        assert!(!status.sleep_delay.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn the_suspended_time_does_not_go_backwards() {
+        let a = suspended_since_boot();
+        let b = suspended_since_boot();
+        // Two non-atomic reads may differ by a little, never by a suspend.
+        assert!(b + MISSED_SLEEP_SLACK > a, "{a:?} {b:?}");
     }
 }

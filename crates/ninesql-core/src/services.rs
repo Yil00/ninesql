@@ -12,7 +12,8 @@
 //! 4. starts the [`SessionManager`] (driver runtime) with the drivers the application
 //!    registered in its [`DriverRegistry`];
 //! 5. starts `DesktopLockWatcher` (feature `desktop-lock`, on by default): sleep and screen lock
-//!    lock the vault and clear the cache;
+//!    lock the vault and clear the cache; a watcher that loses the system bus or logind locks
+//!    once and recovers on its own, and [`CoreServices::lock_watcher_status`] says so live;
 //! 6. runs the idle timer on the driver runtime: [`Vault::lock_if_idle`] and
 //!    [`SessionSecretCache::purge_expired`] every [`CoreConfig::lock_check_interval`];
 //! 7. reads the execution preferences from `settings.toml` ([`crate::preferences`]), opens the
@@ -48,6 +49,8 @@ use std::fmt;
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
+#[cfg(feature = "desktop-lock")]
+use ninesql_secrets::WatcherState;
 use ninesql_secrets::{
     KdfParams, LockHook, LockHooks, LockTrigger, SecretServiceAvailability, SecretStores,
     SecretString, SessionSecretCache, StoreKind, Vault, VaultStatus, VaultStore,
@@ -167,15 +170,32 @@ pub enum StartupError {
 pub struct LockWatcherStatus {
     /// This build has the watcher (feature `desktop-lock`).
     pub built: bool,
-    /// The watcher listens now. `false` when it was not started, could not start (`error`) or
-    /// lost the system bus (it then locked once).
+    /// The watcher listens now. `false` when it was not started or could not start (`error`),
+    /// and while it has lost the system bus or logind (it then locked once and reconnects or
+    /// waits for logind on its own: read it again, it turns `true` when the watcher is back).
     pub is_running: bool,
     /// A logind sleep delay inhibitor is held: the suspend waits until the secrets are locked.
     pub holds_sleep_delay: bool,
     /// The screen lock of the current session is watched (not only sleep).
     pub watches_session_lock: bool,
-    /// Why it is not running, without any secret.
+    /// Why it is not running, without any secret (`None` once it is back).
     pub error: Option<String>,
+}
+
+/// Why a started watcher does not watch now, without any secret (`None` while it watches).
+/// The watcher reconnects and waits for logind on its own, so the problem clears by itself.
+#[cfg(feature = "desktop-lock")]
+fn watcher_state_problem(state: WatcherState) -> Option<String> {
+    match state {
+        WatcherState::Watching => None,
+        WatcherState::Reconnecting => {
+            Some("the system bus connection was lost; secrets were locked; reconnecting".to_owned())
+        }
+        WatcherState::LogindAbsent => {
+            Some("logind is not on the system bus; waiting for it to return".to_owned())
+        }
+        _ => Some("the watcher stopped".to_owned()),
+    }
 }
 
 /// The vault open in this session, or why there is none.
@@ -912,15 +932,17 @@ impl CoreServices {
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner);
             match watcher.as_ref() {
-                Some(w) => LockWatcherStatus {
-                    built: true,
-                    is_running: w.is_running(),
-                    holds_sleep_delay: w.holds_sleep_delay(),
-                    watches_session_lock: w.watches_session_lock(),
-                    error: (!w.is_running()).then(|| {
-                        "the system bus connection was lost; secrets were locked".to_owned()
-                    }),
-                },
+                Some(w) => {
+                    // Read once: the watcher changes state on its own thread.
+                    let state = w.state();
+                    LockWatcherStatus {
+                        built: true,
+                        is_running: state == WatcherState::Watching,
+                        holds_sleep_delay: w.holds_sleep_delay(),
+                        watches_session_lock: w.watches_session_lock(),
+                        error: watcher_state_problem(state),
+                    }
+                }
                 None => LockWatcherStatus {
                     built: true,
                     is_running: false,
@@ -1074,6 +1096,26 @@ fn spawn_idle_timer(
 #[allow(clippy::unwrap_used, clippy::expect_used)] // Tests may panic (AGENTS.md).
 mod tests {
     use super::*;
+
+    /// The UI lists the watcher among the connection problems while `error` is set; it clears
+    /// once the watcher is back (Phase 1 follow-up "Wave 3 (secrets)").
+    #[cfg(feature = "desktop-lock")]
+    #[test]
+    fn the_watcher_problem_follows_its_state() {
+        assert_eq!(watcher_state_problem(WatcherState::Watching), None);
+        for s in [
+            WatcherState::Reconnecting,
+            WatcherState::LogindAbsent,
+            WatcherState::Stopped,
+        ] {
+            assert!(watcher_state_problem(s).is_some(), "{s:?}");
+        }
+        assert!(
+            watcher_state_problem(WatcherState::Reconnecting)
+                .unwrap()
+                .contains("reconnecting")
+        );
+    }
 
     /// Review P1-D wiring, L2: a lock that lands after the unlock was asked for, before the
     /// unlock runs (while it is queued, so the vault had nothing to lock), wins.
