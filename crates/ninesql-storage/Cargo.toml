@@ -19,7 +19,8 @@ toml.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 libc.workspace = true
-rustix.workspace = true
+# `fs`: `renameat2(RENAME_NOREPLACE)` for `fs::write_new_atomic`.
+rustix = { workspace = true, features = ["fs"] }
 zeroize.workspace = true
 # history.sqlite (ADR-0008 §1, P3-C): the bundled SQLite the sqlite driver already uses.
 rusqlite.workspace = true

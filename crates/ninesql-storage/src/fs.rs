@@ -160,6 +160,59 @@ pub fn write_atomic(path: &Path, bytes: &[u8]) -> Result<(), StorageError> {
     Ok(())
 }
 
+/// Creates `path` with `bytes` atomically, **never replacing** an existing file: a `0600` temp
+/// file is written and `fsync`ed next to `path`, then moved with `renameat2(RENAME_NOREPLACE)`;
+/// on a file system without it, a hard link then removal of the temp name; without hard links
+/// either, a check followed by a rename (a narrow race). The parent directory must exist.
+///
+/// # Errors
+/// [`StorageError::Io`] with [`io::ErrorKind::AlreadyExists`] when `path` exists (a symbolic
+/// link included); other I/O errors. On error the temp file is removed and `path` is unchanged.
+pub fn write_new_atomic(path: &Path, bytes: &[u8]) -> Result<(), StorageError> {
+    let dir = parent_dir(path);
+    let (tmp_path, mut tmp) = create_temp(path, dir)?;
+    let result = (|| {
+        tmp.write_all(bytes)?;
+        tmp.sync_all()?;
+        drop(tmp);
+        move_no_replace(&tmp_path, path)
+    })();
+    if let Err(e) = result {
+        let _ = fs::remove_file(&tmp_path);
+        return Err(StorageError::io(path, e));
+    }
+    if let Err(e) = sync_dir(dir) {
+        tracing::warn!(dir = %dir.display(), error = %e, "directory fsync failed after an atomic write");
+    }
+    Ok(())
+}
+
+fn move_no_replace(from: &Path, to: &Path) -> io::Result<()> {
+    use rustix::fs::{CWD, RenameFlags, renameat_with};
+    use rustix::io::Errno;
+    match renameat_with(CWD, from, CWD, to, RenameFlags::NOREPLACE) {
+        Ok(()) => return Ok(()),
+        Err(Errno::INVAL | Errno::NOSYS | Errno::OPNOTSUPP) => {}
+        Err(e) => return Err(io::Error::from(e)),
+    }
+    match fs::hard_link(from, to) {
+        Ok(()) => {
+            let _ = fs::remove_file(from);
+            return Ok(());
+        }
+        Err(e)
+            if e.kind() == io::ErrorKind::Unsupported
+                || matches!(e.raw_os_error(), Some(libc::EPERM | libc::EOPNOTSUPP)) => {}
+        Err(e) => return Err(e),
+    }
+    match fs::symlink_metadata(to) {
+        Ok(_) => return Err(io::Error::from(io::ErrorKind::AlreadyExists)),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e),
+    }
+    fs::rename(from, to)
+}
+
 fn parent_dir(path: &Path) -> &Path {
     match path.parent() {
         Some(p) if !p.as_os_str().is_empty() => p,
@@ -409,6 +462,28 @@ mod tests {
         assert!(target.join("keep").exists());
         let count = fs::read_dir(tmp.path()).unwrap().count();
         assert_eq!(count, 1);
+    }
+
+    #[test]
+    fn write_new_never_replaces() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("new.sql");
+        write_new_atomic(&path, b"first").unwrap();
+        assert_eq!(mode(&path), FILE_MODE);
+        let err = write_new_atomic(&path, b"second").unwrap_err();
+        assert!(
+            matches!(&err, StorageError::Io { source, .. } if source.kind() == io::ErrorKind::AlreadyExists),
+            "{err}"
+        );
+        assert_eq!(fs::read(&path).unwrap(), b"first");
+        // A symbolic link (even dangling) in place of the name is not replaced or followed.
+        let link = tmp.path().join("link.sql");
+        std::os::unix::fs::symlink(tmp.path().join("nowhere"), &link).unwrap();
+        assert!(write_new_atomic(&link, b"x").is_err());
+        assert!(!tmp.path().join("nowhere").exists());
+        // No temp file left behind.
+        let count = fs::read_dir(tmp.path()).unwrap().count();
+        assert_eq!(count, 2);
     }
 
     #[test]

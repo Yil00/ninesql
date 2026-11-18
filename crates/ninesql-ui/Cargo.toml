@@ -17,6 +17,8 @@ ninesql-core.workspace = true
 ninesql-grid.workspace = true
 ninesql-editor.workspace = true
 thiserror.workspace = true
+# The session file model (`scripts::session`, F-WS-06); already in the graph through the core.
+serde.workspace = true
 toml.workspace = true
 toml_edit.workspace = true
 tracing.workspace = true

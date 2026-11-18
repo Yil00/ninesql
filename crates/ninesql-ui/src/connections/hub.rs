@@ -510,6 +510,20 @@ impl ConnectionHub {
         self.local_edit.clone()
     }
 
+    /// The open project's name, when a project is open.
+    #[must_use]
+    pub fn project_name(&self) -> Option<String> {
+        self.workspace
+            .as_ref()
+            .map(|w| w.project().as_str().to_owned())
+    }
+
+    /// `$XDG_STATE_HOME/ninesql/session.json`, when a project is open (F-WS-06).
+    #[must_use]
+    pub fn session_file(&self) -> Option<std::path::PathBuf> {
+        self.workspace.as_ref().map(|w| w.paths().session_file())
+    }
+
     /// The open project's directories (snippets), when a project is open.
     #[must_use]
     pub fn project_paths(&self) -> Option<ninesql_core::storage::ProjectPaths> {

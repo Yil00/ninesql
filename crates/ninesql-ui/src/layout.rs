@@ -13,6 +13,8 @@
 
 use std::fmt;
 
+use serde::{Deserialize, Serialize};
+
 /// Identifier of an editor tab, unique within one workspace window.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct TabId(u64);
@@ -415,9 +417,212 @@ impl EditorLayout {
     }
 }
 
+/// Deepest split nesting restored from a session file.
+pub const MAX_SNAPSHOT_DEPTH: usize = 16;
+
+/// The direction of a split in a [`LayoutSnapshot`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SnapshotAxis {
+    /// Side by side.
+    Horizontal,
+    /// Stacked.
+    Vertical,
+}
+
+impl From<SplitAxis> for SnapshotAxis {
+    fn from(axis: SplitAxis) -> Self {
+        match axis {
+            SplitAxis::Horizontal => Self::Horizontal,
+            SplitAxis::Vertical => Self::Vertical,
+        }
+    }
+}
+
+impl From<SnapshotAxis> for SplitAxis {
+    fn from(axis: SnapshotAxis) -> Self {
+        match axis {
+            SnapshotAxis::Horizontal => Self::Horizontal,
+            SnapshotAxis::Vertical => Self::Vertical,
+        }
+    }
+}
+
+/// The layout in the session file (F-WS-06): the split tree, each pane's tabs as indices into
+/// the session's tab list, its active tab and which pane had the focus. Tabs that are not
+/// restored (unsaved scripts, object editors) are left out.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum LayoutSnapshot {
+    /// A tab strip.
+    Pane {
+        /// Indices into the session's tabs, in order.
+        tabs: Vec<usize>,
+        /// Position of the active tab in `tabs`.
+        #[serde(default)]
+        active: usize,
+        /// The active pane of the window.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        focused: bool,
+    },
+    /// A split.
+    Split {
+        /// Direction.
+        axis: SnapshotAxis,
+        /// Children in order.
+        children: Vec<LayoutSnapshot>,
+    },
+}
+
+impl EditorLayout {
+    /// The layout as a snapshot; `index` maps a tab to its index in the session's tab list,
+    /// `None` for a tab that is not restored. Panes left with no tab are dropped (an empty
+    /// layout is one empty pane).
+    #[must_use]
+    pub fn snapshot(&self, index: impl Fn(TabId) -> Option<usize>) -> LayoutSnapshot {
+        self.snapshot_node(&self.root, &index)
+            .unwrap_or(LayoutSnapshot::Pane {
+                tabs: Vec::new(),
+                active: 0,
+                focused: true,
+            })
+    }
+
+    fn snapshot_node(
+        &self,
+        node: &Node,
+        index: &impl Fn(TabId) -> Option<usize>,
+    ) -> Option<LayoutSnapshot> {
+        match node {
+            Node::Pane(id) => {
+                let pane = self.pane(*id)?;
+                let mut tabs = Vec::new();
+                let mut active = 0;
+                for (ix, tab) in pane.tabs.iter().enumerate() {
+                    if let Some(i) = index(*tab) {
+                        if ix <= pane.active {
+                            active = tabs.len();
+                        }
+                        tabs.push(i);
+                    }
+                }
+                (!tabs.is_empty()).then_some(LayoutSnapshot::Pane {
+                    tabs,
+                    active,
+                    focused: *id == self.active_pane,
+                })
+            }
+            Node::Split { axis, children } => {
+                let mut kept: Vec<LayoutSnapshot> = children
+                    .iter()
+                    .filter_map(|c| self.snapshot_node(c, index))
+                    .collect();
+                match kept.len() {
+                    0 => None,
+                    1 => kept.pop(),
+                    _ => Some(LayoutSnapshot::Split {
+                        axis: (*axis).into(),
+                        children: kept,
+                    }),
+                }
+            }
+        }
+    }
+
+    /// Replaces the panes and splits with `snapshot`, its tab indices mapped by `tab_for`
+    /// (`None`: the tab was not restored). A tab placed twice is kept once; panes left with no
+    /// tab are dropped and splits left with one child collapse; nesting deeper than
+    /// [`MAX_SNAPSHOT_DEPTH`] is dropped. Returns the tabs placed.
+    pub fn restore(
+        &mut self,
+        snapshot: &LayoutSnapshot,
+        tab_for: impl Fn(usize) -> Option<TabId>,
+    ) -> Vec<TabId> {
+        let mut panes = Vec::new();
+        let mut placed = Vec::new();
+        let mut focused = None;
+        let root = self.restore_node(snapshot, 0, &tab_for, &mut panes, &mut placed, &mut focused);
+        match root {
+            Some(root) => {
+                self.root = root;
+                let first = panes.first().map(|p: &Pane| p.id);
+                self.panes = panes;
+                self.active_pane = focused.or(first).unwrap_or(self.active_pane);
+            }
+            None => {
+                let id = PaneId(self.next());
+                self.root = Node::Pane(id);
+                self.panes = vec![Pane::new(id)];
+                self.active_pane = id;
+            }
+        }
+        placed
+    }
+
+    fn restore_node(
+        &mut self,
+        node: &LayoutSnapshot,
+        depth: usize,
+        tab_for: &impl Fn(usize) -> Option<TabId>,
+        panes: &mut Vec<Pane>,
+        placed: &mut Vec<TabId>,
+        focused: &mut Option<PaneId>,
+    ) -> Option<Node> {
+        if depth > MAX_SNAPSHOT_DEPTH {
+            return None;
+        }
+        match node {
+            LayoutSnapshot::Pane {
+                tabs,
+                active,
+                focused: has_focus,
+            } => {
+                let mut pane = Pane::new(PaneId(0));
+                for (ix, i) in tabs.iter().enumerate() {
+                    if let Some(tab) = tab_for(*i).filter(|t| !placed.contains(t)) {
+                        if ix <= *active {
+                            pane.active = pane.tabs.len();
+                        }
+                        pane.tabs.push(tab);
+                        placed.push(tab);
+                    }
+                }
+                if pane.tabs.is_empty() {
+                    return None;
+                }
+                pane.id = PaneId(self.next());
+                if *has_focus {
+                    *focused = Some(pane.id);
+                }
+                let id = pane.id;
+                panes.push(pane);
+                Some(Node::Pane(id))
+            }
+            LayoutSnapshot::Split { axis, children } => {
+                let mut kept = Vec::new();
+                for child in children {
+                    if let Some(n) =
+                        self.restore_node(child, depth + 1, tab_for, panes, placed, focused)
+                    {
+                        kept.push(n);
+                    }
+                }
+                match kept.len() {
+                    0 => None,
+                    1 => kept.pop(),
+                    _ => Some(Node::Split {
+                        axis: (*axis).into(),
+                        children: kept,
+                    }),
+                }
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{EditorLayout, Node, SplitAxis};
+    use super::{EditorLayout, LayoutSnapshot, Node, SplitAxis};
 
     fn layout_with_tabs(n: usize) -> EditorLayout {
         let mut layout = EditorLayout::new();
@@ -568,5 +773,65 @@ mod tests {
         assert!(layout.activate_tab(first));
         assert_eq!(layout.active_pane_id(), p1);
         assert_eq!(layout.pane_of(t), layout.pane_order().get(1).copied());
+    }
+
+    #[test]
+    fn snapshot_and_restore_keep_splits_and_drop_missing_tabs() {
+        let mut layout = layout_with_tabs(2);
+        let tabs = layout.all_tabs();
+        let t3 = layout.allocate_tab();
+        layout.split(SplitAxis::Horizontal, t3);
+        let t4 = layout.allocate_tab();
+        layout.split(SplitAxis::Vertical, t4);
+        // t2 is not restorable (an unsaved tab).
+        let restorable = [tabs[0], t3, t4];
+        let index = |t| restorable.iter().position(|r| *r == t);
+        let snap = layout.snapshot(index);
+        let json = serde_json::to_string(&snap).unwrap_or_default();
+        let back: LayoutSnapshot = serde_json::from_str(&json).unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(back, snap);
+
+        // Restore in a fresh layout with t4's script gone.
+        let mut fresh = EditorLayout::new();
+        let new_tabs: Vec<_> = (0..3).map(|_| fresh.allocate_tab()).collect();
+        let placed = fresh.restore(&snap, |i| (i != 2).then(|| new_tabs[i]));
+        assert_eq!(placed, vec![new_tabs[0], new_tabs[1]]);
+        assert_eq!(fresh.pane_count(), 2);
+        assert!(matches!(
+            fresh.root(),
+            Node::Split { axis: SplitAxis::Horizontal, children } if children.len() == 2
+        ));
+        // The focused pane was the one of t4, gone: the first pane is active.
+        assert_eq!(fresh.active_tab(), Some(new_tabs[0]));
+        // Nothing restorable: one empty pane.
+        let mut empty = EditorLayout::new();
+        assert!(empty.restore(&snap, |_| None).is_empty());
+        assert_eq!(empty.pane_count(), 1);
+        assert!(empty.active_tab().is_none());
+    }
+
+    #[test]
+    fn restore_ignores_duplicates_and_deep_nesting() {
+        let mut snap = LayoutSnapshot::Pane {
+            tabs: vec![0, 0, 1],
+            active: 2,
+            focused: true,
+        };
+        for _ in 0..40 {
+            snap = LayoutSnapshot::Split {
+                axis: super::SnapshotAxis::Vertical,
+                children: vec![snap],
+            };
+        }
+        let mut layout = EditorLayout::new();
+        let t: Vec<_> = (0..2).map(|_| layout.allocate_tab()).collect();
+        assert!(layout.restore(&snap, |i| t.get(i).copied()).is_empty());
+        let flat = LayoutSnapshot::Pane {
+            tabs: vec![0, 0, 1],
+            active: 2,
+            focused: true,
+        };
+        assert_eq!(layout.restore(&flat, |i| t.get(i).copied()), t);
+        assert_eq!(layout.active_tab(), Some(t[1]));
     }
 }

@@ -3,11 +3,12 @@
 //! ```text
 //! $XDG_CONFIG_HOME/ninesql/settings.toml
 //! $XDG_DATA_HOME/ninesql/workspace/<project>/{project.json, connections.json,
-//!                                             connection-types.json, scripts/, diagrams/}
+//!                                             connection-types.json, scripts.json, scripts/,
+//!                                             diagrams/}
 //! $XDG_DATA_HOME/ninesql/vault.bin
 //! $XDG_DATA_HOME/ninesql/known_hosts
 //! $XDG_DATA_HOME/ninesql/ninesql.lock
-//! $XDG_STATE_HOME/ninesql/{history.sqlite, ninesql.log}
+//! $XDG_STATE_HOME/ninesql/{history.sqlite, session.json, ninesql.log}
 //! ```
 
 use std::ffi::OsString;
@@ -161,6 +162,14 @@ impl Paths {
         self.state_dir.join("history.sqlite")
     }
 
+    /// `$XDG_STATE_HOME/ninesql/session.json`: the editor session restored at the next start
+    /// (F-WS-06): open script paths, connection ids, cursor and scroll positions and the
+    /// layout, never editor text (ADR-0025 §4).
+    #[must_use]
+    pub fn session_file(&self) -> PathBuf {
+        self.state_dir.join("session.json")
+    }
+
     /// `$XDG_STATE_HOME/ninesql/ninesql.log`.
     #[must_use]
     pub fn log_file(&self) -> PathBuf {
@@ -209,6 +218,12 @@ impl ProjectPaths {
     #[must_use]
     pub fn snippets_file(&self) -> PathBuf {
         self.dir.join("snippets.json")
+    }
+
+    /// `scripts.json`: which connection each script of `scripts/` is linked to (F-SQL-11).
+    #[must_use]
+    pub fn script_links_file(&self) -> PathBuf {
+        self.dir.join("scripts.json")
     }
 
     /// `scripts/`.
@@ -335,6 +350,7 @@ mod tests {
         assert_eq!(p.lock_file(), Path::new("/d/ninesql/ninesql.lock"));
         assert_eq!(p.history_file(), Path::new("/s/ninesql/history.sqlite"));
         assert_eq!(p.log_file(), Path::new("/s/ninesql/ninesql.log"));
+        assert_eq!(p.session_file(), Path::new("/s/ninesql/session.json"));
         let proj = p.project(&ProjectName::default_project());
         assert_eq!(
             proj.connections_file(),
@@ -355,6 +371,10 @@ mod tests {
         assert_eq!(
             proj.scripts_dir(),
             Path::new("/d/ninesql/workspace/General/scripts")
+        );
+        assert_eq!(
+            proj.script_links_file(),
+            Path::new("/d/ninesql/workspace/General/scripts.json")
         );
         assert_eq!(
             proj.diagrams_dir(),

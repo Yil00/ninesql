@@ -39,7 +39,7 @@ pub fn init(mut settings: SettingsState, cx: &mut App) {
     // Changes still waiting for the debounce timer are written when NineSQL quits.
     cx.on_app_quit(crate::persist::flush_on_quit).detach();
 
-    cx.on_action(|_: &Quit, cx| cx.quit());
+    cx.on_action(|_: &Quit, cx| crate::scripts::request_quit(cx));
     cx.on_action(|_: &NewWindow, cx| {
         open_window(cx);
     });
@@ -54,7 +54,7 @@ pub fn init(mut settings: SettingsState, cx: &mut App) {
 pub fn perform_app_action(action: &dyn Action, cx: &mut App) -> bool {
     let any = action.as_any();
     if any.is::<Quit>() {
-        cx.quit();
+        crate::scripts::request_quit(cx);
     } else if any.is::<NewWindow>() {
         open_window(cx);
     } else if any.is::<ToggleTheme>() {
@@ -120,6 +120,9 @@ pub fn run(registry: ninesql_core::DriverRegistry) {
         // The core (workspace, secret stores, vault, lock watcher, driver runtime) starts off
         // the UI thread; windows open at once and the hub fills in when it is ready.
         crate::connections::hub::start(registry, cx);
+        // Before the hub's shutdown below: quit handlers run in the order they were added, and
+        // the session is written while the hub and its DBeaver roots are still there.
+        crate::scripts::install_quit_handler(cx);
         cx.on_app_quit(|cx| {
             if let Some(hub) = crate::connections::hub::Hub::get(cx) {
                 hub.update(cx, |hub, _| hub.shutdown(std::time::Duration::from_secs(2)));
@@ -135,6 +138,9 @@ pub fn run(registry: ninesql_core::DriverRegistry) {
         })
         .detach();
         open_window(cx);
+        // Session restore (F-WS-06): the previous session reopens once the core is up; the
+        // session is written when NineSQL quits.
+        crate::scripts::install(cx);
         cx.activate(true);
     });
 }

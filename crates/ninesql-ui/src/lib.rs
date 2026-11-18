@@ -10,6 +10,8 @@
 //! - [`import`]: the DBeaver import flow (P2-B): first-run offer, preview, apply, outcome.
 //! - [`navigator`], [`browse`]: the metadata tree, navigator filters, "Find object", the object
 //!   editor, "Generate SQL" and the editor's object completion (P4-B).
+//! - [`scripts`]: script files in the project's `scripts/` linked to a connection (F-SQL-11)
+//!   and session restore from `$XDG_STATE_HOME/ninesql/session.json` (F-WS-06).
 //!
 //! GPUI comes from `gpui-kit` under the controls of ADR-0013. GPUI's credentials and HTTP
 //! client APIs are never used: secrets go through `ninesql-secrets` only (I1), and NineSQL has
@@ -30,6 +32,7 @@ pub mod navigator;
 pub mod palette;
 pub mod persist;
 pub mod script_view;
+pub mod scripts;
 pub mod services;
 pub mod settings;
 pub mod snippets;
