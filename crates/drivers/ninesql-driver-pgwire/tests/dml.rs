@@ -1,10 +1,11 @@
 //! DML generation (P5-B): offline checks of the PostgreSQL-family dialects, and engine tests
-//! against the `postgresql` and `timescaledb` services of `dev/compose.yaml` (ADR-0009): every
-//! row change runs once through its parameterized form and once through its preview, and both
-//! must leave the same row state.
+//! against the `postgresql`, `timescaledb` and `yugabytedb` services of `dev/compose.yaml`
+//! (ADR-0009): every row change runs once through its parameterized form and once through its
+//! preview, and both must leave the same row state.
 //!
 //! Engine tests are skipped when an engine is unreachable, unless `NINESQL_REQUIRE_ENGINES`
-//! lists it. Start them with `python3 dev/ready.py up sql --engines postgresql,timescaledb`.
+//! lists it. Start them with
+//! `python3 dev/ready.py up sql --engines postgresql,timescaledb,yugabytedb`.
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::print_stderr)]
 
 use std::cell::RefCell;
@@ -326,8 +327,20 @@ async fn exec(s: &mut dyn Session, st: Statement) -> Result<Out, DriverError> {
     Ok(o)
 }
 
+/// Runs `text`, retried on a serialization failure (SQLSTATE 40001): YugabyteDB reports one
+/// when the test binary's concurrent DDL touches the catalog ("Restart read required"); the
+/// statement had no effect and the client is expected to retry it.
 async fn sql(s: &mut dyn Session, text: &str) -> Out {
-    exec(s, Statement::sql(text)).await.unwrap()
+    let mut attempt = 0;
+    loop {
+        match exec(s, Statement::sql(text)).await {
+            Err(DriverError::Query { code: Some(c), .. }) if c == "40001" && attempt < 10 => {
+                attempt += 1;
+                tokio::time::sleep(Duration::from_millis(100 * attempt)).await;
+            }
+            other => return other.unwrap(),
+        }
+    }
 }
 
 /// Runs `st` and checks that exactly one row changed.
@@ -543,7 +556,12 @@ async fn types_round_trip(engine: &str) {
     sql(s, &TYPES_DDL.replace("{t}", &t)).await;
     let cols = columns(s, &t).await;
     // The composite key is (id, k2); the round trip keys on both.
-    round_trip_composite(s, &t, &cols, &types_values(0), &types_values(1)).await;
+    let mut next = types_values(1);
+    if engine == "yugabytedb" {
+        // YugabyteDB: "DECIMAL does not support NaN yet" (SQLSTATE 0A000, docs/08).
+        next[6] = Param::Decimal("123.45".into());
+    }
+    round_trip_composite(s, &t, &cols, &types_values(0), &next).await;
     // The comparison sees a difference.
     sql(s, &format!("UPDATE {t} SET t = t || 'x' WHERE id = 2")).await;
     assert!(!same_rows(s, &t, &cols, 1, 2).await);
@@ -660,8 +678,23 @@ async fn timescaledb_types_round_trip() {
 }
 
 #[tokio::test]
+async fn yugabytedb_types_round_trip() {
+    types_round_trip("yugabytedb").await;
+}
+
+#[tokio::test]
 async fn postgresql_keys() {
-    let Some(dev) = dev("postgresql") else { return };
+    keys("postgresql").await;
+}
+
+#[tokio::test]
+async fn yugabytedb_keys() {
+    keys("yugabytedb").await;
+}
+
+/// No key, a nullable unique key and (where the server has it) `NULLS NOT DISTINCT`.
+async fn keys(engine: &str) {
+    let Some(dev) = dev(engine) else { return };
     let mut s = connect(&dev).await;
     let s = s.as_mut();
     let d = s.dialect();
@@ -724,6 +757,11 @@ async fn postgresql_keys() {
     ));
 
     // `NULLS NOT DISTINCT` (PostgreSQL 15+): a NULL key value identifies one row (`IS NULL`).
+    if !d.supports_unique_nulls_not_distinct() {
+        eprintln!("{engine}: no NULLS NOT DISTINCT ({:?})", s.server_version());
+        sql(s, "DROP TABLE p5b_nokey, p5b_uq").await;
+        return;
+    }
     sql(
         s,
         "CREATE TABLE p5b_uqnd (u int UNIQUE NULLS NOT DISTINCT, v text)",
@@ -750,7 +788,16 @@ async fn postgresql_keys() {
 
 #[tokio::test]
 async fn postgresql_hostile_identifiers() {
-    let Some(dev) = dev("postgresql") else { return };
+    hostile_identifiers("postgresql").await;
+}
+
+#[tokio::test]
+async fn yugabytedb_hostile_identifiers() {
+    hostile_identifiers("yugabytedb").await;
+}
+
+async fn hostile_identifiers(engine: &str) {
+    let Some(dev) = dev(engine) else { return };
     let mut s = connect(&dev).await;
     let s = s.as_mut();
     let d = s.dialect();
@@ -805,7 +852,16 @@ async fn postgresql_hostile_identifiers() {
 
 #[test]
 fn postgresql_preview_round_trips_property() {
-    let Some(dev) = dev("postgresql") else { return };
+    preview_round_trips_property("postgresql", 64);
+}
+
+#[test]
+fn yugabytedb_preview_round_trips_property() {
+    preview_round_trips_property("yugabytedb", 32);
+}
+
+fn preview_round_trips_property(engine: &str, cases: u32) {
+    let Some(dev) = dev(engine) else { return };
     let rt = tokio::runtime::Runtime::new().unwrap();
     let session = RefCell::new(Some(rt.block_on(connect(&dev))));
     let table = "p5b_prop";
@@ -864,7 +920,7 @@ fn postgresql_preview_round_trips_property() {
                 Param::Json(j),
             ]
         });
-    let mut runner = proptest::test_runner::TestRunner::new(ProptestConfig::with_cases(64));
+    let mut runner = proptest::test_runner::TestRunner::new(ProptestConfig::with_cases(cases));
     runner
         .run(
             &(row.clone(), row),
