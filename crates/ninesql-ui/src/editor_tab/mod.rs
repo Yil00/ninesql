@@ -62,8 +62,9 @@ use ninesql_core::{
 use ninesql_editor::completion::{CompletionEngine, KeywordSet, MetadataProvider, NoMetadata};
 use ninesql_editor::execution::{ExecutionRequest, StatementError};
 use ninesql_editor::params::ParameterStyle;
+use ninesql_editor::script::ScriptPath;
 use ninesql_editor::split::DialectSplitter;
-use ninesql_editor::{EditorSetup, SqlEditor};
+use ninesql_editor::{DirtyChanged, EditorSetup, SqlEditor};
 use ninesql_grid::{ExecutionEvent, GridBudget, ResultsView};
 
 use crate::connections::connect_flow::open_statement_confirmation;
@@ -236,6 +237,10 @@ pub struct SqlEditorTab {
     warming: Option<Task<()>>,
     /// The table the tab shows and its editing (P5-A).
     table: table::TableState,
+    /// The connection the tab's script is linked to (F-SQL-11), or the one a restored tab was
+    /// using (F-WS-06), kept while the tab has no session: never connected automatically, the
+    /// toolbar offers "Connect" through the normal flow.
+    linked: Option<ConnectionId>,
     _tasks: Vec<Task<()>>,
     _subscriptions: Vec<Subscription>,
 }
@@ -300,6 +305,10 @@ impl SqlEditorTab {
         let subscriptions = vec![
             cx.subscribe(&hub, Self::on_hub_event),
             cx.observe(&hub, |_, _, cx| cx.notify()),
+            cx.subscribe(&editor, |_, _, event: &DirtyChanged, cx| {
+                cx.emit(*event);
+                cx.notify();
+            }),
         ];
         let transaction = session.as_ref().map(SessionHandle::transaction_state);
         Self {
@@ -319,6 +328,7 @@ impl SqlEditorTab {
             default_schema,
             warming: None,
             table: table::TableState::default(),
+            linked: connection,
             _tasks: vec![requests, dropped],
             _subscriptions: subscriptions,
         }
@@ -376,6 +386,46 @@ impl SqlEditorTab {
     #[must_use]
     pub fn title(&self) -> &SharedString {
         &self.title
+    }
+
+    /// Renames the tab (a script was saved under a new name).
+    pub fn set_title(&mut self, title: impl Into<SharedString>, cx: &mut Context<Self>) {
+        self.title = title.into();
+        cx.notify();
+    }
+
+    /// The script file the tab shows, once saved or opened (F-SQL-11).
+    #[must_use]
+    pub fn script(&self, cx: &App) -> Option<ScriptPath> {
+        self.editor.read(cx).script().cloned()
+    }
+
+    /// Whether the tab holds unsaved text (the dirty marker; closing asks first).
+    #[must_use]
+    pub fn is_dirty(&self, cx: &App) -> bool {
+        self.editor.read(cx).is_dirty()
+    }
+
+    /// The connection the script runs on: the session's, else the linked one (not connected).
+    #[must_use]
+    pub fn script_connection(&self) -> Option<ConnectionId> {
+        self.connection().or(self.linked)
+    }
+
+    /// The linked connection while the tab has no session (shown "not connected").
+    #[must_use]
+    pub fn linked_not_connected(&self) -> Option<ConnectionId> {
+        if self.session().is_some() {
+            None
+        } else {
+            self.linked
+        }
+    }
+
+    /// Links the tab to a connection without connecting (a script's link, a restored tab).
+    pub fn set_linked(&mut self, connection: Option<ConnectionId>, cx: &mut Context<Self>) {
+        self.linked = connection;
+        cx.notify();
     }
 
     /// The SQL editor.
@@ -492,6 +542,9 @@ impl SqlEditorTab {
         self.transaction = session.as_ref().map(SessionHandle::transaction_state);
         let dialect = session.as_ref().map(SessionHandle::dialect);
         self.results.update(cx, |r, _| r.set_dialect(dialect));
+        if connection.is_some() {
+            self.linked = connection;
+        }
         self.session = session;
         self.message = None;
         self.editor.update(cx, |e, cx| {
@@ -1151,9 +1204,16 @@ impl SqlEditorTab {
         let danger = contrast(theme.danger);
         let warning = contrast(theme.warning);
         let border = theme.border;
-        let label = match self.session() {
-            Some(s) => format!("Connection: {}", s.info().connection_name),
-            None => "No connection".to_owned(),
+        let linked_name = self.linked_not_connected().map(|id| {
+            self.hub
+                .read(cx)
+                .connection(id)
+                .map_or_else(|| "a deleted connection".to_owned(), |c| c.name.clone())
+        });
+        let label = match (self.session(), &linked_name) {
+            (Some(s), _) => format!("Connection: {}", s.info().connection_name),
+            (None, Some(name)) => format!("Connection: {name} (not connected)"),
+            (None, None) => "No connection".to_owned(),
         };
         let running = self.is_running();
         let in_tx = self.transaction().is_some_and(|t| t.in_transaction);
@@ -1183,6 +1243,18 @@ impl SqlEditorTab {
                             .dispatch_action(Box::new(crate::actions::ChooseEditorConnection), cx);
                     }),
             );
+        if linked_name.is_some() {
+            bar = bar.child(
+                Button::new("editor-connect-linked")
+                    .xsmall()
+                    .label("Connect")
+                    .tooltip("Connect script connection")
+                    .on_click(|_, window, cx| {
+                        window
+                            .dispatch_action(Box::new(crate::actions::ConnectScriptConnection), cx);
+                    }),
+            );
+        }
         if let Some(b) = self.badges(cx) {
             bar = bar.child(badges("editor", &b, true, cx));
         }
@@ -1434,6 +1506,8 @@ pub fn open_connection_picker(
         )
     });
 }
+
+impl EventEmitter<DirtyChanged> for SqlEditorTab {}
 
 impl Focusable for SqlEditorTab {
     fn focus_handle(&self, cx: &App) -> FocusHandle {

@@ -1,7 +1,7 @@
 //! Script files linked to a connection (F-SQL-11) and editor session restore (F-WS-06): models
-//! and their JSON form. Reading and writing the files is the storage layer's job (ADR-0008:
-//! `scripts/` in the project, the window layout in `$XDG_STATE_HOME/ninesql`); the editor never
-//! does file I/O on the UI thread (I6).
+//! and their JSON form. The shell reads and writes the files off the UI thread
+//! (`ninesql_ui::scripts`; ADR-0008: `scripts/` and `scripts.json` in the project,
+//! `session.json` in `$XDG_STATE_HOME/ninesql`); the editor never does file I/O (I6).
 //!
 //! The session file holds **references only** (script paths, connection ids, cursor
 //! positions), never editor text: an unsaved buffer could hold a password typed in a statement,
@@ -43,8 +43,16 @@ pub enum ScriptError {
     },
 }
 
+/// Most folder levels in a script path (folders plus the file).
+pub const MAX_SCRIPT_PATH_DEPTH: usize = 16;
+
+/// Longest name of one folder or file of a script path, in bytes (the usual file system limit).
+pub const MAX_SCRIPT_NAME_BYTES: usize = 255;
+
 /// A script path relative to the project's `scripts/` folder, validated: relative, no `..`,
-/// no root or prefix, ends in `.sql`.
+/// no root or prefix, ends in `.sql`; no hidden folder or file (a leading `.`, which is also how
+/// the atomic writer names its temp files), no control character, at most
+/// [`MAX_SCRIPT_PATH_DEPTH`] levels of at most [`MAX_SCRIPT_NAME_BYTES`] bytes each.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(try_from = "PathBuf", into = "PathBuf")]
 pub struct ScriptPath(PathBuf);
@@ -56,11 +64,20 @@ impl ScriptPath {
     /// [`ScriptError::InvalidPath`].
     pub fn new(path: impl Into<PathBuf>) -> Result<Self, ScriptError> {
         let path: PathBuf = path.into();
-        let normal = path.components().all(|c| matches!(c, Component::Normal(_)));
+        let normal = path.components().all(|c| match c {
+            Component::Normal(name) => {
+                let name = name.to_string_lossy();
+                !name.starts_with('.')
+                    && name.len() <= MAX_SCRIPT_NAME_BYTES
+                    && !name.chars().any(char::is_control)
+            }
+            _ => false,
+        });
+        let depth = path.components().count();
         let sql = path
             .extension()
             .is_some_and(|e| e.eq_ignore_ascii_case("sql"));
-        if path.as_os_str().is_empty() || !normal || !sql {
+        if path.as_os_str().is_empty() || !normal || !sql || depth > MAX_SCRIPT_PATH_DEPTH {
             return Err(ScriptError::InvalidPath(path));
         }
         Ok(Self(path))
@@ -99,8 +116,11 @@ impl From<ScriptPath> for PathBuf {
 pub const SCRIPT_LINKS_SCHEMA: u32 = 1;
 
 /// Which connection each script of a project runs on (`scripts.json` next to `scripts/`).
+///
+/// The version key is `schema_version`, as in every NineSQL file (ADR-0008 §2).
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ScriptLinks {
+    #[serde(rename = "schema_version")]
     schema: u32,
     links: BTreeMap<ScriptPath, ConnectionId>,
 }
@@ -193,6 +213,18 @@ impl ScriptLinks {
 /// Current schema of [`EditorSession`].
 pub const SESSION_SCHEMA: u32 = 1;
 
+/// When a script file was last seen: its size and modification time. Restore skips a script
+/// whose file no longer matches (changed since NineSQL quit). Metadata only, never content.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FileStamp {
+    /// Size in bytes.
+    pub len: u64,
+    /// Modification time, seconds since the Unix epoch (negative before it).
+    pub modified_secs: i64,
+    /// Nanoseconds of the modification time.
+    pub modified_nanos: u32,
+}
+
 /// One restorable editor tab: a saved script, its connection and the cursor. No text.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SessionTab {
@@ -207,11 +239,18 @@ pub struct SessionTab {
     /// 0-based cursor column, in `char`s.
     #[serde(default)]
     pub cursor_column: usize,
+    /// 0-based first visible line.
+    #[serde(default)]
+    pub scroll_line: usize,
+    /// The script file as it was when the session was written.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stamp: Option<FileStamp>,
 }
 
 /// The editor tabs of one window, to reopen at the next start.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EditorSession {
+    #[serde(rename = "schema_version")]
     schema: u32,
     /// Tabs in order.
     pub tabs: Vec<SessionTab>,
@@ -231,6 +270,36 @@ impl Default for EditorSession {
 }
 
 impl EditorSession {
+    /// A session of the current schema with these tabs.
+    #[must_use]
+    pub fn new(tabs: Vec<SessionTab>, active: Option<usize>) -> Self {
+        Self {
+            schema: SESSION_SCHEMA,
+            tabs,
+            active,
+        }
+    }
+
+    /// The schema the session was written with; above [`SESSION_SCHEMA`] when a newer NineSQL
+    /// wrote it (callers that embed the session in a larger file refuse it then).
+    #[must_use]
+    pub fn schema(&self) -> u32 {
+        self.schema
+    }
+
+    /// Whether a newer NineSQL wrote this session.
+    #[must_use]
+    pub fn is_newer(&self) -> bool {
+        self.schema > SESSION_SCHEMA
+    }
+
+    /// The active index, dropped when out of range (an embedded session is not checked by
+    /// [`Self::from_json`]).
+    #[must_use]
+    pub fn checked_active(&self) -> Option<usize> {
+        self.active.filter(|a| *a < self.tabs.len())
+    }
+
     /// JSON form.
     ///
     /// # Errors
@@ -287,6 +356,11 @@ mod tests {
     fn script_paths_stay_inside_the_folder() {
         assert!(ScriptPath::new("reports/monthly.sql").is_ok());
         assert!(ScriptPath::new("Q.SQL").is_ok());
+        let deep = vec!["d"; MAX_SCRIPT_PATH_DEPTH].join("/") + ".sql";
+        assert!(ScriptPath::new(&deep).is_ok());
+        let deeper = vec!["d"; MAX_SCRIPT_PATH_DEPTH + 1].join("/") + ".sql";
+        assert!(ScriptPath::new(&deeper).is_err());
+        assert!(ScriptPath::new("x".repeat(MAX_SCRIPT_NAME_BYTES + 1) + ".sql").is_err());
         for bad in [
             "/etc/passwd.sql",
             "../x.sql",
@@ -294,6 +368,10 @@ mod tests {
             "x.txt",
             "",
             "./x.sql",
+            ".hidden.sql",
+            "dir/.x.sql.1-2-3.tmp",
+            ".git/x.sql",
+            "a\nb.sql",
         ] {
             assert!(ScriptPath::new(bad).is_err(), "{bad}");
         }
@@ -320,18 +398,17 @@ mod tests {
 
     #[test]
     fn refuses_newer_schema_and_bad_paths() {
-        let newer = r#"{"schema": 2, "links": {}}"#;
+        let newer = r#"{"schema_version": 2, "links": {}}"#;
         assert!(matches!(
             ScriptLinks::from_json(newer),
             Err(ScriptError::NewerSchema { .. })
         ));
-        let escaping =
-            r#"{"schema": 1, "links": {"../x.sql": "6a2f41a3-c54c-4b62-9b7a-6d8e0a6f1f0e"}}"#;
+        let escaping = r#"{"schema_version": 1, "links": {"../x.sql": "6a2f41a3-c54c-4b62-9b7a-6d8e0a6f1f0e"}}"#;
         assert!(matches!(
             ScriptLinks::from_json(escaping),
             Err(ScriptError::Json { .. })
         ));
-        let newer = r#"{"schema": 9, "tabs": []}"#;
+        let newer = r#"{"schema_version": 9, "tabs": []}"#;
         assert!(matches!(
             EditorSession::from_json(newer),
             Err(ScriptError::NewerSchema { .. })
@@ -345,6 +422,8 @@ mod tests {
             connection: Some(ConnectionId::new_random()),
             cursor_line: 3,
             cursor_column: 7,
+            scroll_line: 1,
+            stamp: None,
         };
         let session = EditorSession {
             tabs: vec![tab("a.sql"), tab("b.sql"), tab("c.sql")],
@@ -360,14 +439,20 @@ mod tests {
         keys.sort();
         assert_eq!(
             keys,
-            ["connection", "cursor_column", "cursor_line", "script"]
+            [
+                "connection",
+                "cursor_column",
+                "cursor_line",
+                "script",
+                "scroll_line"
+            ]
         );
         let back = EditorSession::from_json(&json).ok();
         assert_eq!(back.as_ref(), Some(&session));
         let kept = session.retain_existing(|p| p.as_path() != Path::new("a.sql"));
         assert_eq!(kept.tabs.len(), 2);
         assert_eq!(kept.active, Some(0), "b.sql is still the active tab");
-        let bad_active = r#"{"schema": 1, "tabs": [], "active": 4}"#;
+        let bad_active = r#"{"schema_version": 1, "tabs": [], "active": 4}"#;
         assert_eq!(
             EditorSession::from_json(bad_active)
                 .ok()

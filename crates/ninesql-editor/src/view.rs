@@ -76,6 +76,19 @@ struct PendingRun {
     nulls: Vec<bool>,
 }
 
+/// Emitted by [`SqlEditor`] when its unsaved state flips ([`SqlEditor::is_dirty`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DirtyChanged(pub bool);
+
+/// A fingerprint of a text (length and hash), to tell an edited buffer from its saved copy
+/// without keeping a second copy of the text.
+fn fingerprint(text: &str) -> (usize, u64) {
+    use std::hash::Hasher as _;
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    hasher.write(text.as_bytes());
+    (text.len(), hasher.finish())
+}
+
 /// The SQL editor view.
 pub struct SqlEditor {
     editor: Entity<EditorState>,
@@ -93,8 +106,15 @@ pub struct SqlEditor {
     bidi: Vec<BidiControl>,
     removed_controls: usize,
     occurrences: Vec<Range<usize>>,
+    /// Fingerprint of the text as last saved or loaded; `None` for a buffer never saved.
+    saved: Option<(usize, u64)>,
+    dirty: bool,
+    /// First line to scroll to once the editor is laid out (session restore).
+    pending_scroll: Option<usize>,
     _subscriptions: Vec<Subscription>,
 }
+
+impl EventEmitter<DirtyChanged> for SqlEditor {}
 
 impl SqlEditor {
     /// An empty editor.
@@ -129,7 +149,120 @@ impl SqlEditor {
             bidi: Vec::new(),
             removed_controls: 0,
             occurrences: Vec::new(),
+            saved: None,
+            dirty: false,
+            pending_scroll: None,
             _subscriptions: subscriptions,
+        }
+    }
+
+    // --- script files ------------------------------------------------------------------------
+
+    /// Loads a script file's text (read by the storage layer): sanitized like typed text
+    /// ([`Self::set_text`]), the caret at the start, the buffer marked as saved with `raw` as
+    /// its saved copy. When sanitizing changed the text, the buffer differs from the file and
+    /// shows as unsaved. Returns the number of characters removed or changed.
+    pub fn load_script(
+        &mut self,
+        raw: &str,
+        script: ScriptPath,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> usize {
+        let fixes = self.set_text(raw, window, cx);
+        self.editor
+            .update(cx, |s, cx| s.set_selected_range(0..0, cx));
+        self.script = Some(script);
+        self.saved = Some(fingerprint(raw));
+        if fixes > 0 {
+            self.notice = Some(SharedString::from(format!(
+                "{fixes} control character(s) or line end(s) changed on load: saving writes the cleaned text"
+            )));
+        }
+        self.refresh_dirty(cx);
+        fixes
+    }
+
+    /// The buffer was written to `script` with the text `saved`.
+    pub fn mark_saved(&mut self, script: ScriptPath, saved: &str, cx: &mut Context<Self>) {
+        self.script = Some(script);
+        self.saved = Some(fingerprint(saved));
+        self.refresh_dirty(cx);
+    }
+
+    /// Whether the buffer holds text that is not saved: edited since its script was loaded or
+    /// saved, or, for a buffer never saved, any text at all (which would be lost on close and
+    /// is never restored, I1).
+    #[must_use]
+    pub fn is_dirty(&self) -> bool {
+        self.dirty
+    }
+
+    fn refresh_dirty(&mut self, cx: &mut Context<Self>) {
+        let len = self.editor.read(cx).text().len();
+        let dirty = match self.saved {
+            None => len > 0,
+            Some((saved_len, _)) if saved_len != len => true,
+            Some(saved) => fingerprint(&self.text(cx)) != saved,
+        };
+        if dirty != self.dirty {
+            self.dirty = dirty;
+            cx.emit(DirtyChanged(dirty));
+            cx.notify();
+        }
+    }
+
+    /// The caret as a 0-based line and column (in `char`s).
+    #[must_use]
+    pub fn cursor_line_column(&self, cx: &App) -> (usize, usize) {
+        let text = self.text(cx);
+        let cursor = self.editor.read(cx).cursor();
+        let position = crate::text::LineIndex::new(&text).position(cursor);
+        (position.line, position.column)
+    }
+
+    /// Puts the caret at a 0-based line and column (in `char`s), clamped to the text.
+    pub fn set_cursor_line_column(&mut self, line: usize, column: usize, cx: &mut Context<Self>) {
+        let text = self.text(cx);
+        let offset = crate::text::LineIndex::new(&text).offset(line, column);
+        self.editor
+            .update(cx, |s, cx| s.set_selected_range(offset..offset, cx));
+    }
+
+    /// The first visible line (0 before the editor is laid out).
+    #[must_use]
+    pub fn scroll_line(&self, cx: &App) -> usize {
+        let state = self.editor.read(cx);
+        let Some(height) = state.line_height().filter(|h| *h > px(0.)) else {
+            return self.pending_scroll.unwrap_or(0);
+        };
+        let top = -f32::from(state.scroll_offset().y);
+        if top <= 0. {
+            return 0;
+        }
+        (top / f32::from(height)).floor() as usize
+    }
+
+    /// Scrolls so that `line` is the first visible line, once the editor is laid out.
+    pub fn set_scroll_line(&mut self, line: usize, cx: &mut Context<Self>) {
+        self.pending_scroll = (line > 0).then_some(line);
+        cx.notify();
+    }
+
+    fn apply_pending_scroll(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(line) = self.pending_scroll else {
+            return;
+        };
+        match self.editor.read(cx).line_height() {
+            Some(height) => {
+                self.pending_scroll = None;
+                let y = -(f32::from(height) * line as f32);
+                self.editor.update(cx, |s, cx| {
+                    s.set_scroll_offset(point(px(0.), px(y)), cx);
+                });
+            }
+            // Not laid out yet: try again on the next frame.
+            None => cx.on_next_frame(window, |_, _, cx| cx.notify()),
         }
     }
 
@@ -156,6 +289,7 @@ impl SqlEditor {
         self.error = None;
         self.last_request = None;
         self.refresh_bidi(&clean, cx);
+        self.refresh_dirty(cx);
         cx.notify();
         fixes.len()
     }
@@ -355,6 +489,7 @@ impl SqlEditor {
             self.refresh_bidi(&text, cx);
         }
         self.occurrences.clear();
+        self.refresh_dirty(cx);
     }
 
     /// Repairs the document in place: the minimal edits of [`hygiene::fixes`], cursor kept.
@@ -917,7 +1052,8 @@ impl Focusable for SqlEditor {
 }
 
 impl Render for SqlEditor {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        self.apply_pending_scroll(window, cx);
         let theme = cx.theme().clone();
         let bidi = (!self.bidi.is_empty()).then(|| {
             let first = self.bidi.first().map(BidiControl::label).unwrap_or_default();

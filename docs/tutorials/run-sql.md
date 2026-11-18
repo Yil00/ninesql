@@ -184,8 +184,32 @@ There is no screen to create snippets yet: they live in the project's `snippets.
 - Names are unique (ignoring case), up to 128 bytes; bodies up to 64 KiB; at most 1 000 snippets.
 - A snippet must never hold a password: a body with a URL holding credentials, or a credential word (`PASSWORD`, `IDENTIFIED`, `SECRET`, `TOKEN`…) next to a literal written in the body, is refused and dropped when the file is read. Use a placeholder instead: `CREATE USER ${user} IDENTIFIED BY ${password}`.
 
+## 12. Script files and session restore
+An editor tab is a scratch buffer until you save it. Scripts live in the project's `scripts/` folder (`~/.local/share/ninesql/workspace/General/scripts/`, [where files are](build-and-run.md#where-ninesql-keeps-its-files)), with any folders you like, and each one remembers the connection it runs on.
+
+| Action | Keys | What it does |
+|---|---|---|
+| **New script** | `Ctrl+N` | Creates `Script-<n>.sql` in `scripts/`, linked to the active editor's connection, and opens it |
+| **Open script…** | `Ctrl+O` | Lists the scripts of `scripts/` (and only those); type to filter, `↑` / `↓` and `Enter` to open. A script already open is brought to the front |
+| **Save script** | `Ctrl+S` | Writes the editor to its file; the first time, asks for a name like "Save script as…" |
+| **Save script as…** | `Ctrl+Shift+S` | Asks for a name inside `scripts/` (`reports/monthly` becomes `reports/monthly.sql`; folders are created as needed). An existing name is refused: "… already exists: choose another name." |
+| **Connect script connection** | `Ctrl+K` then `Ctrl+Shift+O` | Connects the connection a script is linked to, through the usual connect flow (password prompt, init SQL confirmation…) |
+
+All of them are in the command palette (`Ctrl+Shift+P`).
+
+- **Unsaved changes.** A tab with unsaved text shows `●` before its name. Closing it asks: "Save", "Discard changes" or "Cancel". Closing the window or quitting (`Ctrl+Q`) with unsaved tabs asks too ("Close without saving", "Quit without saving"). An untitled tab with text counts as unsaved: its text is lost on close.
+- **What is refused.** A name that leaves `scripts/` (`..`, an absolute path), a hidden name (starting with `.`), a symbolic link inside `scripts/` (to a file or a folder), and a project inside a DBeaver workspace: NineSQL never reads or writes scripts in DBeaver's files. A file over 8 MiB, or not UTF-8, is not opened.
+- **On load,** control characters are removed and Windows line ends become `\n`, as for pasted text; the tab then shows `●` and the notice under the editor says that saving writes the cleaned text.
+- Files are written atomically and readable by you only (`0600`). The link between a script and its connection is in the project's `scripts.json`.
+
+**Session restore.** When NineSQL quits, it writes `~/.local/state/ninesql/session.json`: for each window, the saved scripts open in it, the connection each tab was using, the cursor and scroll positions, the split layout and whether the navigator was shown. At the next start, once the connections are loaded, those scripts reopen as saved on disk.
+- **No text is kept.** Untitled tabs are not restored, and a script reopens without the edits you did not save: unsaved text could hold a password typed in a statement, and NineSQL never writes it anywhere you did not choose. Save what you want to keep.
+- **Nothing connects by itself.** A restored tab shows "Connection: <name> (not connected)" with a **Connect** button (or "Connect script connection"); connecting asks for secrets and confirmations as usual. Connecting from the navigator also gives the session to the tabs linked to that connection.
+- **Skipped files.** A script deleted, moved or changed (another size or modification time) since NineSQL quit is not reopened; a "Previous session" notice names it. Open it with "Open script…".
+- A session file written by a newer NineSQL is not restored and is left as it is.
+
 ## Not built yet
-- Saving and opening script files, and reopening tabs after a restart. Unsaved tabs will not be restored even then: their text could hold a password.
+- Renaming, moving or deleting scripts from NineSQL, a script list in the navigator, an autosave of untitled tabs (it needs its own decision: their text could hold a password), and restoring object editors.
 - Completion of joins on foreign keys.
 - A keyboard fold action, a history view, a preferences page, an auto-commit toggle, a reconnect when a session is lost.
 - Formatter settings, a screen to create and edit snippets, the per-statement run summary in the interface.

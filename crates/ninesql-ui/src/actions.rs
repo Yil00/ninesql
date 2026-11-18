@@ -153,6 +153,16 @@ actions!(
         OpenReferencingRows,
         /// Export chosen connections to a new DBeaver data-sources.json or project folder.
         ExportToDbeaver,
+        /// Create a script file in the project's scripts folder and open it in a new tab.
+        NewScript,
+        /// Open a script of the project's scripts folder (a picker with a filter).
+        OpenScript,
+        /// Save the active SQL editor to its script file (asks for a name the first time).
+        SaveScript,
+        /// Save the active SQL editor under a new name in the scripts folder.
+        SaveScriptAs,
+        /// Connect the connection the active script is linked to (through the normal flow).
+        ConnectScriptConnection,
     ]
 );
 
@@ -798,6 +808,46 @@ pub const ACTIONS: &[ActionSpec] = &[
         Workspace,
         ["ctrl-k ctrl-shift-d"],
         keywords = ["dbeaver", "data-sources.json", "export", "project"]
+    ),
+    spec!(
+        NewScript,
+        "New script",
+        "SQL editor",
+        Workspace,
+        ["ctrl-n"],
+        keywords = ["file", "create", "sql", "scripts folder"]
+    ),
+    spec!(
+        OpenScript,
+        "Open script…",
+        "SQL editor",
+        Workspace,
+        ["ctrl-o"],
+        keywords = ["file", "load", "scripts", "list", "folder"]
+    ),
+    spec!(
+        SaveScript,
+        "Save script",
+        "SQL editor",
+        Workspace,
+        ["ctrl-s"],
+        keywords = ["file", "write", "store"]
+    ),
+    spec!(
+        SaveScriptAs,
+        "Save script as…",
+        "SQL editor",
+        Workspace,
+        ["ctrl-shift-s"],
+        keywords = ["file", "rename", "copy", "folder"]
+    ),
+    spec!(
+        ConnectScriptConnection,
+        "Connect script connection",
+        "SQL editor",
+        Workspace,
+        ["ctrl-k ctrl-shift-o"],
+        keywords = ["linked", "restore", "session", "open"]
     ),
 ];
 

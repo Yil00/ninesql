@@ -28,7 +28,7 @@ pub mod view;
 pub use ninesql_core as core;
 
 pub use actions::{EDITOR_ACTIONS, EDITOR_BINDING_CONTEXT, EDITOR_CONTEXT, EditorActionSpec};
-pub use view::{EditorSetup, ShownError, SqlEditor};
+pub use view::{DirtyChanged, EditorSetup, ShownError, SqlEditor};
 
 /// Installs the editor's default key bindings. Call after `gpui_kit::init`; `ninesql-ui`
 /// installs [`EDITOR_ACTIONS`] through its own keymap instead (user overrides).

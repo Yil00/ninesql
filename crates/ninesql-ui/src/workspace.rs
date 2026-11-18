@@ -34,6 +34,7 @@ use crate::actions::{
     GenerateSelectSql, GenerateUpdateSql, LoadMoreObjects, OpenObjectEditor, RefreshNavigatorNode,
     ShowObjectDdl,
 };
+use crate::actions::{ConnectScriptConnection, NewScript, OpenScript, SaveScript, SaveScriptAs};
 use crate::actions::{ExportResults, ExportTable, FormatSql, ImportCsv, InsertSnippet};
 use crate::appearance;
 use crate::browse::generate::{KeySource, Template, TemplateInput, names_survive_editor, template};
@@ -55,6 +56,7 @@ use crate::keymap::EffectiveKeymap;
 use crate::layout::{EditorLayout, Node, PaneId, SplitAxis, TabId};
 use crate::navigator::Navigator;
 use crate::navigator::{NavigatorEvent, Selection};
+use crate::scripts::{SessionState, UnsavedChoice};
 use crate::services::Services;
 use crate::settings::SettingsState;
 use gpui_kit::component::notification::Notification;
@@ -62,6 +64,8 @@ use ninesql_core::ConnectionId;
 use ninesql_core::NodeKey;
 use ninesql_core::driver_api::ObjectKind;
 use ninesql_core::driver_api::metadata::{ObjectInfo, ObjectPath};
+use ninesql_editor::DirtyChanged;
+use ninesql_editor::script::{EditorSession, ScriptPath, SessionTab};
 
 /// What runs once sessions were closed as the user chose (see `Workspace::close_sessions_then`).
 type AfterClose = Rc<dyn Fn(&mut Workspace, &mut Window, &mut Context<Workspace>)>;
@@ -84,6 +88,12 @@ pub struct Workspace {
     dialog: Option<Entity<ConnectionDialog>>,
     import: Option<Entity<ImportFlow>>,
     first_run_hidden: bool,
+    /// The window this workspace fills (dialogs from application-wide actions, restore).
+    window: AnyWindowHandle,
+    /// One subscription per SQL editor tab: its dirty marker re-renders the tab strip.
+    tab_subscriptions: HashMap<TabId, Subscription>,
+    /// Closing the window was confirmed despite unsaved text.
+    close_confirmed: bool,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -113,10 +123,25 @@ impl Workspace {
             dialog: None,
             import: None,
             first_run_hidden: false,
+            window: window.window_handle(),
+            tab_subscriptions: HashMap::new(),
+            close_confirmed: false,
             _subscriptions: subscriptions,
         };
         this.new_tab(window, cx);
+        SessionState::register(cx.entity().downgrade(), cx);
+        let weak = cx.entity().downgrade();
+        window.on_window_should_close(cx, move |window, cx| {
+            weak.update(cx, |ws, cx| ws.should_close_window(window, cx))
+                .unwrap_or(true)
+        });
         this
+    }
+
+    /// The window this workspace fills.
+    #[must_use]
+    pub fn window_handle(&self) -> AnyWindowHandle {
+        self.window
     }
 
     /// The tab and split model.
@@ -139,6 +164,19 @@ impl Workspace {
             .into_iter()
             .filter_map(|t| self.title_of(t, cx))
             .collect()
+    }
+
+    /// The label of a tab in its tab strip: its title, with a "●" marker when it holds unsaved
+    /// text.
+    #[must_use]
+    pub fn tab_label(&self, tab: TabId, cx: &App) -> Option<SharedString> {
+        let title = self.title_of(tab, cx)?;
+        let dirty = self.tabs.get(&tab).is_some_and(|e| e.read(cx).is_dirty(cx));
+        Some(if dirty {
+            SharedString::from(format!("● {title}"))
+        } else {
+            title
+        })
     }
 
     fn title_of(&self, tab: TabId, cx: &App) -> Option<SharedString> {
@@ -185,20 +223,37 @@ impl Workspace {
     }
 
     fn create_tab(&mut self, window: &mut Window, cx: &mut Context<Self>) -> TabId {
-        let id = self.layout.allocate_tab();
         let title = format!("Script-{}", self.next_script);
         self.next_script += 1;
-        // A new editor runs on the active editor's session, else on the last connection
-        // opened in this window.
-        let session = self
-            .active_editor()
+        let session = self.default_session(cx);
+        self.create_tab_with(title, session, window, cx)
+    }
+
+    /// The session a new editor runs on: the active editor's, else the last connection opened
+    /// in this window.
+    fn default_session(&self, cx: &App) -> Option<ninesql_core::SessionHandle> {
+        self.active_editor()
             .and_then(|t| t.read(cx).session().cloned())
             .or_else(|| {
                 let id = self.active_connection?;
                 self.hub.read(cx).sessions(id).last().cloned()
-            });
+            })
+    }
+
+    /// Creates an editor tab (not placed in the layout yet).
+    fn create_tab_with(
+        &mut self,
+        title: impl Into<SharedString>,
+        session: Option<ninesql_core::SessionHandle>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> TabId {
+        let id = self.layout.allocate_tab();
         let hub = self.hub.clone();
+        let title = title.into();
         let editor = cx.new(|cx| SqlEditorTab::new(title, hub, session, window, cx));
+        let subscription = cx.subscribe(&editor, |_, _, _: &DirtyChanged, cx| cx.notify());
+        self.tab_subscriptions.insert(id, subscription);
         self.tabs.insert(id, editor);
         id
     }
@@ -221,12 +276,51 @@ impl Workspace {
     /// (always for production, ADR-0007 §5) and no other editor of this window uses that
     /// session, asks first: commit, roll back, or keep the tab.
     pub fn close_tab(&mut self, tab: TabId, window: &mut Window, cx: &mut Context<Self>) {
+        self.close_tab_checked(tab, false, window, cx);
+    }
+
+    /// [`Self::close_tab`]; with `unsaved_ok`, unsaved text was already confirmed lost or saved.
+    /// Without it, a tab holding unsaved text asks first: "Save" (a script is saved to its
+    /// file, an untitled tab asks for a name), "Discard changes", or Cancel.
+    pub fn close_tab_checked(
+        &mut self,
+        tab: TabId,
+        unsaved_ok: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         if self.objects.contains_key(&tab) {
             return self.close_tab_now(tab, window, cx);
         }
         let Some(editor) = self.tabs.get(&tab).cloned() else {
             return;
         };
+        if !unsaved_ok && editor.read(cx).is_dirty(cx) {
+            let title = editor.read(cx).title().clone();
+            let message = if editor.read(cx).script(cx).is_some() {
+                format!("\"{title}\" has unsaved changes. Save them before closing?")
+            } else {
+                format!(
+                    "\"{title}\" was never saved. Save it as a script before closing? Unsaved text is not kept anywhere."
+                )
+            };
+            let this = cx.entity().downgrade();
+            crate::scripts::open_unsaved_confirmation(
+                "Unsaved changes",
+                message,
+                true,
+                "Discard changes",
+                Rc::new(move |choice, window, cx| {
+                    let _ = this.update(cx, |ws, cx| match choice {
+                        UnsavedChoice::Discard => ws.close_tab_checked(tab, true, window, cx),
+                        UnsavedChoice::Save => ws.save_tab(tab, true, window, cx),
+                    });
+                }),
+                window,
+                cx,
+            );
+            return;
+        }
         let session = editor.read(cx).session().cloned();
         let shared = session.as_ref().is_some_and(|s| {
             self.tabs
@@ -285,6 +379,7 @@ impl Workspace {
     pub fn close_tab_now(&mut self, tab: TabId, window: &mut Window, cx: &mut Context<Self>) {
         if self.layout.close_tab(tab) {
             self.tabs.remove(&tab);
+            self.tab_subscriptions.remove(&tab);
             // Dropping an object editor drops its loads (cancelled in the core).
             self.objects.remove(&tab);
             self.after_change(window, cx);
@@ -801,14 +896,29 @@ impl Workspace {
                 warnings,
             } => {
                 self.active_connection = Some(*connection);
-                // The active editor without a connection takes the session just opened; never
-                // one with a run going on (its run stays on the session it started on).
-                if let Some(editor) = self.active_editor().cloned()
-                    && !editor.read(cx).is_running()
-                    && editor.read(cx).session().is_none()
-                    && let Some(session) = self.hub.read(cx).sessions(*connection).last().cloned()
-                {
-                    editor.update(cx, |e, cx| e.set_session(Some(session), cx));
+                // The active editor without a connection takes the session just opened, and so
+                // does every editor of this window linked to that connection (a script, a
+                // restored tab); never one with a run going on (its run stays on the session it
+                // started on), nor one linked to another connection.
+                if let Some(session) = self.hub.read(cx).sessions(*connection).last().cloned() {
+                    let active = self.active_editor().map(Entity::entity_id);
+                    let takers: Vec<Entity<SqlEditorTab>> = self
+                        .tabs
+                        .values()
+                        .filter(|e| {
+                            let t = e.read(cx);
+                            let linked = t.linked_not_connected();
+                            !t.is_running()
+                                && t.session().is_none()
+                                && (linked == Some(*connection)
+                                    || (linked.is_none() && active == Some(e.entity_id())))
+                        })
+                        .cloned()
+                        .collect();
+                    for editor in takers {
+                        let session = session.clone();
+                        editor.update(cx, |e, cx| e.set_session(Some(session), cx));
+                    }
                 }
                 let name = self
                     .hub
@@ -1241,8 +1351,20 @@ impl Workspace {
             self.open_foreign_key_rows(true, window, cx);
         } else if self.table_action(any, window, cx) {
             // Handled by the active editor's table.
+        } else if any.is::<NewScript>() {
+            self.new_script(window, cx);
+        } else if any.is::<OpenScript>() {
+            self.open_script(window, cx);
+        } else if any.is::<SaveScript>() {
+            self.save_active_script(window, cx);
+        } else if any.is::<SaveScriptAs>() {
+            self.save_active_script_as(window, cx);
+        } else if any.is::<ConnectScriptConnection>() {
+            self.connect_script_connection(window, cx);
         } else if any.is::<CloseWindow>() {
-            window.remove_window();
+            if self.should_close_window(window, cx) {
+                window.remove_window();
+            }
         } else {
             return false;
         }
@@ -1262,14 +1384,20 @@ impl Workspace {
             .iter()
             .map(|tab| {
                 let title = self.title_of(*tab, cx).unwrap_or_default();
+                let label = self.tab_label(*tab, cx).unwrap_or_default();
+                let close_tip = if label == title {
+                    format!("Close {title}")
+                } else {
+                    format!("Close {title} (unsaved changes)")
+                };
                 let tab_id = *tab;
                 let this = this.clone();
-                Tab::new().label(title.clone()).suffix(
+                Tab::new().label(label).suffix(
                     Button::new(("close-tab", tab.get()))
                         .ghost()
                         .xsmall()
                         .icon(IconName::Close)
-                        .tooltip(format!("Close {title}"))
+                        .tooltip(close_tip)
                         .on_click(move |_, window, cx| {
                             let _ = this.update(cx, |ws, cx| ws.close_tab(tab_id, window, cx));
                         }),
@@ -2596,6 +2724,474 @@ impl Workspace {
     }
 }
 
+/// What runs once a tab was saved.
+type AfterSave = Box<dyn FnOnce(&mut Workspace, &mut Window, &mut Context<Workspace>)>;
+
+// --- script files and session restore (F-SQL-11, F-WS-06) ------------------------------------
+impl Workspace {
+    fn script_store(&self, cx: &App) -> Option<crate::scripts::store::ScriptStore> {
+        crate::scripts::store_of(self.hub.read(cx))
+    }
+
+    fn no_project(window: &mut Window, cx: &mut App) {
+        Self::notify(
+            "No project is open: scripts cannot be saved or opened (see Show connection problems).",
+            window,
+            cx,
+        );
+    }
+
+    /// The editor tabs holding unsaved text.
+    #[must_use]
+    pub fn dirty_tab_count(&self, cx: &App) -> usize {
+        self.tabs
+            .values()
+            .filter(|e| e.read(cx).is_dirty(cx))
+            .count()
+    }
+
+    /// The tab showing `script`, if one is open.
+    #[must_use]
+    pub fn tab_of_script(&self, script: &ScriptPath, cx: &App) -> Option<TabId> {
+        self.layout.all_tabs().into_iter().find(|t| {
+            self.tabs
+                .get(t)
+                .is_some_and(|e| e.read(cx).script(cx).as_ref() == Some(script))
+        })
+    }
+
+    /// "New script": creates `Script-<n>.sql` (the first free name) in the scripts folder,
+    /// linked to the active editor's connection, and opens it in a new tab.
+    pub fn new_script(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(store) = self.script_store(cx) else {
+            return Self::no_project(window, cx);
+        };
+        let link = self
+            .active_editor()
+            .and_then(|e| e.read(cx).script_connection())
+            .or(self.active_connection);
+        let start = self.next_script;
+        let task = cx.background_spawn(async move {
+            let path = store.free_name(start)?;
+            let (_, problem) = store.write(&path, "", link, true)?;
+            Ok::<_, crate::scripts::store::ScriptFileError>((path, problem))
+        });
+        cx.spawn_in(window, async move |this, cx| {
+            let result = task.await;
+            let _ = this.update_in(cx, |ws, window, cx| match result {
+                Ok((path, problem)) => {
+                    ws.next_script += 1;
+                    let session = ws.default_session(cx);
+                    let id = ws.create_tab_with(path.file_name(), session, window, cx);
+                    if let Some(editor) = ws.tabs.get(&id).cloned() {
+                        editor.update(cx, |e, cx| {
+                            e.editor()
+                                .update(cx, |ed, cx| ed.mark_saved(path.clone(), "", cx));
+                            if e.session().is_none() {
+                                e.set_linked(link, cx);
+                            }
+                        });
+                    }
+                    ws.layout.open_tab(id);
+                    ws.after_change(window, cx);
+                    if let Some(p) = problem {
+                        Self::notify(p, window, cx);
+                    }
+                }
+                Err(e) => window.push_notification(
+                    Notification::error(e.to_string()).title("Script not created"),
+                    cx,
+                ),
+            });
+        })
+        .detach();
+    }
+
+    /// "Open script…": lists the scripts folder off the UI thread, then shows the picker.
+    pub fn open_script(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(store) = self.script_store(cx) else {
+            return Self::no_project(window, cx);
+        };
+        let task = cx.background_spawn(async move { store.list() });
+        cx.spawn_in(window, async move |this, cx| {
+            let result = task.await;
+            let _ = this.update_in(cx, |_, window, cx| match result {
+                Ok((scripts, truncated)) => {
+                    let weak = cx.entity().downgrade();
+                    crate::scripts::open_script_picker(
+                        scripts,
+                        truncated,
+                        Rc::new(move |script, window, cx| {
+                            let _ =
+                                weak.update(cx, |ws, cx| ws.open_script_path(script, window, cx));
+                        }),
+                        window,
+                        cx,
+                    );
+                }
+                Err(e) => window.push_notification(
+                    Notification::error(e.to_string()).title("Scripts not listed"),
+                    cx,
+                ),
+            });
+        })
+        .detach();
+    }
+
+    /// Opens `script` (read off the UI thread), or activates its tab when it is open.
+    pub fn open_script_path(
+        &mut self,
+        script: ScriptPath,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Task<Option<TabId>> {
+        if let Some(tab) = self.tab_of_script(&script, cx) {
+            self.activate_tab(tab, window, cx);
+            return Task::ready(Some(tab));
+        }
+        let Some(store) = self.script_store(cx) else {
+            Self::no_project(window, cx);
+            return Task::ready(None);
+        };
+        let task = cx.background_spawn(async move { store.read(&script) });
+        cx.spawn_in(window, async move |this, cx| {
+            let result = task.await;
+            this.update_in(cx, |ws, window, cx| match result {
+                Ok(loaded) => {
+                    let id = ws.open_loaded(loaded, window, cx);
+                    ws.layout.open_tab(id);
+                    ws.after_change(window, cx);
+                    Some(id)
+                }
+                Err(e) => {
+                    window.push_notification(
+                        Notification::error(e.to_string()).title("Script not opened"),
+                        cx,
+                    );
+                    None
+                }
+            })
+            .ok()
+            .flatten()
+        })
+    }
+
+    /// A tab (not placed yet) showing a script just read: on an already open session of the
+    /// script's connection when there is one (never a new connection), else linked to it and
+    /// shown "not connected".
+    fn open_loaded(
+        &mut self,
+        loaded: crate::scripts::store::LoadedScript,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> TabId {
+        let session = match loaded.link {
+            Some(c) => self.hub.read(cx).sessions(c).last().cloned(),
+            None => self.default_session(cx),
+        };
+        let id = self.create_tab_with(loaded.path.file_name(), session, window, cx);
+        if let Some(editor) = self.tabs.get(&id).cloned() {
+            editor.update(cx, |e, cx| {
+                e.editor().update(cx, |ed, cx| {
+                    ed.load_script(&loaded.text, loaded.path.clone(), window, cx);
+                });
+                if e.session().is_none() {
+                    e.set_linked(loaded.link, cx);
+                }
+            });
+        }
+        id
+    }
+
+    /// "Save script": the active editor to its script file, or "Save script as…" the first time.
+    pub fn save_active_script(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(tab) = self
+            .layout
+            .active_tab()
+            .filter(|t| self.tabs.contains_key(t))
+        else {
+            return Self::notify("Open an SQL editor first.", window, cx);
+        };
+        self.save_tab(tab, false, window, cx);
+    }
+
+    /// "Save script as…" for the active editor.
+    pub fn save_active_script_as(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(tab) = self
+            .layout
+            .active_tab()
+            .filter(|t| self.tabs.contains_key(t))
+        else {
+            return Self::notify("Open an SQL editor first.", window, cx);
+        };
+        self.prompt_save_as(tab, None, window, cx);
+    }
+
+    /// Saves a tab to its script, or asks for a name when it has none; with `then_close`, the
+    /// tab closes once saved.
+    pub fn save_tab(
+        &mut self,
+        tab: TabId,
+        then_close: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(editor) = self.tabs.get(&tab) else {
+            return;
+        };
+        let after: Option<AfterSave> = then_close.then(|| {
+            Box::new(
+                move |ws: &mut Workspace, window: &mut Window, cx: &mut Context<Workspace>| {
+                    ws.close_tab_checked(tab, true, window, cx);
+                },
+            ) as AfterSave
+        });
+        match editor.read(cx).script(cx) {
+            Some(script) => self.save_tab_to(tab, script, false, after, window, cx),
+            None => self.prompt_save_as(tab, after, window, cx),
+        }
+    }
+
+    fn prompt_save_as(
+        &mut self,
+        tab: TabId,
+        after: Option<AfterSave>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(editor) = self.tabs.get(&tab) else {
+            return;
+        };
+        let current = editor.read(cx).script(cx);
+        let initial = current.as_ref().map_or_else(
+            || format!("{}.sql", editor.read(cx).title()),
+            |s| s.as_path().to_string_lossy().into_owned(),
+        );
+        let weak = cx.entity().downgrade();
+        let after = Rc::new(std::cell::RefCell::new(after));
+        crate::scripts::open_save_as(
+            &initial,
+            Rc::new(move |path, window, cx| {
+                let create_new = current.as_ref() != Some(&path);
+                let after = after.borrow_mut().take();
+                let _ = weak.update(cx, |ws, cx| {
+                    ws.save_tab_to(tab, path, create_new, after, window, cx)
+                });
+            }),
+            window,
+            cx,
+        );
+    }
+
+    /// Writes a tab's text to `script` off the UI thread (atomic, `0600`) and records its
+    /// connection in `scripts.json`. `create_new` refuses an existing file ("Save as…").
+    pub fn save_tab_to(
+        &mut self,
+        tab: TabId,
+        script: ScriptPath,
+        create_new: bool,
+        after: Option<AfterSave>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(editor) = self.tabs.get(&tab).cloned() else {
+            return;
+        };
+        let Some(store) = self.script_store(cx) else {
+            return Self::no_project(window, cx);
+        };
+        let text = editor.read(cx).editor().read(cx).text(cx);
+        let link = editor.read(cx).script_connection();
+        let written = text.clone();
+        let path = script.clone();
+        let task =
+            cx.background_spawn(async move { store.write(&path, &written, link, create_new) });
+        cx.spawn_in(window, async move |this, cx| {
+            let result = task.await;
+            let _ = this.update_in(cx, |ws, window, cx| match result {
+                Ok((_, problem)) => {
+                    editor.update(cx, |e, cx| {
+                        e.set_title(script.file_name(), cx);
+                        e.editor()
+                            .update(cx, |ed, cx| ed.mark_saved(script.clone(), &text, cx));
+                    });
+                    if let Some(p) = problem {
+                        Self::notify(p, window, cx);
+                    }
+                    cx.notify();
+                    if let Some(after) = after {
+                        after(ws, window, cx);
+                    }
+                }
+                Err(e) => window.push_notification(
+                    Notification::error(e.to_string()).title("Script not saved"),
+                    cx,
+                ),
+            });
+        })
+        .detach();
+    }
+
+    /// "Connect script connection": opens the active editor's linked connection through the
+    /// normal connect flow (secrets, confirmations); the editor takes the session when it opens.
+    pub fn connect_script_connection(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let linked = self
+            .active_editor()
+            .and_then(|e| e.read(cx).linked_not_connected());
+        match linked {
+            Some(id) if self.hub.read(cx).connection(id).is_some() => {
+                self.connect(id, Purpose::Open, window, cx);
+            }
+            Some(_) => Self::notify(
+                "The connection of this script was deleted: choose another one with Choose editor connection.",
+                window,
+                cx,
+            ),
+            None => Self::notify(
+                "This editor is not linked to a connection waiting to be connected.",
+                window,
+                cx,
+            ),
+        }
+    }
+
+    /// Whether the window may close now. With unsaved text it asks first ("Close without
+    /// saving" or Cancel) and answers `false`. Records the window's session when it may close.
+    pub fn should_close_window(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        let n = self.dirty_tab_count(cx);
+        if n > 0 && !self.close_confirmed && !SessionState::quit_confirmed(cx) {
+            let weak = cx.entity().downgrade();
+            crate::scripts::open_unsaved_confirmation(
+                "Unsaved scripts",
+                format!(
+                    "{n} editor tab(s) in this window hold unsaved text, which is lost when the window closes."
+                ),
+                false,
+                "Close without saving",
+                Rc::new(move |_, window, cx| {
+                    let closed = weak.update(cx, |ws, cx| {
+                        ws.close_confirmed = true;
+                        ws.should_close_window(window, cx)
+                    });
+                    if closed.unwrap_or(false) {
+                        window.remove_window();
+                    }
+                }),
+                window,
+                cx,
+            );
+            return false;
+        }
+        let snapshot = self.session_snapshot(cx);
+        SessionState::window_closing(&cx.entity(), snapshot, cx);
+        true
+    }
+
+    /// This window's part of the session file: the saved scripts open in it (as references:
+    /// path, connection, cursor, scroll), the layout and the navigator. Never editor text;
+    /// untitled tabs and object editors are left out (I1, ADR-0025 §4).
+    #[must_use]
+    pub fn session_snapshot(&self, cx: &App) -> crate::scripts::session::WindowSession {
+        let mut tabs = Vec::new();
+        let mut index: HashMap<TabId, usize> = HashMap::new();
+        for tab in self.layout.all_tabs() {
+            let Some(editor) = self.tabs.get(&tab) else {
+                continue;
+            };
+            let editor = editor.read(cx);
+            let Some(script) = editor.script(cx) else {
+                continue;
+            };
+            let view = editor.editor().read(cx);
+            let (line, column) = view.cursor_line_column(cx);
+            index.insert(tab, tabs.len());
+            tabs.push(SessionTab {
+                script,
+                connection: editor.script_connection(),
+                cursor_line: line,
+                cursor_column: column,
+                scroll_line: view.scroll_line(cx),
+                stamp: None,
+            });
+        }
+        let active = self
+            .layout
+            .active_tab()
+            .and_then(|t| index.get(&t).copied());
+        crate::scripts::session::WindowSession {
+            editor: EditorSession::new(tabs, active),
+            layout: self.layout.snapshot(|t| index.get(&t).copied()),
+            navigator_visible: self.navigator_visible,
+        }
+    }
+
+    /// Whether the window still shows only what it opened with: one empty, untitled editor.
+    fn is_pristine(&self, cx: &App) -> bool {
+        self.objects.is_empty()
+            && self.tabs.len() == 1
+            && self.tabs.values().all(|e| {
+                let e = e.read(cx);
+                e.script(cx).is_none() && !e.is_dirty(cx) && !e.is_running()
+            })
+    }
+
+    /// Reopens a window of the previous session: its scripts, as saved on disk, with their
+    /// connection shown "not connected" (no connection is opened, I3), cursor and scroll
+    /// positions, and the layout when the window was still untouched.
+    pub fn apply_restore(
+        &mut self,
+        plan: crate::scripts::session::WindowPlan,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let pristine = self.is_pristine(cx);
+        let mut ids: Vec<(usize, TabId)> = Vec::new();
+        for restored in plan.tabs {
+            if self.tab_of_script(&restored.script.path, cx).is_some() {
+                continue;
+            }
+            let title = restored.script.path.file_name();
+            let id = self.create_tab_with(title, None, window, cx);
+            if let Some(editor) = self.tabs.get(&id).cloned() {
+                let script = restored.script;
+                editor.update(cx, |e, cx| {
+                    e.editor().update(cx, |ed, cx| {
+                        ed.load_script(&script.text, script.path.clone(), window, cx);
+                        ed.set_cursor_line_column(restored.cursor.0, restored.cursor.1, cx);
+                        ed.set_scroll_line(restored.scroll_line, cx);
+                    });
+                    e.set_linked(restored.connection, cx);
+                });
+            }
+            ids.push((restored.index, id));
+        }
+        if ids.is_empty() {
+            return;
+        }
+        if pristine {
+            let old: Vec<TabId> = self.layout.all_tabs();
+            let placed = self.layout.restore(&plan.layout, |i| {
+                ids.iter().find(|(ix, _)| *ix == i).map(|(_, id)| *id)
+            });
+            for (_, id) in &ids {
+                if !placed.contains(id) {
+                    self.layout.open_tab(*id);
+                }
+            }
+            for tab in old {
+                self.tabs.remove(&tab);
+                self.tab_subscriptions.remove(&tab);
+            }
+            self.navigator_visible = plan.navigator_visible;
+        } else {
+            for (_, id) in &ids {
+                self.layout.open_tab(*id);
+            }
+        }
+        self.after_change(window, cx);
+    }
+}
+
 fn collect_first(node: &Node, out: &mut Vec<PaneId>) {
     match node {
         Node::Pane(p) => out.push(*p),
@@ -2682,6 +3278,40 @@ impl Render for Workspace {
             GenerateDeleteSql,
             ShowObjectDdl,
             CopyObjectDdl,
+        );
+        // A second list: the macro builds one long expression per list.
+        let root = on!(
+            root,
+            cx,
+            FormatSql,
+            InsertSnippet,
+            ExportResults,
+            ExportTable,
+            ImportCsv,
+            OpenTableData,
+            EditCell,
+            SetCellNull,
+            InsertRow,
+            DuplicateRow,
+            DeleteRows,
+            RevertRowChanges,
+            DiscardChanges,
+            PreviewChanges,
+            SaveChanges,
+            FilterTableRows,
+            FilterTableBySelectedValue,
+            SortTableAscending,
+            SortTableDescending,
+            ClearTableFilter,
+            RefreshTableData,
+            OpenReferencedRows,
+            OpenReferencingRows,
+            ExportToDbeaver,
+            NewScript,
+            OpenScript,
+            SaveScript,
+            SaveScriptAs,
+            ConnectScriptConnection,
         );
         let content = root
             .when(client_decorated, |el| {
