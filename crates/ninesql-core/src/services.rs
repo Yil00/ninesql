@@ -171,8 +171,9 @@ pub struct LockWatcherStatus {
     /// This build has the watcher (feature `desktop-lock`).
     pub built: bool,
     /// The watcher listens now. `false` when it was not started or could not start (`error`),
-    /// and while it has lost the system bus or logind (it then locked once and reconnects or
-    /// waits for logind on its own: read it again, it turns `true` when the watcher is back).
+    /// while it has lost the system bus or logind (it then locked once and reconnects or
+    /// waits for logind on its own: read it again, it turns `true` when the watcher is back),
+    /// and while the session's screen lock, watched before, is not any more (only sleep is).
     pub is_running: bool,
     /// A logind sleep delay inhibitor is held: the suspend waits until the secrets are locked.
     pub holds_sleep_delay: bool,
@@ -182,11 +183,17 @@ pub struct LockWatcherStatus {
     pub error: Option<String>,
 }
 
-/// Why a started watcher does not watch now, without any secret (`None` while it watches).
-/// The watcher reconnects and waits for logind on its own, so the problem clears by itself.
+/// Why a started watcher does not watch (fully) now, without any secret (`None` while it
+/// watches). The watcher reconnects and waits for logind on its own, so the problem clears by
+/// itself. `session_lock_lost`: the session's screen lock was watched before and is not any
+/// more (security review M1), reported even while sleep is watched.
 #[cfg(feature = "desktop-lock")]
-fn watcher_state_problem(state: WatcherState) -> Option<String> {
+fn watcher_state_problem(state: WatcherState, session_lock_lost: bool) -> Option<String> {
     match state {
+        WatcherState::Watching if session_lock_lost => Some(
+            "the screen lock is no longer watched (the session was not found again); only sleep locks the secrets"
+                .to_owned(),
+        ),
         WatcherState::Watching => None,
         WatcherState::Reconnecting => {
             Some("the system bus connection was lost; secrets were locked; reconnecting".to_owned())
@@ -935,12 +942,13 @@ impl CoreServices {
                 Some(w) => {
                     // Read once: the watcher changes state on its own thread.
                     let state = w.state();
+                    let error = watcher_state_problem(state, w.session_lock_lost());
                     LockWatcherStatus {
                         built: true,
-                        is_running: state == WatcherState::Watching,
+                        is_running: error.is_none(),
                         holds_sleep_delay: w.holds_sleep_delay(),
                         watches_session_lock: w.watches_session_lock(),
-                        error: watcher_state_problem(state),
+                        error,
                     }
                 }
                 None => LockWatcherStatus {
@@ -1102,16 +1110,21 @@ mod tests {
     #[cfg(feature = "desktop-lock")]
     #[test]
     fn the_watcher_problem_follows_its_state() {
-        assert_eq!(watcher_state_problem(WatcherState::Watching), None);
+        assert_eq!(watcher_state_problem(WatcherState::Watching, false), None);
+        assert!(
+            watcher_state_problem(WatcherState::Watching, true)
+                .unwrap()
+                .contains("screen lock")
+        );
         for s in [
             WatcherState::Reconnecting,
             WatcherState::LogindAbsent,
             WatcherState::Stopped,
         ] {
-            assert!(watcher_state_problem(s).is_some(), "{s:?}");
+            assert!(watcher_state_problem(s, false).is_some(), "{s:?}");
         }
         assert!(
-            watcher_state_problem(WatcherState::Reconnecting)
+            watcher_state_problem(WatcherState::Reconnecting, false)
                 .unwrap()
                 .contains("reconnecting")
         );

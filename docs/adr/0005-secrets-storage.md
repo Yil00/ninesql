@@ -1,6 +1,6 @@
 # ADR-0005: Secrets storage
 
-- **Status**: Accepted. Partially superseded by [ADR-0012](0012-secret-service-client-and-msrv.md) for the client crate (`secret-service` 6 instead of `keyring`) and the Secret Service item attributes; everything else stands. Note (P1-D, 2026-11-14): the vault of §2 is implemented as format v1; its bounds and known limits are documented in the rustdoc of `ninesql_secrets::vault` and in [docs/05](../05-security.md#vault-format-v1). Amended (P1-D wiring, 2026-11-15) by the [section at the end](#amendment-p1-d-wiring-2026-11-15): locking on sleep and screen lock in default builds, and the Flatpak permissions it needs; the decision above is unchanged.
+- **Status**: Accepted. Partially superseded by [ADR-0012](0012-secret-service-client-and-msrv.md) for the client crate (`secret-service` 6 instead of `keyring`) and the Secret Service item attributes; everything else stands. Note (P1-D, 2026-11-14): the vault of §2 is implemented as format v1; its bounds and known limits are documented in the rustdoc of `ninesql_secrets::vault` and in [docs/05](../05-security.md#vault-format-v1). Amended (P1-D wiring, 2026-11-15) by the [section](#amendment-p1-d-wiring-2026-11-15) below: locking on sleep and screen lock in default builds, and the Flatpak permissions it needs; the decision above is unchanged. A further amendment, [lock watcher reconnect (2026-11-18)](#amendment-lock-watcher-reconnect-2026-11-18), is **Proposed**: it changes point 4 of the P1-D wiring amendment.
 - **Date**: 2026-11-14
 
 ## Context
@@ -41,10 +41,32 @@ Approved by the maintainer. It adds to the decision above and changes none of it
 - Default builds lock secrets on sleep and screen lock without enabling the Secret Service backend, which is not validated yet (ADR-0012).
 - Default builds open a system-bus connection to logind. That is local D-Bus traffic, not network traffic, so I2 is unaffected.
 - On a system without logind, or in a Flatpak without the logind permission, only the idle lock and the explicit `CoreServices::lock_now` apply. The UI can tell from `lock_watcher_status`.
-- A watcher that lost the bus is not restarted until the next start of the application (ROADMAP follow-up).
-
-*Note (2026-11-18, Phase 1 follow-up "Wave 3 (secrets)").* This changes the last sentence of point 4 and the last consequence above; the rest of the amendment stands. A watcher that loses the system-bus connection still locks once at once (fail-closed), then reconnects on its own instead of stopping: a bounded exponential back-off of 1 s doubling to 60 s (reset only after a connection that stayed up 60 s, so a flapping bus is not retried every second; each attempt bounded by the 5 s setup timeout), and on success it subscribes again to `PrepareForSleep`, `Lock`, the `LockedHint` changes and `NameOwnerChanged`, and takes the delay inhibitor again. Back on the bus it locks at once when the session's `LockedHint` is already true, or when the machine was suspended during the outage (`CLOCK_BOOTTIME` ahead of `CLOCK_MONOTONIC` by more than 2 s beyond what it was at the loss), since those events were not seen. When logind (rather than the bus) leaves, the watcher now also locks once and waits for a new owner, then reads `LockedHint` the same way. On the bus it still talks only to logind (now also reading the session's `LockedHint` with `Properties.Get`) and to the bus daemon. `lock_watcher_status` reports the state live, so the UI's problem entry clears when the watcher is back. Only a bus lost after a successful start is retried: a watcher that could not start is not (point 5 unchanged). A screen lock followed by an unlock while the bus is away is not seen.
+- A watcher that lost the bus is not restarted until the next start of the application (ROADMAP follow-up). Changed by the proposed [lock watcher reconnect amendment](#amendment-lock-watcher-reconnect-2026-11-18).
 
 **Rejected alternatives.**
 - **Keep the watcher behind `secret-service`**: default builds would get no sleep or screen-lock locking until the Secret Service backend is validated.
 - **Make `secret-service` default-on to get the watcher**: contradicts ADR-0012, which keeps the release-candidate client off until the desktop round trip and the stable 6.x.
+
+## Amendment (lock watcher reconnect, 2026-11-18)
+**Status: Proposed** (to be accepted by the maintainer). It changes point 4 of the [P1-D wiring amendment](#amendment-p1-d-wiring-2026-11-15) ("When it loses the bus connection, it locks once and stops (fail-closed). It is not restarted.", and the list of bus calls) and its last consequence; points 1 to 3, 5 and 6 are unchanged. Raised by the Phase 1 follow-up "Wave 3 (secrets)" and its security review. Behaviour as implemented: `crates/ninesql-secrets/src/lock_signals.rs` (`supervise`, `BusLink::watch_signals`, `RECONNECT_FIRST`, `RECONNECT_MAX`, `WatcherState`), `CoreServices::lock_watcher_status`, [docs/02](../02-architecture.md#secrets-adr-0005-p1-d) and [docs/05](../05-security.md#vault-format-v1).
+
+**Context.** A watcher that lost the system bus locked once and stopped for the rest of the session, leaving only the idle lock even after the bus came back (a `dbus-broker` / `dbus-daemon` restart). A logind that left the bus was waited for, but nothing was locked meanwhile, and events missed during either outage were never looked for.
+
+**Decision.**
+1. **Reconnect.** When the bus connection is lost, the watcher still locks once at once (`LockTrigger::Requested`), then reconnects with a bounded exponential back-off: 1 s doubling to 60 s, reset only after a connection that stayed up 60 s, each attempt bounded by the 5 s setup timeout (values and reasons in [docs/02](../02-architecture.md#secrets-adr-0005-p1-d) and [docs/05](../05-security.md#vault-format-v1)). On success it subscribes again to `NameOwnerChanged`, `PrepareForSleep`, the session's `Lock` and its `LockedHint` changes, and takes the sleep delay inhibitor again. The session found before is kept when the lookup fails on a redial, and looked up again (subscribing to the new path) once logind answers.
+2. **logind leaving the bus** locks once (`Requested`); nothing is watched until a new owner appears.
+3. **Missed screen lock.** After a bus outage, and when logind returns, the session's `LockedHint` is read; `true` locks at once. A read that fails or times out (5 s method timeout) is taken as locked (fail-closed).
+4. **Missed suspend.** `CLOCK_BOOTTIME` minus `CLOCK_MONOTONIC` (time suspended since boot) is recorded when the bus or logind goes away; if it grew by more than 2 s when it is back, a suspend was missed and the secrets are locked (`LockTrigger::Sleep`). A suspend shorter than the 2 s slack is not seen.
+5. **Bus calls.** Besides the calls of point 4 of the P1-D wiring amendment, the watcher reads the session's `LockedHint` with `org.freedesktop.DBus.Properties.Get` on logind, and repeats the session lookup after logind returns. It still talks only to `org.freedesktop.login1` and to the bus daemon.
+6. **State.** `DesktopLockWatcher::state()` (`Watching`, `LogindAbsent`, `Reconnecting`, `Stopped`) and `session_lock_lost()` are reported live by `CoreServices::lock_watcher_status`, so the UI's problem entry appears while the watcher does not watch fully and clears when it is back. Every wait of the watcher runs on one timer thread started with it.
+
+**Consequences.**
+- The secrets are locked on every bus or logind outage, including a logind restart during a package upgrade: the user unlocks the vault again.
+- While the bus or logind is away, sleep and screen lock are not watched (the idle lock still applies). A screen lock followed by an unlock within the outage is not seen.
+- A watcher that could not start at all (no system bus, or no permission, point 5 of the P1-D wiring amendment) is not retried.
+- At most one connection attempt a minute while the bus stays away.
+
+**Rejected alternatives.**
+- **Stop after the first loss** (the previous behaviour): leaves default builds without sleep and screen-lock locking for the rest of the session after a transient bus restart.
+- **A fixed retry interval**: too short loads the bus daemon while it is down, too long leaves a returned bus unnoticed.
+- **Treat an unreadable `LockedHint` as unlocked**: fails open on exactly the case the check is for.
