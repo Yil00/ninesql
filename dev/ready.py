@@ -135,6 +135,20 @@ def check() -> int:
                 errors.append(f"{seed}: profiles must match its engine's")
             elif seed_svc.get("ports"):
                 errors.append(f"{seed}: a seed service must not publish ports")
+        # A one-shot service that makes test-only TLS certificates for an image without
+        # openssl: the engine waits for it (depends_on), so `up` starts it with its engine.
+        tls_service = (e.get("tls") or {}).get("service")
+        if tls_service:
+            referenced.add(tls_service)
+            tls_svc = services.get(tls_service)
+            if tls_svc is None:
+                errors.append(f"{eid}: TLS service {tls_service!r} missing from compose.yaml")
+            elif set(tls_svc.get("profiles", [])) != expected_profiles:
+                errors.append(f"{tls_service}: profiles must match its engine's")
+            elif tls_svc.get("ports"):
+                errors.append(f"{tls_service}: a TLS service must not publish ports")
+            elif (svc.get("depends_on") or {}).get(tls_service, {}).get("condition") != "service_completed_successfully":
+                errors.append(f"{eid}: must depend on {tls_service} with condition service_completed_successfully")
 
     for name in services:
         if name not in referenced:

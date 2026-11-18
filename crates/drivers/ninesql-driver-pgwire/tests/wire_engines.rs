@@ -519,6 +519,137 @@ async fn cancel_timeout_and_drop_stop_statements() {
     }
 }
 
+// ---------------------------------------------------------------------------------------------
+// TLS (ADR-0011, P4 review L1)
+// ---------------------------------------------------------------------------------------------
+
+/// The SQL that reads the CA of the engine's test-only TLS (`tls.ca_sql` in `engines.json`).
+fn tls_ca_sql(id: &str) -> Option<String> {
+    let doc = engines_json();
+    let e = doc["engines"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|e| e["id"] == id)
+        .unwrap()
+        .clone();
+    e["tls"]["ca_sql"].as_str().map(str::to_owned)
+}
+
+/// A self-signed CA certificate unrelated to the dev services (public material only, generated
+/// for this test; its key was discarded).
+const OTHER_CA: &str = "-----BEGIN CERTIFICATE-----
+MIIBrzCCAVWgAwIBAgIUUVfAdcCn/sfv3j7zyLALYhK+8zcwCgYIKoZIzj0EAwIw
+JDEiMCAGA1UEAwwZTmluZVNRTCB1bnJlbGF0ZWQgdGVzdCBDQTAgFw0yNjExMTgx
+OTQ4MDhaGA8yMTI2MTAyNTE5NDgwOFowJDEiMCAGA1UEAwwZTmluZVNRTCB1bnJl
+bGF0ZWQgdGVzdCBDQTBZMBMGByqGSM49AgEGCCqGSM49AwEHA0IABERFnVCBN3cP
+giws+kGS0tC5BaJQDVP8FgC/3O4lhs//w99ThHrFPc0UHcySfG2l5iwcL+/x05d6
+e2W1VflfOsWjYzBhMB0GA1UdDgQWBBT4H0JKbsWRnJ98i1oZInGecHDvZTAfBgNV
+HSMEGDAWgBT4H0JKbsWRnJ98i1oZInGecHDvZTAPBgNVHRMBAf8EBTADAQH/MA4G
+A1UdDwEB/wQEAwIBBjAKBggqhkjOPQQDAgNIADBFAiEA+4JYyD4RjAaSVOBRpxhe
+jVchMN7mzrRUyd8oeW8ZVHACIFO5Ikji6URqKjQeuuiqe1PqwEalrcjBNx6uTviq
+SJyO
+-----END CERTIFICATE-----
+";
+
+async fn on_tls(s: &mut dyn Session) -> Option<String> {
+    let c = run(
+        s,
+        "SELECT ssl::text FROM pg_stat_ssl WHERE pid = pg_backend_pid()",
+    )
+    .await
+    .unwrap();
+    scalar(&c)
+}
+
+/// `verify-full` against the dev service's throwaway CA succeeds; an untrusted issuer, a CA
+/// that did not sign the server certificate and a mismatched host name are refused. The
+/// PostgreSQL test `verify_full_rejects_untrusted_certificates` (tests/postgres.rs), on
+/// TimescaleDB and YugabyteDB, whose dev services have test-only TLS (docs/08).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn verify_full_against_the_dev_ca_and_refusals() {
+    let driver = PgWireDriver::new();
+    for dev in pg_engines() {
+        let id = dev.engine.as_str().to_owned();
+        let caps = driver.capabilities(&dev.engine, None).unwrap();
+        for mode in [
+            TlsMode::Disable,
+            TlsMode::Require,
+            TlsMode::VerifyCa,
+            TlsMode::VerifyFull,
+        ] {
+            assert!(caps.tls.contains(&mode), "{id}: {mode:?} not declared");
+        }
+        let ca_sql = tls_ca_sql(&id)
+            .unwrap_or_else(|| panic!("{id}: engines.json has no tls.ca_sql (dev/compose.yaml)"));
+        let mut s = connect(params(&dev)).await;
+        let ca = scalar(&run(s.as_mut(), &ca_sql).await.unwrap()).unwrap();
+        assert!(ca.contains("BEGIN CERTIFICATE"), "{id}");
+        assert_eq!(on_tls(s.as_mut()).await.as_deref(), Some("false"), "{id}");
+        s.close().await.unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let ca_path = dir.path().join("ca.pem");
+        std::fs::write(&ca_path, ca).unwrap();
+        let make = || {
+            let mut p = params(&dev);
+            p.tls.mode = TlsMode::VerifyFull;
+            p
+        };
+        // The positive control with the trusted CA; no CA (untrusted issuer) refused by
+        // `verify-ca` and `verify-full`; a wrong host name refused by `verify-full` only.
+        conformance::assert_verify_full_rejects_untrusted_certificate(
+            &driver,
+            &make,
+            &ca_path,
+            "wrong.example.test",
+        )
+        .await;
+        // A CA that did not sign the server certificate.
+        let other = dir.path().join("other-ca.pem");
+        std::fs::write(&other, OTHER_CA).unwrap();
+        for mode in [TlsMode::VerifyCa, TlsMode::VerifyFull] {
+            let mut p = make();
+            p.tls.mode = mode;
+            p.tls.ca_file = Some(other.clone());
+            match driver.connect(p).await {
+                Err(DriverError::Tls(m)) => assert!(!m.contains(&dev.password), "{id}: {m}"),
+                other => panic!(
+                    "{id}: {mode:?} accepted a wrong CA: {:?}",
+                    other.map(|_| ())
+                ),
+            }
+        }
+        // `require` encrypts without verification; the session really is on TLS.
+        let mut p = params(&dev);
+        p.tls.mode = TlsMode::Require;
+        let mut s = driver.connect(p).await.unwrap();
+        assert_eq!(on_tls(s.as_mut()).await.as_deref(), Some("true"), "{id}");
+        s.close().await.unwrap();
+        // A tunnel-style endpoint: connect to 127.0.0.1, verify the name "localhost". The
+        // session is on TLS, and cancel requests travel over TLS as well.
+        let mut p = make();
+        p.tls.ca_file = Some(ca_path.clone());
+        p.tls.server_name = Some("localhost".into());
+        let mut s = driver.connect(p).await.unwrap();
+        assert_eq!(on_tls(s.as_mut()).await.as_deref(), Some("true"), "{id}");
+        let started = std::time::Instant::now();
+        let outcome = run_opts(
+            s.as_mut(),
+            "SELECT pg_sleep(30)",
+            ExecOptions::default().with_timeout(Some(Duration::from_millis(500))),
+        )
+        .await;
+        assert!(
+            matches!(outcome, Err(DriverError::Timeout(_))),
+            "{id}: {:?}",
+            outcome.map(|_| ())
+        );
+        assert!(started.elapsed() < Duration::from_secs(10), "{id}");
+        run_when_idle(s.as_mut(), "SELECT 1").await.unwrap();
+        s.close().await.unwrap();
+    }
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn transactions_follow_the_declared_capabilities() {
     if let Some(dev) = dev("yugabytedb") {

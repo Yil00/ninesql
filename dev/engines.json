@@ -155,6 +155,15 @@
       "readiness": {
         "healthcheck": true,
         "seed_service": null
+      },
+      "tls": {
+        "$comment": "Test-only TLS (dev/tls/generate-certs.sh, run by the one-shot service below because the image has no openssl; dev/tls/timescaledb-tls.sh turns it on): certificate for these names, signed by a CA generated at first start; read the CA (public) with ca_sql.",
+        "service": "timescaledb-tls",
+        "server_names": [
+          "localhost",
+          "127.0.0.1"
+        ],
+        "ca_sql": "SELECT pg_read_file('/ninesql-tls/ca.crt')"
       }
     },
     {
@@ -176,6 +185,14 @@
       "readiness": {
         "healthcheck": true,
         "seed_service": "yugabytedb-seed"
+      },
+      "tls": {
+        "$comment": "Test-only TLS (dev/tls/generate-certs.sh, run by the service's start command): certificate for these names, signed by a CA generated in the container at first start; read the CA (public) with ca_sql.",
+        "server_names": [
+          "localhost",
+          "127.0.0.1"
+        ],
+        "ca_sql": "SELECT pg_read_file('/home/yugabyte/var/ninesql-tls/ca.crt')"
       }
     },
     {
