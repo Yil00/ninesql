@@ -2181,16 +2181,58 @@ impl Workspace {
             Self::notify("Select a table or a view in the navigator.", window, cx);
             return None;
         }
-        let hub = self.hub.read(cx);
-        let Some(session) = hub.sessions(connection).first().cloned() else {
+        let Some(session) = self.transfer_session(connection, cx) else {
             Self::notify("Connect first.", window, cx);
             return None;
         };
+        let hub = self.hub.read(cx);
         let Some(transfer) = hub.transfer() else {
             Self::notify("The driver runtime is not running.", window, cx);
             return None;
         };
         Some((connection, path, session, transfer))
+    }
+
+    /// The open session of `connection` an "Export table…" or "Import CSV…" leases
+    /// ([`pick_transfer_session`]): the active editor's session when it is on that connection
+    /// and free, else the newest free session other than the oldest one (the metadata service
+    /// binds the oldest, so a long transfer there would stop every navigator load), else the
+    /// oldest when free. When every session is busy, the active editor's (or the newest) is
+    /// returned and the dialog says why it cannot start. A session is busy when it is closed,
+    /// leased, or an editor tab of this window has a run on it (a paused, paged result
+    /// included). Opening a dedicated session is not done: it goes through the interactive
+    /// connect flow (secrets, init SQL and host-key confirmations).
+    #[must_use]
+    pub fn transfer_session(
+        &self,
+        connection: ConnectionId,
+        cx: &App,
+    ) -> Option<ninesql_core::SessionHandle> {
+        let sessions = self.hub.read(cx).sessions(connection);
+        let running: Vec<ninesql_core::SessionId> = self
+            .tabs
+            .values()
+            .filter_map(|t| {
+                let t = t.read(cx);
+                if !t.is_running() {
+                    return None;
+                }
+                t.run_session().or(t.session()).map(|s| s.id())
+            })
+            .collect();
+        let active = self
+            .active_editor()
+            .and_then(|t| t.read(cx).session().map(|s| s.id()));
+        let ids: Vec<ninesql_core::SessionId> = sessions.iter().map(|s| s.id()).collect();
+        let busy = |id: ninesql_core::SessionId| {
+            running.contains(&id)
+                || sessions
+                    .iter()
+                    .find(|s| s.id() == id)
+                    .is_none_or(|s| s.is_closed() || s.is_leased())
+        };
+        let id = pick_transfer_session(&ids, active, busy)?;
+        sessions.iter().find(|s| s.id() == id).cloned()
     }
 
     /// "Export table…" on the navigator's table.
@@ -2682,5 +2724,67 @@ impl Render for Workspace {
         } else {
             content.into_any_element()
         }
+    }
+}
+
+/// Which of a connection's open sessions (`sessions`, oldest first) a navigator transfer
+/// leases: `active` (the active editor's session) when it is one of them and not `busy`; else
+/// the newest free session other than the oldest (which the metadata service binds); else the
+/// oldest when free; else `active` when it is one of them, or the newest (the dialog then says
+/// the session is busy). `None` when there is no session.
+pub fn pick_transfer_session<T: Copy + PartialEq>(
+    sessions: &[T],
+    active: Option<T>,
+    busy: impl Fn(T) -> bool,
+) -> Option<T> {
+    let active = active.filter(|a| sessions.contains(a));
+    if let Some(a) = active.filter(|a| !busy(*a)) {
+        return Some(a);
+    }
+    if let Some(s) = sessions.iter().skip(1).rev().find(|s| !busy(**s)) {
+        return Some(*s);
+    }
+    if let Some(s) = sessions.first().filter(|s| !busy(**s)) {
+        return Some(*s);
+    }
+    active.or_else(|| sessions.last().copied())
+}
+
+#[cfg(test)]
+mod transfer_session_tests {
+    use super::pick_transfer_session;
+
+    #[test]
+    fn active_editor_session_first_then_not_the_metadata_one() {
+        let free = |_: u32| false;
+        // The active editor's session, even the oldest, when free.
+        assert_eq!(pick_transfer_session(&[1, 2, 3], Some(1), free), Some(1));
+        assert_eq!(pick_transfer_session(&[1, 2, 3], Some(2), free), Some(2));
+        // An active editor on another connection does not count: newest, not the oldest.
+        assert_eq!(pick_transfer_session(&[1, 2, 3], Some(9), free), Some(3));
+        assert_eq!(pick_transfer_session(&[1, 2, 3], None, free), Some(3));
+        // One session only: that one.
+        assert_eq!(pick_transfer_session(&[1], None, free), Some(1));
+        assert_eq!(pick_transfer_session::<u32>(&[], Some(1), free), None);
+    }
+
+    #[test]
+    fn busy_sessions_are_skipped_and_the_last_resort_is_reported_busy() {
+        // The active editor pages a result on 2: the other non-metadata session.
+        assert_eq!(
+            pick_transfer_session(&[1, 2, 3], Some(2), |s| s == 2),
+            Some(3)
+        );
+        // Every session but the oldest busy: the oldest.
+        assert_eq!(
+            pick_transfer_session(&[1, 2, 3], Some(2), |s| s != 1),
+            Some(1)
+        );
+        // All busy: the active editor's, so the dialog says why.
+        assert_eq!(
+            pick_transfer_session(&[1, 2, 3], Some(2), |_| true),
+            Some(2)
+        );
+        assert_eq!(pick_transfer_session(&[1, 2, 3], None, |_| true), Some(3));
     }
 }

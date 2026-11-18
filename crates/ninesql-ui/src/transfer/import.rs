@@ -65,6 +65,9 @@ pub struct ImportCsvDialog {
     /// `mapping[target] = Some(file field)`.
     mapping: Vec<Option<usize>>,
     transaction: ImportTransaction,
+    /// The commit mode of the last import started (the summary's wording follows it, not the
+    /// option shown now).
+    ran_with: ImportTransaction,
     skip_invalid: bool,
     stage: ImportStage,
     /// The statement of the confirmation, laid out once ([`ScriptRows`]).
@@ -94,6 +97,7 @@ impl ImportCsvDialog {
             preview: None,
             mapping,
             transaction: ImportTransaction::AllOrNothing,
+            ran_with: ImportTransaction::AllOrNothing,
             skip_invalid: false,
             stage: ImportStage::ChooseFile,
             confirm_script: None,
@@ -326,6 +330,7 @@ impl ImportCsvDialog {
             cx.notify();
             return;
         }
+        self.ran_with = self.transaction;
         // Never blocks: the core runs the import on the driver runtime.
         let mut job = self.transfer.import_csv(&self.session, request);
         self.stage = ImportStage::Running {
@@ -396,7 +401,9 @@ impl ImportCsvDialog {
             ImportStage::Running { .. } | ImportStage::Previewing
         ) {
             self.tasks.clear();
-            self.stage = ImportStage::Failed(match self.transaction {
+            let running = matches!(self.stage, ImportStage::Running { .. });
+            self.stage = ImportStage::Failed(match self.ran_with {
+                _ if !running => "Cancelled: the preview was stopped.".into(),
                 ImportTransaction::AllOrNothing => {
                     "Cancelled: the import's transaction is rolled back.".into()
                 }
@@ -446,10 +453,67 @@ impl ImportCsvDialog {
             .flatten()
     }
 
-    /// The summary lines of a finished import.
+    /// The commit mode of the last import started (what its summary describes).
     #[must_use]
-    pub fn summary_lines(s: &ImportSummary) -> Vec<String> {
-        let end = match s.end {
+    pub fn ran_with(&self) -> ImportTransaction {
+        self.ran_with
+    }
+
+    /// The summary lines of a finished import run in commit mode `mode`.
+    #[must_use]
+    pub fn summary_lines(s: &ImportSummary, mode: ImportTransaction) -> Vec<String> {
+        let mut lines = SummaryFacts::of(s).lines(mode);
+        if s.issues_total > 0 {
+            lines.push(format!("{} issue(s):", s.issues_total));
+            lines.extend(s.issues.iter().take(50).map(|i| i.describe()));
+        }
+        lines
+    }
+}
+
+/// What the summary of an import says, apart from its issues ([`ImportCsvDialog::summary_lines`]).
+#[derive(Debug, Clone, PartialEq)]
+pub struct SummaryFacts {
+    /// How it ended.
+    pub end: ImportEnd,
+    /// The error's text, if one stopped it.
+    pub error: Option<String>,
+    /// Data rows read.
+    pub rows_read: u64,
+    /// Rows the database accepted.
+    pub rows_inserted: u64,
+    /// Rows committed and kept.
+    pub rows_committed: u64,
+    /// Invalid rows skipped.
+    pub rows_skipped: u64,
+    /// The engine ran the import in transactions.
+    pub transactional: bool,
+    /// Wall-clock seconds.
+    pub elapsed_secs: f64,
+}
+
+impl SummaryFacts {
+    /// The facts of a core summary.
+    #[must_use]
+    pub fn of(s: &ImportSummary) -> Self {
+        Self {
+            end: s.end,
+            error: s.error.as_ref().map(error_text),
+            rows_read: s.rows_read,
+            rows_inserted: s.rows_inserted,
+            rows_committed: s.rows_committed,
+            rows_skipped: s.rows_skipped,
+            transactional: s.transactional,
+            elapsed_secs: s.elapsed.as_secs_f64(),
+        }
+    }
+
+    /// The lines, worded from the commit mode the user chose (`mode`): what was committed is
+    /// said first, so a "commit every N rows" import that stopped never reads as rolled back
+    /// entirely. Matches docs/tutorials/export-import.md §5 step 7.
+    #[must_use]
+    pub fn lines(&self, mode: ImportTransaction) -> Vec<String> {
+        let end = match self.end {
             ImportEnd::Completed => "Import completed",
             ImportEnd::Cancelled => "Import cancelled",
             ImportEnd::Failed => "Import failed",
@@ -457,26 +521,37 @@ impl ImportCsvDialog {
         };
         let mut lines = vec![format!(
             "{end}: {} rows read, {} inserted, {} committed, {} skipped, in {:.1} s.",
-            s.rows_read,
-            s.rows_inserted,
-            s.rows_committed,
-            s.rows_skipped,
-            s.elapsed.as_secs_f64()
+            self.rows_read,
+            self.rows_inserted,
+            self.rows_committed,
+            self.rows_skipped,
+            self.elapsed_secs
         )];
-        if let Some(e) = &s.error {
-            lines.push(error_text(e));
+        if let Some(e) = &self.error {
+            lines.push(e.clone());
         }
-        if s.end != ImportEnd::Completed && s.transactional {
-            lines.push("The transaction was rolled back: nothing was written.".into());
-        } else if s.end != ImportEnd::Completed && s.rows_committed > 0 {
+        if self.end == ImportEnd::Completed {
+            return lines;
+        }
+        // Rows inserted after the last commit, rolled back with the open batch.
+        let uncommitted = self.rows_inserted.saturating_sub(self.rows_committed);
+        if self.rows_committed > 0 {
             lines.push(format!(
                 "{} rows were committed before the end and stay in the table.",
-                s.rows_committed
+                self.rows_committed
             ));
-        }
-        if s.issues_total > 0 {
-            lines.push(format!("{} issue(s):", s.issues_total));
-            lines.extend(s.issues.iter().take(50).map(|i| i.describe()));
+            if self.transactional && uncommitted > 0 {
+                lines.push(format!(
+                    "The {uncommitted} rows inserted after the last commit were rolled back."
+                ));
+            }
+        } else {
+            lines.push(match mode {
+                ImportTransaction::AllOrNothing => {
+                    "The transaction was rolled back: nothing was written.".into()
+                }
+                _ => "No rows were committed before the end: nothing was written.".into(),
+            });
         }
         lines
     }
@@ -670,9 +745,11 @@ impl Render for ImportCsvDialog {
                 bytes_text(*bytes),
                 bytes_text(*file_bytes)
             )),
-            ImportStage::Done(s) => {
-                body.children(Self::summary_lines(s).into_iter().map(|l| div().child(l)))
-            }
+            ImportStage::Done(s) => body.children(
+                Self::summary_lines(s, self.ran_with)
+                    .into_iter()
+                    .map(|l| div().child(l)),
+            ),
             ImportStage::Failed(why) => {
                 body.child(div().text_color(theme.danger).child(why.clone()))
             }
@@ -758,4 +835,98 @@ pub fn targets_from(items: &[ninesql_core::driver_api::metadata::ObjectInfo]) ->
         .collect();
     cols.sort_by_key(|(o, _)| *o);
     cols.into_iter().map(|(_, c)| c).collect()
+}
+
+#[cfg(test)]
+mod summary_tests {
+    use ninesql_core::{ImportEnd, ImportTransaction};
+
+    use super::{COMMIT_EVERY_ROWS, SummaryFacts};
+
+    fn facts(end: ImportEnd, inserted: u64, committed: u64) -> SummaryFacts {
+        SummaryFacts {
+            end,
+            error: (end == ImportEnd::Failed).then(|| "line 5501: not a number".into()),
+            rows_read: inserted + u64::from(end != ImportEnd::Completed),
+            rows_inserted: inserted,
+            rows_committed: committed,
+            rows_skipped: 0,
+            // PostgreSQL, MySQL and SQLite: transactional whatever the mode.
+            transactional: true,
+            elapsed_secs: 1.2,
+        }
+    }
+
+    const EVERY: ImportTransaction = ImportTransaction::CommitEvery(COMMIT_EVERY_ROWS);
+    const ROLLED_BACK: &str = "The transaction was rolled back: nothing was written.";
+
+    #[test]
+    fn success_says_only_the_counts_in_both_modes() {
+        for mode in [ImportTransaction::AllOrNothing, EVERY] {
+            assert_eq!(
+                facts(ImportEnd::Completed, 7000, 7000).lines(mode),
+                vec![
+                    "Import completed: 7000 rows read, 7000 inserted, 7000 committed, 0 skipped, in 1.2 s."
+                ]
+            );
+        }
+    }
+
+    #[test]
+    fn commit_every_failure_after_commits_never_says_rolled_back_entirely() {
+        let lines = facts(ImportEnd::Failed, 5500, 5000).lines(EVERY);
+        assert_eq!(
+            lines,
+            vec![
+                "Import failed: 5501 rows read, 5500 inserted, 5000 committed, 0 skipped, in 1.2 s.",
+                "line 5501: not a number",
+                "5000 rows were committed before the end and stay in the table.",
+                "The 500 rows inserted after the last commit were rolled back.",
+            ]
+        );
+        assert!(!lines.iter().any(|l| l == ROLLED_BACK));
+        // Cancelled the same way.
+        let lines = facts(ImportEnd::Cancelled, 2000, 2000).lines(EVERY);
+        assert_eq!(
+            lines.last().map(String::as_str),
+            Some("2000 rows were committed before the end and stay in the table.")
+        );
+    }
+
+    #[test]
+    fn commit_every_failure_before_any_commit() {
+        let lines = facts(ImportEnd::Failed, 600, 0).lines(EVERY);
+        assert_eq!(
+            lines.last().map(String::as_str),
+            Some("No rows were committed before the end: nothing was written.")
+        );
+        assert!(!lines.iter().any(|l| l == ROLLED_BACK));
+    }
+
+    #[test]
+    fn all_or_nothing_failure_rolls_everything_back() {
+        let lines = facts(ImportEnd::Failed, 5500, 0).lines(ImportTransaction::AllOrNothing);
+        assert_eq!(lines.last().map(String::as_str), Some(ROLLED_BACK));
+        assert_eq!(lines.len(), 3);
+        let lines = facts(ImportEnd::Cancelled, 10, 0).lines(ImportTransaction::AllOrNothing);
+        assert_eq!(
+            lines,
+            vec![
+                "Import cancelled: 11 rows read, 10 inserted, 0 committed, 0 skipped, in 1.2 s."
+                    .to_owned(),
+                ROLLED_BACK.to_owned(),
+            ]
+        );
+    }
+
+    #[test]
+    fn non_transactional_engine_keeps_every_inserted_row() {
+        let mut f = facts(ImportEnd::Failed, 300, 300);
+        f.transactional = false;
+        let lines = f.lines(EVERY);
+        assert_eq!(
+            lines.last().map(String::as_str),
+            Some("300 rows were committed before the end and stay in the table.")
+        );
+    }
 }

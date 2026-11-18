@@ -244,6 +244,43 @@ fn copy_through_key_bindings(cx: &mut TestAppContext) {
 }
 
 #[gpui::test]
+fn ctrl_c_copies_have_the_formula_guard(cx: &mut TestAppContext) {
+    use ninesql_core::driver_api::arrow_array::StringArray;
+    let (view, _, mut vcx) = open(cx, small_budget());
+    let s = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int64, true),
+        Field::new("name", DataType::Utf8, true),
+    ]));
+    let rows = RecordBatch::try_new(
+        s.clone(),
+        vec![
+            Arc::new(Int64Array::from(vec![-1, 2])),
+            Arc::new(StringArray::from(vec!["=HYPERLINK(\"x\")", "+1"])),
+        ],
+    )
+    .unwrap();
+    send(
+        &view,
+        &mut vcx,
+        vec![
+            ExecutionEvent::Started,
+            item(0, ResultItem::ResultSet(ResultSetHeader::tabular(0, s))),
+            item(0, ResultItem::Rows(rows)),
+        ],
+    );
+    select_cell(&view, &mut vcx, 0, 1);
+    vcx.simulate_keystrokes("ctrl-c");
+    assert_eq!(clipboard(&vcx), "\"'=HYPERLINK(\"\"x\"\")\"");
+    vcx.simulate_keystrokes("ctrl-a ctrl-c");
+    assert_eq!(clipboard(&vcx), "-1\t\"'=HYPERLINK(\"\"x\"\")\"\n2\t'+1\n");
+    vcx.simulate_keystrokes("ctrl-shift-c");
+    assert_eq!(
+        clipboard(&vcx),
+        "id\tname\n-1\t\"'=HYPERLINK(\"\"x\"\")\"\n2\t'+1\n"
+    );
+}
+
+#[gpui::test]
 fn reordered_columns_copy_in_display_order(cx: &mut TestAppContext) {
     let (view, _, mut vcx) = open(cx, small_budget());
     send(
