@@ -3,8 +3,10 @@
 //! that rolls the whole save back, filtered and sorted table queries with bound values,
 //! foreign-key navigation, and the "SQL INSERT" export replayed into a copy of the table.
 //!
-//! PostgreSQL, MySQL and MariaDB need `python3 dev/ready.py up core`; they are skipped (not
-//! failed) when unreachable, unless `NINESQL_REQUIRE_ENGINES` lists them (AGENTS.md). SQLite
+//! Runs on PostgreSQL, YugabyteDB, MySQL, MariaDB and SQLite. PostgreSQL, MySQL and MariaDB
+//! need `python3 dev/ready.py up core`, YugabyteDB
+//! `python3 dev/ready.py up sql --engines yugabytedb`; they are skipped (not failed) when
+//! unreachable, unless `NINESQL_REQUIRE_ENGINES` lists them (AGENTS.md). SQLite
 //! always runs.
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::print_stderr)] // Tests may panic (AGENTS.md).
 
@@ -445,7 +447,8 @@ async fn scenario(
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
     let script = std::fs::read_to_string(&out).unwrap();
-    if engine == "postgresql" {
+    let pgwire = matches!(engine.as_str(), "postgresql" | "yugabytedb");
+    if pgwire {
         // The literals read the same in either lexical mode (security review H1 of P5-B): the
         // file is replayed with backslash escapes on.
         exec_ok(h, "SET standard_conforming_strings = off").await;
@@ -453,7 +456,7 @@ async fn scenario(
     for span in h.dialect().split_statements(&script) {
         exec_ok(h, &script[span.start..span.end]).await;
     }
-    if engine == "postgresql" {
+    if pgwire {
         exec_ok(h, "SET standard_conforming_strings = on").await;
     }
     let copied = query(
@@ -561,7 +564,7 @@ fn server_engine(engine: &str, driver: Arc<dyn Driver>) {
         for s in ddl(&n, "varchar(100)") {
             exec_ok(&h, &s).await;
         }
-        let schema = if engine == "postgresql" {
+        let schema = if matches!(engine, "postgresql" | "yugabytedb") {
             "public".to_owned()
         } else {
             dev.database.clone()
@@ -577,6 +580,14 @@ fn server_engine(engine: &str, driver: Arc<dyn Driver>) {
 fn postgresql_edit_filter_navigate_export() {
     server_engine(
         "postgresql",
+        Arc::new(ninesql_driver_pgwire::PgWireDriver::new()),
+    );
+}
+
+#[test]
+fn yugabytedb_edit_filter_navigate_export() {
+    server_engine(
+        "yugabytedb",
         Arc::new(ninesql_driver_pgwire::PgWireDriver::new()),
     );
 }

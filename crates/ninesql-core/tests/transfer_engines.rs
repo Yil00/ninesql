@@ -1,14 +1,14 @@
 //! Transfer service (P5-C) against real engines: the phase 5 exit criterion as far as the core
 //! goes. Exports the dev PostgreSQL `big_events` table (1 M rows of the "nine" dataset) to CSV
-//! in bounded memory, and imports a 100 000-line CSV into the dev PostgreSQL, the dev MySQL and
-//! a SQLite file.
+//! in bounded memory, and imports a 100 000-line CSV into the dev PostgreSQL, the dev MySQL, the
+//! dev MariaDB and a SQLite file. The same export and import run on the dev YugabyteDB.
 //!
 //! Also (P5-E): imports into a MyISAM table on MySQL and MariaDB ("All or nothing" refused, rows
 //! written reported as kept), and the export's read-only transaction on MySQL (used: a writing
 //! function is refused by the engine) and on TiDB (none: a warning, refused on strict types).
 //!
-//! PostgreSQL, MySQL and MariaDB need `python3 dev/ready.py up core`, TiDB
-//! `python3 dev/ready.py up sql --engines tidb`; they are skipped (not failed) when
+//! PostgreSQL, MySQL and MariaDB need `python3 dev/ready.py up core`, TiDB and YugabyteDB
+//! `python3 dev/ready.py up sql --engines tidb,yugabytedb`; they are skipped (not failed) when
 //! unreachable, unless `NINESQL_REQUIRE_ENGINES` lists them (AGENTS.md). SQLite always runs.
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::print_stderr)] // Tests may panic (AGENTS.md).
 
@@ -223,9 +223,28 @@ async fn import(
     assert!(!h.transaction_state().in_transaction);
 }
 
-#[test]
-fn postgresql_big_events_export_and_100k_import() {
-    let Some(dev) = dev("postgresql") else { return };
+/// The label the CSV gives row `id` (`id` not a multiple of 10).
+fn expected_label(id: usize) -> String {
+    format!("it's \"row\", {id}\nline 2")
+}
+
+async fn label_of(h: &SessionHandle, table: &str, id: usize) -> Option<String> {
+    let events = exec_ok(h, &format!("SELECT label FROM {table} WHERE id = {id}")).await;
+    events.iter().find_map(|e| match e {
+        ExecEvent::Item(ResultItem::Rows(b)) => match cell(b.column(0), 0) {
+            CellValue::Text(t) => Some(t.to_owned()),
+            CellValue::Bytes(t) => Some(String::from_utf8(t.to_vec()).unwrap()),
+            _ => None,
+        },
+        _ => None,
+    })
+}
+
+/// PostgreSQL-wire engines: `big_events` (1 M rows of "nine") exported to CSV in bounded
+/// memory inside an engine-side read-only transaction, then a 100 000-line CSV imported "All
+/// or nothing".
+fn pgwire_big_events_export_and_100k_import(engine: &str) {
+    let Some(dev) = dev(engine) else { return };
     let tmp = tempfile::tempdir().unwrap();
     let (manager, _) = manager(
         Arc::new(ninesql_driver_pgwire::PgWireDriver::new()),
@@ -234,12 +253,7 @@ fn postgresql_big_events_export_and_100k_import() {
     let transfer = TransferService::new(manager.clone(), &paths(&tmp.path().join("ninesql")));
     let out = tempfile::tempdir().unwrap();
     ui(async {
-        let h = open_with(
-            &manager,
-            tcp_connection(&dev, "postgresql"),
-            Some(&dev.password),
-        )
-        .await;
+        let h = open_with(&manager, tcp_connection(&dev, engine), Some(&dev.password)).await;
         // 1 M rows of big_events to CSV.
         let target = out.path().join("big_events.csv");
         let request = ExportRequest::table(
@@ -251,29 +265,35 @@ fn postgresql_big_events_export_and_100k_import() {
         let started = Instant::now();
         let mut job = transfer.export(&h, request);
         let summary = loop {
-            match tokio::time::timeout(Duration::from_secs(300), job.next())
+            match tokio::time::timeout(Duration::from_secs(600), job.next())
                 .await
                 .unwrap()
             {
                 Some(ExportEvent::Done(s)) => break s,
-                Some(ExportEvent::Failed(e)) => panic!("{e}"),
+                Some(ExportEvent::Failed(e)) => panic!("{engine}: {e}"),
                 Some(_) => {}
                 None => panic!("ended"),
             }
         };
         eprintln!(
-            "postgresql big_events export: {} rows, {} bytes, {:?}, peak buffered {} bytes (batch budget {budget})",
+            "{engine} big_events export: {} rows, {} bytes, {:?}, peak buffered {} bytes (batch budget {budget})",
             summary.rows,
             summary.bytes,
             started.elapsed(),
             summary.peak_buffered_bytes
         );
-        assert_eq!(summary.rows, 1_000_000);
+        assert_eq!(summary.rows, 1_000_000, "{engine}");
+        assert!(
+            summary.warnings.is_empty(),
+            "{engine}: {:?}",
+            summary.warnings
+        );
         assert!(
             summary.peak_buffered_bytes
                 <= (ninesql_core::transfer::WRITER_QUEUE as u64 + 2) * budget
         );
         assert_eq!(std::fs::metadata(&target).unwrap().len(), summary.bytes);
+        let _ = std::fs::remove_file(&target);
 
         // The export ran in an engine-side read-only transaction (review L7), ended after it.
         let ro = out.path().join("ro.csv");
@@ -288,17 +308,21 @@ fn postgresql_big_events_export_and_100k_import() {
         loop {
             match job.next().await {
                 Some(ExportEvent::Done(_)) => break,
-                Some(ExportEvent::Failed(e)) => panic!("{e}"),
+                Some(ExportEvent::Failed(e)) => panic!("{engine}: {e}"),
                 Some(_) => {}
                 None => panic!("ended"),
             }
         }
-        assert_eq!(std::fs::read_to_string(&ro).unwrap(), "ro\non\n");
+        assert_eq!(
+            std::fs::read_to_string(&ro).unwrap(),
+            "ro\non\n",
+            "{engine}"
+        );
         let deadline = Instant::now() + Duration::from_secs(5);
         while h.is_leased() || h.transaction_state().in_transaction {
             assert!(
                 Instant::now() < deadline,
-                "the read-only transaction stayed open"
+                "{engine}: the read-only transaction stayed open"
             );
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
@@ -306,6 +330,7 @@ fn postgresql_big_events_export_and_100k_import() {
         // 100 000-line CSV import.
         let file = write_csv(out.path());
         let table = format!("p5c_import_{}", std::process::id());
+        let _ = run(&h, &format!("DROP TABLE IF EXISTS {table}")).await;
         exec_ok(
             &h,
             &format!("CREATE TABLE {table} (id bigint PRIMARY KEY, label varchar(200), amount numeric(12,2), born date)"),
@@ -321,22 +346,29 @@ fn postgresql_big_events_export_and_100k_import() {
         )
         .await;
         assert_eq!(count(&h, &table).await, IMPORT_ROWS as i64);
-        let events = exec_ok(&h, &format!("SELECT label FROM {table} WHERE id = 1")).await;
-        let label = events.iter().find_map(|e| match e {
-            ExecEvent::Item(ResultItem::Rows(b)) => match cell(b.column(0), 0) {
-                CellValue::Text(t) => Some(t.to_owned()),
-                _ => None,
-            },
-            _ => None,
-        });
-        assert_eq!(label.as_deref(), Some("it's \"row\", 1\nline 2"));
+        assert_eq!(
+            label_of(&h, &table, 1).await.as_deref(),
+            Some(expected_label(1).as_str()),
+            "{engine}"
+        );
         exec_ok(&h, &format!("DROP TABLE {table}")).await;
     });
 }
 
 #[test]
-fn mysql_100k_import() {
-    let Some(dev) = dev("mysql") else { return };
+fn postgresql_big_events_export_and_100k_import() {
+    pgwire_big_events_export_and_100k_import("postgresql");
+}
+
+#[test]
+fn yugabytedb_big_events_export_and_100k_import() {
+    pgwire_big_events_export_and_100k_import("yugabytedb");
+}
+
+/// MySQL family: the 100 000-line CSV imported once per transaction mode, "commit every N
+/// rows" then "All or nothing", into InnoDB tables.
+fn mysql_family_100k_import(engine: &str) {
+    let Some(dev) = dev(engine) else { return };
     let tmp = tempfile::tempdir().unwrap();
     let (manager, _) = manager(
         Arc::new(ninesql_driver_mysqlwire::MySqlWireDriver::new()),
@@ -345,26 +377,50 @@ fn mysql_100k_import() {
     let transfer = TransferService::new(manager.clone(), &paths(&tmp.path().join("ninesql")));
     let out = tempfile::tempdir().unwrap();
     ui(async {
-        let h = open_with(&manager, tcp_connection(&dev, "mysql"), Some(&dev.password)).await;
+        let h = open_with(&manager, tcp_connection(&dev, engine), Some(&dev.password)).await;
         let file = write_csv(out.path());
-        let table = format!("p5c_import_{}", std::process::id());
-        exec_ok(
-            &h,
-            &format!("CREATE TABLE {table} (id bigint PRIMARY KEY, label varchar(200), amount decimal(12,2), born date)"),
-        )
-        .await;
-        import(
-            &transfer,
-            &h,
-            &file,
-            vec![table.clone()],
-            "bigint",
-            ImportTransaction::CommitEvery(25_000),
-        )
-        .await;
-        assert_eq!(count(&h, &table).await, IMPORT_ROWS as i64);
-        exec_ok(&h, &format!("DROP TABLE {table}")).await;
+        for (suffix, transaction) in [
+            ("every", ImportTransaction::CommitEvery(25_000)),
+            ("all", ImportTransaction::AllOrNothing),
+        ] {
+            let table = format!("p5c_import_{suffix}_{}", std::process::id());
+            exec_ok(&h, &format!("DROP TABLE IF EXISTS {table}")).await;
+            exec_ok(
+                &h,
+                &format!("CREATE TABLE {table} (id bigint PRIMARY KEY, label varchar(200), amount decimal(12,2), born date) ENGINE=InnoDB"),
+            )
+            .await;
+            // Schema-qualified, so that the table's storage is read: "All or nothing" is
+            // refused on the MySQL family when it is unknown (P5-E M1).
+            import(
+                &transfer,
+                &h,
+                &file,
+                vec![dev.database.clone(), table.clone()],
+                "bigint",
+                transaction,
+            )
+            .await;
+            assert_eq!(count(&h, &table).await, IMPORT_ROWS as i64, "{engine}");
+            assert_eq!(
+                label_of(&h, &table, 1).await.as_deref(),
+                Some(expected_label(1).as_str()),
+                "{engine}"
+            );
+            assert_eq!(label_of(&h, &table, 10).await, None, "{engine}: NULL label");
+            exec_ok(&h, &format!("DROP TABLE {table}")).await;
+        }
     });
+}
+
+#[test]
+fn mysql_100k_import() {
+    mysql_family_100k_import("mysql");
+}
+
+#[test]
+fn mariadb_100k_import() {
+    mysql_family_100k_import("mariadb");
 }
 
 #[test]
