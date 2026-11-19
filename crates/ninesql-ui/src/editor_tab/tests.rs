@@ -686,3 +686,100 @@ fn a_result_closed_after_idle_keeps_its_rows_and_hints_at_the_open_transaction(
     tab.update_in(&mut vcx, |t, window, cx| t.cancel_run(window, cx));
     wait_until(&mut vcx, |vcx| !tab.read_with(vcx, |t, _| t.is_running()));
 }
+
+#[gpui::test]
+fn a_statement_waiting_behind_a_metadata_load_says_so_until_it_starts(cx: &mut TestAppContext) {
+    use ninesql_core::RunEvent;
+    use ninesql_grid::FetchState;
+    use std::time::Duration;
+
+    let tmp = tempfile::tempdir().unwrap_or_else(|e| panic!("{e}"));
+    let live = mock_connection("Live", ConnectionTypeId::dev(), Auth::None);
+    let (_ws, _hub, tab, mut vcx) = connected_with(cx, vec![live], tmp.path());
+    // A paged read pauses after its first page, so the run stays open for injected events.
+    run(
+        &tab,
+        "SELECT * FROM numbers(1000000)",
+        ExecutionKind::Statement,
+        &mut vcx,
+    );
+    wait_until(&mut vcx, |vcx| {
+        tab.read_with(vcx, |t, cx| {
+            t.results()
+                .read(cx)
+                .results()
+                .tabs()
+                .first()
+                .is_some_and(|r| match r {
+                    ResultTab::Table(m) => m.borrow().state() == FetchState::Idle,
+                    ResultTab::Documents { .. } => false,
+                })
+        })
+    });
+    assert_eq!(message(&tab, &vcx), "");
+
+    // What the core sends when the next statement waits past 250 ms behind a navigator load.
+    tab.update_in(&mut vcx, |t, window, cx| {
+        let generation = t.generation;
+        t.on_run_event(
+            generation,
+            RunEvent::WaitingForMetadata { index: 1 },
+            window,
+            cx,
+        );
+    });
+    vcx.run_until_parked();
+    assert_eq!(message(&tab, &vcx), super::WAITING_FOR_METADATA);
+    assert!(message(&tab, &vcx).starts_with("Waiting for the navigator"));
+
+    // The statement starts: the notice goes away.
+    tab.update_in(&mut vcx, |t, window, cx| {
+        let generation = t.generation;
+        t.on_run_event(
+            generation,
+            RunEvent::StatementStarted {
+                index: 1,
+                span: 0..6,
+                execution: None,
+            },
+            window,
+            cx,
+        );
+    });
+    vcx.run_until_parked();
+    assert_eq!(message(&tab, &vcx), "");
+
+    // The same holds for the wait behind a previous cancel; the event that ends the wait
+    // keeps its own message.
+    tab.update_in(&mut vcx, |t, window, cx| {
+        let generation = t.generation;
+        t.on_run_event(
+            generation,
+            RunEvent::WaitingForPreviousCancel { index: 2 },
+            window,
+            cx,
+        );
+    });
+    vcx.run_until_parked();
+    assert_eq!(
+        message(&tab, &vcx),
+        "Waiting for the previous statement to stop…"
+    );
+    tab.update_in(&mut vcx, |t, window, cx| {
+        let generation = t.generation;
+        t.on_run_event(
+            generation,
+            RunEvent::StatementCancelled {
+                index: 2,
+                elapsed: Duration::from_millis(1),
+            },
+            window,
+            cx,
+        );
+    });
+    vcx.run_until_parked();
+    assert_eq!(message(&tab, &vcx), "Cancelled.");
+
+    tab.update_in(&mut vcx, |t, window, cx| t.cancel_run(window, cx));
+    wait_until(&mut vcx, |vcx| !tab.read_with(vcx, |t, _| t.is_running()));
+}

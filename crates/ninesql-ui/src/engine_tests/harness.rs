@@ -115,10 +115,87 @@ pub(super) struct Dev {
     pub database: String,
 }
 
-/// The dev password every I1 scan looks for (one value for all dev engines; read from the file).
-pub(super) fn dev_password() -> String {
-    // All the engines of these tests share it; read it from PostgreSQL's entry.
-    dev_entry("postgresql").password
+/// Every distinct password of `dev/engines.json` the I1 scan looks for: its `"password"`
+/// fields and the `password: <value>` of its notes (root and SYSDBA passwords), as
+/// `scripts/e2e-local.sh` redacts them. Values under 4 characters are skipped (too short to
+/// scan for without false positives), as in the script.
+pub(super) fn dev_passwords() -> Vec<String> {
+    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../dev/engines.json");
+    let text = std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("{e}"));
+    let doc: serde_json::Value = serde_json::from_str(&text).unwrap_or_else(|e| panic!("{e}"));
+    let passwords = passwords_in(&doc);
+    assert!(
+        !passwords.is_empty(),
+        "no password found in dev/engines.json"
+    );
+    passwords
+}
+
+/// The distinct passwords of a parsed `dev/engines.json`, longest first.
+fn passwords_in(doc: &serde_json::Value) -> Vec<String> {
+    fn walk(v: &serde_json::Value, found: &mut std::collections::BTreeSet<String>) {
+        match v {
+            serde_json::Value::Object(map) => {
+                for (k, x) in map {
+                    if k == "password"
+                        && let Some(p) = x.as_str()
+                        && !p.is_empty()
+                    {
+                        found.insert(p.to_owned());
+                    }
+                    walk(x, found);
+                }
+            }
+            serde_json::Value::Array(items) => items.iter().for_each(|x| walk(x, found)),
+            serde_json::Value::String(s) => found.extend(note_passwords(s)),
+            _ => {}
+        }
+    }
+    let mut found = std::collections::BTreeSet::new();
+    walk(doc, &mut found);
+    let mut out: Vec<String> = found.into_iter().filter(|w| w.len() >= 4).collect();
+    out.sort_by_key(|w| std::cmp::Reverse(w.len()));
+    out
+}
+
+/// The `<value>` of each `password: <value>` in a note (the script's
+/// `password:\s*([^\s,;]+)`, a trailing `.` dropped).
+fn note_passwords(text: &str) -> Vec<String> {
+    const KEY: &str = "password:";
+    let mut out = Vec::new();
+    let mut rest = text;
+    while let Some(at) = rest.find(KEY) {
+        rest = rest[at + KEY.len()..].trim_start();
+        let end = rest
+            .find(|c: char| c.is_whitespace() || c == ',' || c == ';')
+            .unwrap_or(rest.len());
+        let value = rest[..end].trim_end_matches('.');
+        if !value.is_empty() {
+            out.push(value.to_owned());
+        }
+        rest = &rest[end..];
+    }
+    out
+}
+
+#[test]
+fn the_i1_scan_looks_for_every_dev_password() {
+    let doc = serde_json::json!({
+        "engines": [
+            { "id": "a", "password": "first_pw" },
+            { "id": "b", "password": "first_pw", "notes": "root password: second_pw (set by x)" },
+            { "id": "c", "password": null, "notes": "SYSDBA password: third_pw. Database: path" },
+            { "id": "d", "password": "", "notes": "password:fourth_pw, password: abc" }
+        ]
+    });
+    assert_eq!(
+        passwords_in(&doc),
+        ["fourth_pw", "second_pw", "first_pw", "third_pw"]
+    );
+    // The real file: the shared dev password and the root password of its notes.
+    let real = dev_passwords();
+    assert!(real.iter().any(|p| p == &dev_entry("postgresql").password));
+    assert!(real.len() >= 2, "{} passwords", real.len());
 }
 
 fn required(engine: &str) -> bool {
@@ -703,21 +780,23 @@ impl App {
         });
     }
 
-    /// I1: no file under the test's directories holds the dev password.
+    /// I1: no file under the test's directories holds any password of `dev/engines.json`.
     pub(super) fn assert_no_password_on_disk(&self) {
-        let password = dev_password();
-        assert!(!password.is_empty());
+        let passwords = dev_passwords();
         let mut seen = 0;
         for file in walk(&self.root) {
             seen += 1;
             let bytes = std::fs::read(&file).unwrap_or_default();
-            assert!(
-                !bytes
-                    .windows(password.len())
-                    .any(|w| w == password.as_bytes()),
-                "I1: the dev password is in {}",
-                file.display()
-            );
+            for (n, password) in passwords.iter().enumerate() {
+                // The value itself is never printed, only its rank in the list.
+                assert!(
+                    !bytes
+                        .windows(password.len())
+                        .any(|w| w == password.as_bytes()),
+                    "I1: dev password #{n} of dev/engines.json is in {}",
+                    file.display()
+                );
+            }
         }
         assert!(seen > 0, "the scan found the workspace files");
     }
