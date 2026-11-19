@@ -26,3 +26,72 @@ ignore-dev-dependencies = true
 # Our own crates are covered by LICENSE and NOTICE, shipped next to this file.
 ignore-transitive-dependencies = false
 private = { ignore = true }
+
+# Crates whose declared license does not cover everything they compile into the binary
+# (P6-E review M1, ADR-0002 rule 5). A clarification replaces what cargo-about would scan in
+# the crate with exactly the files below; each text is taken from the crate's own sources in
+# the cargo registry (offline) and pinned by SHA-256, so a new crate version whose texts differ
+# makes the clarification fail. cargo-about only *warns* when a clarification fails and falls
+# back to scanning, so packaging/deb/check-notices.sh fails the build when the FreeType or
+# Lucide texts are missing from the generated file.
+
+# freetype-sys compiles its bundled FreeType 2.13.2 (C) statically whenever the system's
+# FreeType is older than its 24.3.18 floor, which is the case in the Ubuntu 22.04 builder
+# (24.1.18). FreeType is dual-licensed FTL / GPLv2; NineSQL takes it under the FTL (I7), whose
+# credit is also in NOTICE. The BDF and PCF drivers and fthash.c, compiled in too, carry their
+# own MIT-style notices (freetype2/LICENSE.TXT). The crate's Rust bindings are MIT.
+[freetype-sys]
+accepted = ["FTL"]
+
+[freetype-sys.clarify]
+license = "MIT AND FTL"
+
+[[freetype-sys.clarify.files]]
+path = "LICENSE"
+license = "MIT"
+checksum = "8911cb953a89daca54f0ab96616f5e447e2b1399fba7ec098872cfdacde5354b"
+
+[[freetype-sys.clarify.files]]
+path = "freetype2/docs/FTL.TXT"
+license = "FTL"
+checksum = "08c135755dd589039470f1fdbb400daaabaaa50d0b366d19cebff4d22986baa1"
+
+[[freetype-sys.clarify.files]]
+path = "freetype2/src/bdf/README"
+license = "MIT"
+start = "Copyright (C) 2001-2002 by Francesco Zappa Nardelli"
+end = "THE USE OR OTHER DEALINGS IN THE SOFTWARE."
+checksum = "4b12f48f25b3bac00cc0984f7ed10ff278e96784108be3734363d025a67916a8"
+
+[[freetype-sys.clarify.files]]
+path = "freetype2/src/bdf/README"
+license = "MIT"
+start = "Copyright 2000 Computing Research Labs"
+end = "THE USE OR OTHER DEALINGS IN THE SOFTWARE."
+checksum = "3f2e5b6119614886216f1463bd71d3bd0e5681b6f410ce42983e06cce2cc89e5"
+
+[[freetype-sys.clarify.files]]
+path = "freetype2/src/pcf/README"
+license = "MIT"
+start = "Copyright (C) 2000 by Francesco Zappa Nardelli"
+end = "SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE."
+checksum = "5c045da0b72d43f7f10a2457f43bf0cfa30004ecaa2aedfbd6fb33a69df3b622"
+
+# gpui-kit-assets declares Apache-2.0 (its code) but embeds about 1,830 Lucide SVG icons under
+# ISC, some of them derived from Feather under MIT (its LICENSE-LUCIDE). cargo-about would keep
+# only the Apache-2.0 text (canonical: the crate ships no Apache file).
+[gpui-kit-assets.clarify]
+license = "Apache-2.0 AND ISC AND MIT"
+
+[[gpui-kit-assets.clarify.files]]
+path = "LICENSE-LUCIDE"
+license = "ISC"
+start = "ISC License"
+end = "OR PERFORMANCE OF THIS SOFTWARE."
+checksum = "bb4e713d5d93acd16e464fedb99d294f779e6b1bc984357aac96d9524aedcb8c"
+
+[[gpui-kit-assets.clarify.files]]
+path = "LICENSE-LUCIDE"
+license = "MIT"
+start = "The following Lucide icons are derived"
+checksum = "b5e665ef74d9f58eff9140502a615d9438edb7ef96af3bc4ab1fdad7ddc8ad73"

@@ -10,7 +10,7 @@ How NineSQL is packaged for Debian / Ubuntu and Flatpak (P6-A, [ADR-0010](../doc
 | `linux/icons/*.png`, `linux/render-icons.sh` | hicolor PNG icons rendered from [`docs/assets/logo.svg`](../docs/assets/logo.svg) (the scalable icon is the SVG itself); rerun the script only when the logo changes |
 | `deb/build.sh` | Builds the `.deb` |
 | `deb/builder.Dockerfile` | The Ubuntu 22.04 build environment |
-| `deb/about.toml`, `deb/third-party-licenses.hbs` | The third-party license file (cargo-about) |
+| `deb/about.toml`, `deb/third-party-licenses.hbs`, `deb/check-notices.sh` | The third-party license file (cargo-about) and its check for the FreeType and Lucide notices |
 | `deb/install-test.sh` | Install test on Debian 12 / 13 and Ubuntu 22.04 / 24.04 |
 | `deb/check-reproducible.sh` | Builds twice and compares the hashes |
 | `sbom.py` | CycloneDX SBOM of the binary |
@@ -50,6 +50,7 @@ Needs Docker, rustup with the repository's toolchain, and on the host exactly ca
 - **No maintainer script** (ADR-0010 §1): nothing runs at install or removal, so nothing can touch the network; dpkg triggers refresh the desktop, icon and man caches. The install test fails if one appears.
 - **No phone-home (I2).** The package adds no service, no timer, no update check and no APT source.
 - **Third-party licenses.** `cargo about generate --frozen --fail` takes the license texts from the crates themselves (no network) for the crates linked into the binary on `x86_64-unknown-linux-gnu`, without build and dev dependencies. `about.toml` accepts exactly the licenses `deny.toml` allows, so a crate under another license fails the build as it fails `cargo deny check`. SQLite (public domain) and other notices are in `NOTICE`.
+- **What a crate compiles in besides its own code** (P6-E review M1, ADR-0002 rule 5). cargo-about knows only a crate's declared license, so `about.toml` clarifies two crates, with texts taken from their own sources and pinned by SHA-256: `freetype-sys`, which compiles its bundled FreeType 2.13.2 statically because the builder's FreeType (24.1.18) is older than its 24.3.18 floor, gets the FreeType License (`FTL.TXT`, the license NineSQL takes FreeType under; `FTL` is accepted for that crate only) and the BDF / PCF driver notices; `gpui-kit-assets`, which declares Apache-2.0 but embeds about 1,830 Lucide icons, gets the Lucide ISC license and the MIT license of the Feather-derived icons. `NOTICE` carries the FreeType credit the FTL asks for. A clarification whose checksum no longer matches (a crate bump) is only a warning in cargo-about, so `check-notices.sh` fails `build.sh` and `prepare-sources.sh` when those texts are missing from the generated file; after a bump of either crate, recompute the checksums in `about.toml` from the new sources.
 - **MIME type.** `.sql` is already `application/sql` in shared-mime-info, so the package ships no MIME definition. The desktop file does not declare `MimeType=application/sql` yet: `ninesql` does not open a file given on its command line, and offering it under "Open with" would do nothing (I8). Once the binary opens a script passed as an argument (follow-up, `ui-engineer`), add `MimeType=application/sql;` and `Exec=ninesql %F`.
 
 ## Install test
@@ -72,11 +73,11 @@ Not pinned yet (follow-up): the apt packages of the builder (linker, C compiler,
 ```bash
 make sbom                # = python3 packaging/sbom.py target/ninesql.cdx.json
 ```
-CycloneDX 1.5 JSON from `cargo cyclonedx` 0.5.10, limited to the crates linked into the binary (cargo-cyclonedx also lists the root crate's test-only dependencies, which `sbom.py` removes with their graph entries). Its timestamp is `SOURCE_DATE_EPOCH`.
+CycloneDX 1.5 JSON from `cargo cyclonedx` 0.5.10, limited to the crates linked into the binary (cargo-cyclonedx also lists the root crate's test-only dependencies, which `sbom.py` removes with their graph entries). Its timestamp is `SOURCE_DATE_EPOCH`. The FreeType C library that `freetype-sys` compiles in is not a crate, so `sbom.py` adds it as its own component (`freetype`, version read from the crate's bundled `freetype.h`, license `FTL OR GPL-2.0-or-later` with the property `ninesql:license-elected = FTL`), a dependency of `freetype-sys`.
 
 ## Release workflow
 [`release.yml`](../.github/workflows/release.yml) runs on the push of a tag `vX.Y.Z` or `vX.Y.Z-…` only; never on pull requests or branches. The maintainer pushes the tag (a tag created with `GITHUB_TOKEN` does not start workflows). Jobs:
-1. **build** (two replicas, two checkout paths, `contents: read`): checks that the tag matches the workspace version and is on `main`, installs the pinned toolchain (`RUSTUP_TOOLCHAIN`, bumped in its own PR) and the packaging tools from crates.io (`--locked`), runs `packaging/deb/build.sh`, and writes the SBOM;
+1. **build** (two replicas, two checkout paths, `contents: read`): checks that the tag matches the workspace version and is on `main`, installs the pinned toolchain (`RUSTUP_TOOLCHAIN`, bumped in its own PR), runs the supply-chain gate before building (`cargo deny --locked check advisories bans licenses sources` with the CI's cargo-deny version, installed `--locked`, and `scripts/verify-patches.sh`; P6-E review L2), installs the packaging tools from crates.io (`--locked`), runs `packaging/deb/build.sh`, and writes the SBOM;
 2. **reproducible** (no permission): the two `.deb` files must be byte-identical;
 3. **install-test**: `packaging/deb/install-test.sh` on the four distributions;
 4. **sign** (`id-token: write` only, environment `release`, after the three others): `SHA256SUMS` and cosign keyless signatures (`cosign sign-blob --bundle`, Sigstore with the workflow's OIDC identity) of the `.deb`, the SBOM and `SHA256SUMS`; it has no write access to the repository;

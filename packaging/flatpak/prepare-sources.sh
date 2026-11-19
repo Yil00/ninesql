@@ -47,4 +47,6 @@ cargo about generate --frozen --fail \
     packaging/deb/third-party-licenses.hbs
 sed -i 's|/usr/share/doc/ninesql/copyright|/app/share/licenses/io.github.yil00.NineSQL/LICENSE|; s|/usr/share/doc/ninesql/NOTICE|/app/share/licenses/io.github.yil00.NineSQL/NOTICE|' \
     "$HERE/THIRD-PARTY-LICENSES.txt"
+# FreeType (FTL) and Lucide / Feather notices, which cargo-about finds only through about.toml.
+"$REPO/packaging/deb/check-notices.sh" "$HERE/THIRD-PARTY-LICENSES.txt"
 echo "wrote $HERE/cargo-sources.json and $HERE/THIRD-PARTY-LICENSES.txt"

@@ -12,6 +12,17 @@ its owner and is used only to describe interoperability.
 
 Third-party code compiled into the binary (ADR-0002 rule 5):
 
+FreeType 2.13.2 (bundled by freetype-sys and compiled into the binary when
+the build system's FreeType is too old, as for the .deb) is used under the
+FreeType License (FTL); its full text is in THIRD-PARTY-LICENSES.txt.
+Portions of this software are copyright (C) 2023 The FreeType Project
+(www.freetype.org).  All rights reserved.
+
+The icons (Lucide, embedded by gpui-kit-assets) are under the ISC License,
+Copyright (c) 2026 Lucide Icons and Contributors; the icons derived from
+Feather are under the MIT License, Copyright (c) 2013-present Cole Bemis.
+Both texts are in THIRD-PARTY-LICENSES.txt.
+
 SQLite (bundled by libsqlite3-sys) is in the public domain
 (https://sqlite.org/copyright.html).
 

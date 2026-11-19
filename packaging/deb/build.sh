@@ -14,7 +14,8 @@
 #      the checkout or the cargo home lives on the host.
 #   4. Check that the binary needs no glibc symbol newer than 2.35 (Ubuntu 22.04).
 #   5. Generate the man page (gzip -n) and the third-party license file (cargo-about, offline,
-#      from the crates' own license files) next to the binary.
+#      from the crates' own license files) next to the binary, and check that it holds the
+#      FreeType and Lucide notices (check-notices.sh).
 #   6. `cargo deb --no-build` on the host, with mtimes clamped to SOURCE_DATE_EPOCH.
 #
 # Environment (all optional):
@@ -155,6 +156,9 @@ cargo about generate --frozen --fail \
     -m crates/ninesql-ui/Cargo.toml \
     -o "$BUILD_DIR/release/THIRD-PARTY-LICENSES.txt" \
     packaging/deb/third-party-licenses.hbs
+# The FreeType (FTL) and Lucide / Feather notices come from clarifications in about.toml, which
+# cargo-about drops with a mere warning when they stop matching: fail instead (P6-E review M1).
+packaging/deb/check-notices.sh "$BUILD_DIR/release/THIRD-PARTY-LICENSES.txt"
 
 log "6/6 cargo deb"
 version=$(cargo metadata --format-version 1 --no-deps --locked --offline \
