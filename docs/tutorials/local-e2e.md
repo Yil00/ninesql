@@ -14,7 +14,7 @@ The script is [`scripts/e2e-local.sh`](../../scripts/e2e-local.sh). It calls the
 - Recommended:
   - `dbus-daemon` (`sudo apt install dbus-daemon`), so the lock-watcher tests run instead of skipping;
   - `mesa-utils` (`glxinfo`) and `vulkan-tools` (`vulkaninfo`), so the report names your GPU;
-  - only if you want a screenshot (`--screenshot`): `xdotool` or `wmctrl` and ImageMagick (`import`), which capture the NineSQL window alone on X11 or XWayland. Without them the script falls back, with a warning, to a whole-screen tool: `grim` (wlroots Wayland), `spectacle` (KDE), `gnome-screenshot`, ImageMagick `import` or `scrot` (X11).
+  - only if you want a screenshot (`--screenshot`): `xdotool` or `wmctrl` and ImageMagick (`import`), which capture the window of the process the script started, alone, on X11 or XWayland. There is no whole-screen fallback: without them, or on a Wayland-native window, no screenshot is taken.
 - Free disk space: the script warns below 15 GiB. The debug build, the release build and the engine images all take room.
 - Nothing listening on the dev engines' host ports (15432, 13306, 13307, 15433, 15434, 18812, 19000, 14000, 14080). Stop your own dev containers first (`make dev-down`), or reuse them with `--engines-running` ([section 3](#3-options)).
 
@@ -62,11 +62,11 @@ scripts/e2e-local.sh --only static,unit --fail-fast
 | `--timeout SECS` | Time limit of each long cargo command (default 2700). A command that hits it shows exit status 124. |
 | `--dev-timeout SECS` | Time limit of the image pulls and of engine readiness (default 900). |
 | `--gui-wait SECS` | How long the window stays open (default 15). |
-| `--screenshot` | Take a screenshot in `gui-smoke` (off by default). On X11, or XWayland, the script finds the NineSQL window by its class `io.github.yil00.NineSQL` (`xdotool search`, or `wmctrl`), raises it (`xdotool windowactivate --sync`) and captures that window only with ImageMagick `import -window`. When that is not possible (a Wayland-native window, or the tools missing), it prints a warning and captures the **whole screen**. |
+| `--screenshot` | Take a screenshot in `gui-smoke` (off by default). On X11, or XWayland, the script looks for the visible windows of the process it started, by its pid (`xdotool search --pid`, or the pid column of `wmctrl -lp`), never by window class, so a NineSQL window of your own is never picked. When exactly one window matches, it raises it (`xdotool windowactivate --sync`) and captures that window only with ImageMagick `import -window`. When none or several match (a Wayland-native window, a window that does not set `_NET_WM_PID`, the tools missing), no screenshot is taken and the summary says why; the script never captures the whole screen instead. |
 | `--no-screenshot` | Accepted for older command lines; no screenshot is the default. |
 | `--no-secret-scan` | Write `report.tar.gz` without the gitleaks scan, for example when gitleaks is not installed. Read the report before you send it. |
 | `--keep-temp` | Keep the temporary `HOME` and XDG directories of `gui-smoke`, for a closer look. |
-| `--check-report DIR` | Run no stage: scrub and secret-check an existing report directory, then archive it if the checks pass. `scripts/e2e-local-report-test.sh` uses it to test the scrubber and the secret checks on fake reports. |
+| `--check-report DIR` | Run no stage: scrub and secret-check an existing report directory, then archive it if the checks pass. The directory must be yours and hold a `summary.md` whose first line is `# NineSQL local end-to-end report`; any other directory is refused (exit status 2), as is one where `summary.md`, `credential-uris.txt`, `gitleaks.log` or `report.tar.gz` is a symbolic link or not a regular file. Only regular files are read and rewritten: symbolic links and other special files are skipped, and a rewrite replaces the file rather than writing through a hard link. `scripts/e2e-local-report-test.sh` uses this option to test the scrubber and the secret checks on fake reports. |
 
 Exit status: 0 when no stage failed, 1 otherwise, 2 for a wrong option.
 
@@ -80,7 +80,7 @@ The report directory is `target/e2e-reports/<UTC time>-<short commit>/`:
 | `static-<step>.log` | One log per `static` step |
 | `engines-compose-ps.txt`, `engines-containers.log` | Container state and the last lines of each container's log |
 | `gui-smoke-stderr.log`, `gui-smoke-stdout.log` | What the window printed |
-| `gui-smoke-window.png` or `gui-smoke-screen.png` | Only with `--screenshot`: the NineSQL window, or the whole screen when the window could not be captured alone |
+| `gui-smoke-window.png` | Only with `--screenshot`, and only when the window of the launched process could be captured alone |
 | `gitleaks.log` | The secret scan's output (findings redacted) |
 | `credential-uris.txt` | Only when the check found one: the `file:line` of each URI with a user and a password, without the values |
 | `report.tar.gz` | The whole directory, written only when the secret checks passed ([section 6](#6-privacy)) |
@@ -88,23 +88,25 @@ The report directory is `target/e2e-reports/<UTC time>-<short commit>/`:
 `SKIP` means the stage could not run here (for example `gui-smoke` without a display); the reason is in the summary. `FAIL` with exit status 124 is a time limit, not a test failure.
 
 ## 5. What to send back
-Send `summary.md` back to the session. That is usually enough. If the agent asks for more, or a failure needs the full logs, send `report.tar.gz`. The script's last lines give both paths; when no archive was written, the "Secret checks" section at the end of `summary.md` says why.
+Send `summary.md` back to the session. That is usually enough. If the agent asks for more, or a failure needs the full logs, send `report.tar.gz`. The script's last lines give both paths.
+
+When no archive was written, the last line reads "Do not send anything before fixing the lines listed above." instead of "Next: send summary.md…": the lines above it, and the "Secret checks" section at the end of `summary.md`, say why (a credential URI, a gitleaks finding, gitleaks missing). Fix them, then run `scripts/e2e-local.sh --check-report <report directory>` to check and archive the report again.
 
 ## 6. Privacy
 - Every file the script writes is readable by you only (`umask 077`: directories `0700`, files `0600`).
 - The `env` stage does not record your host name, user name or IP addresses. Before the summary and the archive are written, every text file in the report is scrubbed:
   - the repository path becomes `<repo>` and `$HOME` becomes `~`;
   - your user name becomes `<user>` and your host name becomes `<host>`, as whole words, except generic names such as `root`, `user` or `ubuntu`;
-  - IPv4 addresses become `<ip>`, private and public alike; `127.x` and `0.0.0.0` stay readable, and so does a four-part number labelled as a version (`conformanceVersion = 1.4.0.0`);
+  - IPv4 addresses become `<ip>`, private and public alike; `127.x` and `0.0.0.0` stay readable. The only four-part numbers kept are the ones `vulkaninfo` prints right after `conformanceVersion = `, `apiVersion = ` or `driverVersion = `, and dotted numbers that cannot be addresses (a part above 255, such as `1.2.300.4`). Any other version number shaped like an address (`version: 10.4.5.6`) becomes `<ip>`: the scrubber errs toward hiding;
   - global, unique local (`fc00::/7`) and link-local (`fe80::/10`) IPv6 addresses become `<ip>`, with their zone (`%eth0`); `::1` stays readable;
   - MAC addresses become `<mac>`.
 - The summary gives the number of uncommitted paths in your working tree, not their names.
 - Then the secret checks, in this order:
   1. every password listed in [`dev/engines.json`](../../dev/README.md#engines-ports-and-dev-credentials) (the dev engines' fake, public credentials) is replaced with `<dev-password>`, and the summary says in how many files;
-  2. any other URI with a user and a password (`scheme://user:password@…`) fails the run: no archive, and `credential-uris.txt` lists where, without the values;
+  2. any other URI with a user and a password (`scheme://user:password@…`) fails the run: no archive, and `credential-uris.txt` lists where, without the values. The scheme is matched in any case (`HTTP://`), the user may be empty (`redis://:password@host`), and the password runs to the next `@` on the same line, spaces included (it never spans another `://`). A line with a URL with a port and, later, an `@` (an e-mail address) can be flagged too; check the line it names;
   3. gitleaks scans the report. The archive is written only when it finds nothing. A finding, or a gitleaks error, fails the run with no archive (see `gitleaks.log`). When gitleaks is not installed, no archive is written either, unless you pass `--no-secret-scan`.
 - The "Secret checks" section at the end of `summary.md` records what happened.
-- **No screenshot is taken unless you pass `--screenshot`.** With it, the script captures the NineSQL window only when it can (X11 or XWayland with `xdotool` or `wmctrl` and ImageMagick); otherwise it warns and captures the **whole screen** (`gui-smoke-screen.png`). Screenshots are not scrubbed: look at the file before you send the archive. The script reminds you at the end.
+- **No screenshot is taken unless you pass `--screenshot`.** With it, the script captures only the window of the process it started, found by its pid (X11 or XWayland with `xdotool` or `wmctrl` and ImageMagick). When it cannot find exactly one such window it takes no screenshot and records why; it never captures the whole screen. Screenshots are not scrubbed: look at the file before you send the archive. The script reminds you at the end.
 - The GUI run uses an empty temporary `HOME` and XDG directories and makes no connection, so no saved password or DBeaver connection of yours can appear in its window, logs or screenshot.
 - Nothing is uploaded: the script writes files, and you choose what to send.
 
