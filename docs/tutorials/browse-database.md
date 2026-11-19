@@ -89,7 +89,7 @@ With a table (or view) selected in the navigator:
 - "Open table data" (`Alt+G` then `O`) opens its rows in a new tab, editable when the table has a usable key ([Edit data](edit-data.md));
 - "Export table…" (`Alt+G` then `X`) writes every row to a file, "Import CSV…" (`Alt+G` then `M`) loads a CSV file into a table ([Export and import data](export-import.md)).
 
-These actions are in the command palette and on their keys; they are not in the navigator's context menu yet.
+These actions are in the command palette and on their keys. "Open table data" is also the first entry of the context menu of a table or view row (right click); the export and import actions are not in the context menu yet.
 
 ## Labels with unusual characters
 Object names are shown as stored, with markers for what would otherwise be invisible or misleading: control, bidirectional and zero-width characters appear as `�` (U+FFFD), space characters other than the ordinary space as `␣` (U+2423), and a leading or trailing space as `␠` (U+2420). Long names are cut at 200 characters with `…`. These markers are labels only; generated SQL always uses the real name, quoted.

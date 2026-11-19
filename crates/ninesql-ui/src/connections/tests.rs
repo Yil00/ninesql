@@ -1906,3 +1906,18 @@ fn a_confirmation_of_other_init_sql_or_a_failed_write_keeps_the_marker(cx: &mut 
     deliver(cx, marked.init_sql.clone(), None);
     assert!(!hub.read_with(cx, |h, _| h.init_sql_marker(id)));
 }
+
+#[test]
+fn the_dialog_body_leaves_room_for_the_test_result_on_a_short_window() {
+    use super::dialog::body_max_height;
+    use gpui::px;
+    // A tall window: the usual cap.
+    assert_eq!(body_max_height(px(1400.)), px(560.));
+    // 1080 physical pixels at 200 % (about 540 logical minus the panels): the body shrinks so
+    // the "Test connection" result and the buttons stay inside the window.
+    let short = body_max_height(px(520.));
+    assert!(short < px(300.), "{short:?}");
+    assert!(short + px(260.) <= px(520.));
+    // Never below a usable minimum (the body scrolls).
+    assert_eq!(body_max_height(px(200.)), px(120.));
+}

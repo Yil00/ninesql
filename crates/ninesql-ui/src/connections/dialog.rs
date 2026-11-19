@@ -43,6 +43,26 @@ struct PropertyInputs {
     value: Entity<InputState>,
 }
 
+/// The tallest the form body gets on a large window.
+const BODY_MAX_HEIGHT: f32 = 560.;
+/// The smallest body height kept on a tiny window (the body scrolls).
+const BODY_MIN_HEIGHT: f32 = 120.;
+/// Window height the body leaves to the rest: the dialog's margins and paddings, its title, the
+/// "Test connection" result and the buttons.
+const BODY_RESERVED_HEIGHT: f32 = 260.;
+/// The tallest the "Test connection" result gets before it scrolls.
+const TEST_STATUS_MAX_HEIGHT: f32 = 72.;
+
+/// The form body's maximum height in a window whose viewport is `viewport_height` high: at
+/// most [`BODY_MAX_HEIGHT`], less on a short window (a large display scale makes the logical
+/// viewport short), so the "Test connection" result and the buttons below the body always fit
+/// in the dialog instead of falling below the window's edge.
+#[must_use]
+pub fn body_max_height(viewport_height: Pixels) -> Pixels {
+    let available = f32::from(viewport_height) - BODY_RESERVED_HEIGHT;
+    px(available.clamp(BODY_MIN_HEIGHT, BODY_MAX_HEIGHT))
+}
+
 /// State of the last "Test connection".
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TestState {
@@ -959,7 +979,7 @@ fn field(label: &'static str, el: impl IntoElement) -> Div {
 }
 
 impl Render for ConnectionDialog {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.sync(cx);
         let hub = self.hub.read(cx);
         let offers = hub.offers().to_vec();
@@ -1352,7 +1372,7 @@ impl Render for ConnectionDialog {
         let body = v_flex()
             .id("connection-dialog-body")
             .gap_2()
-            .max_h(px(560.))
+            .max_h(body_max_height(window.viewport_size().height))
             .overflow_y_scroll()
             .pr_2()
             .child(field("Name", Input::new(&self.name)))
@@ -1394,29 +1414,36 @@ impl Render for ConnectionDialog {
                 el.child(div().id("dialog-error").text_sm().text_color(danger).child(e))
             });
 
+        // The result of "Test connection" sits outside the scrolled body, right above the
+        // buttons, so it is visible whatever the window height and display scale; a long
+        // message wraps and scrolls inside its own small box.
+        let test_row = test_status.map(|(status, color)| {
+            let color = crate::appearance::ensure_contrast(
+                color,
+                &[background],
+                crate::appearance::MIN_TEXT_CONTRAST,
+            );
+            div()
+                .id("test-status")
+                .w_full()
+                .max_h(px(TEST_STATUS_MAX_HEIGHT))
+                .overflow_y_scroll()
+                .text_xs()
+                .text_color(color)
+                .child(status)
+        });
         let footer = h_flex()
             .gap_2()
             .justify_between()
             .child(
-                h_flex()
-                    .gap_2()
-                    .child(
-                        Button::new("connection-test")
-                            .label("Test connection")
-                            .disabled(self.test == TestState::Running || has_error)
-                            .on_click(
-                                cx.listener(|this, _, window, cx| this.test_connection(window, cx)),
-                            ),
-                    )
-                    .when_some(test_status, |el, (status, color)| {
-                        el.child(
-                            div()
-                                .id("test-status")
-                                .text_xs()
-                                .text_color(color)
-                                .child(status),
-                        )
-                    }),
+                h_flex().gap_2().child(
+                    Button::new("connection-test")
+                        .label("Test connection")
+                        .disabled(self.test == TestState::Running || has_error)
+                        .on_click(
+                            cx.listener(|this, _, window, cx| this.test_connection(window, cx)),
+                        ),
+                ),
             )
             .child(
                 h_flex()
@@ -1438,6 +1465,7 @@ impl Render for ConnectionDialog {
             .key_context("ConnectionDialog")
             .gap_2()
             .child(body)
+            .children(test_row)
             .child(footer)
             .into_any_element()
     }

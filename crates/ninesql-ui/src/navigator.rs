@@ -40,8 +40,8 @@ use ninesql_core::{
 
 use crate::actions::{
     ConfigureNavigatorFilters, CopyObjectDdl, FindObject, GenerateDeleteSql, GenerateInsertSql,
-    GenerateSelectSql, GenerateUpdateSql, LoadMoreObjects, OpenObjectEditor, RefreshNavigatorNode,
-    ShowObjectDdl,
+    GenerateSelectSql, GenerateUpdateSql, LoadMoreObjects, OpenObjectEditor, OpenTableData,
+    RefreshNavigatorNode, ShowObjectDdl,
 };
 use crate::browse::generate::Template;
 use crate::browse::tree::{Effect, Group, MetaTree, RevealStep, Row, RowKey, RowKind, TreeEnv};
@@ -907,33 +907,16 @@ impl Navigator {
                         .first()
                         .is_some_and(|s| s.info().read_only)
                 });
-                if kind.is_some_and(is_table_like) {
-                    menu = menu.menu("Open object editor", Box::new(OpenObjectEditor));
-                    menu = menu.separator();
-                    for (t, action) in [
-                        (
-                            Template::Select,
-                            Box::new(GenerateSelectSql) as Box<dyn Action>,
-                        ),
-                        (Template::Insert, Box::new(GenerateInsertSql)),
-                        (Template::Update, Box::new(GenerateUpdateSql)),
-                        (Template::Delete, Box::new(GenerateDeleteSql)),
-                    ] {
-                        if kind.is_some_and(|k| t.offered(k, read_only)) {
-                            menu = menu.menu(format!("Generate SQL: {}", t.label()), action);
-                        }
-                    }
-                }
                 let ddl = match (connection, kind, hub.read(cx).metadata()) {
                     (Some(c), Some(k), Some(m)) => m.supports_ddl(*c, k),
                     _ => false,
                 };
-                if ddl {
-                    menu = menu
-                        .menu("Show DDL", Box::new(ShowObjectDdl))
-                        .menu("Copy DDL", Box::new(CopyObjectDdl));
+                for entry in object_menu_entries(kind, read_only, ddl) {
+                    menu = match entry {
+                        Some((label, action)) => menu.menu(label, action),
+                        None => menu.separator(),
+                    };
                 }
-                menu = menu.separator();
             }
             if incomplete {
                 menu = menu.menu("Load more objects", Box::new(LoadMoreObjects));
@@ -984,6 +967,52 @@ impl Navigator {
             .child(badges(&key, &b, false, cx))
             .into_any_element()
     }
+}
+
+/// One entry of a context menu: its label and action, or `None` for a separator.
+pub(crate) type MenuEntry = Option<(String, Box<dyn Action>)>;
+
+/// The object part of a navigator row's context menu, in order. Table and view rows start with
+/// "Open table data" (the action's own condition: a table-like object; it only reads, so a
+/// read-only session offers it too), then "Open object editor" and the "Generate SQL" templates
+/// the kind and the session allow (I8); "Show DDL" / "Copy DDL" only when the driver declares
+/// DDL for the kind.
+pub(crate) fn object_menu_entries(
+    kind: Option<ninesql_core::driver_api::ObjectKind>,
+    read_only: bool,
+    ddl: bool,
+) -> Vec<MenuEntry> {
+    let mut entries: Vec<MenuEntry> = Vec::new();
+    if kind.is_some_and(is_table_like) {
+        entries.push(Some((
+            "Open table data".to_owned(),
+            Box::new(OpenTableData),
+        )));
+        entries.push(Some((
+            "Open object editor".to_owned(),
+            Box::new(OpenObjectEditor),
+        )));
+        entries.push(None);
+        for (t, action) in [
+            (
+                Template::Select,
+                Box::new(GenerateSelectSql) as Box<dyn Action>,
+            ),
+            (Template::Insert, Box::new(GenerateInsertSql)),
+            (Template::Update, Box::new(GenerateUpdateSql)),
+            (Template::Delete, Box::new(GenerateDeleteSql)),
+        ] {
+            if kind.is_some_and(|k| t.offered(k, read_only)) {
+                entries.push(Some((format!("Generate SQL: {}", t.label()), action)));
+            }
+        }
+    }
+    if ddl {
+        entries.push(Some(("Show DDL".to_owned(), Box::new(ShowObjectDdl))));
+        entries.push(Some(("Copy DDL".to_owned(), Box::new(CopyObjectDdl))));
+    }
+    entries.push(None);
+    entries
 }
 
 impl Focusable for Navigator {

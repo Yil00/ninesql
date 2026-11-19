@@ -982,6 +982,7 @@ impl SqlEditorTab {
         *self.current.borrow_mut() = None;
         self.grid(ExecutionEvent::Finished, window, cx);
         self.refresh_editing(cx);
+        self.table_run_ended(window, cx);
         let id = active.request.id;
         self.editor.update(cx, |e, cx| e.finish_run(id, cx));
         cx.notify();

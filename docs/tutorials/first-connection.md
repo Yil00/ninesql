@@ -79,7 +79,7 @@ Read-only is enforced by the database engine for the whole session, not only by 
 Optionally, put the connection in a **Folder**: a `/`-separated path such as `team/sales`.
 
 ## 6. Test, then save
-Press **"Test connection"**: it runs the real connect flow with what the dialog holds, then closes the session. The dialog shows "Testing…", then "Connected to <server version>" (with the security warnings, if any) or "Failed: <reason>". Fix the settings until it connects, then press **"Save"**. A notification confirms: Saved "nine-pg".
+Press **"Test connection"**: it runs the real connect flow with what the dialog holds, then closes the session. The dialog shows "Testing…", then "Connected to <server version>" (with the security warnings, if any) or "Failed: <reason>", right above its buttons (the form above scrolls; on a short window or a large display scale it gets shorter so the result stays in view). Fix the settings until it connects, then press **"Save"**. A notification confirms: Saved "nine-pg".
 
 The connection is written to `connections.json` in the workspace, without any password ([where files are](build-and-run.md#where-ninesql-keeps-its-files)).
 
