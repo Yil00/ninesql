@@ -38,8 +38,11 @@
 //! or, in the sandbox, `/run/flatpak/doc/…`) that says nothing about where the file really is,
 //! and the portal writes through to the host. Such a path is mapped to its host path with
 //! `org.freedesktop.portal.Documents.GetHostPaths` (Documents portal version 5, session bus,
-//! bounded to [`PORTAL_TIMEOUT`]; feature `document-portal`, on by default), and the checks above
-//! run on the host path:
+//! bounded to [`PORTAL_TIMEOUT`]; feature `document-portal`, on by default; answers cached per
+//! document id, at most 256 ids, 10 min for a host path and 30 s for "no answer"), and the checks
+//! above run on the host path. The local checks run on the portal path itself first: a
+//! `DBeaverData` component, a known root or a marker visible through the portal's mount (a
+//! workspace folder picked through the folder portal) is inside, never a way out. Then:
 //! - the portal is unavailable, times out, fails, does not know the document, or returns a path
 //!   that does not match the document's name: the file counts as inside (fail closed), with
 //!   [`FileCheck::unverified`] set;
@@ -236,7 +239,9 @@ impl DbeaverRoots {
         let lexical = normalize(&absolute);
         let portal = self.portal_env();
         match portal.locate(&resolved) {
-            DocLocation::Document(doc) => return self.check_document(&portal, resolved, &doc),
+            DocLocation::Document(doc) => {
+                return self.check_document(&portal, &lexical, resolved, &doc);
+            }
             DocLocation::Malformed => {
                 tracing::debug!("malformed document-portal path: treated as inside DBeaver");
                 return FileCheck::checked(resolved, true);
@@ -270,9 +275,18 @@ impl DbeaverRoots {
     fn check_document(
         &self,
         portal: &PortalEnv,
+        lexical: &Path,
         resolved: PathBuf,
         doc: &DocumentPath,
     ) -> FileCheck {
+        // The local checks on the portal path itself first (re-review N1): a root, a
+        // `DBeaverData` component or a marker visible through the portal's mount (a workspace
+        // folder picked through the folder portal) is a verified inside. Never a way out.
+        if self.lexical_match(&[lexical, &resolved], portal) == Match::Inside
+            || self.marker_walk(&resolved, Walk::Local) != Marker::Absent
+        {
+            return FileCheck::checked(resolved, true);
+        }
         let Some(host) = portal.host_path(doc) else {
             tracing::debug!(
                 "document-portal path without a host path: treated as inside DBeaver (unverified)"
@@ -568,11 +582,73 @@ fn parse_document(rel: &Path) -> Option<DocumentPath> {
     })
 }
 
+/// How long the portal's answer for a document id is reused. Ids are stable for the life of a
+/// document; the bound only limits how long a removed and re-created document could be served
+/// from the cache.
+const CACHE_FOUND_TTL: Duration = Duration::from_secs(600);
+/// How long "no answer" is reused, so that checks against a portal root whose host path is
+/// unknown do not call the bus again and again (re-review N2). Still fail closed meanwhile.
+const CACHE_MISSING_TTL: Duration = Duration::from_secs(30);
+/// Most document ids kept; the oldest entry goes first.
+const CACHE_MAX_ENTRIES: usize = 256;
+
+/// Answers of the Documents portal per document id, bounded in size and age.
+#[derive(Default)]
+#[cfg_attr(not(feature = "document-portal"), allow(dead_code))]
+struct HostPathCache {
+    entries: std::collections::HashMap<String, (Option<PathBuf>, std::time::Instant)>,
+}
+
+#[cfg_attr(not(feature = "document-portal"), allow(dead_code))]
+impl HostPathCache {
+    /// The cached answer for `id` at `now` (`Some(None)`: "no answer", still fresh), or `None`
+    /// when nothing fresh is cached.
+    fn lookup(&self, id: &str, now: std::time::Instant) -> Option<Option<PathBuf>> {
+        let (answer, at) = self.entries.get(id)?;
+        let ttl = if answer.is_some() {
+            CACHE_FOUND_TTL
+        } else {
+            CACHE_MISSING_TTL
+        };
+        (now.saturating_duration_since(*at) < ttl).then(|| answer.clone())
+    }
+
+    /// Keeps `answer` for `id`, dropping the oldest entry when full.
+    fn insert(&mut self, id: &str, answer: Option<PathBuf>, now: std::time::Instant) {
+        if !self.entries.contains_key(id) && self.entries.len() >= CACHE_MAX_ENTRIES {
+            let oldest = self
+                .entries
+                .iter()
+                .min_by_key(|(_, (_, at))| *at)
+                .map(|(k, _)| k.clone());
+            if let Some(oldest) = oldest {
+                self.entries.remove(&oldest);
+            }
+        }
+        self.entries.insert(id.to_owned(), (answer, now));
+    }
+}
+
+/// Host path of document `id`, from [`HostPathCache`] or the portal. The cache lock is not held
+/// during the bus call: two checks of a new id may both ask the portal.
+#[cfg(feature = "document-portal")]
+fn portal_host_path(id: &str) -> Option<PathBuf> {
+    static CACHE: std::sync::LazyLock<std::sync::Mutex<HostPathCache>> =
+        std::sync::LazyLock::new(Default::default);
+    let cache = || CACHE.lock().unwrap_or_else(PoisonError::into_inner);
+    if let Some(answer) = cache().lookup(id, std::time::Instant::now()) {
+        return answer;
+    }
+    let answer = portal_host_path_uncached(id);
+    cache().insert(id, answer.clone(), std::time::Instant::now());
+    answer
+}
+
 /// Host path of document `id` through the Documents portal (version 5 `GetHostPaths`), on a
 /// thread of its own, waited for at most [`PORTAL_TIMEOUT`]. At most [`MAX_PORTAL_PENDING`]
 /// calls in flight: past that (a portal that hangs), `None` at once.
 #[cfg(feature = "document-portal")]
-fn portal_host_path(id: &str) -> Option<PathBuf> {
+fn portal_host_path_uncached(id: &str) -> Option<PathBuf> {
     use std::sync::atomic::{AtomicUsize, Ordering};
     static PENDING: AtomicUsize = AtomicUsize::new(0);
     if PENDING.fetch_add(1, Ordering::AcqRel) >= MAX_PORTAL_PENDING {
@@ -1252,5 +1328,70 @@ mod tests {
         );
         std::fs::create_dir_all(b.join("plain")).unwrap();
         assert!(!roots.contains(&link));
+    }
+
+    /// Re-review N1: a workspace picked through the folder portal, whose marker is visible
+    /// through the portal's mount, is a verified inside, whatever the portal answers.
+    #[test]
+    fn markers_visible_through_the_portal_mount_are_a_verified_inside() {
+        let base = tempfile::tempdir().unwrap();
+        let b = std::fs::canonicalize(base.path()).unwrap();
+        let mount = b.join("runtime/doc");
+        let ws = mount.join("wsid/workspace6");
+        std::fs::create_dir_all(ws.join(".metadata")).unwrap();
+        std::fs::write(ws.join(".metadata/dbeaver-workspace.properties"), b"").unwrap();
+        std::fs::create_dir_all(ws.join("General")).unwrap();
+        let db = ws.join("General/a.db");
+        std::fs::write(&db, b"").unwrap();
+        std::fs::create_dir_all(b.join("plain")).unwrap();
+        // No answer from the portal, then an answer that alone would say "outside".
+        for map in [Vec::new(), vec![("wsid", b.join("plain/workspace6"))]] {
+            let roots = with_portal(DbeaverRoots::none(), vec![mount.clone()], false, map);
+            let check = roots.check(&db);
+            assert!(check.inside && !check.unverified, "{check:?}");
+            assert!(roots.forbids_new_file(&db));
+        }
+        // A `DBeaverData` component in the portal path itself.
+        let named = mount.join("x/DBeaverData");
+        std::fs::create_dir_all(&named).unwrap();
+        let roots = with_portal(
+            DbeaverRoots::none(),
+            vec![mount.clone()],
+            false,
+            vec![("x", b.join("plain/DBeaverData"))],
+        );
+        let check = roots.check(&named.join("a.db"));
+        assert!(check.inside && !check.unverified, "{check:?}");
+    }
+
+    /// Re-review N2: answers are reused per id, "no answer" for a shorter time, within a bound.
+    #[test]
+    fn portal_answers_are_cached_per_id_within_bounds() {
+        let mut cache = HostPathCache::default();
+        let t0 = std::time::Instant::now();
+        assert_eq!(cache.lookup("a", t0), None);
+        cache.insert("a", Some(PathBuf::from("/h/a.db")), t0);
+        cache.insert("b", None, t0);
+        assert_eq!(cache.lookup("a", t0), Some(Some(PathBuf::from("/h/a.db"))));
+        assert_eq!(cache.lookup("b", t0), Some(None));
+        let later = t0 + CACHE_MISSING_TTL;
+        assert_eq!(cache.lookup("b", later), None, "a miss is asked again");
+        assert!(cache.lookup("a", later).is_some());
+        assert_eq!(cache.lookup("a", t0 + CACHE_FOUND_TTL), None);
+        for i in 0..CACHE_MAX_ENTRIES + 10 {
+            cache.insert(
+                &format!("id{i}"),
+                None,
+                t0 + Duration::from_millis(u64::try_from(i).unwrap() + 1),
+            );
+        }
+        assert_eq!(cache.entries.len(), CACHE_MAX_ENTRIES);
+        // The oldest entries went first.
+        assert!(!cache.entries.contains_key("a") && !cache.entries.contains_key("id0"));
+        assert!(
+            cache
+                .entries
+                .contains_key(&format!("id{}", CACHE_MAX_ENTRIES + 9))
+        );
     }
 }

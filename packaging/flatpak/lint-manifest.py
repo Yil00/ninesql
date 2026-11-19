@@ -50,6 +50,35 @@ FORBIDDEN_PATTERNS = [
 ]
 
 
+def enables_secret_service(line: str) -> bool:
+    """Whether a build command line is a `cargo build` enabling the secret-service feature."""
+    return bool(
+        re.search(r"\bcargo\b.*\bbuild\b", line)
+        and re.search(r"(?<!\S)(?:-F|--features)[= ]?\S*.*secret-service", line)
+    )
+
+
+def self_test() -> None:
+    """Both flag forms count, and only on the cargo build line (review L4, re-review N4)."""
+    build = "cargo --offline build --release --locked -p ninesql-ui --bin ninesql"
+    for flags in (
+        "--features ninesql-core/secret-service",
+        "--features=ninesql-core/secret-service",
+        "-F ninesql-core/secret-service",
+        "-F=ninesql-core/secret-service",
+        "-Fninesql-core/secret-service",
+        "--features 'mock,ninesql-core/secret-service'",
+    ):
+        assert enables_secret_service(f"{build} {flags}"), flags
+    for line in (
+        build,
+        f"{build} # secret-service",
+        "echo --features ninesql-core/secret-service",
+        "cargo --offline fetch --locked --features ninesql-core/secret-service",
+    ):
+        assert not enables_secret_service(line), line
+
+
 def check(manifest_path: Path) -> list[str]:
     errors: list[str] = []
     data = yaml.safe_load(manifest_path.read_text(encoding="utf-8"))
@@ -97,11 +126,9 @@ def check(manifest_path: Path) -> list[str]:
     ]
     joined = "\n".join(build_commands)
     # The feature is enabled only on the `cargo build` line (review L4): a comment or another
-    # command naming secret-service does not count.
-    secret_service_built = any(
-        re.search(r"\bcargo\b.*\bbuild\b", line) and re.search(r"--features[= ].*secret-service", line)
-        for line in joined.splitlines()
-    )
+    # command naming secret-service does not count. `-F x`, `-F=x`, `-Fx`, `--features x` and
+    # `--features=x` all enable it (re-review N4).
+    secret_service_built = any(enables_secret_service(line) for line in joined.splitlines())
 
     for arg in data["finish-args"]:
         for pattern, why in FORBIDDEN_PATTERNS:
@@ -143,6 +170,7 @@ def check(manifest_path: Path) -> list[str]:
 
 
 def main() -> int:
+    self_test()
     manifest = Path(sys.argv[1]).resolve() if len(sys.argv) > 1 else DEFAULT_MANIFEST
     errors = check(manifest)
     for error in errors:

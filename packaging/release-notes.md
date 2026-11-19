@@ -4,8 +4,14 @@
 NineSQL @VERSION@.
 
 Built by the release workflow from commit `@COMMIT@` (tag `@TAG@`). The signatures are bound
-to that commit: check that it is the commit of the tag (`git rev-parse @TAG@^{commit}` in a
-clone of https://github.com/@REPOSITORY@) before you trust them.
+to that commit. Before you trust them, check in a clone of https://github.com/@REPOSITORY@
+that it is the commit of the tag and that it is on `main`:
+
+```bash
+git fetch origin main --tags
+test "$(git rev-parse @TAG@^{commit})" = @COMMIT@
+git merge-base --is-ancestor @COMMIT@ origin/main && echo "on main"
+```
 
 ## Verify the files
 
@@ -19,7 +25,10 @@ sha256sum -c SHA256SUMS --ignore-missing
 ```
 
 Every file is signed: the `.deb`, the CycloneDX SBOM (`.cdx.json`) and `SHA256SUMS`. A
-signature made from another workflow, another tag or another commit fails this check.
+signature made from another workflow, another tag or another commit fails this check. What
+really decides who can produce such a signature is the repository's tag ruleset: only the
+maintainer can push `v*` tags, and the workflow (with its approval step) is the one in the
+tagged commit.
 
 ## Changes
 

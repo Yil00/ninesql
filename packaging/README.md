@@ -85,7 +85,7 @@ CycloneDX 1.5 JSON from `cargo cyclonedx` 0.5.10, limited to the crates linked i
 Every action is pinned to a commit SHA.
 
 ### Verify a release file
-The Sigstore certificate names the workflow file, the tag and the commit. Check all three: the identity and issuer prove the signature came from this repository's `release.yml` on that tag, and the commit (printed in the release notes; compare it with `git rev-parse vX.Y.Z^{commit}` in a clone) proves which sources it was built from.
+The Sigstore certificate names the workflow file, the tag and the commit. Check all three: the identity and issuer prove the signature came from this repository's `release.yml` on that tag, and the commit (printed in the release notes) proves which sources it was built from. In a clone, check that the commit is the tag's and that it is on `main`: `git rev-parse vX.Y.Z^{commit}`, then `git merge-base --is-ancestor <commit> origin/main` (after `git fetch origin main --tags`). The workflow checks the latter too, but a workflow changed in the tagged commit could skip that check.
 ```bash
 cosign verify-blob --bundle ninesql_0.1.0-1_amd64.deb.sigstore.json \
   --certificate-identity "https://github.com/Yil00/ninesql/.github/workflows/release.yml@refs/tags/v0.1.0" \
@@ -96,7 +96,7 @@ sha256sum -c SHA256SUMS --ignore-missing
 ```
 
 ### Who can sign a release
-Anyone who can run `release.yml` on a `v*` tag can obtain a valid signature, so the repository settings decide who can sign. They cannot be set from the repository's files; the maintainer creates them before the first release (P6-B):
+Anyone who can run `release.yml` on a `v*` tag can obtain a valid signature, so the repository settings decide who can sign, and the **tag ruleset is what really decides**: the workflow that runs is the one in the tagged commit, so someone able to push a `v*` tag on a commit of their own could remove the `environment:` line and the `main` check from it and sign without any approval. The `release` environment is a second gate for tags pushed by the maintainer. They cannot be set from the repository's files; the maintainer creates them before the first release (P6-B):
 1. **Tag ruleset**: Settings → Rules → Rulesets → New tag ruleset, target `refs/tags/v*`, enforcement active, restrict creations, updates and deletions, with only the maintainer (repository admin role) in the bypass list. Nobody else can push, move or delete a release tag.
 2. **`release` environment**: Settings → Environments → New environment `release`, with **required reviewers** set to the maintainer (leave "Prevent self-review" off while the maintainer, who pushes the tag, is the only reviewer), and **deployment branches and tags** set to "Selected branches and tags" with the single tag rule `v*`. The **sign** and **release** jobs wait for the maintainer's approval in each run, and cannot run from any other ref.
 3. Keep the Actions default `GITHUB_TOKEN` permissions read-only (RELEASE.md §5).
