@@ -63,7 +63,7 @@ What NineSQL does not do yet, or does only partly, as of phase 6. The list is bu
 | No rename, move or delete of scripts from NineSQL, no script list in the navigator; object editors are not restored; a script changed on disk since the quit is skipped, not reopened | Later |
 | No screen to create snippets (edit `snippets.json`); the formatter does not break `AND` / `OR` and has no settings; the per-statement run summary is not shown | Later |
 | No "Explain" action or visual plans: type and run `EXPLAIN` yourself | Later (phase 10) |
-| "Commit transaction" waits while a paged result keeps the session busy | Later |
+| "Commit transaction" waits while a paged result keeps the session busy, and up to 30 s while the navigator loads metadata on the same session (closing the tab ends that wait; the commit is then not sent) | Later |
 
 ## Navigator
 | Limitation | When |
@@ -74,6 +74,7 @@ What NineSQL does not do yet, or does only partly, as of phase 6. The list is bu
 | "Generate SQL" offers `UPDATE` and `DELETE` templates on QuestDB (which has no `DELETE`) and on views, whatever the engine supports | Later |
 | With very large catalogs, completion is rebuilt on the interface thread after every metadata change (up to 250 000 objects), and one metadata load can hold about 320 MiB briefly | Later |
 | Filters of a deleted connection stay in `navigator.json` (harmless); load limits are not configurable | Later |
+| MySQL, MariaDB, TiDB: a one-shot `SET TRANSACTION …` (next transaction only) is set again after the navigator reads, except when a stored routine ran it, or, in auto-commit mode, when a `SELECT` without a table ran between it and the navigator read; the next transaction may then run without those settings | Later |
 | The navigator's "Not connected" hint always reads "Ctrl+K Ctrl+O", even when "Connect" is rebound | Later |
 | No create / alter / drop forms, dependencies, users and roles, schema compare or ER diagrams | Later (phase 10) |
 

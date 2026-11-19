@@ -22,7 +22,7 @@ use ninesql_driver_api::{
     TRUNCATED_VALUES_METADATA_KEY, TlsMode, conformance,
 };
 use ninesql_driver_pgwire::PgWireDriver;
-use tokio::sync::OnceCell;
+use tokio::sync::{Mutex, OnceCell};
 
 struct Dev {
     host: String,
@@ -159,6 +159,11 @@ async fn run_when_idle(s: &mut dyn Session, sql: &str) -> Result<Collected, Driv
     }
     Err(DriverError::Busy)
 }
+
+/// Held by every test that commits rows to `ninesql_test.written` or compares its row count
+/// before and after a write that must not commit: cargo runs the tests of this binary in
+/// parallel, and a row committed by one test must never land inside another test's window.
+static WRITTEN: Mutex<()> = Mutex::const_new(());
 
 /// Test objects in schema `ninesql_test`, created once per test binary.
 static FIXTURES: OnceCell<()> = OnceCell::const_new();
@@ -350,6 +355,7 @@ async fn statements_with_credentials_are_never_logged() {
 async fn read_only_refuses_writes_engine_side() {
     let Some(dev) = dev() else { return };
     fixtures(&dev).await;
+    let _written = WRITTEN.lock().await;
     let driver = PgWireDriver::new();
     let writes = conformance::writes_for(&EngineId::POSTGRESQL);
     conformance::assert_read_only_refuses_writes(&driver, params(&dev), &writes).await;
@@ -409,6 +415,7 @@ async fn one_shot_read_write_transaction_cannot_write() {
     const ONE_SHOT: &str = "SET TRANSACTION ISOLATION LEVEL READ COMMITTED, READ WRITE";
     let Some(dev) = dev() else { return };
     fixtures(&dev).await;
+    let _written = WRITTEN.lock().await;
     let mut p = params(&dev);
     p.read_only = true;
     let mut s = PgWireDriver::new().connect(p).await.unwrap();
@@ -1345,6 +1352,7 @@ async fn driver_queries_never_resolve_to_user_operators() {
 async fn dropped_read_with_side_effects_is_rolled_back() {
     let Some(dev) = dev() else { return };
     fixtures(&dev).await;
+    let _written = WRITTEN.lock().await;
     let mut s = connect(&dev).await;
     run(s.as_mut(), "CREATE TEMP TABLE m3_marker (a int)")
         .await

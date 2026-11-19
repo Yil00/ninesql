@@ -154,9 +154,7 @@ fn range_clause(col: &str, first: &str, last: &str) -> String {
 
 impl MyMetadata {
     async fn query(&self, sql: &str, value_limit: Option<u64>) -> DriverResult<Rows> {
-        self.link
-            .internal_limited(sql, false, value_limit, Some(&self.control))
-            .await
+        self.link.navigator(sql, value_limit, &self.control).await
     }
 
     /// Column `col` of the single row of a `SHOW CREATE` statement.

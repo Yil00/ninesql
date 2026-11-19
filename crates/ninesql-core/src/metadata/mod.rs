@@ -19,6 +19,27 @@
 //! - Every call runs on the driver runtime (I6) and answers through a [`MetadataRequest`]
 //!   (await it on any executor, or poll it with [`MetadataRequest::try_take`]) and an event on
 //!   the [`MetadataEvents`] channel.
+//! - **One load at a time per session.** A driver session runs one execution at a time and
+//!   answers a second one with [`DriverError::Busy`] (ADR-0004), and metadata calls share the
+//!   session's connection. Loads of the service on one session therefore wait in a FIFO queue
+//!   (the session's metadata gate, shared by every `MetadataService` bound to that session)
+//!   and run one after the other: the service's own loads never fail with `Busy` because of
+//!   each other. Waiting happens on the driver runtime, never on the caller's thread (I6).
+//! - **Statements first.** While a statement or transaction command is queued or running on
+//!   the session (a paged result paused for the grid included, which holds the session until
+//!   it is stopped or read to its end), a load fails quickly, before any driver call, with
+//!   `MetadataError::Driver(DriverError::Busy)` (kind `driver-busy`): it waits at most
+//!   250 ms (a statement that just sent its last event is recorded as ended a moment later),
+//!   never behind a result that may stay open for minutes. A `Busy` answered by the driver
+//!   (an abandoned metadata call still confirming its server-side cancel, or a statement that
+//!   started meanwhile) is retried every 25 ms for up to the driver's cancel grace plus 1 s,
+//!   within the load's timeout.
+//! - **A running load finishes.** The session task takes the same gate before it starts a
+//!   statement or a transaction command and releases it once the driver accepted the
+//!   statement, so a statement sent while a load runs waits behind it (its wait counts toward
+//!   its timeout and a cancel ends it) instead of getting `Busy`. Once a load holds the gate,
+//!   only a command already using the driver session makes it fail
+//!   (`SessionHandle::driver_active`); one waiting at the gate does not.
 //!
 //! # Guarantees
 //! - **Capabilities first** (I8): a kind the session does not declare in
@@ -29,12 +50,14 @@
 //!   share it.
 //! - **Cancel on drop**: dropping a [`MetadataRequest`] withdraws its interest; when no one waits
 //!   any more, the driver call is abandoned (its future dropped, as the trait allows).
-//! - **Timeout**: each driver call sequence gets [`MetadataConfig::request_timeout`].
+//! - **Timeout**: each load gets [`MetadataConfig::request_timeout`], counted from the moment it
+//!   was queued: the time spent waiting behind other loads of the session counts, so every
+//!   request answers within the timeout.
 //! - **Bounded**: a node holds at most `page_size × max_pages_per_load` objects per load
 //!   ([`MetadataService::load_more`] continues); the cache of a connection holds at most
 //!   [`MetadataConfig::max_nodes_per_connection`] entries and
 //!   [`MetadataConfig::max_bytes_per_connection`] estimated bytes, least recently used evicted
-//!   first; at most [`MetadataConfig::max_concurrent_requests`] driver calls run per connection.
+//!   first; at most one driver call runs per session (see above).
 //! - **No secret**: metadata holds object names, comments, types and DDL, never a credential;
 //!   logs carry connection ids, kind names and counts only, never object names or engine
 //!   messages (ADR-0007 §6).
@@ -61,6 +84,16 @@ use std::time::{Duration, Instant};
 use ninesql_driver_api::metadata::{Metadata, ObjectInfo, ObjectPath, PageRequest};
 use ninesql_driver_api::{DriverError, MetadataCapabilities, ObjectKind};
 use tokio::sync::{Semaphore, mpsc, oneshot};
+
+/// Wait between two attempts when the driver answers `Busy` while no statement is pending (an
+/// abandoned metadata call still confirming its cancel).
+const BUSY_RETRY: Duration = Duration::from_millis(25);
+
+/// How long a load waits for a statement of its session to be recorded as ended before it
+/// fails with `Busy`: covers a statement that just sent its last event (the session task
+/// records its end right after), not a running or paused result.
+const STATEMENT_GRACE: Duration = Duration::from_millis(250);
+const STATEMENT_POLL: Duration = Duration::from_millis(10);
 use tokio::task::AbortHandle;
 
 use self::cache::{CacheKey, CacheValue, LruCache};
@@ -85,7 +118,8 @@ fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct MetadataConfig {
-    /// Time allowed to one load (every page of it) or one DDL fetch. Default 30 s.
+    /// Time allowed to one load (every page of it) or one DDL fetch, counted from the moment
+    /// it was queued behind the session's other loads. Default 30 s.
     pub request_timeout: Duration,
     /// Objects per driver page (1..=10 000). Default [`PageRequest::DEFAULT_LIMIT`].
     pub page_size: u32,
@@ -96,7 +130,9 @@ pub struct MetadataConfig {
     pub max_nodes_per_connection: usize,
     /// Estimated memory budget of one connection's cache, in bytes. Default 64 MiB.
     pub max_bytes_per_connection: usize,
-    /// Driver calls running at once per connection. Default 4.
+    /// Kept for compatibility; no longer used. Driver sessions run one execution at a time, so
+    /// the service runs at most one load at a time per session and queues the others
+    /// (the module documentation). Default 4.
     pub max_concurrent_requests: usize,
     /// Capacity of the event channel. Default 1 024.
     pub event_queue: usize,
@@ -522,7 +558,6 @@ struct ConnState {
     caps: MetadataCapabilities,
     cache: LruCache,
     flights: HashMap<FlightKey, Flight>,
-    limiter: Arc<Semaphore>,
     watcher: AbortHandle,
     snapshot: Option<Arc<CompletionSnapshot>>,
 }
@@ -645,7 +680,6 @@ impl Inner {
                     self.config.max_bytes_per_connection,
                 ),
                 flights: HashMap::new(),
-                limiter: Arc::new(Semaphore::new(self.config.max_concurrent_requests)),
                 watcher,
                 snapshot: None,
             }))
@@ -770,7 +804,7 @@ impl Inner {
         let work = Work {
             session: cs.session.clone(),
             metadata: Arc::clone(&cs.metadata),
-            limiter: Arc::clone(&cs.limiter),
+            gate: cs.session.metadata_gate(),
             key: key.clone(),
             base,
             filter,
@@ -881,12 +915,22 @@ impl Inner {
     }
 }
 
+/// Which session commands make a metadata load fail fast ([`Work::wait_for_statements`]).
+#[derive(Clone, Copy)]
+enum Pending {
+    /// Any statement or transaction command queued or running on the session task.
+    Queued,
+    /// Only one already using the driver session (past the gate).
+    Running,
+}
+
 /// One flight's work, run on the driver runtime.
 struct Work {
     /// Checked before every driver call: no metadata call starts on a leased session.
     session: crate::session::SessionHandle,
     metadata: Arc<dyn Metadata>,
-    limiter: Arc<Semaphore>,
+    /// The session's metadata queue: one load at a time per session.
+    gate: Arc<Semaphore>,
     key: FlightKey,
     base: Option<Arc<NodeChildren>>,
     filter: Option<KindFilter>,
@@ -897,35 +941,84 @@ struct Work {
 
 impl Work {
     async fn run(self) -> FlightResult {
-        // The permit is held for the driver calls only; the timeout starts once it is granted.
-        let Ok(_permit) = Arc::clone(&self.limiter).acquire_owned().await else {
-            return Err(MetadataError::Cancelled);
-        };
+        // One load at a time per session (FIFO); the timeout covers the wait in the queue too,
+        // so a request answers within it whatever runs before it. The permit is released when
+        // the load ends, times out or is abandoned (its future dropped).
         let timeout = self.timeout;
-        match tokio::time::timeout(timeout, self.call()).await {
+        let load = async {
+            // Fail fast behind a statement rather than queue behind it.
+            self.wait_for_statements(Pending::Queued).await?;
+            let Ok(_permit) = Arc::clone(&self.gate).acquire_owned().await else {
+                return Err(MetadataError::Cancelled);
+            };
+            self.call().await
+        };
+        match tokio::time::timeout(timeout, load).await {
             Ok(r) => r,
             Err(_) => Err(MetadataError::Timeout(timeout)),
         }
     }
 
-    fn check_lease(&self) -> Result<(), MetadataError> {
-        if self.session.is_leased() {
-            Err(MetadataError::SessionLeased)
-        } else {
-            Ok(())
+    /// Checked before every driver call: no metadata call starts on a leased session
+    /// ([`MetadataError::SessionLeased`] at once), nor while a statement or transaction command
+    /// of the session is queued or running, a paused paged result included. A statement that
+    /// just sent its last event is recorded as ended a moment later, so the check waits up to
+    /// [`STATEMENT_GRACE`] for that; past it the driver would answer `Busy`, so the service
+    /// does, without queueing behind a result that may stay open for minutes.
+    ///
+    /// Before the load holds the gate, every queued or running command counts
+    /// ([`Pending::Queued`]): a load does not start ahead of a statement already sent. Once it
+    /// holds the gate, only a command already using the driver session counts
+    /// ([`Pending::Running`]): a statement sent meanwhile waits at the gate behind the load
+    /// (the session task takes it before it starts), so it must not make the load fail.
+    async fn wait_for_statements(&self, pending: Pending) -> Result<(), MetadataError> {
+        let started = Instant::now();
+        loop {
+            if self.session.is_leased() {
+                return Err(MetadataError::SessionLeased);
+            }
+            let busy = match pending {
+                Pending::Queued => self.session.has_pending_commands(),
+                Pending::Running => self.session.driver_active(),
+            };
+            if !busy {
+                return Ok(());
+            }
+            if started.elapsed() >= STATEMENT_GRACE {
+                return Err(MetadataError::Driver(DriverError::Busy));
+            }
+            tokio::time::sleep(STATEMENT_POLL).await;
+        }
+    }
+
+    /// One driver call, after [`Self::wait_for_statements`]. A `Busy` from the driver is
+    /// retried: either a statement started meanwhile (the next check fails after its grace) or
+    /// an earlier metadata call of the service was abandoned (timeout, request dropped) and
+    /// the driver is still confirming its server-side cancel. Bounded by the driver's cancel
+    /// grace plus 1 s (and the load's timeout).
+    async fn driver_call<T, F, Fut>(&self, mut call: F) -> Result<T, MetadataError>
+    where
+        F: FnMut() -> Fut,
+        Fut: Future<Output = Result<T, DriverError>>,
+    {
+        let grace = ninesql_driver_api::SERVER_CANCEL_GRACE + Duration::from_secs(1);
+        let started = Instant::now();
+        loop {
+            self.wait_for_statements(Pending::Running).await?;
+            match call().await {
+                Err(DriverError::Busy) if started.elapsed() < grace => {
+                    tokio::time::sleep(BUSY_RETRY).await;
+                }
+                other => return other.map_err(MetadataError::Driver),
+            }
         }
     }
 
     async fn call(&self) -> FlightResult {
-        self.check_lease()?;
         match &self.key {
             FlightKey::Children(k) | FlightKey::More(k) => self.list(k).await,
             FlightKey::Ddl(path) => {
-                let text = self
-                    .metadata
-                    .ddl(path)
-                    .await
-                    .map_err(MetadataError::Driver)?;
+                let text = self.driver_call(|| self.metadata.ddl(path)).await?;
                 let bytes = text.len() + model::path_bytes(path) + 128;
                 Ok(CacheValue::Ddl(Arc::new(ObjectDdl {
                     path: path.clone(),
@@ -947,19 +1040,13 @@ impl Work {
         let mut added = 0usize;
         let mut pages = 0u32;
         loop {
-            self.check_lease()?;
+            let request = PageRequest::first()
+                .with_limit(self.page_size)
+                .with_cursor(cursor.clone())
+                .with_filter(server.clone());
             let page = self
-                .metadata
-                .list(
-                    &key.parent,
-                    key.kind,
-                    PageRequest::first()
-                        .with_limit(self.page_size)
-                        .with_cursor(cursor.clone())
-                        .with_filter(server.clone()),
-                )
-                .await
-                .map_err(MetadataError::Driver)?;
+                .driver_call(|| self.metadata.list(&key.parent, key.kind, request.clone()))
+                .await?;
             pages += 1;
             for item in page.items {
                 // A driver that answers with objects from elsewhere is not trusted with the

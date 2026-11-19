@@ -586,6 +586,13 @@ pub enum RunEvent {
         /// Statement index.
         index: usize,
     },
+    /// Statement `index` is not sent yet: it has waited more than 250 ms behind a metadata
+    /// load of the same session (navigator, completion, a table description). At most once per
+    /// statement; its timeout runs and "Cancel" ends the wait at once.
+    WaitingForMetadata {
+        /// Statement index.
+        index: usize,
+    },
     /// One result item of statement `index`, unchanged from the driver: a result-set header,
     /// a batch of rows, documents, an update count, a notice, or `Truncated` (the budget was
     /// reached; the result is incomplete).
@@ -1915,6 +1922,11 @@ impl RunJob {
                             .out
                             .send(RunEvent::WaitingForPreviousCancel { index })
                             .await;
+                    }
+                }
+                ExecEvent::WaitingForMetadata => {
+                    if forwarding {
+                        forwarding = self.out.send(RunEvent::WaitingForMetadata { index }).await;
                     }
                 }
                 ExecEvent::Started { execution: id } => {

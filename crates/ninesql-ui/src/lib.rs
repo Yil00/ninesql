@@ -41,3 +41,7 @@ pub mod workspace;
 
 #[cfg(test)]
 mod tests;
+
+/// `TestAppContext` tests against the real drivers and the dev engines (ADR-0029 step 1).
+#[cfg(test)]
+mod engine_tests;

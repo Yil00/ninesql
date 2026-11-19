@@ -745,3 +745,76 @@ fn read_only_sessions_offer_select_only(cx: &mut TestAppContext) {
         f.ws.read_with(&f.vcx, |ws, _| ws.active_object_editor().cloned());
     assert!(editor.is_some_and(|e| e.read_with(&f.vcx, |e, cx| e.read_only(cx))));
 }
+
+#[test]
+fn the_context_menu_of_tables_and_views_starts_with_open_table_data() {
+    use crate::navigator::object_menu_entries;
+    let labels = |kind: Option<ObjectKind>, read_only: bool, ddl: bool| -> Vec<String> {
+        object_menu_entries(kind, read_only, ddl)
+            .into_iter()
+            .map(|e| e.map_or_else(|| "-".to_owned(), |(label, _)| label))
+            .collect()
+    };
+    for kind in [
+        ObjectKind::Table,
+        ObjectKind::View,
+        ObjectKind::MaterializedView,
+    ] {
+        let entries = labels(Some(kind), false, true);
+        assert_eq!(entries.first().map(String::as_str), Some("Open table data"));
+        assert_eq!(
+            entries.get(1).map(String::as_str),
+            Some("Open object editor")
+        );
+        // Reading the rows is offered on a read-only session too (the action only reads).
+        let read_only = labels(Some(kind), true, false);
+        assert_eq!(
+            read_only.first().map(String::as_str),
+            Some("Open table data")
+        );
+        assert!(
+            !read_only.iter().any(|l| l == "Generate SQL: DELETE"),
+            "{read_only:?}"
+        );
+    }
+    let entries = object_menu_entries(Some(ObjectKind::Table), false, false);
+    let first = entries
+        .first()
+        .and_then(|e| e.as_ref())
+        .map(|(_, a)| a.name());
+    assert_eq!(first, Some("ninesql::OpenTableData"));
+    // Not offered where the action refuses (a column, a schema).
+    for kind in [ObjectKind::Column, ObjectKind::Schema] {
+        assert!(!labels(Some(kind), false, true).contains(&"Open table data".to_owned()));
+    }
+    assert_eq!(labels(Some(ObjectKind::Schema), false, false), ["-"]);
+}
+
+#[gpui::test]
+fn open_table_data_from_the_context_menu_opens_the_table(cx: &mut TestAppContext) {
+    let mut f = connected(cx, MetadataConfig::default());
+    open_tables(&mut f);
+    let ix = index_of(&f, "t000");
+    f.nav
+        .update(&mut f.vcx, |n, cx| n.select_index(Some(ix), cx));
+    let entries = crate::navigator::object_menu_entries(Some(ObjectKind::Table), false, false);
+    let Some(Some((_, action))) = entries.into_iter().next() else {
+        panic!("a first entry");
+    };
+    f.ws.update_in(&mut f.vcx, |ws, window, cx| {
+        ws.perform(action.as_ref(), window, cx);
+    });
+    let tab = f.ws.read_with(&f.vcx, |ws, _| ws.active_editor().cloned());
+    let Some(tab) = tab else {
+        panic!("a table tab");
+    };
+    assert!(tab.read_with(&f.vcx, |t, _| t.table_state().source.is_some()));
+    wait_until(&mut f.vcx, |vcx| {
+        tab.read_with(vcx, |t, cx| {
+            t.table_state().describing.is_none()
+                && t.table_state().source_request.is_some()
+                && !t.is_running()
+                && t.editor().read(cx).running().is_none()
+        })
+    });
+}

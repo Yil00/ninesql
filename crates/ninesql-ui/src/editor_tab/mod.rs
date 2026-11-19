@@ -140,6 +140,10 @@ pub fn idle_close_message(after: std::time::Duration, in_transaction: bool) -> S
 
 /// The text of the editor item a core statement span belongs to, for "Export results…";
 /// `None` when it had bind values (they are not kept after the run) or no item matches.
+/// Toolbar message while a statement waits behind a metadata load of its session.
+const WAITING_FOR_METADATA: &str =
+    "Waiting for the navigator to finish loading on this connection… (Cancel stops waiting)";
+
 fn statement_text(request: &ExecutionRequest, span: &Range<usize>) -> Option<String> {
     let item = request
         .items
@@ -225,6 +229,9 @@ pub struct SqlEditorTab {
     generation: u64,
     transaction: Option<TransactionState>,
     message: Option<TabMessage>,
+    /// The toolbar message is a "waiting" notice of the current run (behind a cancel or a
+    /// metadata load), cleared by the run's next event.
+    waiting_notice: bool,
     budget: GridBudget,
     /// Where [`ConfirmationGuard`]s report their dialog gone.
     confirmation_dropped: Sender<u64>,
@@ -325,6 +332,7 @@ impl SqlEditorTab {
             generation: 0,
             transaction,
             message: None,
+            waiting_notice: false,
             budget,
             confirmation_dropped: dropped_tx,
             statement_texts: HashMap::new(),
@@ -650,6 +658,7 @@ impl SqlEditorTab {
     }
 
     fn say(&mut self, text: impl Into<SharedString>, error: bool, cx: &mut Context<Self>) {
+        self.waiting_notice = false;
         self.message = Some(TabMessage {
             text: text.into(),
             error,
@@ -813,6 +822,16 @@ impl SqlEditorTab {
         };
         let base = active.base;
         let n = |index: usize| base.saturating_add(u32::try_from(index).unwrap_or(u32::MAX));
+        let waiting = matches!(
+            event,
+            RunEvent::WaitingForPreviousCancel { .. } | RunEvent::WaitingForMetadata { .. }
+        );
+        if self.waiting_notice && !waiting {
+            // The statement started (or the run moved on): the wait is over.
+            self.waiting_notice = false;
+            self.message = None;
+            cx.notify();
+        }
         match event {
             RunEvent::StatementStarted { index, span, .. } => {
                 let text = statement_text(&active.request, &span);
@@ -828,6 +847,11 @@ impl SqlEditorTab {
             }
             RunEvent::WaitingForPreviousCancel { .. } => {
                 self.say("Waiting for the previous statement to stop…", false, cx);
+                self.waiting_notice = true;
+            }
+            RunEvent::WaitingForMetadata { .. } => {
+                self.say(WAITING_FOR_METADATA, false, cx);
+                self.waiting_notice = true;
             }
             RunEvent::Item { index, item } => {
                 self.grid(
@@ -982,6 +1006,7 @@ impl SqlEditorTab {
         *self.current.borrow_mut() = None;
         self.grid(ExecutionEvent::Finished, window, cx);
         self.refresh_editing(cx);
+        self.table_run_ended(window, cx);
         let id = active.request.id;
         self.editor.update(cx, |e, cx| e.finish_run(id, cx));
         cx.notify();

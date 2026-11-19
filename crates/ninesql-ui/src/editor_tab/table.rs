@@ -9,7 +9,11 @@
 //!   statement typed in the editor is read-only, with the explanation [`TYPED_READ_ONLY`]
 //!   (`PendingEdits` matches columns by name and cannot see aliases or expressions, so only the
 //!   core's query is trusted). The table's key comes from `EditService::describe_table`; a
-//!   `NotEditable` answer is shown as the reason and the grid stays read-only (I8).
+//!   `NotEditable` answer is shown as the reason and the grid stays read-only (I8). The key is
+//!   read **before** the table query runs: a table larger than one page pauses its read, which
+//!   holds the session until the result ends or is stopped, so a description read meanwhile
+//!   answers "session busy". A busy answer is asked again (briefly, then once more when the
+//!   tab's run ends), so stopping a paused result leaves its loaded rows editable.
 //! - **Saving.** `EditService::save` runs on the driver runtime; its events are awaited on the
 //!   background executor and applied here (I6). A production save stops at
 //!   `SaveEvent::NeedsConfirmation`: the dialog shows the exact script, and "Save changes"
@@ -46,6 +50,13 @@ use super::SqlEditorTab;
 /// Why a result typed in the editor cannot be edited.
 pub const TYPED_READ_ONLY: &str =
     "Read-only: open the table from the navigator (Open table data) to edit its rows.";
+
+/// The error kind of a description refused because the session was busy (`DriverError::Busy`
+/// through the metadata service).
+const DESCRIBE_BUSY_KIND: &str = "driver-busy";
+/// How many times a description refused as busy is asked, and the wait in between (2 s).
+const DESCRIBE_ATTEMPTS: u32 = 20;
+const DESCRIBE_RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(100);
 
 /// The table a tab shows, with its server-side sort and filter.
 #[derive(Clone)]
@@ -169,6 +180,9 @@ pub struct TableState {
     pub(super) run_text_override: Option<String>,
     /// The table's description, once read.
     pub described: Option<Result<EditableTable, String>>,
+    /// The description failed while the tab's run held the session (a paused read keeps it
+    /// busy): it is read again when the run ends.
+    pub describe_again: bool,
     /// Edit state.
     pub mode: EditMode,
     /// A save waiting for the user's confirmation.
@@ -177,7 +191,7 @@ pub struct TableState {
     pub saving: bool,
     /// The next run of the table query keeps the toolbar message (the save's).
     pub(super) keep_message: bool,
-    pub(super) describing: Option<Task<()>>,
+    pub(crate) describing: Option<Task<()>>,
     pub(super) save_task: Option<Task<()>>,
 }
 
@@ -192,6 +206,7 @@ impl Default for TableState {
             #[cfg(test)]
             run_text_override: None,
             described: None,
+            describe_again: false,
             mode: EditMode::ReadOnly(TYPED_READ_ONLY.to_owned()),
             confirmation: None,
             saving: false,
@@ -303,52 +318,99 @@ impl SqlEditorTab {
 
     // --- source ------------------------------------------------------------------------------
 
-    /// Opens `source` in this tab: reads the table's key and runs its query.
+    /// Opens `source` in this tab: reads the table's key, then runs its query. The key is read
+    /// first because the query's read holds the session while it is paused after a page (a
+    /// table larger than one page): a description read meanwhile would find the session busy
+    /// and leave the result read-only.
     pub fn open_table(&mut self, source: TableSource, window: &mut Window, cx: &mut Context<Self>) {
         self.title = source.label().into();
         self.table.source = Some(source);
         self.table.described = None;
-        self.describe_source(cx);
-        self.run_source(window, cx);
+        if !self.describe_source(true, window, cx) {
+            self.run_source(window, cx);
+        }
     }
 
-    /// Reads the key of the source table (`EditService::describe_table`).
-    fn describe_source(&mut self, cx: &mut Context<Self>) {
+    /// Reads the key of the source table (`EditService::describe_table`); with `then_run`, the
+    /// source's query runs once the answer is there (whatever it is). Returns whether the read
+    /// started (else nothing runs from here).
+    fn describe_source(
+        &mut self,
+        then_run: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        self.table.describe_again = false;
         let (Some(source), Some(session)) = (self.table.source.clone(), self.session().cloned())
         else {
-            return;
+            return false;
         };
         let Some(edit) = self.hub.update(cx, |h, _| h.edit()) else {
             self.table.described = Some(Err(
                 "Read-only: the driver runtime is not running.".to_owned()
             ));
-            return;
+            return false;
         };
-        let reply = edit.describe_table(&session, source.path.clone());
-        self.table.mode = EditMode::Describing;
-        self.table.describing = Some(cx.spawn(async move |this, cx| {
-            let result = reply.await;
-            let _ = this.update(cx, |tab, cx| {
+        // Never replaces an editable state (its pending changes): only called without one.
+        if !matches!(self.table.mode, EditMode::Editable(_)) {
+            self.table.mode = EditMode::Describing;
+        }
+        let path = source.path;
+        self.table.describing = Some(cx.spawn_in(window, async move |this, cx| {
+            // A session busy with other work (another metadata load, a paused read) answers
+            // `Busy` at once: asked again a few times, waiting in between (never blocking).
+            let mut attempt = 0;
+            let result = loop {
+                let result = edit.describe_table(&session, path.clone()).await;
+                let busy = matches!(&result, Some(Err(e)) if e.kind() == DESCRIBE_BUSY_KIND);
+                attempt += 1;
+                if !busy || attempt >= DESCRIBE_ATTEMPTS {
+                    break result;
+                }
+                cx.background_executor().timer(DESCRIBE_RETRY_DELAY).await;
+            };
+            let busy = matches!(&result, Some(Err(e)) if e.kind() == DESCRIBE_BUSY_KIND);
+            let _ = this.update_in(cx, |tab, window, cx| {
                 let described = match result {
                     Some(Ok(t)) => Ok(t),
                     Some(Err(e)) => Err(format!("Read-only: {}.", edit_text(&e))),
                     None => Err("Read-only: the session closed.".to_owned()),
                 };
                 tab.set_description(described, cx);
+                // Still busy: read again when the tab's next run ends.
+                tab.table.describe_again |= busy;
+                if then_run {
+                    tab.run_source(window, cx);
+                }
             });
         }));
+        true
     }
 
-    /// Records the table's description (from `describe_table`; tests give their own).
+    /// Records the table's description (from `describe_table`; tests give their own). A
+    /// failure while the tab's own run holds the session is read again when the run ends.
     pub fn set_description(
         &mut self,
         described: Result<EditableTable, String>,
         cx: &mut Context<Self>,
     ) {
         self.table.describing = None;
+        self.table.describe_again = described.is_err() && self.is_running();
         self.table.described = Some(described);
         self.refresh_editing(cx);
         cx.notify();
+    }
+
+    /// The run ended: a description refused during it is read again, now that the session is
+    /// free (the loaded rows of a stopped table result stay editable, ADR-0027 §2.3 note).
+    pub(super) fn table_run_ended(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.table.describe_again
+            && self.table.source_live
+            && !matches!(self.table.mode, EditMode::Editable(_))
+        {
+            self.table.described = None;
+            self.describe_source(false, window, cx);
+        }
     }
 
     /// Runs the source's query (the initial one first): the editor shows the statement and the

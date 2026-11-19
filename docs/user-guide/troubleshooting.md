@@ -50,6 +50,7 @@ NineSQL writes no log file of its own.
 | "Bind parameters need a single statement: …" | Run statements with placeholders one at a time |
 | A harmless statement asks for confirmation on production | The classifier errs on the side of asking ([Safety model](safety-model.md#the-limits-of-the-statement-checks)) |
 | "Waiting for the previous statement to stop…" | The server takes a moment to confirm the cancel; the next run starts when it does |
+| "Waiting for the navigator to finish loading on this connection… (Cancel stops waiting)" | The navigator is reading metadata on the same session; the statement starts when that read ends (at most 30 s per read). "Cancel" stops waiting and the statement is not sent |
 
 ## Editing, export and import
 | Symptom | What to do |

@@ -1,6 +1,6 @@
 # ADR-0024: Phase 3 execution, history, preferences and results decisions
 
-- **Status**: Accepted (maintainer, 2026-11-15). It amends [ADR-0004](0004-driver-api-runtime-and-results.md) (result model: the memory budget is per execution, "fetch all" never goes above it; §4 below) and [ADR-0008](0008-workspace-and-config-storage.md) (§4 history: nothing for production and for statements holding a credential; §1 `settings.toml` also holds execution preferences written by the core; §1 to §3 below), and adds notes to [ADR-0004](0004-driver-api-runtime-and-results.md) (per-connection timeout, §1) and [ADR-0007](0007-production-safety-model.md) (§5 manual commit and the close confirmation, §6 below). It does not rewrite their decisions. Notes (P3 end-of-phase review, 2026-11-16) at the end of §4 (fixed overhead per result-set header and update count, result tabs capped; review M2) and §5 (an idle paused read closed by the core before the driver's limit; review M1); the decisions above them are unchanged.
+- **Status**: Accepted (maintainer, 2026-11-15). It amends [ADR-0004](0004-driver-api-runtime-and-results.md) (result model: the memory budget is per execution, "fetch all" never goes above it; §4 below) and [ADR-0008](0008-workspace-and-config-storage.md) (§4 history: nothing for production and for statements holding a credential; §1 `settings.toml` also holds execution preferences written by the core; §1 to §3 below), and adds notes to [ADR-0004](0004-driver-api-runtime-and-results.md) (per-connection timeout, §1) and [ADR-0007](0007-production-safety-model.md) (§5 manual commit and the close confirmation, §6 below). It does not rewrite their decisions. Notes (P3 end-of-phase review, 2026-11-16) at the end of §4 (fixed overhead per result-set header and update count, result tabs capped; review M2) and §5 (an idle paused read closed by the core before the driver's limit; review M1); the decisions above them are unchanged. A [note on §6](#note-on-6-close-while-waiting-at-the-metadata-gate-2026-11-19) (a close while a statement or transaction command waits at the metadata gate) was added on 2026-11-19, accepted by the maintainer the same day; §6 is unchanged.
 - **Date**: 2026-11-15
 
 ## Context
@@ -72,3 +72,12 @@ Invariants involved: I1 (no secret in clear on disk, history included), I3 (prod
 - **Releasing any paused statement**: a release is a server-side cancel, which can roll back or half-apply a write.
 - **Resuming a script by statement index**: indexes change when an earlier statement changed the lexical modes; a token could then confirm another statement.
 - **Running the statements before a refused piece**: the user would get a half-run script and a refusal in the middle.
+
+## Note on §6 (close while waiting at the metadata gate, 2026-11-19)
+Accepted (maintainer, 2026-11-19). Since the P6 local tests batch, statements and transaction commands wait behind a running metadata load on the same session (the metadata gate, [ADR-0026 note](0026-phase-4-metadata-navigator-and-wire-engine-decisions.md#note-on-13-14-and-24-metadata-gate-and-mysqlwire-navigator-reads-2026-11-19)). How a close meets that wait:
+
+1. A close, or a lost tunnel, cancels a transaction command or a statement still waiting at the gate: it is not sent and answers `SessionClosed`; the session then closes in order, and the driver rolls back an open transaction.
+2. A session is marked closing before its running statement is cancelled, so a statement or transaction command taken while the session closes is not sent.
+3. `close_with(Commit)` still commits before closing.
+
+The confirmation rules of §6.2 are unchanged. Details: [docs/02, metadata service](../02-architecture.md#metadata-service-p4-b).

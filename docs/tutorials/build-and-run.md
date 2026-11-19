@@ -12,7 +12,8 @@ What you get today: the main window (navigator, editor tabs and splits, status b
    ```bash
    sudo apt install build-essential pkg-config clang cmake libvulkan-dev libwayland-dev libxkbcommon-dev libxkbcommon-x11-dev libx11-xcb-dev libxcb1-dev libfontconfig-dev libfreetype-dev libzstd-dev libasound2-dev
    ```
-3. To run the window you need a GPU with Vulkan 1.2 drivers (Mesa `radv` or `anv`, or the NVIDIA proprietary driver) and a Wayland or X11 session. Software Vulkan (`lavapipe`) works but is slow.
+3. For [the checks before a PR](checks-before-a-pr.md) and the [local end-to-end check](local-e2e.md), also install Python **3.11 or newer**: `scripts/verify-patches.sh` reads `Cargo.toml` with `tomllib`, which older versions lack (Debian 12 ships 3.11, Ubuntu 22.04 ships 3.10). The dev databases alone need Python 3.9.
+4. To run the window you need a GPU with Vulkan 1.2 drivers (Mesa `radv` or `anv`, or the NVIDIA proprietary driver) and a Wayland or X11 session. Software Vulkan (`lavapipe`) works but is slow.
 
 ### macOS (UI iteration only)
 macOS is a development platform, not a release target. `make deps-macos` prints the list:

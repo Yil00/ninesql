@@ -41,6 +41,7 @@ mod conn;
 mod dialect;
 mod dml;
 mod metadata;
+mod oneshot;
 mod proto;
 mod session;
 mod tidb;

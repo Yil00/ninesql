@@ -72,7 +72,15 @@ jobs:
         with:
           toolchain: stable
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
-      # No GPUI system packages: none of the tested crates depends on GPUI.
+      # System packages for GPUI: ninesql-ui's TestAppContext tests against the dev engines
+      # (src/engine_tests, ADR-0029 step 1) run here too, headless like in the rust job.
+      - name: System packages for GPUI
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential pkg-config clang cmake libvulkan-dev libwayland-dev \
+            libxkbcommon-dev libxkbcommon-x11-dev libx11-xcb-dev libxcb1-dev \
+            libfontconfig-dev libfreetype-dev libzstd-dev libasound2-dev
       - name: Pull images
         run: |
           timeout 900 docker compose -f dev/compose.yaml --profile core pull --quiet
@@ -86,7 +94,7 @@ jobs:
         run: >-
           cargo test --locked
           -p ninesql-driver-pgwire -p ninesql-driver-mysqlwire -p ninesql-driver-sqlite
-          -p ninesql-core -p ninesql-ssh
+          -p ninesql-core -p ninesql-ssh -p ninesql-ui
       - name: Show state
         if: always()
         run: docker compose -f dev/compose.yaml --profile all ps --all

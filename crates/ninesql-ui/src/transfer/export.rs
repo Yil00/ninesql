@@ -587,5 +587,7 @@ pub fn open_export_dialog(
     window.open_dialog(cx, move |d, _, _| {
         d.title(title).w(px(620.)).child(view.clone())
     });
+    #[cfg(test)]
+    super::OPENED_EXPORT.with(|o| *o.borrow_mut() = Some(dialog.clone()));
     dialog
 }

@@ -841,3 +841,98 @@ fn tidb_dialect_overrides() {
         }
     }
 }
+
+/// Navigator reads in manual-commit mode end the transaction they started (TiDB starts one on
+/// any statement with `autocommit = 0`), never one the user started; another session's DDL on
+/// a browsed table does not wait for the browsing session (TiDB's metadata lock).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn navigator_reads_leave_no_transaction_and_keep_the_users() {
+    let Some(dev) = dev() else { return };
+    let _shared = INSTANCE.read().await;
+    let mut admin = connect(params(&dev)).await;
+    for sql in [
+        "DROP TABLE IF EXISTS ninesql_tidb_meta_txn",
+        "CREATE TABLE ninesql_tidb_meta_txn (id INT PRIMARY KEY, v INT, KEY v_idx (v))",
+    ] {
+        run(admin.as_mut(), sql).await.unwrap();
+    }
+    let sch = ObjectPath::root().child(ObjectKind::Schema, &dev.database);
+    let table = sch.child(ObjectKind::Table, "ninesql_tidb_meta_txn");
+    async fn browse(s: &dyn Session, sch: &ObjectPath, table: &ObjectPath, expected: bool) {
+        let m = s.metadata();
+        m.list(
+            &ObjectPath::root(),
+            ObjectKind::Schema,
+            PageRequest::first(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(s.in_transaction(), expected, "after listing schemas");
+        m.list(sch, ObjectKind::Table, PageRequest::first())
+            .await
+            .unwrap();
+        assert_eq!(s.in_transaction(), expected, "after listing tables");
+        for kind in [
+            ObjectKind::Column,
+            ObjectKind::Index,
+            ObjectKind::Constraint,
+        ] {
+            m.list(table, kind, PageRequest::first()).await.unwrap();
+            assert_eq!(s.in_transaction(), expected, "after listing {kind:?}");
+        }
+        m.ddl(table).await.unwrap();
+        assert_eq!(s.in_transaction(), expected, "after the DDL");
+    }
+    let mut s = connect(params(&dev)).await;
+    s.set_auto_commit(false).await.unwrap();
+    assert!(!s.in_transaction());
+    browse(s.as_ref(), &sch, &table, false).await;
+    let ddl = async {
+        run(
+            admin.as_mut(),
+            "ALTER TABLE ninesql_tidb_meta_txn ADD COLUMN extra INT",
+        )
+        .await
+        .unwrap();
+        run(
+            admin.as_mut(),
+            "ALTER TABLE ninesql_tidb_meta_txn DROP COLUMN extra",
+        )
+        .await
+        .unwrap();
+    };
+    tokio::time::timeout(Duration::from_secs(20), ddl)
+        .await
+        .expect("DDL waited for the browsing session");
+
+    // The user's own transaction (manual commit) stays open with its uncommitted row.
+    run(
+        s.as_mut(),
+        "INSERT INTO ninesql_tidb_meta_txn VALUES (1, 10)",
+    )
+    .await
+    .unwrap();
+    assert!(s.in_transaction());
+    browse(s.as_ref(), &sch, &table, true).await;
+    let count = "SELECT CAST(COUNT(*) AS CHAR) FROM ninesql_tidb_meta_txn";
+    assert_eq!(
+        scalar(&run(s.as_mut(), count).await.unwrap()).as_deref(),
+        Some("1")
+    );
+    assert_eq!(
+        scalar(&run(admin.as_mut(), count).await.unwrap()).as_deref(),
+        Some("0")
+    );
+    s.rollback().await.unwrap();
+    assert!(!s.in_transaction());
+    s.set_auto_commit(true).await.unwrap();
+    assert_eq!(
+        scalar(&run(s.as_mut(), count).await.unwrap()).as_deref(),
+        Some("0")
+    );
+    s.close().await.unwrap();
+    run(admin.as_mut(), "DROP TABLE ninesql_tidb_meta_txn")
+        .await
+        .unwrap();
+    admin.close().await.unwrap();
+}
