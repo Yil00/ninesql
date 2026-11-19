@@ -1685,6 +1685,7 @@ async fn open_session(
             result_queue: shared.config.result_queue.max(1) + 1,
             leased: Mutex::new(false),
             pending: std::sync::atomic::AtomicUsize::new(0),
+            metadata_gate: Arc::new(tokio::sync::Semaphore::new(1)),
         }),
     };
     lock(&shared.sessions).insert(id, handle.clone());
@@ -2049,6 +2050,9 @@ struct HandleInner {
     /// before each send, lowered by the task once the command is done. A lease is granted only
     /// at zero, so a command the task already took but has not finished is never missed.
     pending: std::sync::atomic::AtomicUsize,
+    /// One metadata load at a time on this session, whichever `MetadataService` asks: a driver
+    /// session runs one execution at a time and answers a second one with `Busy` (ADR-0004).
+    metadata_gate: Arc<tokio::sync::Semaphore>,
 }
 
 /// Exclusive use of a session by one transfer ([`SessionHandle::lease`]); released on drop.
@@ -2249,6 +2253,20 @@ impl SessionHandle {
     /// timeout, cancel and capability checks around every call (ADR-0004).
     pub(crate) fn metadata(&self) -> Arc<dyn ninesql_driver_api::Metadata> {
         Arc::clone(&self.inner.metadata)
+    }
+
+    /// The session's metadata queue: the metadata service holds its single permit for each
+    /// load, so its own loads on one session never overlap (FIFO, shared by every
+    /// `MetadataService` bound to the session).
+    pub(crate) fn metadata_gate(&self) -> Arc<tokio::sync::Semaphore> {
+        Arc::clone(&self.inner.metadata_gate)
+    }
+
+    /// `true` while a statement or transaction command is queued or running on the session
+    /// task, a paged result paused for the grid included (it holds the driver session until it
+    /// is stopped or read to its end).
+    pub(crate) fn has_pending_commands(&self) -> bool {
+        self.inner.pending.load(Ordering::SeqCst) > 0
     }
 
     /// Resolves once the session task ended (closed on request, lost or panicked).
