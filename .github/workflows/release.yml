@@ -38,6 +38,8 @@ env:
   CARGO_DEB_VERSION: "3.8.0"
   CARGO_ABOUT_VERSION: "0.9.3"
   CARGO_CYCLONEDX_VERSION: "0.5.10"
+  # The same cargo-deny as the CI `deny` job (ci.yml); bump both together.
+  CARGO_DENY_VERSION: "0.20.2"
   COSIGN_VERSION: "v3.1.4"
 
 jobs:
@@ -80,6 +82,16 @@ jobs:
       - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master
         with:
           toolchain: ${{ env.RUSTUP_TOOLCHAIN }}
+      # Supply-chain gate at tag time (P6-E review L2): the tagged commit's dependencies are
+      # checked again before anything is built, with today's advisory database, so a release
+      # cannot ship a crate that became vulnerable, banned or unlicensed since its PR's CI ran,
+      # nor a patched crate that drifted from its audited archive.
+      - name: Supply-chain gate (cargo-deny, locked)
+        run: |
+          cargo install --locked --version "$CARGO_DENY_VERSION" cargo-deny
+          cargo deny --locked check advisories bans licenses sources
+      - name: Patched crates
+        run: bash scripts/verify-patches.sh
       - name: Packaging tools (built from crates.io, locked)
         run: |
           cargo install --locked "cargo-deb@$CARGO_DEB_VERSION" "cargo-cyclonedx@$CARGO_CYCLONEDX_VERSION"
