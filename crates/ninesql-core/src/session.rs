@@ -31,6 +31,15 @@
 //! [`ExecEvent::WaitingForPreviousCancel`] and retries until the session is free, for at most
 //! [`ManagerConfig::busy_wait`], then fails with [`CoreError::StillCancelling`].
 //!
+//! Metadata loads share the driver session with statements: the session task takes the
+//! session's metadata gate before it starts a statement or a transaction command, so a
+//! statement sent while a load runs waits behind it (FIFO, each load bounded by its own
+//! timeout) instead of getting `Busy`. That wait counts toward the statement's timeout, ends at
+//! once on cancel or close, sends no event, and runs on the driver runtime. The gate is
+//! released once the driver accepted the statement; a load that starts while the statement's
+//! result is still open fails fast with `Busy` (see the metadata service). The keep-alive ping
+//! is skipped while a load runs.
+//!
 //! # Production safety (ADR-0007)
 //! Before every statement the session task classifies it with the session's dialect. On a
 //! connection whose type confirms destructive statements (always for production) or every
@@ -1686,6 +1695,7 @@ async fn open_session(
             leased: Mutex::new(false),
             pending: std::sync::atomic::AtomicUsize::new(0),
             metadata_gate: Arc::new(tokio::sync::Semaphore::new(1)),
+            driver_active: std::sync::atomic::AtomicBool::new(false),
         }),
     };
     lock(&shared.sessions).insert(id, handle.clone());
@@ -2053,6 +2063,11 @@ struct HandleInner {
     /// One metadata load at a time on this session, whichever `MetadataService` asks: a driver
     /// session runs one execution at a time and answers a second one with `Busy` (ADR-0004).
     metadata_gate: Arc<tokio::sync::Semaphore>,
+    /// `true` while the session task drives the driver session: from the moment it holds
+    /// [`Self::metadata_gate`] for a statement or transaction command until that command
+    /// ended (a paged result paused for the grid included). Read by the metadata service once
+    /// it holds the gate itself, to fail fast instead of colliding with a running result.
+    driver_active: std::sync::atomic::AtomicBool,
 }
 
 /// Exclusive use of a session by one transfer ([`SessionHandle::lease`]); released on drop.
@@ -2269,6 +2284,14 @@ impl SessionHandle {
         self.inner.pending.load(Ordering::SeqCst) > 0
     }
 
+    /// `true` while a statement or transaction command of the session task uses the driver
+    /// session (it took the metadata gate to start and has not ended yet, a paused paged result
+    /// included). Unlike [`Self::has_pending_commands`], a command still waiting for the gate
+    /// behind a metadata load does not count.
+    pub(crate) fn driver_active(&self) -> bool {
+        self.inner.driver_active.load(Ordering::SeqCst)
+    }
+
     /// Resolves once the session task ended (closed on request, lost or panicked).
     pub(crate) async fn closed(&self) {
         self.inner.commands.closed().await;
@@ -2442,6 +2465,10 @@ impl SessionTask {
         &self.handle.info().policy
     }
 
+    fn set_driver_active(&self, on: bool) {
+        self.handle.inner.driver_active.store(on, Ordering::SeqCst);
+    }
+
     async fn run(
         mut self,
         mut commands: mpsc::Receiver<Command>,
@@ -2518,6 +2545,11 @@ impl SessionTask {
 
     /// One keep-alive ping (F-CON-10). Only a fatal error ends the session.
     async fn keep_alive(&mut self) -> Flow {
+        // A metadata load runs on the session: it is activity enough, and a ping would only
+        // get `Busy` from the driver.
+        let Ok(_permit) = self.handle.metadata_gate().try_acquire_owned() else {
+            return Flow::Continue;
+        };
         let Some(session) = self.session.as_mut() else {
             return Flow::Continue;
         };
@@ -2579,6 +2611,7 @@ impl SessionTask {
                 *lock(&self.handle.inner.current) = Some(cancel.clone());
                 let mut out = Output::new(events, cancel.clone());
                 let flow = self.execute(request, &mut out, &cancel).await;
+                self.set_driver_active(false);
                 *lock(&self.handle.inner.current) = None;
                 // The terminal event leaves after the state is recorded, so a consumer that
                 // reads `transaction_state()` on it sees the state after the statement.
@@ -2608,6 +2641,16 @@ impl SessionTask {
             let _ = reply.send(Err(CoreError::PendingTransaction));
             return Flow::Continue;
         }
+        // Behind an in-flight metadata load of this session (bounded by that load's own
+        // timeout), so the driver does not answer `Busy`; a statement never holds the gate past
+        // its start, so it is free here.
+        let _permit = self.handle.metadata_gate().acquire_owned().await.ok();
+        self.set_driver_active(true);
+        let Some(session) = self.session.as_mut() else {
+            self.set_driver_active(false);
+            let _ = reply.send(Err(CoreError::SessionClosed));
+            return Flow::Continue;
+        };
         let result = match op {
             TxOp::Begin => session.begin().await,
             TxOp::Commit => session.commit().await,
@@ -2615,6 +2658,10 @@ impl SessionTask {
             TxOp::SetAutoCommit(on) => session.set_auto_commit(on).await,
             TxOp::Ping => session.ping().await,
         };
+        self.handle
+            .inner
+            .driver_active
+            .store(false, Ordering::SeqCst);
         let flow = match &result {
             Err(e) if e.is_fatal() => Flow::Lost(e.clone()),
             _ => Flow::Continue,
@@ -2689,6 +2736,46 @@ impl SessionTask {
             budget,
             ..
         } = request;
+        // Behind an in-flight metadata load of this session (FIFO with the loads, each bounded
+        // by its own timeout): the wait counts toward the statement's timeout and ends at once
+        // on cancel (closing the session cancels too). No event: the wait is short and is not
+        // a cancel tail. The gate is held until the driver accepted the statement, so no load
+        // starts in between; a load that starts later sees `driver_active` and fails fast.
+        let gate_wait = Instant::now();
+        let gate = self.handle.metadata_gate();
+        let acquire = gate.acquire_owned();
+        let deadline = async {
+            match timeout {
+                Some(t) => tokio::time::sleep(t).await,
+                None => std::future::pending::<()>().await,
+            }
+        };
+        let permit = tokio::select! {
+            biased;
+            () = cancel.cancelled() => {
+                out.finish(ExecEvent::Failed(CoreError::Driver(DriverError::Cancelled)));
+                return Flow::Continue;
+            }
+            permit = acquire => permit.ok(),
+            () = deadline => {
+                let t = timeout.unwrap_or_default();
+                tracing::debug!(session = %id, "statement timed out behind a metadata load");
+                out.finish(ExecEvent::Failed(CoreError::Driver(DriverError::Timeout(t))));
+                return Flow::Continue;
+            }
+        };
+        self.set_driver_active(true);
+        let full_timeout = timeout;
+        let timeout = timeout.map(|t| t.saturating_sub(gate_wait.elapsed()));
+        if let (Some(t), Some(left)) = (full_timeout, timeout)
+            && left.is_zero()
+        {
+            drop(permit);
+            out.finish(ExecEvent::Failed(CoreError::Driver(DriverError::Timeout(
+                t,
+            ))));
+            return Flow::Continue;
+        }
         let statement = Statement::new(text, language).with_params(params);
         let options = ExecOptions::default()
             .with_timeout(timeout)
@@ -2704,7 +2791,10 @@ impl SessionTask {
                 return Flow::Continue;
             };
             match session.execute(statement.clone(), options.clone()).await {
-                Ok(stream) => break stream,
+                Ok(stream) => {
+                    drop(permit);
+                    break stream;
+                }
                 Err(DriverError::Busy) => {
                     if started.elapsed() >= self.busy_wait {
                         out.finish(ExecEvent::Failed(CoreError::StillCancelling));

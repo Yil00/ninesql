@@ -357,3 +357,72 @@ fn concurrent_loads_on_one_session_never_fail_busy() {
         within(h.close()).await.unwrap().unwrap();
     });
 }
+
+/// The reverse race against a real driver session: statements and a ping sent while the
+/// default-schema warm-up and a table description run on the session wait behind the loads
+/// (never `Busy`, never "waiting for the previous cancel"), and the loads do not fail either.
+#[test]
+fn statements_sent_during_loads_wait_behind_them() {
+    let Some(dev) = dev() else { return };
+    let tmp = tempfile::tempdir().unwrap();
+    let (manager, _) = manager(Arc::new(PgWireDriver::new()), tmp.path());
+    let svc = MetadataService::new(manager.clone(), MetadataConfig::default());
+    let types = ConnectionTypes::default();
+    ui(async {
+        let connection = pg_connection(&dev, ConnectionTypeId::dev());
+        let id = connection.id;
+        let request = OpenRequest::new(connection, &types)
+            .with_secret(SecretSlot::Auth, SecretString::from(dev.password.clone()));
+        let h = match open(&manager, request).await.unwrap() {
+            OpenOutcome::Opened(h) => h,
+            other => panic!("{other:?}"),
+        };
+        let public = ObjectPath::root().child(ObjectKind::Schema, "public");
+        let orders = public.child(ObjectKind::Table, "orders");
+        let kinds = svc.child_kinds(id, &orders).unwrap();
+        for round in 0..10 {
+            svc.invalidate(id, &ObjectPath::root());
+            let warm = svc.warm_schema(id, public.clone());
+            let describe: Vec<_> = kinds
+                .iter()
+                .map(|kind| svc.children(id, NodeKey::new(orders.clone(), *kind)))
+                .collect();
+            // Let the loads reach the session first.
+            tokio::time::sleep(Duration::from_millis(2)).await;
+            for n in 0..3 {
+                let mut exec = h.execute(ninesql_core::ExecuteRequest::sql(
+                    "SELECT count(*) FROM public.orders",
+                ));
+                let finished = within(async {
+                    while let Some(e) = exec.next().await {
+                        match e {
+                            ninesql_core::ExecEvent::WaitingForPreviousCancel => {
+                                panic!("round {round}, statement {n}: waited for a cancel")
+                            }
+                            ninesql_core::ExecEvent::Failed(e) => {
+                                panic!("round {round}, statement {n}: {e:?}")
+                            }
+                            ninesql_core::ExecEvent::Finished { rows, .. } => return rows,
+                            _ => {}
+                        }
+                    }
+                    panic!("round {round}, statement {n}: no terminal event")
+                })
+                .await;
+                assert_eq!(finished, 1);
+            }
+            within(h.ping())
+                .await
+                .unwrap()
+                .unwrap_or_else(|e| panic!("round {round}: ping {e:?}"));
+            for r in describe {
+                within(r)
+                    .await
+                    .unwrap_or_else(|e| panic!("round {round}: {e:?}"));
+            }
+            let summary = within(warm).await.unwrap();
+            assert_eq!(summary.failed, 0, "round {round}: {summary:?}");
+        }
+        within(h.close()).await.unwrap().unwrap();
+    });
+}

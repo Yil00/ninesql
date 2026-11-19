@@ -2,7 +2,7 @@
 //! cancel on drop, timeout, cache bounds and eviction, invalidation on session close, refresh,
 //! filters (F-NAV-04), paging, capability checks (I8), search (F-NAV-05), completion snapshots,
 //! prefetch, and one load at a time per session (a driver session answers `Busy` to a second
-//! execution).
+//! execution), statements and transaction commands queued behind a running load.
 #![allow(clippy::unwrap_used, clippy::expect_used)] // Tests may panic (AGENTS.md).
 
 mod support;
@@ -55,6 +55,8 @@ struct Fake {
     active: AtomicU64,
     max_active: AtomicU64,
     busy: AtomicU64,
+    /// Statements the driver accepted.
+    statements: AtomicU64,
 }
 
 struct Abandon<'a>(&'a Fake, bool);
@@ -325,6 +327,9 @@ impl Session for FakeSession {
         Arc::clone(&self.fake) as Arc<dyn Metadata>
     }
     async fn execute(&mut self, s: Statement, o: ExecOptions) -> DriverResult<ResultStream> {
+        // One driver session: a statement sent while a metadata call runs gets `Busy`.
+        let _active = self.fake.enter()?;
+        self.fake.statements.fetch_add(1, Ordering::SeqCst);
         self.inner.execute(s, o).await
     }
     fn cancel_handle(&self) -> Arc<dyn CancelHandle> {
@@ -346,6 +351,7 @@ impl Session for FakeSession {
         self.inner.set_read_only(ro).await
     }
     async fn ping(&mut self) -> DriverResult<()> {
+        let _active = self.fake.enter()?;
         self.inner.ping().await
     }
     async fn close(self: Box<Self>) -> DriverResult<()> {
@@ -1336,5 +1342,156 @@ fn time_in_the_session_queue_counts_toward_the_timeout() {
         // Without the shared deadline it would take about 2 s (1 s queued, then 1 s hanging).
         assert!(waited < Duration::from_millis(1_800), "{waited:?}");
         assert_eq!(within(first).await.unwrap_err(), timeout);
+    });
+}
+
+/// Collects an execution's events until its terminal one.
+async fn drain(exec: &mut ninesql_core::Execution) -> Vec<ExecEvent> {
+    within(async {
+        let mut all = Vec::new();
+        while let Some(e) = exec.next().await {
+            let end = matches!(
+                e,
+                ExecEvent::Finished { .. } | ExecEvent::Failed(_) | ExecEvent::NeedsConfirmation(_)
+            );
+            all.push(e);
+            if end {
+                break;
+            }
+        }
+        all
+    })
+    .await
+}
+
+/// Waits until the fake runs a metadata call.
+async fn until_a_call_runs(fake: &Fake) {
+    within(async {
+        while fake.active.load(Ordering::SeqCst) == 0 {
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+    })
+    .await;
+}
+
+/// The reverse race: a statement sent while a metadata load runs on the same session waits
+/// behind it (no driver `Busy`, no "waiting for the previous cancel"), then runs; the load
+/// finishes too. The load has several pages: the statement waiting for the gate does not make
+/// the rest of the load fail.
+#[test]
+fn a_statement_sent_during_a_load_waits_behind_it() {
+    let env = env();
+    env.fake.exclusive.store(true, Ordering::SeqCst);
+    env.fake.delay_ms.store(150, Ordering::SeqCst);
+    let mut config = MetadataConfig::default();
+    config.page_size = 1;
+    let svc = MetadataService::new(env.manager.clone(), config);
+    ui(async {
+        let (id, h) = env.open().await;
+        // Only the fourth table passes the filter: four pages of one table, about 600 ms.
+        let filters = ConnectionFilters::new()
+            .with(
+                ObjectKind::Table,
+                KindFilter::new(Vec::<&str>::new(), ["c*", "o*"], false).unwrap(),
+            )
+            .unwrap();
+        within(svc.set_filters(id, filters)).await.unwrap().unwrap();
+        for round in 0..3 {
+            svc.invalidate(id, &ObjectPath::root());
+            let calls = env.calls();
+            let load = svc.children(id, tables("public"));
+            let statement = async {
+                until_a_call_runs(&env.fake).await;
+                let sent = Instant::now();
+                let mut exec = h.execute(ExecuteRequest::sql("SELECT * FROM numbers(3)"));
+                let events = drain(&mut exec).await;
+                (events, sent.elapsed())
+            };
+            let (node, (events, waited)) = within(async { tokio::join!(load, statement) }).await;
+            let node = node.unwrap_or_else(|e| panic!("round {round}: {e:?}"));
+            assert_eq!(names(&node), ["tmp_import"]);
+            assert_eq!(env.calls() - calls, 4);
+            assert!(
+                !events
+                    .iter()
+                    .any(|e| matches!(e, ExecEvent::WaitingForPreviousCancel)),
+                "round {round}: {events:?}"
+            );
+            assert!(
+                matches!(events.last(), Some(ExecEvent::Finished { rows: 3, .. })),
+                "round {round}: {events:?}"
+            );
+            // It waited for the rest of the load (at least the page that was running).
+            assert!(
+                waited >= Duration::from_millis(100),
+                "round {round}: {waited:?}"
+            );
+        }
+        assert_eq!(env.fake.busy.load(Ordering::SeqCst), 0);
+        assert_eq!(env.fake.max_active.load(Ordering::SeqCst), 1);
+        assert_eq!(env.fake.statements.load(Ordering::SeqCst), 3);
+    });
+}
+
+/// The wait behind a load counts toward the statement's timeout and a cancel ends it at once;
+/// neither reaches the driver. A transaction command waits behind the load too.
+#[test]
+fn the_wait_behind_a_load_is_timed_and_cancellable() {
+    let env = env();
+    env.fake.exclusive.store(true, Ordering::SeqCst);
+    env.fake.delay_ms.store(1_500, Ordering::SeqCst);
+    let svc = MetadataService::new(env.manager.clone(), MetadataConfig::default());
+    ui(async {
+        let (id, h) = env.open().await;
+        let load = svc.children(id, tables("public"));
+        let checks = async {
+            until_a_call_runs(&env.fake).await;
+            // Timed out while queued.
+            let started = Instant::now();
+            let mut exec = h.execute(
+                ExecuteRequest::sql("SELECT * FROM numbers(3)")
+                    .with_timeout(Some(Duration::from_millis(200))),
+            );
+            let events = drain(&mut exec).await;
+            assert!(
+                matches!(
+                    events.last(),
+                    Some(ExecEvent::Failed(ninesql_core::CoreError::Driver(
+                        DriverError::Timeout(t)
+                    ))) if *t == Duration::from_millis(200)
+                ),
+                "{events:?}"
+            );
+            assert!(started.elapsed() < Duration::from_millis(1_000));
+            // Cancelled while queued.
+            let mut exec = h.execute(ExecuteRequest::sql("SELECT * FROM numbers(3)"));
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            let started = Instant::now();
+            exec.cancel();
+            let events = drain(&mut exec).await;
+            assert!(
+                matches!(
+                    events.last(),
+                    Some(ExecEvent::Failed(ninesql_core::CoreError::Driver(
+                        DriverError::Cancelled
+                    )))
+                ),
+                "{events:?}"
+            );
+            assert!(started.elapsed() < Duration::from_millis(500));
+            // A transaction command (here a ping) waits for the load instead of `Busy`.
+            within(h.ping()).await.unwrap().unwrap();
+        };
+        let (node, ()) = within(async { tokio::join!(load, checks) }).await;
+        assert_eq!(node.unwrap().items.len(), 4);
+        assert_eq!(env.fake.busy.load(Ordering::SeqCst), 0);
+        assert_eq!(env.fake.statements.load(Ordering::SeqCst), 0);
+        // The session still works.
+        let mut exec = h.execute(ExecuteRequest::sql("SELECT * FROM numbers(2)"));
+        let events = drain(&mut exec).await;
+        assert!(matches!(
+            events.last(),
+            Some(ExecEvent::Finished { rows: 2, .. })
+        ));
     });
 }
