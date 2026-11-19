@@ -34,6 +34,12 @@
 //!   (an abandoned metadata call still confirming its server-side cancel, or a statement that
 //!   started meanwhile) is retried every 25 ms for up to the driver's cancel grace plus 1 s,
 //!   within the load's timeout.
+//! - **A running load finishes.** The session task takes the same gate before it starts a
+//!   statement or a transaction command and releases it once the driver accepted the
+//!   statement, so a statement sent while a load runs waits behind it (its wait counts toward
+//!   its timeout and a cancel ends it) instead of getting `Busy`. Once a load holds the gate,
+//!   only a command already using the driver session makes it fail
+//!   (`SessionHandle::driver_active`); one waiting at the gate does not.
 //!
 //! # Guarantees
 //! - **Capabilities first** (I8): a kind the session does not declare in
@@ -909,6 +915,15 @@ impl Inner {
     }
 }
 
+/// Which session commands make a metadata load fail fast ([`Work::wait_for_statements`]).
+#[derive(Clone, Copy)]
+enum Pending {
+    /// Any statement or transaction command queued or running on the session task.
+    Queued,
+    /// Only one already using the driver session (past the gate).
+    Running,
+}
+
 /// One flight's work, run on the driver runtime.
 struct Work {
     /// Checked before every driver call: no metadata call starts on a leased session.
@@ -932,7 +947,7 @@ impl Work {
         let timeout = self.timeout;
         let load = async {
             // Fail fast behind a statement rather than queue behind it.
-            self.wait_for_statements().await?;
+            self.wait_for_statements(Pending::Queued).await?;
             let Ok(_permit) = Arc::clone(&self.gate).acquire_owned().await else {
                 return Err(MetadataError::Cancelled);
             };
@@ -950,13 +965,23 @@ impl Work {
     /// just sent its last event is recorded as ended a moment later, so the check waits up to
     /// [`STATEMENT_GRACE`] for that; past it the driver would answer `Busy`, so the service
     /// does, without queueing behind a result that may stay open for minutes.
-    async fn wait_for_statements(&self) -> Result<(), MetadataError> {
+    ///
+    /// Before the load holds the gate, every queued or running command counts
+    /// ([`Pending::Queued`]): a load does not start ahead of a statement already sent. Once it
+    /// holds the gate, only a command already using the driver session counts
+    /// ([`Pending::Running`]): a statement sent meanwhile waits at the gate behind the load
+    /// (the session task takes it before it starts), so it must not make the load fail.
+    async fn wait_for_statements(&self, pending: Pending) -> Result<(), MetadataError> {
         let started = Instant::now();
         loop {
             if self.session.is_leased() {
                 return Err(MetadataError::SessionLeased);
             }
-            if !self.session.has_pending_commands() {
+            let busy = match pending {
+                Pending::Queued => self.session.has_pending_commands(),
+                Pending::Running => self.session.driver_active(),
+            };
+            if !busy {
                 return Ok(());
             }
             if started.elapsed() >= STATEMENT_GRACE {
@@ -979,7 +1004,7 @@ impl Work {
         let grace = ninesql_driver_api::SERVER_CANCEL_GRACE + Duration::from_secs(1);
         let started = Instant::now();
         loop {
-            self.wait_for_statements().await?;
+            self.wait_for_statements(Pending::Running).await?;
             match call().await {
                 Err(DriverError::Busy) if started.elapsed() < grace => {
                     tokio::time::sleep(BUSY_RETRY).await;
