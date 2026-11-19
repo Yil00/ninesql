@@ -40,8 +40,9 @@
 //! statement before it is sent. A statement or a transaction command waiting at the gate is not
 //! sent when the session is closed or its tunnel lost meanwhile (`SessionClosed`), even when
 //! the close's cancel missed the statement; the session then closes in order. A close marks
-//! the session closing before it cancels the running statement, so a statement the task takes
-//! after that mark is never sent either, even through a free gate (`SessionClosed`). The gate is
+//! the session closing before it cancels the running statement, so a statement or a
+//! transaction command the task takes after that mark is never sent either, even through a free
+//! gate (`SessionClosed`). The gate is
 //! released once the driver accepted the statement; a load that starts while the statement's
 //! result is still open fails fast with `Busy` (see the metadata service). The keep-alive ping
 //! is skipped while a load runs.
@@ -2731,6 +2732,17 @@ impl SessionTask {
             }
             permit = gate.acquire_owned() => permit.ok(),
         };
+        // A close that started before this command was taken (`mark_closing` ran, the close
+        // request is not in the channel yet) is seen here, once the permit is granted (review
+        // L-B): the command is **not sent** and answers `SessionClosed`, whether the gate was
+        // free or busy, so the outcome never depends on timing. The loop then takes the close
+        // request, and the driver close rolls back an open transaction. `close_with(Commit)`
+        // awaits its commit before it marks the session closing, so that commit still runs.
+        if self.handle.inner.closing.load(Ordering::SeqCst) {
+            tracing::debug!(session = %self.id(), "transaction command taken while the session was closing; not sent");
+            let _ = reply.send(Err(CoreError::SessionClosed));
+            return Flow::Continue;
+        }
         self.set_driver_active(true);
         let Some(session) = self.session.as_mut() else {
             self.set_driver_active(false);
@@ -3129,10 +3141,13 @@ mod tests {
         assert!(rx.recv().await.is_none());
     }
 
-    /// Counts what reaches the driver: statements sent and sessions closed.
+    /// Counts what reaches the driver: statements sent, transaction commands (begin, commit,
+    /// rollback, auto-commit switches) and sessions closed.
     #[derive(Default)]
     struct Counts {
         statements: AtomicU64,
+        tx_commands: AtomicU64,
+        commits: AtomicU64,
         closes: AtomicU64,
     }
 
@@ -3211,7 +3226,21 @@ mod tests {
             self.inner.in_transaction()
         }
         async fn set_auto_commit(&mut self, on: bool) -> ninesql_driver_api::DriverResult<()> {
+            self.counts.tx_commands.fetch_add(1, Ordering::SeqCst);
             self.inner.set_auto_commit(on).await
+        }
+        async fn begin(&mut self) -> ninesql_driver_api::DriverResult<()> {
+            self.counts.tx_commands.fetch_add(1, Ordering::SeqCst);
+            self.inner.begin().await
+        }
+        async fn commit(&mut self) -> ninesql_driver_api::DriverResult<()> {
+            self.counts.tx_commands.fetch_add(1, Ordering::SeqCst);
+            self.counts.commits.fetch_add(1, Ordering::SeqCst);
+            self.inner.commit().await
+        }
+        async fn rollback(&mut self) -> ninesql_driver_api::DriverResult<()> {
+            self.counts.tx_commands.fetch_add(1, Ordering::SeqCst);
+            self.inner.rollback().await
         }
         fn is_read_only(&self) -> bool {
             self.inner.is_read_only()
@@ -3425,6 +3454,150 @@ mod tests {
             within(h.close()).await.unwrap().unwrap();
             assert_eq!(counts.closes.load(Ordering::SeqCst), closes + 1);
             assert_eq!(counts.statements.load(Ordering::SeqCst), 1);
+        });
+    }
+
+    /// A counting mock session manager with one open dev session, for the closing tests.
+    fn counting_manager(
+        tmp: &std::path::Path,
+        counts: &Arc<Counts>,
+    ) -> (SessionManager, ConnectionTypes, Connection) {
+        let mut caps = ninesql_driver_api::mock::full_capabilities();
+        caps.tls = [
+            ninesql_driver_api::TlsMode::Disable,
+            ninesql_driver_api::TlsMode::Require,
+            ninesql_driver_api::TlsMode::VerifyCa,
+            ninesql_driver_api::TlsMode::VerifyFull,
+        ]
+        .into_iter()
+        .collect();
+        let mut registry = DriverRegistry::new();
+        registry.register(Arc::new(CountingDriver {
+            mock: ninesql_driver_api::mock::MockDriver::new().with_capabilities(caps),
+            counts: Arc::clone(counts),
+        }));
+        let mut stores = SecretStores::new();
+        stores.register(Arc::new(ninesql_secrets::MemoryStore::new(
+            StoreKind::Keyring,
+        )));
+        let mut config = ManagerConfig::with_known_hosts(KnownHostsFiles {
+            own: tmp.join("known_hosts"),
+            user: None,
+        });
+        config.workers = 2;
+        let manager = SessionManager::new(config, registry, stores).unwrap();
+        let c = Connection::new(
+            "Mock",
+            EngineId::new(ninesql_driver_api::mock::MOCK_ENGINE.as_str()).unwrap(),
+            Endpoint::Tcp {
+                host: "mock.example.test".into(),
+                port: Some(5000),
+                database: Some("app".into()),
+            },
+            crate::connection::Auth::None,
+            crate::connection_type::ConnectionTypeId::dev(),
+        );
+        (manager, ConnectionTypes::default(), c)
+    }
+
+    /// Review L-B: a transaction command the session task takes after `mark_closing` and
+    /// before the close request is in the channel is not sent, even through a free metadata
+    /// gate, and answers `SessionClosed` (as it does behind a busy gate, where the close ends
+    /// its wait): a commit, a rollback and an auto-commit switch alike. The close then
+    /// completes in order, once, and the driver close rolls the open transaction back.
+    #[test]
+    fn a_transaction_command_taken_while_closing_is_not_sent_through_a_free_gate() {
+        let tmp = tempfile::tempdir().unwrap();
+        let counts = Arc::new(Counts::default());
+        let (manager, types, c) = counting_manager(tmp.path(), &counts);
+        let ui = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        ui.block_on(async {
+            let opened = within(manager.open(OpenRequest::new(c, &types)))
+                .await
+                .unwrap()
+                .unwrap();
+            let OpenOutcome::Opened(h) = opened else {
+                panic!("not opened: {opened:?}");
+            };
+            // A transaction is open before the close.
+            let state = within(h.begin()).await.unwrap().unwrap();
+            assert!(state.in_transaction);
+            assert_eq!(counts.tx_commands.load(Ordering::SeqCst), 1);
+            let closes = counts.closes.load(Ordering::SeqCst);
+
+            // The first half of `close()`, with a free gate and no close request yet.
+            h.mark_closing();
+            assert_eq!(h.metadata_gate().available_permits(), 1);
+            let commit = h.commit();
+            let rollback = h.rollback();
+            let auto_commit = h.set_auto_commit(false);
+            for (what, reply) in [
+                ("commit", commit),
+                ("rollback", rollback),
+                ("auto-commit", auto_commit),
+            ] {
+                let answer = within(reply).await.unwrap();
+                assert!(
+                    matches!(answer, Err(CoreError::SessionClosed)),
+                    "{what}: {answer:?}"
+                );
+            }
+            assert_eq!(
+                counts.tx_commands.load(Ordering::SeqCst),
+                1,
+                "a transaction command taken while closing reached the driver"
+            );
+            assert_eq!(counts.commits.load(Ordering::SeqCst), 0);
+            assert_eq!(counts.closes.load(Ordering::SeqCst), closes);
+            // Nothing was committed: the transaction is still open until the driver close.
+            assert!(h.transaction_state().in_transaction);
+
+            // The second half: the close completes in order, once.
+            within(h.send_close()).await.unwrap().unwrap();
+            within(h.closed()).await;
+            within(h.close()).await.unwrap().unwrap();
+            assert_eq!(counts.closes.load(Ordering::SeqCst), closes + 1);
+            assert_eq!(counts.commits.load(Ordering::SeqCst), 0);
+            assert_eq!(counts.tx_commands.load(Ordering::SeqCst), 1);
+        });
+    }
+
+    /// Review L-B: `close_with(Commit)` still commits. It awaits its commit before it marks the
+    /// session closing, so the closing check does not refuse it; then the session closes once.
+    #[test]
+    fn close_with_commit_still_commits_before_closing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let counts = Arc::new(Counts::default());
+        let (manager, types, c) = counting_manager(tmp.path(), &counts);
+        let ui = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        ui.block_on(async {
+            let opened = within(manager.open(OpenRequest::new(c, &types)))
+                .await
+                .unwrap()
+                .unwrap();
+            let OpenOutcome::Opened(h) = opened else {
+                panic!("not opened: {opened:?}");
+            };
+            assert!(within(h.begin()).await.unwrap().unwrap().in_transaction);
+            let closes = counts.closes.load(Ordering::SeqCst);
+            within(h.close_with(TransactionEnd::Commit)).await.unwrap();
+            assert_eq!(counts.commits.load(Ordering::SeqCst), 1);
+            assert!(!h.transaction_state().in_transaction);
+            within(h.closed()).await;
+            assert_eq!(counts.closes.load(Ordering::SeqCst), closes + 1);
+            // Closed: a later commit answers `SessionClosed` and reaches nothing.
+            let late = within(h.commit()).await;
+            assert!(
+                matches!(late, None | Some(Err(CoreError::SessionClosed))),
+                "{late:?}"
+            );
+            assert_eq!(counts.commits.load(Ordering::SeqCst), 1);
         });
     }
 
