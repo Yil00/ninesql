@@ -450,7 +450,7 @@ Items left by the phase 5 task reports, the security reviews of P5-B, P5-C, P5-D
 
 | Workstream | Owner | Tasks |
 |----------|--------------|--------|
-| P6-A Packaging | `core-engineer` | [ ] `.deb` (ADR-0010): desktop file, icons, AppStream, MIME, man page, third-party licenses · [ ] Install tests in Debian 12 / 13 and Ubuntu 22.04 / 24.04 containers · [ ] Flatpak manifest with minimal permissions · [ ] Reproducible build check, SBOM, cosign signatures from the tag-push workflow |
+| P6-A Packaging | `core-engineer` | [x] `.deb` (ADR-0010): desktop file, icons, AppStream, MIME, man page, third-party licenses · [~] Install tests in Debian 12 / 13 and Ubuntu 22.04 / 24.04 containers · [~] Flatpak manifest with minimal permissions · [~] Reproducible build check, SBOM, cosign signatures from the tag-push workflow |
 | P6-B Release infrastructure | maintainer | [ ] APT signing key, signed repository on GitHub Pages, fingerprint in SECURITY.md · [ ] Flathub submission · [x] Branch protection (done in P0-F) · [ ] Release settings (tag-push signing, Pages) ([RELEASE.md](../RELEASE.md)) |
 | P6-C Measurements | `ui-engineer` | [ ] Publish measured cold start, idle memory and 1 M-row behavior, with method, machine and commit, in docs/04 — replacing every target with a measurement |
 | P6-D Documentation | `docs-keeper` | [ ] User guide (install, import from DBeaver, connections, editor, safety model), known limitations, capability matrix final pass, CHANGELOG. *Starts from the [tutorials](tutorials/README.md), kept current since phase 1* |

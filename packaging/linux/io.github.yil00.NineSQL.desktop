@@ -1,0 +1,12 @@
+[Desktop Entry]
+Type=Application
+Name=NineSQL
+GenericName=Database Client
+Comment=Native database client for PostgreSQL, MySQL, MariaDB, SQLite and more
+Exec=ninesql
+Icon=io.github.yil00.NineSQL
+Terminal=false
+Categories=Development;Database;
+Keywords=SQL;database;PostgreSQL;MySQL;MariaDB;SQLite;DBeaver;
+StartupNotify=true
+StartupWMClass=io.github.yil00.NineSQL

@@ -2,7 +2,7 @@
 
 NineSQL has no release yet: you build it from the repository. This page covers Linux (Debian, Ubuntu), the platforms NineSQL targets, and macOS, which is kept compiling so contributors on a Mac can iterate on the interface ([docs/10](../10-supported-platforms.md)).
 
-What you get today: the main window (navigator, editor tabs and splits, status bar, several windows), the command palette, themes, the connection dialog, sessions to PostgreSQL, MySQL, MariaDB, SQLite, TimescaleDB, YugabyteDB, QuestDB and TiDB, the DBeaver import, the SQL editor with its results grid, the navigator's object tree and object editor, data editing, export and import with the export of connections to DBeaver ([Edit data](edit-data.md), [Export and import data](export-import.md)), and script files with session restore ([Run SQL](run-sql.md#12-script-files-and-session-restore)). Not built yet: in-cell editing, packages (phase 6).
+What you get today: the main window (navigator, editor tabs and splits, status bar, several windows), the command palette, themes, the connection dialog, sessions to PostgreSQL, MySQL, MariaDB, SQLite, TimescaleDB, YugabyteDB, QuestDB and TiDB, the DBeaver import, the SQL editor with its results grid, the navigator's object tree and object editor, data editing, export and import with the export of connections to DBeaver ([Edit data](edit-data.md), [Export and import data](export-import.md)), and script files with session restore ([Run SQL](run-sql.md#12-script-files-and-session-restore)). Not built yet: in-cell editing, and no published package yet: you can build the `.deb` yourself ([section 5](#5-build-and-install-the-deb)).
 
 ## 1. Install the toolchain
 
@@ -62,6 +62,28 @@ Only one NineSQL process can use the workspace at a time: a second one is refuse
 The connection actions are in [Create your first connection](first-connection.md), the editor and results grid actions in [Run SQL and read results](run-sql.md), the navigator and object actions in [Browse a database](browse-database.md), the secret actions in [Secrets](secrets.md).
 
 On macOS the default bindings use **Ctrl** too, not Cmd: the defaults are the Linux ones on every platform.
+
+## 5. Build and install the `.deb`
+NineSQL has no published package yet (the signed APT repository and Flathub come with the first release). You can build the Debian package from the repository and install it on Debian 12 or 13, or Ubuntu 22.04 or 24.04 ([packaging/README.md](../../packaging/README.md)).
+
+1. Install Docker and the two packaging tools:
+   ```bash
+   cargo install --locked cargo-deb@3.8.0
+   cargo install --locked cargo-about@0.9.3 --features cli
+   ```
+2. Build the package. The binary is linked in an Ubuntu 22.04 container, so it also runs on the older targets; the build itself has no network access:
+   ```bash
+   make deb TIMEOUT=3000     # writes target/debian/ninesql_<version>-1_amd64.deb
+   ```
+3. Install it with apt, which pulls the dependencies (Vulkan loader, xkbcommon, Wayland and fontconfig libraries):
+   ```bash
+   sudo apt install ./target/debian/ninesql_0.0.0-1_amd64.deb
+   ninesql --version
+   ```
+   NineSQL appears in the applications menu. `man ninesql` lists its files. The package has no install or removal script and adds no service, update check or APT source.
+4. Remove it with `sudo apt purge ninesql`. Your workspace, settings and vault stay in your home directory ([where NineSQL keeps its files](#where-ninesql-keeps-its-files)).
+
+`make deb-install-test` checks the package in Debian 12 / 13 and Ubuntu 22.04 / 24.04 containers, and `make deb-reproducible` builds it twice and compares the hashes.
 
 ## Settings and key bindings
 NineSQL reads `$XDG_CONFIG_HOME/ninesql/settings.toml` (by default `~/.config/ninesql/settings.toml`, on macOS too). The file is optional; changes you make in the window (theme, fonts, zoom) are written back to it, keeping your comments. An example:

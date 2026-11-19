@@ -6,7 +6,7 @@ NineSQL is **pre-alpha**: nothing is released, and you run it from source. What 
 
 | Tutorial | For | You will |
 |---|---|---|
-| [Build and run NineSQL from source](build-and-run.md) | Everyone | Install the toolchain, build, start the `ninesql` window on Linux (and on macOS for UI work) |
+| [Build and run NineSQL from source](build-and-run.md) | Everyone | Install the toolchain, build, start the `ninesql` window on Linux (and on macOS for UI work), build and install the `.deb` |
 | [Start the dev databases](dev-databases.md) | Contributors, testers | Run PostgreSQL, MySQL, MariaDB, TimescaleDB, YugabyteDB, QuestDB, TiDB and the other engines in containers with the "nine" dataset |
 | [Create your first connection](first-connection.md) | Everyone | Create, test and open a PostgreSQL, MySQL, MariaDB or SQLite connection: TLS, SSH, connection types; the conditions of TimescaleDB, YugabyteDB, QuestDB and TiDB |
 | [Run SQL and read results](run-sql.md) | Everyone | Open an SQL editor on a connection, run statements, selections and scripts with parameters, confirm on production, cancel, commit or roll back, page through and copy results, set timeouts and history retention, format SQL, insert snippets, save and open script files, reopen them after a restart |

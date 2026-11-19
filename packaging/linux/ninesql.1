@@ -1,0 +1,61 @@
+.\" Man page of ninesql (P6-A). Plain man(7) macros; check with: man -l packaging/linux/ninesql.1
+.TH NINESQL 1 "2026-11-19" "NineSQL" "User Commands"
+.SH NAME
+ninesql \- native database client
+.SH SYNOPSIS
+.B ninesql
+.RB [ \-h | \-\-help | \-V | \-\-version ]
+.SH DESCRIPTION
+.B ninesql
+opens the NineSQL window: a database client for PostgreSQL, MySQL, MariaDB, SQLite and
+wire-compatible engines (TimescaleDB, YugabyteDB, QuestDB, TiDB), with a SQL editor, a results
+grid, a database navigator, data editing, export and CSV import, and an import of DBeaver
+workspaces that never modifies DBeaver's files.
+.PP
+It needs a Wayland or X11 session and a GPU with Vulkan 1.2 drivers.
+.PP
+NineSQL sends no telemetry and opens network connections only to the databases you declare and
+their SSH hops.
+.SH OPTIONS
+.TP
+.BR \-h ", " \-\-help
+Print a short help and exit.
+.TP
+.BR \-V ", " \-\-version
+Print the version and exit.
+.PP
+Any other argument is refused (exit status 2).
+.SH FILES
+.TP
+.I $XDG_CONFIG_HOME/ninesql/settings.toml
+Preferences (default \fI~/.config/ninesql/\fR).
+.TP
+.I $XDG_DATA_HOME/ninesql/workspace/
+Projects, connections, connection types and scripts (default \fI~/.local/share/ninesql/\fR).
+Connection files hold references to saved secrets, never the secrets.
+.TP
+.I $XDG_DATA_HOME/ninesql/vault.bin
+The encrypted vault of saved passwords, when the desktop keyring is not used.
+.TP
+.I $XDG_DATA_HOME/ninesql/known_hosts
+SSH host keys accepted in NineSQL.
+.TP
+.I $XDG_STATE_HOME/ninesql/
+Query history (\fIhistory.sqlite\fR) and \fIsession.json\fR, the windows and script tabs
+reopened at the next start, never editor text (default \fI~/.local/state/ninesql/\fR).
+.TP
+.I ~/.ssh/known_hosts
+Read, with NineSQL's own file, to verify SSH host keys.
+.SH ENVIRONMENT
+.TP
+.B XDG_CONFIG_HOME\fR, \fBXDG_DATA_HOME\fR, \fBXDG_STATE_HOME
+Base directories of the files above.
+.SH EXIT STATUS
+0 on success, 2 for an unknown argument.
+.SH SEE ALSO
+The tutorials at
+.UR https://github.com/Yil00/ninesql/tree/main/docs/tutorials
+.UE .
+.SH LICENSE
+Apache License 2.0. The licenses of the third-party code in the binary are in
+.IR /usr/share/doc/ninesql/THIRD-PARTY-LICENSES.txt .

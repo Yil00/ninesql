@@ -1,0 +1,65 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- AppStream metadata of NineSQL (P6-A, ADR-0010 §1). Validate with
+     `appstreamcli validate packaging/linux/io.github.yil00.NineSQL.metainfo.xml`. -->
+<component type="desktop-application">
+  <id>io.github.yil00.NineSQL</id>
+  <metadata_license>CC0-1.0</metadata_license>
+  <project_license>Apache-2.0</project_license>
+  <name>NineSQL</name>
+  <summary>Native database client for SQL engines</summary>
+  <developer id="io.github.yil00">
+    <name>NineSQL contributors</name>
+  </developer>
+  <description>
+    <p>
+      NineSQL is an open-source database client for the Linux desktop, written in Rust with a
+      GPU-rendered interface. It connects to PostgreSQL, MySQL, MariaDB, SQLite and
+      wire-compatible engines (TimescaleDB, YugabyteDB, QuestDB, TiDB), and imports DBeaver
+      workspaces without modifying them.
+    </p>
+    <ul>
+      <li>SQL editor with completion, parameters and script runs</li>
+      <li>Results grid that streams large results within a memory budget</li>
+      <li>Database navigator, object editor and DDL</li>
+      <li>Data editing with a preview of the statements, export and CSV import</li>
+      <li>Read-only connections enforced by the database session, and confirmations on production</li>
+      <li>Passwords kept in an encrypted vault or the desktop keyring, never in plain files</li>
+      <li>Verified TLS and SSH tunnels with host key checks</li>
+    </ul>
+    <p>
+      NineSQL sends no telemetry and connects only to the databases you declare and their SSH hops.
+    </p>
+  </description>
+  <launchable type="desktop-id">io.github.yil00.NineSQL.desktop</launchable>
+  <url type="homepage">https://github.com/Yil00/ninesql</url>
+  <url type="bugtracker">https://github.com/Yil00/ninesql/issues</url>
+  <provides>
+    <binary>ninesql</binary>
+  </provides>
+  <categories>
+    <category>Development</category>
+    <category>Database</category>
+  </categories>
+  <keywords>
+    <keyword>SQL</keyword>
+    <keyword>database</keyword>
+    <keyword>PostgreSQL</keyword>
+    <keyword>MySQL</keyword>
+    <keyword>MariaDB</keyword>
+    <keyword>SQLite</keyword>
+  </keywords>
+  <requires>
+    <display_length compare="ge">768</display_length>
+  </requires>
+  <supports>
+    <control>keyboard</control>
+    <control>pointing</control>
+  </supports>
+  <branding>
+    <color type="primary" scheme_preference="light">#38bdf8</color>
+    <color type="primary" scheme_preference="dark">#0b0f19</color>
+  </branding>
+  <content_rating type="oars-1.1"/>
+  <!-- Releases are added by the release PR (RELEASE.md); screenshots come with the visual
+       pass of P6-F (packaging/README.md). -->
+</component>

@@ -79,7 +79,10 @@ pub fn window_options(cx: &App) -> WindowOptions {
     WindowOptions {
         window_bounds: Some(WindowBounds::Windowed(bounds)),
         window_min_size: Some(size(px(640.), px(400.))),
-        app_id: Some("ninesql".to_owned()),
+        // The Wayland app id (X11 WM_CLASS): the basename of the desktop file and the Flatpak
+        // app id, so the desktop shows the window with NineSQL's name and icon (P6-A,
+        // packaging/linux/).
+        app_id: Some("io.github.yil00.NineSQL".to_owned()),
         titlebar: Some(TitlebarOptions {
             title: Some("NineSQL".into()),
             ..TitleBar::title_bar_options()

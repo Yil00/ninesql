@@ -1,0 +1,94 @@
+# Flatpak manifest of NineSQL (P6-A, ADR-0010 §3, ADR-0005 amendment "P1-D wiring" point 6).
+# Not built by the project yet: see packaging/README.md ("Flatpak") for how to build it, and
+# packaging/flatpak/lint-manifest.py for the checks run on it (`make flatpak-lint`).
+#
+# Before building: packaging/flatpak/prepare-sources.sh writes, next to this file,
+#   cargo-sources.json         every crate of Cargo.lock as a checksummed source
+#                              (flatpak-cargo-generator), so the build runs offline;
+#   THIRD-PARTY-LICENSES.txt   the same third-party license file as the .deb (cargo-about).
+# Both are generated, not committed.
+id: io.github.yil00.NineSQL
+runtime: org.freedesktop.Platform
+runtime-version: '25.08'
+sdk: org.freedesktop.Sdk
+sdk-extensions:
+  # Rust 1.89 or newer (ADR-0012); the extension follows the stable channel.
+  - org.freedesktop.Sdk.Extension.rust-stable
+command: ninesql
+
+# The narrowest permissions that work. Every entry is explained; lint-manifest.py refuses
+# anything not on its list.
+finish-args:
+  # Display: Wayland, and X11 only when no Wayland compositor runs.
+  - --socket=wayland
+  - --socket=fallback-x11
+  # X11 shared memory (MIT-SHM); unused on Wayland.
+  - --share=ipc
+  # GPU: GPUI renders with Vulkan.
+  - --device=dri
+  # The user's database connections and their SSH / proxy hops. Flatpak grants the network
+  # all-or-nothing; the limit to declared connections is NineSQL's own (I2). Nothing else
+  # connects: no telemetry, no update check.
+  - --share=network
+  # logind on the system bus: the vault is locked and the "ask every time" secrets dropped on
+  # sleep and screen lock (DesktopLockWatcher, default-on `desktop-lock` feature). Without it
+  # only the idle lock applies, and NineSQL says so.
+  - --system-talk-name=org.freedesktop.login1
+  # Read-only: OpenSSH's known_hosts, so host keys the user already trusts in OpenSSH are
+  # recognised (ADR-0011); the file only, never ~/.ssh itself (private keys stay out of reach).
+  # Without it every host key is checked against NineSQL's own known_hosts only.
+  - --filesystem=~/.ssh/known_hosts:ro
+  # Read-only: DBeaver's workspace (.deb / tarball install), so the first-run import offer finds
+  # it, and so the sandbox itself enforces that NineSQL never writes DBeaver files (I4).
+  # Other DBeaver locations (DBeaver's own Flatpak, the Snap) are chosen with the folder portal.
+  - --filesystem=~/.local/share/DBeaverData:ro
+  # Not granted:
+  # - --talk-name=org.freedesktop.secrets: the Secret Service backend (`secret-service`
+  #   feature) is off by default (ADR-0012), so saved passwords go to the encrypted vault in
+  #   ~/.var/app/io.github.yil00.NineSQL/data/ninesql/. Add it only to a build with
+  #   `--features ninesql-core/secret-service` (ADR-0005 §5).
+  # - --socket=ssh-auth: the SSH agent is opt-in (ADR-0010 §3):
+  #   flatpak override --user --socket=ssh-auth io.github.yil00.NineSQL
+  # - home or host file access: scripts, exports, imports, SQLite files and SSH key files go
+  #   through the file chooser portal; a Unix-socket database needs an explicit override
+  #   (packaging/README.md).
+
+build-options:
+  append-path: /usr/lib/sdk/rust-stable/bin
+  env:
+    CARGO_HOME: /run/build/ninesql/cargo
+    CARGO_NET_OFFLINE: 'true'
+    CARGO_INCREMENTAL: '0'
+
+modules:
+  - name: ninesql
+    buildsystem: simple
+    build-commands:
+      - cargo --offline fetch --locked --verbose
+      - cargo --offline build --release --locked -p ninesql-ui --bin ninesql
+      - install -Dm755 target/release/ninesql /app/bin/ninesql
+      - install -Dm644 packaging/linux/io.github.yil00.NineSQL.desktop /app/share/applications/io.github.yil00.NineSQL.desktop
+      - install -Dm644 packaging/linux/io.github.yil00.NineSQL.metainfo.xml /app/share/metainfo/io.github.yil00.NineSQL.metainfo.xml
+      - install -Dm644 docs/assets/logo.svg /app/share/icons/hicolor/scalable/apps/io.github.yil00.NineSQL.svg
+      - |
+        for size in 32 48 64 128 256 512; do
+          install -Dm644 "packaging/linux/icons/${size}.png" \
+            "/app/share/icons/hicolor/${size}x${size}/apps/io.github.yil00.NineSQL.png"
+        done
+      - install -Dm644 LICENSE /app/share/licenses/io.github.yil00.NineSQL/LICENSE
+      - install -Dm644 NOTICE /app/share/licenses/io.github.yil00.NineSQL/NOTICE
+      - install -Dm644 THIRD-PARTY-LICENSES.txt /app/share/licenses/io.github.yil00.NineSQL/THIRD-PARTY-LICENSES.txt
+    sources:
+      # Local builds: the checkout. For Flathub (P6-B) this becomes a `git` source with the
+      # release tag and its commit.
+      - type: dir
+        path: ../..
+        skip:
+          - target
+          - .git
+          - .flatpak-builder
+          - packaging/flatpak/build-dir
+          - packaging/flatpak/.flatpak-builder
+      - type: file
+        path: THIRD-PARTY-LICENSES.txt
+      - cargo-sources.json

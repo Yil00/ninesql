@@ -59,6 +59,7 @@ FORBIDDEN_GPUI_APIS = set_http_client|with_http_client|read_credentials|write_cr
 	fmt fmt-check clippy test deny md-links verify-patches verify-gpui-snapshot forbidden-apis check \
 	dev-up dev-up-all dev-down dev-check dev-ps \
 	test-engines test-engines-run \
+	deb deb-install-test deb-reproducible sbom flatpak-lint \
 	clean deps-debian deps-macos
 
 # ---------------------------------------------------------------------------------------------
@@ -162,6 +163,25 @@ test-engines: ## Start core and the wire engines, run driver/core/ssh tests, sto
 
 test-engines-run: ## Run the same tests against engines that are already up
 	$(ENGINE_TESTS)
+
+# ---------------------------------------------------------------------------------------------
+##@ Packaging (packaging/README.md; Docker, cargo-deb and cargo-about)
+# ---------------------------------------------------------------------------------------------
+
+deb: ## Build the .deb in the Ubuntu 22.04 builder (output in target/debian/)
+	TIMEOUT=$(TIMEOUT) packaging/deb/build.sh
+
+deb-install-test: ## Install target/debian/*.deb on Debian 12 / 13 and Ubuntu 22.04 / 24.04
+	packaging/deb/install-test.sh target/debian/ninesql_*_amd64.deb
+
+deb-reproducible: ## Build the .deb twice (two paths) and compare the hashes
+	TIMEOUT=$(TIMEOUT) packaging/deb/check-reproducible.sh
+
+sbom: ## Write the CycloneDX SBOM of the binary to target/ninesql.cdx.json (needs cargo-cyclonedx)
+	$(PYTHON) packaging/sbom.py target/ninesql.cdx.json
+
+flatpak-lint: ## Check the Flatpak manifest and its permissions (no flatpak-builder needed)
+	$(PYTHON) packaging/flatpak/lint-manifest.py
 
 # ---------------------------------------------------------------------------------------------
 ##@ Helpers

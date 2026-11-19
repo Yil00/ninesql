@@ -1,6 +1,6 @@
 [package]
 name = "ninesql-ui"
-description = "NineSQL desktop application (GPUI)"
+description = "Native database client (NineSQL desktop application, GPUI)"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -45,6 +45,49 @@ ninesql-driver-sqlite = { path = "../drivers/ninesql-driver-sqlite" }
 [[bin]]
 name = "ninesql"
 path = "src/main.rs"
+
+# The .deb (P6-A, ADR-0010 §1), built by packaging/deb/build.sh with cargo-deb (`--no-build`:
+# the binary comes from the Ubuntu 22.04 builder). cargo-deb reads this table from the manifest
+# of the package that owns the binary, hence here; see packaging/README.md. Paths starting with
+# `target/release/` are taken from the build's target directory (the binary, the man page and
+# the third-party license file that build.sh generates there).
+[package.metadata.deb]
+name = "ninesql"
+# Maintainer address of the package: to be replaced by a project address (P6-B).
+maintainer = "NineSQL contributors <105881992+Yil00@users.noreply.github.com>"
+copyright = "2026 MyDataVizion"
+license-file = ["../../LICENSE", "0"]
+section = "database"
+priority = "optional"
+extended-description = """\
+NineSQL is a native database client for Debian and Ubuntu, written in Rust with a \
+GPU-rendered interface. It connects to PostgreSQL, MySQL, MariaDB, SQLite and wire-compatible \
+engines, and imports DBeaver workspaces without modifying them. It sends no telemetry and \
+connects only to the databases you declare and their SSH hops."""
+# Linked: libc6 (glibc 2.35 at most, checked by build.sh), libgcc-s1, libxcb1, libxkbcommon0,
+# libxkbcommon-x11-0. Loaded at run time by GPUI: the Vulkan loader, Wayland and fontconfig.
+# Listed by hand rather than with $auto (dpkg-shlibdeps), so the result does not depend on the
+# host that runs cargo-deb and the names resolve on Debian 12 / 13 and Ubuntu 22.04 / 24.04
+# (packaging/deb/install-test.sh).
+depends = "libc6 (>= 2.35), libgcc-s1, libxcb1, libxkbcommon0, libxkbcommon-x11-0, libvulkan1, libwayland-client0, libfontconfig1"
+recommends = "mesa-vulkan-drivers | vulkan-icd"
+# No maintainer scripts at all (ADR-0010 §1): nothing runs at install or removal; dpkg
+# triggers refresh the icon, desktop and man caches.
+assets = [
+    ["target/release/ninesql", "usr/bin/", "755"],
+    ["target/release/ninesql.1.gz", "usr/share/man/man1/", "644"],
+    ["target/release/THIRD-PARTY-LICENSES.txt", "usr/share/doc/ninesql/", "644"],
+    ["../../NOTICE", "usr/share/doc/ninesql/", "644"],
+    ["../../packaging/linux/io.github.yil00.NineSQL.desktop", "usr/share/applications/", "644"],
+    ["../../packaging/linux/io.github.yil00.NineSQL.metainfo.xml", "usr/share/metainfo/", "644"],
+    ["../../docs/assets/logo.svg", "usr/share/icons/hicolor/scalable/apps/io.github.yil00.NineSQL.svg", "644"],
+    ["../../packaging/linux/icons/32.png", "usr/share/icons/hicolor/32x32/apps/io.github.yil00.NineSQL.png", "644"],
+    ["../../packaging/linux/icons/48.png", "usr/share/icons/hicolor/48x48/apps/io.github.yil00.NineSQL.png", "644"],
+    ["../../packaging/linux/icons/64.png", "usr/share/icons/hicolor/64x64/apps/io.github.yil00.NineSQL.png", "644"],
+    ["../../packaging/linux/icons/128.png", "usr/share/icons/hicolor/128x128/apps/io.github.yil00.NineSQL.png", "644"],
+    ["../../packaging/linux/icons/256.png", "usr/share/icons/hicolor/256x256/apps/io.github.yil00.NineSQL.png", "644"],
+    ["../../packaging/linux/icons/512.png", "usr/share/icons/hicolor/512x512/apps/io.github.yil00.NineSQL.png", "644"],
+]
 
 [dev-dependencies]
 # TestAppContext for view-model tests (AGENTS.md): GPUI's own `test-support`, see root Cargo.toml.
