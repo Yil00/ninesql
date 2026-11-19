@@ -458,6 +458,175 @@ fn a_paged_table_saves_after_stop_fetching_and_keeps_its_edits(cx: &mut TestAppC
     wait_until(&mut l.vcx, |vcx| !tab.read_with(vcx, |t, _| t.is_running()));
 }
 
+/// The table's key is read before its query runs: a table larger than one page pauses its read,
+/// which holds the session, so a description read meanwhile failed with "session busy" and the
+/// tab stayed read-only, also after "Cancel" (the manual-test bug on PostgreSQL; the tests
+/// above give the description by hand and missed it).
+#[gpui::test]
+fn the_table_key_is_read_before_a_paged_query_holds_the_session(cx: &mut TestAppContext) {
+    use ninesql_grid::FetchState;
+
+    let tmp = tempfile::tempdir().unwrap_or_else(|e| panic!("{e}"));
+    let mut l = live(cx, ConnectionTypeId::dev(), tmp.path());
+    open_with_text(&mut l, "SELECT * FROM numbers(1000000)");
+    let tab = l.tab.clone();
+    // Nothing is submitted before the description answered (the mock's metadata is not held by
+    // a paused read, so the order is checked here rather than the busy answer).
+    assert!(tab.read_with(&l.vcx, |t, _| {
+        t.table_state().describing.is_some()
+            && t.table_state().source_request.is_none()
+            && !t.is_running()
+    }));
+    wait_until(&mut l.vcx, |vcx| {
+        tab.read_with(vcx, |t, cx| {
+            t.table_state().described.is_some()
+                && matches!(
+                    t.results().read(cx).results().tabs().first(),
+                    Some(ninesql_grid::ResultTab::Table(m)) if m.borrow().state() == FetchState::Idle
+                )
+        })
+    });
+    let described = tab.read_with(&l.vcx, |t, _| match &t.table_state().described {
+        Some(Err(e)) => e.clone(),
+        Some(Ok(_)) => String::new(),
+        None => "none".to_owned(),
+    });
+    // The mock lists no index, so the answer is a reason, never the busy session.
+    assert!(!described.contains("busy"), "{described}");
+    assert!(
+        tab.read_with(&l.vcx, |t, _| t.is_running()),
+        "paused, not ended"
+    );
+    l.vcx
+        .update(|window, cx| tab.update(cx, |t, cx| t.cancel_run(window, cx)));
+    wait_until(&mut l.vcx, |vcx| !tab.read_with(vcx, |t, _| t.is_running()));
+}
+
+/// A description that failed while the tab's own run held the session is read again when the
+/// run ends, and the loaded rows become editable.
+#[gpui::test]
+fn a_description_refused_during_the_run_is_read_again_at_its_end(cx: &mut TestAppContext) {
+    use ninesql_grid::FetchState;
+
+    let tmp = tempfile::tempdir().unwrap_or_else(|e| panic!("{e}"));
+    let mut l = live(cx, ConnectionTypeId::dev(), tmp.path());
+    open_with_text(&mut l, "SELECT * FROM numbers(1000000)");
+    let tab = l.tab.clone();
+    wait_until(&mut l.vcx, |vcx| {
+        tab.read_with(vcx, |t, cx| {
+            t.table_state().describing.is_none()
+                && matches!(
+                    t.results().read(cx).results().tabs().first(),
+                    Some(ninesql_grid::ResultTab::Table(m)) if m.borrow().state() == FetchState::Idle
+                )
+        })
+    });
+    // The answer a busy session gives, while the paused read holds it.
+    l.vcx.update(|_, cx| {
+        tab.update(cx, |t, cx| {
+            t.set_description(
+                Err("Read-only: session busy: a result is still streaming.".to_owned()),
+                cx,
+            );
+        });
+    });
+    assert!(tab.read_with(&l.vcx, |t, _| t.editing().is_none()));
+    assert!(tab.read_with(&l.vcx, |t, _| t.table_state().describe_again));
+    l.vcx
+        .update(|window, cx| tab.update(cx, |t, cx| t.cancel_run(window, cx)));
+    wait_until(&mut l.vcx, |vcx| !tab.read_with(vcx, |t, _| t.is_running()));
+    // Read again once the session is free (the mock answers without a key: no busy reason).
+    wait_until(&mut l.vcx, |vcx| {
+        tab.read_with(vcx, |t, _| {
+            t.table_state().describing.is_none() && !t.table_state().describe_again
+        })
+    });
+    let reason = tab
+        .read_with(&l.vcx, |t, _| t.read_only_reason().map(str::to_owned))
+        .unwrap_or_default();
+    assert!(!reason.contains("busy"), "{reason}");
+    // With a key (the mock lists none), the stopped result is editable.
+    l.vcx
+        .update(|_, cx| tab.update(cx, |t, cx| t.set_description(Ok(keyed_table()), cx)));
+    assert!(tab.read_with(&l.vcx, |t, _| t.editing().is_some()));
+    assert_eq!(
+        loaded_rows(&l),
+        tab.read_with(&l.vcx, |t, _| t.budget().page_rows) as usize
+    );
+}
+
+/// The pgwire path of the P5-E L4 promise: a "Cancel" (server-side cancel declared) on a paused
+/// table result whose read then ends normally (the driver had read the last rows already, so
+/// the stream ends with `Finished`, not with the cancel error) keeps the loaded rows, the
+/// pending edits and the editing, and the save goes through. `numbers(N)` with `N` one batch:
+/// the read pauses after its only batch, and the stop lets the stream end.
+#[gpui::test]
+fn a_paged_table_keeps_its_edits_when_the_stop_lets_the_read_finish(cx: &mut TestAppContext) {
+    use ninesql_grid::FetchState;
+
+    let tmp = tempfile::tempdir().unwrap_or_else(|e| panic!("{e}"));
+    let mut l = live(cx, ConnectionTypeId::dev(), tmp.path());
+    let tab = l.tab.clone();
+    let page = tab.read_with(&l.vcx, |t, _| t.budget().page_rows);
+    open_with_text(&mut l, &format!("SELECT * FROM numbers({page})"));
+    wait_until(&mut l.vcx, |vcx| {
+        tab.read_with(vcx, |t, cx| {
+            t.table_state().describing.is_none()
+                && matches!(
+                    t.results().read(cx).results().tabs().first(),
+                    Some(ninesql_grid::ResultTab::Table(m)) if m.borrow().state() == FetchState::Idle
+                )
+        })
+    });
+    assert!(
+        tab.read_with(&l.vcx, |t, _| t.is_running()),
+        "paused, not ended"
+    );
+    assert_eq!(tab.read_with(&l.vcx, |t, _| t.cancel_label()), "Cancel");
+    l.vcx
+        .update(|_, cx| tab.update(cx, |t, cx| t.set_description(Ok(keyed_table()), cx)));
+    rename_first_row(&mut l);
+    let text_before = tab.read_with(&l.vcx, |t, cx| t.editor().read(cx).text(cx));
+
+    l.vcx
+        .update(|window, cx| tab.update(cx, |t, cx| t.cancel_run(window, cx)));
+    wait_until(&mut l.vcx, |vcx| !tab.read_with(vcx, |t, _| t.is_running()));
+    assert_eq!(loaded_rows(&l), page as usize, "the loaded rows are kept");
+    assert!(
+        tab.read_with(&l.vcx, |t, _| t.editing().is_some()),
+        "still editable: {:?}",
+        tab.read_with(&l.vcx, |t, _| t.read_only_reason().map(str::to_owned))
+    );
+    assert!(tab.read_with(&l.vcx, |t, _| t.has_pending_edits()));
+    let ix = tab.read_with(&l.vcx, |t, _| t.editing().map(|e| e.tab));
+    let dirty = tab.read_with(&l.vcx, |t, cx| {
+        ix.and_then(|ix| t.results().read(cx).edit_buffer(ix).cloned())
+            .is_some_and(|b| b.is_cell_dirty(0, 1))
+    });
+    assert!(dirty, "the grid still shows the pending value");
+    assert_eq!(
+        tab.read_with(&l.vcx, |t, cx| t.editor().read(cx).text(cx)),
+        text_before,
+        "nothing ran in its place"
+    );
+
+    l.vcx
+        .update(|window, cx| tab.update(cx, |t, cx| t.save_changes(window, cx)));
+    wait_until(&mut l.vcx, |vcx| {
+        tab.read_with(vcx, |t, _| {
+            !t.table_state().saving && !t.has_pending_edits()
+        })
+    });
+    let message = tab
+        .read_with(&l.vcx, |t, _| t.message().map(|m| m.text.to_string()))
+        .unwrap_or_default();
+    assert!(message.starts_with("Saved 1 changes."), "{message}");
+    // The refresh after the save pauses again: end it.
+    l.vcx
+        .update(|window, cx| tab.update(cx, |t, cx| t.cancel_run(window, cx)));
+    wait_until(&mut l.vcx, |vcx| !tab.read_with(vcx, |t, _| t.is_running()));
+}
+
 #[gpui::test]
 fn result_not_matching_the_query_provenance_is_read_only(cx: &mut TestAppContext) {
     // An aliased column: the result's names are not the table's, whatever the query said.
