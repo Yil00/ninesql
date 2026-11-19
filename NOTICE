@@ -12,7 +12,7 @@ its owner and is used only to describe interoperability.
 
 Third-party code compiled into the binary (ADR-0002 rule 5):
 
-FreeType 2.13.2 (bundled by freetype-sys and compiled into the binary when
+FreeType (bundled by freetype-sys and compiled into the binary when
 the build system's FreeType is too old, as for the .deb) is used under the
 FreeType License (FTL); its full text is in THIRD-PARTY-LICENSES.txt.
 Portions of this software are copyright (C) 2023 The FreeType Project
