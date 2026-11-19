@@ -8,12 +8,12 @@ This tutorial opens a table's rows and changes them (phase 5: P5-A, P5-B; featur
 - NineSQL builds and runs ([Build and run](build-and-run.md)), the dev databases are up (`make dev-up`, [Start the dev databases](dev-databases.md)) and a `nine-pg` connection is saved and open ([Create your first connection](first-connection.md)). Use a **dev** connection to try this: the rows really change.
 - You know how to run SQL and read the grid ([Run SQL and read results](run-sql.md)) and how to select a table in the navigator ([Browse a database](browse-database.md)).
 
-Every action below is in the command palette (`Ctrl+Shift+P` or `F1`): the table actions under "Data" and "Data editing", the grid's under "Results". They are not in the navigator's context menu yet: use the palette or the keys. Their key bindings work from the SQL editor and the rest of the window; until 2026-11-18 they were not handled, and these actions were reachable from the palette only.
+Every action below is in the command palette (`Ctrl+Shift+P` or `F1`): the table actions under "Data" and "Data editing", the grid's under "Results". "Open table data" is also the first entry of the context menu of a table or view row in the navigator (right click); the editing actions are not in a context menu yet: use the palette or the keys. Their key bindings work from the SQL editor and the rest of the window; until 2026-11-18 they were not handled, and these actions were reachable from the palette only.
 
 ## 1. Open table data
 1. Select a table in the navigator, for example `public.customers`.
-2. Run "Open table data" (`Alt+G` then `O`). A new tab, named after the table, runs NineSQL's own query of the table and shows its rows in the grid. The toolbar says "Table: <name>".
-3. While NineSQL reads the table's key, the toolbar says "Reading the table's key…". Then it says either "Editable (key: <columns>)", or why the rows are read-only, for example:
+2. Run "Open table data" (`Alt+G` then `O`, or right click the table in the navigator). A new tab, named after the table, runs NineSQL's own query of the table and shows its rows in the grid. The toolbar says "Table: <name>".
+3. NineSQL first reads the table's key (the toolbar says "Reading the table's key…"), then runs the query: the key is read before the rows because a table larger than one page keeps its session busy until the result ends or you stop it. Then the toolbar says either "Editable (key: <columns>)", or why the rows are read-only, for example:
    - "Read-only: the connection is read-only."
    - "Read-only: the table has no primary key or unique key that identifies rows: rows cannot be edited."
    - "Read-only: the table's storage engine has no transactions, so a failed save could not be rolled back: rows cannot be edited." (MySQL MyISAM, MEMORY, ARCHIVE…)
@@ -63,7 +63,7 @@ Only the rows in sight are drawn, so a save of thousands of rows opens at once a
 Run "Save changes" (`Alt+E` then `S`), or press "Save" in the toolbar. The status says "Saving…", then "Saving: N of M…".
 - Each statement must change **exactly one row**. If one changes none (the row was changed or deleted meanwhile) or more than one, or anything fails or you cancel, the whole save is undone and NineSQL says "Not saved: change N of the save: …; nothing was saved", followed by "The changes are still pending." Read the table again ("Refresh table data", `Alt+T` then `R`) and redo the change.
 - A save runs on its own: while it runs, the session refuses other statements ("A save, export or import is using this session: wait for it to end."). A session with a statement still running, or a result still being paged, refuses the save until it ends.
-- **A table larger than one page.** Its result stays open while more rows can be fetched: you can edit the loaded rows, but "Save changes" says "Not saved yet: the table's result is still open (more rows can be fetched, or the statement is running). Press "Stop fetching" in the toolbar (or run "Cancel execution") to end it: the rows already loaded and your pending changes are kept. Then save again." (the button says "Cancel" on drivers that cancel on the server: PostgreSQL, MySQL, MariaDB, SQLite). Press it, then "Save changes" again. While the next page is being fetched, edits wait for it.
+- **A table larger than one page.** Its result stays open while more rows can be fetched: you can edit the loaded rows, but "Save changes" says "Not saved yet: the table's result is still open (more rows can be fetched, or the statement is running). Press "Stop fetching" in the toolbar (or run "Cancel execution") to end it: the rows already loaded and your pending changes are kept. Then save again." (the button says "Cancel" on drivers that cancel on the server: PostgreSQL, MySQL, MariaDB, SQLite). Press it, then "Save changes" again: the tab stays editable after "Cancel" / "Stop fetching" (the status line says "stopped"), with the loaded rows and your pending changes. While the next page is being fetched, edits wait for it.
 - One save takes at most 10 000 changes ("too many changes for one save (at most 10000): save in smaller steps").
 - When it ends: "Saved N changes." in auto-commit mode (the save committed its own transaction). Run "Refresh table data" to see the rows as saved, inserted rows included.
 
@@ -119,7 +119,7 @@ For any result, not only table data:
 ## Not built yet
 - Editing a cell in place in the grid, drawing inserted rows before a refresh.
 - A filter history kept after a restart.
-- "Open table data" and the editing actions in the navigator's context menu.
+- The editing actions in a context menu.
 - QuestDB declares no editing.
 - Value statistics in the metadata panel, folding in the JSON and XML viewers, GIF and animated PNG previews (shown as hex).
 - The visual pass of these screens (P6-F).
