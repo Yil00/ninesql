@@ -109,13 +109,13 @@ Invariants involved: I1 (no secret in logs, results or screenshots), I2 (no netw
 - **I8.** Unchanged; step 1 asserts that undeclared capabilities are hidden or disabled.
 
 ## Open questions for the maintainer
-1. **`trace` in release builds.** This ADR clamps release logs at `debug` (§3.5). The alternative is to allow `trace` in release behind `NINESQL_LOG` with a warning at startup, which helps diagnose a user's problem with statement text on non-production connections. Which one?
+1. **`trace` in release builds.** This ADR clamps release logs at `debug` (§3.5). The alternative is to allow `trace` in release behind `NINESQL_LOG` with a warning at startup, which helps diagnose a user's problem with statement text on non-production connections. Which one? **Decided (maintainer, 2026-11-19): clamp release logs at `debug`, as proposed.**
 2. **Stderr default level.** `warn` (proposed) or `info`? `info` gives more context in a bug report but sends more to the journal.
-3. **Filter variable.** `NINESQL_LOG` with `RUST_LOG` ignored (proposed), or honour `RUST_LOG` as the harness assumes today?
-4. **Native Wayland screenshots.** First version: X11 and XWayland only (proposed). For native Wayland, a nested compositor dedicated to the run (for example `cage` with `grim`, which captures only that compositor's output), or accept the desktop's own screenshot tool on the whole screen with the current warning? Which compositor and tool, if any, should the harness depend on?
+3. **Filter variable.** `NINESQL_LOG` with `RUST_LOG` ignored (proposed), or honour `RUST_LOG` as the harness assumes today? **Decided (maintainer, 2026-11-19): `NINESQL_LOG` only, `RUST_LOG` ignored; the harness moves to `NINESQL_LOG`.**
+4. **Native Wayland screenshots.** First version: X11 and XWayland only (proposed). For native Wayland, a nested compositor dedicated to the run (for example `cage` with `grim`, which captures only that compositor's output), or accept the desktop's own screenshot tool on the whole screen with the current warning? Which compositor and tool, if any, should the harness depend on? **Decided (maintainer, 2026-11-19): X11 and XWayland only in the first version; no nested compositor dependency.**
 5. **Checkpoint handshake.** A fixed hold at each checkpoint (proposed, no inbound channel) can miss a slow capture. A one-line acknowledgement from the harness on the runner's stdin would be exact; it is an inherited pipe, not a listener, but it is an inbound channel. Is that acceptable?
 6. **File log switch.** `[logging] file_level` in `settings.toml` with no preferences page yet (the user edits the file) is proposed; should the file log also get an action in the palette ("Open log folder", "Turn file log on for this session")?
-7. **Where step 2 runs.** Only on the maintainer's desktop through `make e2e-local` (proposed), or also on a CI runner with a software renderer (llvmpipe under Xvfb), which proves no GPU but would catch broken scenarios earlier?
+7. **Where step 2 runs.** Only on the maintainer's desktop through `make e2e-local` (proposed), or also on a CI runner with a software renderer (llvmpipe under Xvfb), which proves no GPU but would catch broken scenarios earlier? **Decided (maintainer, 2026-11-19): only on the maintainer's desktop through `make e2e-local`.**
 
 ## Rejected alternatives
 - **OS-level input injection** (`xdotool`, `ydotool`): coordinates break with layout, theme and scale; blocked on Wayland except through `/dev/uinput`, which needs root-level access.
