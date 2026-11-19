@@ -1009,9 +1009,19 @@ impl TransferService {
         let parent = fs::canonicalize(parent)
             .map_err(|_| TransferError::InvalidPath("the directory does not exist".into()))?;
         let target = parent.join(name);
-        if self.roots.check(&target).inside {
+        let check = self.roots.check(&target);
+        if check.inside && !check.unverified {
             return Err(TransferError::ForbiddenLocation {
                 reason: "the folder is inside a DBeaver workspace, which NineSQL never modifies"
+                    .into(),
+            });
+        }
+        // A file chosen through the document portal whose real location cannot be checked
+        // (P6-A review M1): only a new file is written there, never an existing one replaced.
+        if check.unverified && overwrite != Overwrite::Refuse {
+            return Err(TransferError::ForbiddenLocation {
+                reason: "NineSQL cannot check whether this folder is inside a DBeaver workspace, \
+                         so it does not replace a file there; choose a new file name"
                     .into(),
             });
         }

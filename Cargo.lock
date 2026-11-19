@@ -4566,6 +4566,7 @@ dependencies = [
  "toml_edit 0.22.27",
  "tracing",
  "uuid",
+ "zbus 6.3.0",
  "zeroize",
 ]
 

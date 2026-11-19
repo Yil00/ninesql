@@ -13,13 +13,18 @@ publish.workspace = true
 workspace = true
 
 [features]
-default = ["desktop-lock"]
+default = ["desktop-lock", "document-portal"]
 # Starts `DesktopLockWatcher` in `CoreServices`: the vault and the "ask every time" cache are
 # locked on sleep and screen lock (logind, zbus 6 only). On by default.
 desktop-lock = ["ninesql-secrets/desktop-lock"]
 # Uses the Secret Service (keyring) as the first secret backend when one answers. Off by default
 # until the desktop round trip and the stable secret-service 6.x (ADR-0012).
 secret-service = ["ninesql-secrets/secret-service", "desktop-lock"]
+# Resolves a file chosen through the Flatpak document portal (`/run/user/<uid>/doc/…`) to its
+# host path with `org.freedesktop.portal.Documents.GetHostPaths` (session bus, zbus 6, bounded
+# to 2 s), so the DBeaver workspace check (I4) runs on the real location. Without it, or when
+# the call fails, every document-portal path counts as inside a DBeaver workspace (fail closed).
+document-portal = ["dep:zbus"]
 # Registers nothing by itself: exposes `ninesql_driver_api::mock` (the in-memory mock driver) to
 # UI and core tests. Never enabled in release builds.
 mock = ["ninesql-driver-api/mock"]
@@ -44,6 +49,8 @@ secrecy.workspace = true
 zeroize.workspace = true
 # Driver runtime (ADR-0004): one multi-thread runtime owned by the core, channels to the UI.
 tokio = { workspace = true, features = ["rt", "rt-multi-thread", "sync", "time", "macros"] }
+# The Documents portal client (feature `document-portal`): the same zbus 6 as ninesql-secrets.
+zbus = { workspace = true, optional = true }
 
 [dev-dependencies]
 ninesql-driver-api = { workspace = true, features = ["mock"] }

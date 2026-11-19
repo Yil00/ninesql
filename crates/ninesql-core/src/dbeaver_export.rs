@@ -289,7 +289,7 @@ pub fn export_dbeaver_blocking(
     target: &ExportTarget,
 ) -> Result<DbeaverExportOutcome, DbeaverExportError> {
     let export = generate_dbeaver_export(workspace, ids)?;
-    let written = write_export(&export, target, &|p| roots.contains(p)).map_err(|e| {
+    let written = write_export(&export, target, &|p| roots.forbids_new_file(p)).map_err(|e| {
         let e = DbeaverExportError::from(e);
         tracing::warn!(kind = e.kind(), "the DBeaver export was not written");
         e

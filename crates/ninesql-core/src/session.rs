@@ -1567,6 +1567,7 @@ async fn open_session(
             .unwrap_or(FileCheck {
                 path: None,
                 inside: true,
+                unverified: false,
             });
         // The driver opens the canonical path that was checked, so the check and the open name
         // the same file (review P1-D wiring, L5). Unresolvable: the configured path, read-only.
@@ -1575,6 +1576,8 @@ async fn open_session(
         {
             *path = checked;
         }
+        // `inside` includes a document-portal file that could not be verified (P6-A review M1):
+        // opening a database can modify it, so it opens read-only.
         let inside = check.inside;
         inside_dbeaver_workspace = inside;
         if inside {
