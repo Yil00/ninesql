@@ -16,11 +16,14 @@
 #   unit       make test (cargo test --workspace), NINESQL_REQUIRE_DBUS=1 when dbus-daemon exists
 #   engines    the driver-integration CI job: dev engines up, make test-engines-run, logs, down
 #   gui-smoke  release binary, --version / --help, a window kept open ~15 s, SIGTERM, I1 check
+#              (temporary HOME and XDG directories; screenshot only with --screenshot)
 #   deb        make deb, then make deb-install-test
 #
 # Usage: scripts/e2e-local.sh [options]     (or: make e2e-local E2E_ARGS="...")
 # Run scripts/e2e-local.sh --help for the options.
 set -euo pipefail
+# Everything the run writes (report, logs, temporary directories, archive) is for this user only.
+umask 077
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
@@ -45,9 +48,13 @@ LOG_LINES=200
 CARGO_TIMEOUT=2700
 DEV_TIMEOUT=900
 GUI_WAIT=15
-SCREENSHOT=1
+SCREENSHOT=0
 KEEP_TEMP=0
+NO_SECRET_SCAN=0
+CHECK_REPORT=""
 COMPOSE_PROJECT="${E2E_COMPOSE_PROJECT:-ninesql-e2e-local}"
+COMPOSE_PROJECT_SET=0
+[ -n "${E2E_COMPOSE_PROJECT:-}" ] && COMPOSE_PROJECT_SET=1
 ORIG_ARGS="$*"
 
 usage() {
@@ -70,19 +77,29 @@ Options:
   --verbose            Also print the commands' output on the terminal
   --engines LIST       Engines that must not be skipped in the engines stage
                        (default: postgresql,mysql,mariadb,ssh,timescaledb,yugabytedb,questdb,tidb)
-  --engines-running    Use engines that are already up: start and stop nothing
+  --engines-running    Use engines that are already up: start and stop nothing; their state
+                       and logs are read from the compose project that publishes the dev ports
+  --compose-project N  Compose project of the engines stage (default ninesql-e2e-local; with
+                       --engines-running, the project of the running engines, detected if unset)
   --keep-engines       Leave the engines running after the engines stage
   --clean-volumes      Delete the engines' volumes at the end (down -v); default: down only
   --log-lines N        Last N log lines kept per container (default 200)
   --timeout SECS       Time limit of each long cargo command (default 2700)
   --dev-timeout SECS   Time limit of image pulls and engine readiness (default 900)
   --gui-wait SECS      How long the window stays open in gui-smoke (default 15)
-  --no-screenshot      Do not take a screenshot in gui-smoke (it shows the whole screen)
-  --keep-temp          Keep gui-smoke's temporary XDG directories
+  --screenshot         Take a screenshot in gui-smoke (off by default): the NineSQL window on
+                       X11 / XWayland (xdotool or wmctrl, and ImageMagick import); otherwise,
+                       with a warning, the whole screen
+  --no-screenshot      Accepted for compatibility; no screenshot is the default
+  --no-secret-scan     Write the archive without a gitleaks scan (by default the archive is
+                       written only when gitleaks scanned the report clean)
+  --keep-temp          Keep gui-smoke's temporary HOME and XDG directories
+  --check-report DIR   Run no stage: scrub and secret-check an existing report directory under
+                       target/e2e-reports/ (or any directory you own), then archive it
   -h, --help           Show this help
 
 Environment: CARGO_TARGET_DIR is respected; E2E_COMPOSE_PROJECT names the compose project of
-the engines stage (default ninesql-e2e-local).
+the engines stage, like --compose-project.
 EOF
 }
 
@@ -101,14 +118,19 @@ while [ $# -gt 0 ]; do
         --engines) [ $# -ge 2 ] || die "--engines needs a value"; ENGINES="$2"; shift 2 ;;
         --engines=*) ENGINES="${1#*=}"; shift ;;
         --engines-running) ENGINES_RUNNING=1; shift ;;
+        --compose-project) [ $# -ge 2 ] || die "--compose-project needs a value"; COMPOSE_PROJECT="$2"; COMPOSE_PROJECT_SET=1; shift 2 ;;
+        --compose-project=*) COMPOSE_PROJECT="${1#*=}"; COMPOSE_PROJECT_SET=1; shift ;;
         --keep-engines) KEEP_ENGINES=1; shift ;;
         --clean-volumes) CLEAN_VOLUMES=1; shift ;;
         --log-lines) [ $# -ge 2 ] || die "--log-lines needs a value"; LOG_LINES="$2"; shift 2 ;;
         --timeout) [ $# -ge 2 ] || die "--timeout needs a value"; CARGO_TIMEOUT="$2"; shift 2 ;;
         --dev-timeout) [ $# -ge 2 ] || die "--dev-timeout needs a value"; DEV_TIMEOUT="$2"; shift 2 ;;
         --gui-wait) [ $# -ge 2 ] || die "--gui-wait needs a value"; GUI_WAIT="$2"; shift 2 ;;
-        --no-screenshot) SCREENSHOT=0; shift ;;
+        --screenshot) SCREENSHOT=1; shift ;;
+        --no-screenshot) shift ;; # the default; kept so older command lines still work
+        --no-secret-scan) NO_SECRET_SCAN=1; shift ;;
         --keep-temp) KEEP_TEMP=1; shift ;;
+        --check-report) [ $# -ge 2 ] || die "--check-report needs a directory"; CHECK_REPORT="$2"; shift 2 ;;
         -h|--help) usage; exit 0 ;;
         *) die "unknown option: $1 (see --help)" ;;
     esac
@@ -118,6 +140,7 @@ for n in "$LOG_LINES" "$CARGO_TIMEOUT" "$DEV_TIMEOUT" "$GUI_WAIT"; do
     case "$n" in ''|*[!0-9]*) die "not a whole number: $n" ;; esac
 done
 case "$ENGINES" in ''|*[!a-z0-9,]*) die "--engines takes ids like postgresql,mysql" ;; esac
+case "$COMPOSE_PROJECT" in ''|*[!a-z0-9_-]*|[!a-z0-9]*) die "--compose-project takes a compose project name (lower-case letters, digits, - and _)" ;; esac
 
 in_list() { # in_list <word> <comma-separated list>
     case ",$2," in *",$1,"*) return 0 ;; *) return 1 ;; esac
@@ -138,7 +161,8 @@ for s in "${ALL_STAGES[@]}"; do
     in_list "$s" "$SKIP" && continue
     STAGES+=("$s")
 done
-[ "${#STAGES[@]}" -gt 0 ] || die "no stage left to run"
+[ -n "$CHECK_REPORT" ] && STAGES=()
+[ -n "$CHECK_REPORT" ] || [ "${#STAGES[@]}" -gt 0 ] || die "no stage left to run"
 
 # ---------------------------------------------------------------------------------------------
 # Report directory and helpers
@@ -148,12 +172,18 @@ STARTED_EPOCH="$(date -u +%s)"
 STARTED_UTC="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 STAMP="$(date -u +%Y%m%dT%H%M%SZ)"
 GIT_SHA="$(git rev-parse --short=12 HEAD 2>/dev/null || echo unknown)"
-REPORT="$ROOT/target/e2e-reports/$STAMP-$GIT_SHA"
-suffix=1
-while [ -e "$REPORT" ]; do
-    suffix=$((suffix + 1))
-    REPORT="$ROOT/target/e2e-reports/$STAMP-$GIT_SHA-$suffix"
-done
+if [ -n "$CHECK_REPORT" ]; then
+    [ -d "$CHECK_REPORT" ] && [ -O "$CHECK_REPORT" ] && [ ! -L "$CHECK_REPORT" ] ||
+        die "--check-report: not a directory you own: $CHECK_REPORT"
+    REPORT="$(cd "$CHECK_REPORT" && pwd -P)"
+else
+    REPORT="$ROOT/target/e2e-reports/$STAMP-$GIT_SHA"
+    suffix=1
+    while [ -e "$REPORT" ]; do
+        suffix=$((suffix + 1))
+        REPORT="$ROOT/target/e2e-reports/$STAMP-$GIT_SHA-$suffix"
+    done
+fi
 NOTES="$REPORT/.notes"
 mkdir -p "$NOTES"
 TARGET_DIR="${CARGO_TARGET_DIR:-$ROOT/target}"
@@ -330,7 +360,13 @@ stage_env() {
             kv "$t" "not installed"
         fi
     done
-    have gitleaks || warn "gitleaks not installed: the report is scrubbed but not scanned for secrets before archiving"
+    if ! have gitleaks; then
+        if [ "$NO_SECRET_SCAN" = 1 ]; then
+            warn "gitleaks not installed; --no-secret-scan: the archive will be written without a secret scan"
+        else
+            warn "gitleaks not installed: no report.tar.gz will be written (install gitleaks, or rerun with --no-secret-scan)"
+        fi
+    fi
 
     # Session and display (no display names beyond the session type).
     kv "Session type" "${XDG_SESSION_TYPE:-unknown}"
@@ -358,23 +394,36 @@ stage_env() {
         [ -n "$v" ] && kv "Screen modes (xrandr)" "$v"
     fi
 
-    # GPU.
+    # GPU: only an allowlist of key / value lines is kept (no device or driver UUIDs, no
+    # serial numbers, no full dumps in the log).
+    local lines
     if have_display && have glxinfo; then
-        timeout 15 glxinfo -B >>"$log" 2>&1 || true
-        v="$(timeout 15 glxinfo -B 2>/dev/null | grep -E 'OpenGL renderer string|OpenGL version string' | sed 's/^ *//' | paste -sd ';' - || true)"
+        lines="$(timeout 15 glxinfo -B 2>/dev/null | grep -E '^[[:space:]]*(direct rendering|Vendor|Device|Version|Accelerated|Video memory|Unified memory|OpenGL (vendor|renderer|version|core profile version|ES profile version) string):' | sed 's/^[[:space:]]*//' || true)"
+        printf 'glxinfo -B (filtered):\n%s\n' "${lines:-no answer}" >>"$log"
+        v="$(grep -E '^OpenGL (renderer|version) string' <<<"$lines" | paste -sd ';' - || true)"
         kv "OpenGL (glxinfo -B)" "${v:-no answer}"
     else
         kv "OpenGL (glxinfo -B)" "not available (mesa-utils not installed, or no display)"
     fi
     if have vulkaninfo; then
-        timeout 20 vulkaninfo --summary >>"$log" 2>&1 || true
-        v="$(timeout 20 vulkaninfo --summary 2>/dev/null | grep -E '^\s*(deviceType|deviceName|driverName|driverInfo|apiVersion)\s*=' | sed 's/^[[:space:]]*//; s/[[:space:]][[:space:]]*/ /g' | paste -sd ';' - | sed 's/;/; /g' || true)"
+        lines="$(timeout 20 vulkaninfo --summary 2>/dev/null | grep -E '^[[:space:]]*(apiVersion|driverVersion|vendorID|deviceID|deviceType|deviceName|driverID|driverName|driverInfo|conformanceVersion)[[:space:]]*=' | sed 's/^[[:space:]]*//; s/[[:space:]][[:space:]]*/ /g' || true)"
+        printf 'vulkaninfo --summary (filtered):\n%s\n' "${lines:-no device listed}" >>"$log"
+        v="$(grep -E '^(deviceType|deviceName|driverName|driverInfo|apiVersion) =' <<<"$lines" | paste -sd ';' - | sed 's/;/; /g' || true)"
         kv "Vulkan (vulkaninfo --summary)" "${v:-no device listed}"
     else
         kv "Vulkan (vulkaninfo --summary)" "not available (vulkan-tools not installed)"
     fi
-    have grim || have import || have gnome-screenshot || have spectacle || have scrot ||
-        kv "Screenshot tool" "none found (grim, spectacle, gnome-screenshot, ImageMagick import, scrot): gui-smoke takes no screenshot"
+    if [ "$SCREENSHOT" = 1 ]; then
+        if [ -n "${DISPLAY:-}" ] && have import && { have xdotool || have wmctrl; }; then
+            kv "Screenshot" "requested (--screenshot): the NineSQL window (xdotool / wmctrl and import)"
+        elif have grim || have import || have gnome-screenshot || have spectacle || have scrot; then
+            warn "--screenshot: no window-only capture here (needs DISPLAY, ImageMagick import and xdotool or wmctrl): the screenshot will show the whole screen"
+        else
+            kv "Screenshot" "requested, but no tool found (xdotool / wmctrl with ImageMagick import, grim, spectacle, gnome-screenshot, scrot)"
+        fi
+    else
+        kv "Screenshot" "not requested (--screenshot to take one)"
+    fi
 
     cat "$md" >>"$log"
     if [ "$fatal" = 1 ]; then
@@ -491,10 +540,19 @@ EOF
 
 port_busy() { timeout 2 bash -c "exec 3<>/dev/tcp/127.0.0.1/$1" 2>/dev/null; }
 
+# running_compose_projects <plan>: the compose projects of the containers that publish the
+# plan's host ports, one per line.
+running_compose_projects() {
+    local kind a
+    while read -r kind a; do
+        [ "$kind" = PORT ] || continue
+        docker ps --filter "publish=$a" --format '{{.Label "com.docker.compose.project"}}' 2>/dev/null </dev/null || true
+    done <<<"$1" | grep -E '^[a-z0-9][a-z0-9_-]*$' | sort -u
+}
+
 stage_engines() {
-    local log=$1 rc=0 plan kind a b rest busy=() started=0 p
+    local log=$1 rc=0 plan kind a b rest busy=() started=0 p projects collect=1
     export COMPOSE_PROJECT_NAME="$COMPOSE_PROJECT"
-    note engines "Required engines: \`$ENGINES\`; compose project \`$COMPOSE_PROJECT_NAME\`."
 
     if [ "$DRY_RUN" = 0 ]; then
         if ! have docker || ! timeout 20 docker info >/dev/null 2>&1; then
@@ -509,6 +567,19 @@ stage_engines() {
         reason engines "unknown engine ids: $(grep '^UNKNOWN ' <<<"$plan" | cut -d' ' -f2 | paste -sd, -)"
         return 1
     fi
+    # With --engines-running, the state and the logs come from the project that is actually up
+    # (make dev-up uses ninesql-dev), not from this script's default project.
+    if [ "$ENGINES_RUNNING" = 1 ] && [ "$COMPOSE_PROJECT_SET" = 0 ] && [ "$DRY_RUN" = 0 ]; then
+        projects="$(running_compose_projects "$plan")"
+        case "$(grep -c . <<<"$projects")" in
+            1) COMPOSE_PROJECT_NAME="$projects" ;;
+            0) collect=0
+               note engines "No running compose project publishes the dev ports: container state and logs not collected." ;;
+            *) collect=0
+               note engines "Several compose projects publish the dev ports ($(paste -sd, - <<<"$projects")): container state and logs not collected; rerun with --compose-project." ;;
+        esac
+    fi
+    note engines "Required engines: \`$ENGINES\`; compose project \`$COMPOSE_PROJECT_NAME\`."
 
     teardown() {
         [ "$started" = 1 ] || return 0
@@ -573,10 +644,12 @@ stage_engines() {
     fi
 
     # State and container logs, whatever happened.
-    run "$REPORT/engines-compose-ps.txt" compose --profile all ps --all || true
-    say "    engines: collecting the last $LOG_LINES log lines of each container"
-    run "$REPORT/engines-containers.log" compose --profile all logs --no-color --timestamps --tail "$LOG_LINES" || true
-    note engines "Container state: \`engines-compose-ps.txt\`; last $LOG_LINES lines per container: \`engines-containers.log\`."
+    if [ "$collect" = 1 ]; then
+        run "$REPORT/engines-compose-ps.txt" compose --profile all ps --all || true
+        say "    engines: collecting the last $LOG_LINES log lines of each container"
+        run "$REPORT/engines-containers.log" compose --profile all logs --no-color --timestamps --tail "$LOG_LINES" || true
+        note engines "Container state: \`engines-compose-ps.txt\`; last $LOG_LINES lines per container: \`engines-containers.log\`."
+    fi
     teardown
     trap - INT TERM
     [ "$rc" = 0 ]
@@ -586,7 +659,39 @@ stage_engines() {
 # Stage: gui-smoke
 # ---------------------------------------------------------------------------------------------
 
-take_screenshot() { # <file>
+APP_ID="io.github.yil00.NineSQL"
+
+# find_window: the X11 id of the NineSQL window (WM_CLASS), or nothing.
+find_window() {
+    local id=""
+    if have xdotool; then
+        id="$(timeout 5 xdotool search --onlyvisible --classname "$APP_ID" 2>/dev/null | head -n 1 || true)"
+        [ -n "$id" ] || id="$(timeout 5 xdotool search --onlyvisible --class "$APP_ID" 2>/dev/null | head -n 1 || true)"
+    fi
+    if [ -z "$id" ] && have wmctrl; then
+        id="$(timeout 5 wmctrl -lx 2>/dev/null | awk -v c="$APP_ID" 'index($3, c) { print $1; exit }' || true)"
+    fi
+    case "$id" in ''|*[!0-9a-fA-Fx]*) return 1 ;; esac
+    printf '%s\n' "$id"
+}
+
+# screenshot_window <file>: the NineSQL window only (X11, or XWayland), raised first so no
+# other window covers it. Nothing is clicked or typed.
+screenshot_window() {
+    local out=$1 id
+    if [ -z "${DISPLAY:-}" ] || ! have import; then return 1; fi
+    id="$(find_window)" || return 1
+    if have xdotool; then
+        timeout 5 xdotool windowactivate --sync "$id" >/dev/null 2>&1 || true
+    elif have wmctrl; then
+        timeout 5 wmctrl -i -a "$id" >/dev/null 2>&1 || true
+    fi
+    sleep 1
+    timeout 15 import -window "$id" "$out" 2>/dev/null && [ -s "$out" ]
+}
+
+# screenshot_screen <file>: the whole screen, when no window-only capture works.
+screenshot_screen() {
     local out=$1
     if [ "${XDG_SESSION_TYPE:-}" = wayland ] || [ -n "${WAYLAND_DISPLAY:-}" ]; then
         have grim && timeout 15 grim "$out" 2>/dev/null && return 0
@@ -602,7 +707,7 @@ take_screenshot() { # <file>
 }
 
 stage_gui_smoke() {
-    local log=$1 bin="$TARGET_DIR/release/ninesql" rc=0 tmp="" pid="" code="" fails=() i hits
+    local log=$1 bin="$TARGET_DIR/release/ninesql" rc=0 tmp="" pid="" code="" fails=() i hits shot
     local out="$REPORT/gui-smoke-stdout.log" err="$REPORT/gui-smoke-stderr.log"
 
     if ! have_display; then
@@ -638,21 +743,28 @@ stage_gui_smoke() {
     fi
 
     if [ "$DRY_RUN" = 1 ]; then
-        say "    [dry-run] mkdir temp XDG_CONFIG_HOME / XDG_DATA_HOME / XDG_STATE_HOME / XDG_CACHE_HOME"
-        say "    [dry-run] RUST_LOG=ninesql=debug,info $bin &   (alive check after ${GUI_WAIT} s)"
-        [ "$SCREENSHOT" = 1 ] && say "    [dry-run] screenshot with grim / spectacle / gnome-screenshot / import / scrot"
+        say "    [dry-run] mkdir temp HOME / XDG_CONFIG_HOME / XDG_DATA_HOME / XDG_STATE_HOME / XDG_CACHE_HOME (0700)"
+        say "    [dry-run] HOME=<temp> RUST_LOG=ninesql=debug,info $bin &   (alive check after ${GUI_WAIT} s)"
+        if [ "$SCREENSHOT" = 1 ]; then
+            say "    [dry-run] screenshot of the NineSQL window (xdotool / wmctrl, import -window <id>); whole screen only as a fallback, with a warning"
+        else
+            say "    [dry-run] no screenshot (--screenshot to take one)"
+        fi
         say "    [dry-run] kill -TERM <pid>; wait up to 10 s; I1 scan of the temp XDG directories"
         if [ "${DRY_RUN_GUI_ONLY:-0}" = 1 ]; then return 77; fi
         return 0
     fi
 
     tmp="$(mktemp -d -t ninesql-e2e-XXXXXX)"
-    mkdir -p "$tmp/config" "$tmp/data" "$tmp/state" "$tmp/cache"
-    echo "Temporary XDG directories under $tmp" >>"$log"
+    mkdir -m 0700 "$tmp/home" "$tmp/config" "$tmp/data" "$tmp/state" "$tmp/cache"
+    echo "Temporary HOME and XDG directories under $tmp" >>"$log"
     say "    gui-smoke: starting ninesql for ${GUI_WAIT} s (a window opens; leave it alone)"
+    # A temporary HOME too: the first-run DBeaver detection reads known locations under $HOME,
+    # so the user's real DBeaver connection names never reach the window (or a screenshot).
     # RUST_LOG never at trace: trace may carry query text (AGENTS.md).
-    env XDG_CONFIG_HOME="$tmp/config" XDG_DATA_HOME="$tmp/data" XDG_STATE_HOME="$tmp/state" \
-        XDG_CACHE_HOME="$tmp/cache" RUST_LOG="ninesql=debug,info" "$bin" </dev/null >"$out" 2>"$err" &
+    env HOME="$tmp/home" XDG_CONFIG_HOME="$tmp/config" XDG_DATA_HOME="$tmp/data" \
+        XDG_STATE_HOME="$tmp/state" XDG_CACHE_HOME="$tmp/cache" RUST_LOG="ninesql=debug,info" \
+        "$bin" </dev/null >"$out" 2>"$err" &
     pid=$!
     for ((i = 0; i < GUI_WAIT; i++)); do
         kill -0 "$pid" 2>/dev/null || break
@@ -668,11 +780,22 @@ stage_gui_smoke() {
             fi
         fi
         if [ "$SCREENSHOT" = 1 ]; then
-            if take_screenshot "$REPORT/gui-smoke-screenshot.png"; then
-                note gui-smoke "Screenshot: \`gui-smoke-screenshot.png\` (the whole screen: check it before sending)."
+            shot="$REPORT/gui-smoke-window.png"
+            if screenshot_window "$shot"; then
+                note gui-smoke "Screenshot (--screenshot): \`gui-smoke-window.png\`, the NineSQL window only (check it before sending)."
             else
-                note gui-smoke "Screenshot: not taken (no working tool for this session)."
+                rm -f "$shot"
+                shot="$REPORT/gui-smoke-screen.png"
+                say "    gui-smoke: WARNING: the NineSQL window could not be captured alone; taking a screenshot of the WHOLE screen"
+                if screenshot_screen "$shot"; then
+                    note gui-smoke "**Warning**: screenshot (--screenshot): \`gui-smoke-screen.png\` shows the **whole screen** (no window-only capture worked here: it needs X11 or XWayland, ImageMagick import and xdotool or wmctrl). Check it before sending."
+                else
+                    rm -f "$shot"
+                    note gui-smoke "Screenshot (--screenshot): not taken (no working tool for this session)."
+                fi
             fi
+        else
+            note gui-smoke "No screenshot (pass --screenshot to take one)."
         fi
         kill -TERM "$pid" 2>/dev/null || true
         for ((i = 0; i < 10; i++)); do
@@ -698,7 +821,7 @@ stage_gui_smoke() {
 
     # What the run wrote (names and sizes, relative to the temp directory), and its log file.
     {
-        echo "Files written under the temporary XDG directories:"
+        echo "Files written under the temporary HOME and XDG directories:"
         (cd "$tmp" && find . -type f -printf '  %p (%s bytes, mode %m)\n' | sort)
     } >>"$log"
     if [ -f "$tmp/state/ninesql/ninesql.log" ]; then
@@ -807,7 +930,9 @@ trap - INT
 # ---------------------------------------------------------------------------------------------
 
 # Replaces the repository path with <repo>, $HOME with ~, the user name with <user>, the host
-# name with <host> and private IPv4 addresses with <ip>, in every text file of the report.
+# name with <host>, IPv4 addresses (127.x and 0.x kept) and IPv6 global, unique local and
+# link-local addresses with <ip>, and MAC addresses with <mac>, in every text file of the
+# report.
 scrub() {
     local user host fqdn
     user="$(id -un 2>/dev/null || echo "")"
@@ -825,7 +950,29 @@ for path, token in ((repo, "<repo>"), (os.path.realpath(repo), "<repo>"), (home,
 for name, token in ((fqdn, "<host>"), (host, "<host>"), (user, "<user>")):
     if name and name.lower() not in generic and len(name) >= 2:
         pairs.append((re.compile(r"(?<![A-Za-z0-9_.-])" + re.escape(name) + r"(?![A-Za-z0-9_-])"), token))
-pairs.append((re.compile(r"\b(?:10(?:\.\d{1,3}){3}|192\.168(?:\.\d{1,3}){2}|172\.(?:1[6-9]|2\d|3[01])(?:\.\d{1,3}){2}|169\.254(?:\.\d{1,3}){2})\b"), "<ip>"))
+import ipaddress
+octet = r"(?:25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)"
+ipv4 = re.compile(r"(?<![\w.])" + octet + r"(?:\." + octet + r"){3}(?!\w|\.\d)")
+version_label = re.compile(r"(?i)(?:version|\bver)\W{0,3}$")
+def sub_ipv4(m):
+    first = m.group(0).split(".")[0]
+    # Loopback and 0.x stay readable; so does a four-part version ("conformanceVersion = 1.4.0.0").
+    if first in ("127", "0") or version_label.search(m.string, max(0, m.start() - 24), m.start()):
+        return m.group(0)
+    return "<ip>"
+# Candidates: hex groups with at least two colons and an optional zone (%eth0); each is checked
+# with ipaddress and replaced only when global, unique local or link-local, so Rust paths
+# (std::io), times (12:34:56) and ::1 are left alone.
+ipv6 = re.compile(r"(?<![\w:.%])[0-9A-Fa-f]{0,4}(?::[0-9A-Fa-f]{0,4}){2,7}(?:%[\w.-]+)?(?![\w:])")
+nets = [ipaddress.ip_network(n) for n in ("2000::/3", "fc00::/7", "fe80::/10")]
+def sub_ipv6(m):
+    text = m.group(0)
+    try:
+        ip = ipaddress.IPv6Address(text.partition("%")[0])
+    except ValueError:
+        return text
+    return "<ip>" if any(ip in n for n in nets) else text
+mac = re.compile(r"(?<![\w:-])[0-9A-Fa-f]{2}([:-])[0-9A-Fa-f]{2}(?:\1[0-9A-Fa-f]{2}){4}(?![\w:-])")
 for dirpath, _, files in os.walk(report):
     for f in files:
         p = os.path.join(dirpath, f)
@@ -838,8 +985,69 @@ for dirpath, _, files in os.walk(report):
         new = data
         for rx, token in pairs:
             new = rx.sub(token, new)
+        new = mac.sub("<mac>", new)
+        new = ipv6.sub(sub_ipv6, new)
+        new = ipv4.sub(sub_ipv4, new)
         if new != data:
             open(p, "w", encoding="utf-8", errors="surrogateescape").write(new)
+EOF
+}
+
+# redact_dev_passwords: replaces every distinct password of dev/engines.json (its "password"
+# fields and the "password: <value>" of its notes) with <dev-password> in the report's text
+# files; prints the number of files changed.
+redact_dev_passwords() {
+    python3 -I - "$REPORT" "$ROOT/dev/engines.json" <<'EOF'
+import json, os, re, sys
+report, engines = sys.argv[1:3]
+found = set()
+def walk(v):
+    if isinstance(v, dict):
+        for k, x in v.items():
+            if k == "password" and isinstance(x, str) and x:
+                found.add(x)
+            walk(x)
+    elif isinstance(v, list):
+        for x in v:
+            walk(x)
+    elif isinstance(v, str):
+        for m in re.finditer(r"password:\s*([^\s,;]+)", v):
+            found.add(m.group(1).rstrip("."))
+walk(json.load(open(engines, encoding="utf-8")))
+words = sorted((w for w in found if len(w) >= 4), key=len, reverse=True)
+if not words:
+    sys.exit("no password found in dev/engines.json")
+rx = re.compile("|".join(re.escape(w) for w in words))
+changed = 0
+for dirpath, _, files in os.walk(report):
+    for f in files:
+        if f.endswith((".png", ".gz")):
+            continue
+        p = os.path.join(dirpath, f)
+        data = open(p, encoding="utf-8", errors="surrogateescape").read()
+        new = rx.sub("<dev-password>", data)
+        if new != data:
+            open(p, "w", encoding="utf-8", errors="surrogateescape").write(new)
+            changed += 1
+print(changed)
+EOF
+}
+
+# credential_uris: prints "<file>:<line>" (never the match) for every URI with a user and a
+# password left in the report's text files; redacted dev passwords do not count.
+credential_uris() {
+    python3 -I - "$REPORT" <<'EOF'
+import os, re, sys
+report = sys.argv[1]
+rx = re.compile(r"[a-z][a-z0-9+.-]*://[^/:@\s]+:([^@\s]+)@")
+for dirpath, _, files in sorted(os.walk(report)):
+    for f in sorted(files):
+        if f.endswith((".png", ".gz")):
+            continue
+        p = os.path.join(dirpath, f)
+        for n, line in enumerate(open(p, encoding="utf-8", errors="replace"), 1):
+            if any(m.group(1) != "<dev-password>" for m in rx.finditer(line)):
+                print(f"{os.path.relpath(p, report)}:{n}")
 EOF
 }
 
@@ -881,14 +1089,6 @@ write_summary() {
             [ "$d" != "-" ] && d="$(fmt_dur "$d")"
             echo "| $stage | $r | ${EXIT[$stage]} | $d | \`${LOGFILE[$stage]}\` |"
         done
-        if [ "$changed" != 0 ]; then
-            echo
-            echo "Uncommitted paths (first 30):"
-            echo
-            echo '```text'
-            git status --porcelain 2>/dev/null | head -n 30
-            echo '```'
-        fi
 
         if [ "$nfail" != 0 ]; then
             echo
@@ -938,41 +1138,89 @@ write_summary() {
         if [ -f "$NOTES/env.md" ]; then cat "$NOTES/env.md"; else echo "Not collected (env stage skipped)."; fi
         echo
         echo "---"
-        echo "Generated by scripts/e2e-local.sh. Paths are shown relative to <repo> or ~; the user name, host name and private IP addresses are replaced."
+        echo "Generated by scripts/e2e-local.sh. Paths are shown relative to <repo> or ~; the user name, host name, IP addresses (loopback kept) and MAC addresses are replaced."
     } >"$SUMMARY"
     return "$nfail"
 }
 
-scrub
-set +e
-write_summary
-failures=$?
-set -e
+if [ -z "$CHECK_REPORT" ]; then
+    scrub
+    set +e
+    write_summary
+    failures=$?
+    set -e
+else
+    failures=0
+fi
 scrub
 rm -rf "$NOTES"
 
-# Secret scan of the report, then the archive.
+# Secret checks of the report, then the archive. The archive is written only when every check
+# passed and gitleaks scanned the report clean, or with --no-secret-scan (fail closed).
 archive_ok=1
-if have gitleaks; then
+scan_notes=()
+if ! redacted="$(redact_dev_passwords)"; then
+    redacted=0
+    archive_ok=0
+    failures=$((failures + 1))
+    scan_notes+=("the dev-password redaction failed: no archive")
+fi
+if [ "$redacted" != 0 ]; then
+    scan_notes+=("dev passwords of dev/engines.json found in $redacted file(s) and replaced with \`<dev-password>\`")
+fi
+if ! uris="$(credential_uris)"; then
+    uris="(the URI check failed)"
+fi
+if [ -n "$uris" ]; then
+    archive_ok=0
+    failures=$((failures + 1))
+    printf '%s\n' "$uris" >"$REPORT/credential-uris.txt"
+    scan_notes+=("URIs with a user and a password found on $(grep -c . <<<"$uris") line(s), listed in \`credential-uris.txt\` without the values: no archive")
+    say ""
+    say "FAIL: the report holds URIs with a user and a password; no archive was written."
+    say "      Lines (file:line, values not shown): $REPORT/credential-uris.txt"
+fi
+if [ "$NO_SECRET_SCAN" = 1 ]; then
+    scan_notes+=("gitleaks scan skipped (--no-secret-scan)")
+    say "WARNING: --no-secret-scan: the report was scrubbed but not scanned by gitleaks; read it before sending it."
+elif have gitleaks; then
     gl_rc=0
     gitleaks dir "$REPORT" --redact --no-banner --exit-code 42 >"$REPORT/gitleaks.log" 2>&1 || gl_rc=$?
     if [ "$gl_rc" != 0 ] && [ "$gl_rc" != 42 ]; then
         gl_rc=0
         gitleaks detect --no-git --source "$REPORT" --redact --no-banner --exit-code 42 >"$REPORT/gitleaks.log" 2>&1 || gl_rc=$?
     fi
-    if [ "$gl_rc" = 42 ]; then
+    if [ "$gl_rc" = 0 ]; then
+        scan_notes+=("gitleaks: no finding")
+    elif [ "$gl_rc" = 42 ]; then
         archive_ok=0
+        failures=$((failures + 1))
+        scan_notes+=("gitleaks found secret-like text (\`gitleaks.log\`, redacted): no archive")
         say ""
         say "FAIL: gitleaks found secret-like text in the report; no archive was written."
         say "      Findings (redacted): $REPORT/gitleaks.log"
         say "      Remove or fix the lines it names, or send only the parts that are safe."
+    else
+        archive_ok=0
         failures=$((failures + 1))
-    elif [ "$gl_rc" != 0 ]; then
-        say "WARNING: gitleaks could not scan the report (exit $gl_rc, see gitleaks.log); read the report before sending it."
+        scan_notes+=("gitleaks could not scan the report (exit $gl_rc): no archive")
+        say ""
+        say "FAIL: gitleaks could not scan the report (exit $gl_rc, see gitleaks.log); no archive was written."
     fi
 else
-    say "WARNING: gitleaks is not installed: the report was scrubbed but not scanned; read it before sending it."
+    archive_ok=0
+    scan_notes+=("gitleaks is not installed: no archive (install gitleaks, or rerun with --no-secret-scan)")
+    say ""
+    say "No archive: gitleaks is not installed, so the report was not scanned for secrets."
+    say "      Install gitleaks and rerun, or rerun with --no-secret-scan once you have read the report."
 fi
+{
+    echo
+    echo "## Secret checks"
+    echo
+    printf -- '- %s\n' "${scan_notes[@]}"
+    if [ "$archive_ok" = 1 ]; then echo "- Archive: \`report.tar.gz\`"; else echo "- Archive: not written"; fi
+} >>"$SUMMARY"
 
 if [ "$archive_ok" = 1 ]; then
     tmp_archive="$(dirname "$REPORT")/.$(basename "$REPORT").tar.gz.tmp"
@@ -983,6 +1231,7 @@ fi
 say ""
 say "Summary: $SUMMARY"
 [ "$archive_ok" = 1 ] && say "Archive: $ARCHIVE"
-[ -f "$REPORT/gui-smoke-screenshot.png" ] && say "Note: the archive holds a screenshot of your whole screen (gui-smoke-screenshot.png); check it, or rerun with --no-screenshot."
+[ -f "$REPORT/gui-smoke-window.png" ] && say "Note: the report holds a screenshot of the NineSQL window (gui-smoke-window.png); check it before sending."
+[ -f "$REPORT/gui-smoke-screen.png" ] && say "Note: the report holds a screenshot of your WHOLE screen (gui-smoke-screen.png); check it, or rerun without --screenshot."
 say "Next: send summary.md (or the archive) back to the session."
 [ "$failures" = 0 ]

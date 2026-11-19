@@ -37,8 +37,8 @@ Cloud agent sandboxes (Claude Code on the web and similar) are Linux containers 
 ## Local end-to-end runs for cloud sessions
 A cloud session cannot see the window, use a GPU or, often, run every engine. The maintainer closes that gap with a loop:
 1. The cloud agent pushes its branch and asks for a local run, naming the branch and, if useful, the stages (`--only engines`, `--only gui-smoke`…).
-2. The maintainer checks the branch out on a Linux desktop and runs `make e2e-local` (or `make e2e-local E2E_ARGS="..."`). It runs the static checks, the unit tests, the engine tests and a GUI smoke test, and writes `target/e2e-reports/<UTC time>-<sha>/summary.md` and `report.tar.gz` ([tutorial](tutorials/local-e2e.md)).
-3. The maintainer sends `summary.md` (or the archive) back to the session. The report is scrubbed: no home path, user name, host name or private IP address. It is scanned with gitleaks when gitleaks is installed, and the screenshot is the only part the maintainer must look at.
+2. The maintainer checks the branch out on a Linux desktop and runs `make e2e-local` (or `make e2e-local E2E_ARGS="..."`). It runs the static checks, the unit tests, the engine tests and a GUI smoke test, and writes `target/e2e-reports/<UTC time>-<sha>/summary.md` and, when the secret checks pass, `report.tar.gz` ([tutorial](tutorials/local-e2e.md)).
+3. The maintainer sends `summary.md` (or the archive) back to the session. The report is scrubbed: no home path, user name, host name, IP address (loopback kept) or MAC address, and the dev passwords are redacted. The archive is written only when gitleaks scanned the report clean (or with `--no-secret-scan`) and no other credential URI was found. A screenshot is taken only with `--screenshot`; it is not scrubbed, so the maintainer looks at it before sending.
 4. The agent fixes what failed, says which failures it could reproduce in the sandbox, and asks for another run if the fix needs a display, a GPU or engines the sandbox lacks.
 
 The task report says when a result comes from a local run, with the report's commit.
