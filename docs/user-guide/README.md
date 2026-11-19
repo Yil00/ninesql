@@ -7,7 +7,7 @@ This guide is for people who use NineSQL to work with their databases. It explai
 ## Pages
 | Page | What it covers |
 |---|---|
-| [Install](install.md) | Packages planned for v0.1.0, building from source today, system requirements, where NineSQL keeps its files |
+| [Install](install.md) | The `.deb` (build it yourself for now), the Flatpak status, verifying release signatures, building from source, system requirements, where NineSQL keeps its files |
 | [First start and secrets](first-start-and-secrets.md) | The first window, the three places a password can go (keyring, vault, ask every time), the vault master password, locking |
 | [Import from DBeaver](import-from-dbeaver.md) | Bringing your DBeaver connections and saved passwords over, what is and is not imported, importing again |
 | [Connections](connections.md) | The connection dialog, TLS, SSH tunnels, connection types, read-only and production connections, per-engine conditions |

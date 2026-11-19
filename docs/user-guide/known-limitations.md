@@ -9,12 +9,15 @@ What NineSQL does not do yet, or does only partly, as of phase 6. The list is bu
 ## Release and platform
 | Limitation | When |
 |---|---|
-| No release and no packages yet: you build from source. The signed `.deb`, the APT repository and the Flatpak are being built | v0.1.0 (P6) |
+| No release and no published package yet: you build from source, or build the `.deb` yourself with `make deb` ([Install](install.md#the-deb)). The release workflow (signed `.deb`, SBOM) has not run, the APT repository does not exist, and the Flatpak has not been built | v0.1.0 (P6) |
+| In the Flatpak (once built), a SQLite file chosen through the file chooser opens read-only unless it lies directly in your home folder or its folder is granted with `flatpak override` | Later |
+| The `.deb` has no `md5sums`, so `dpkg --verify` and `debsums` cannot check the installed files (the package itself is covered by `SHA256SUMS` and its signature) | Later |
+| "Open with NineSQL" is not offered for `.sql` files: `ninesql` does not open a file given on its command line yet | Later |
 | The interface was written and tested without a display: its visual check on real Linux desktops (Wayland and X11), with screenshots and a manual run of the main scenarios, has not been done | v0.1.0 (P6) |
 | Start time, idle memory, time to the first rows on screen and scrolling smoothness have **not been measured** on real hardware; no figure is published for them. The only published numbers are core-level test timings (time to the first rows of a 1 M-row query, export and import speeds), each with its method and commit | v0.1.0 (P6) |
 | Accessibility with the Orca screen reader has not been tested | v0.1.0 (P6) |
 | The end-of-MVP security review has not been done | v0.1.0 (P6) |
-| Ubuntu 22.04 and Debian 12 are not checked yet (GPUI may need newer graphics libraries) | v0.1.0 (P6) |
+| Opening a window on Ubuntu 22.04 and Debian 12 is not checked yet (GPUI may need newer graphics libraries); the `.deb` installs and runs `--version` on Ubuntu 22.04 | v0.1.0 (P6) |
 | macOS is a development platform only (no locking on sleep or screen lock, no keyring, macOS-only dependencies not license-checked); Windows is not supported; arm64 is not built | Later |
 
 ## Secrets

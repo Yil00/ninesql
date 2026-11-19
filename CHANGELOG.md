@@ -3,7 +3,7 @@
 All notable changes to this project are documented here. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project uses [Semantic Versioning](https://semver.org/). Released sections are generated at release time from Conventional Commits ([RELEASE.md](RELEASE.md)).
 
 ## [Unreleased]
-No version has been released yet. This section summarizes, for users, everything since the start of the project: phases 0 to 5 and the follow-ups done before phase 6. "Changed", "Fixed" and "Security" describe changes to the behaviour of earlier development builds. What does not work yet is listed in the [known limitations](docs/user-guide/known-limitations.md); measurements of start time, memory and scrolling on real hardware are not available yet.
+No version has been released yet. This section summarizes, for users, everything since the start of the project: phases 0 to 5, the follow-ups done before phase 6 and the phase 6 packaging and documentation. "Changed", "Fixed" and "Security" describe changes to the behaviour of earlier development builds. What does not work yet is listed in the [known limitations](docs/user-guide/known-limitations.md); measurements of start time, memory and scrolling on real hardware are not available yet.
 
 ### Added
 - **Application window** (GPUI, rendered on the GPU): database navigator, editor tabs and splits, several windows, status bar, a command palette listing every action, default key bindings for every action and overrides in `settings.toml`, light / dark / system themes, font sizes and zoom saved back to `settings.toml` (comments kept), "Show settings problems".
@@ -23,6 +23,9 @@ No version has been released yet. This section summarizes, for users, everything
 - **Data editing**: "Open table data", then edit cells (in a dialog), insert, duplicate and delete rows as pending changes; "Preview changes…" with the exact statements; "Save changes", each statement required to change exactly one row and the whole save undone otherwise; one confirmation for a save on production; saves under a savepoint in manual-commit mode; server-side filter and sort with bound values; "Open referenced rows" and "Open referencing rows".
 - **Export and import**: export of results and tables to CSV, TSV, JSON, JSON Lines, SQL `INSERT`, Markdown and HTML, streamed in bounded memory, reads only, in an engine-side read-only transaction where the engine has one, to a new private file, with a spreadsheet formula guard on by default; CSV import with a preview, a column mapping, "All or nothing" or "Commit every 1000 rows", and one confirmation on production.
 - **Export connections to DBeaver**: chosen connections written to a new DBeaver `data-sources.json` or project folder, without any password; connections DBeaver could not reproduce safely skipped with a reason; read-only connections warned that DBeaver enforces read-only more weakly.
+- **Packaging** (no package published yet): a `.deb` for Debian 12 / 13 and Ubuntu 22.04 / 24.04 (amd64), built with `make deb`, with a desktop entry, icons, AppStream metadata, a man page (`man ninesql`) and the licenses of the bundled crates, no install or removal script; a Flatpak manifest with minimal permissions (not built yet); a release workflow that builds the `.deb` twice and compares it, writes an SBOM and signs the files with cosign ([packaging/README.md](packaging/README.md)).
+- **`ninesql --version` and `ninesql --help`** (also `-V` / `-h`), answered without opening a window; any other argument exits with status 2.
+- **Application id `io.github.yil00.NineSQL`** for the window (Wayland app id, X11 `WM_CLASS`), the desktop entry, the icons, AppStream and the Flatpak, so the desktop shows NineSQL's name and icon.
 - **Documentation**: a [user guide](docs/user-guide/README.md) and step-by-step [tutorials](docs/tutorials/README.md).
 - **For contributors**: a dev environment with the 20 planned engines in containers and a sample dataset ("nine"), a root `Makefile`, CI with driver integration tests against eight engines and a macOS build job.
 
@@ -56,6 +59,7 @@ No version has been released yet. This section summarizes, for users, everything
 - TiDB exports no longer claim an engine-side read-only transaction (TiDB has none): they are refused on production unless the connection is read-only, and warned otherwise.
 - DBeaver import: a re-import cannot redirect a saved password to another server (secrets are kept only while engine, host, port, user, TLS, SSH route and key file are unchanged); a weaker or different TLS setting is applied only when accepted per connection; imported init SQL is always confirmed once, whatever the connection type; DBeaver files are left byte-identical.
 - A file inside a DBeaver workspace is opened read-only by NineSQL as well as by the driver.
+- A file chosen through the Flatpak document portal is checked at its host path for a DBeaver workspace; when the portal cannot say, a SQLite file there opens read-only.
 - A new vault master password must be at least 12 characters long.
 - Driver error messages no longer repeat a driver property key raw.
 - The plain `Ctrl+C` copy now has the spreadsheet formula guard, as the CSV copy and export do.

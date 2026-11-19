@@ -213,6 +213,8 @@ Checked on 2026-11-19 against the `Capabilities` each driver declares (`capabili
 
 Every MVP driver declares `parameters = true`, `server_side_timeout = false` and `retains_secret_after_connect = false`; `multiple_result_sets` is true for MySQL and MariaDB only. The UI uses `editing`, `transactions`, `read_only`, `cancel`, `tls`, `parameters`, `metadata` and `connect`; it has no "Explain" action yet, so `explain` is informational.
 
+Oddity found in this pass (I8, follow-up for `driver-engineer`, [Phase 6 follow-ups](ROADMAP.md#phase-6-follow-ups)): `tidb_capabilities()` starts from the MySQL capabilities and keeps `connect.client_certificates = true` while its `tls` allows only `disable`, so TiDB declares client certificates it cannot use; the declaration should say `false` until TiDB has TLS.
+
 ## Feature capabilities
 | Engine | Metadata tree | DDL | Edit data | Transactions | Server-side cancel | Explain | Multiple result sets |
 |---|---|---|---|---|---|---|---|

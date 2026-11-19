@@ -1,6 +1,6 @@
 # ADR-0010: Packaging and distribution
 
-- **Status**: Accepted. Note (P1-D wiring, 2026-11-15): the Flatpak permissions of §3 also include `--system-talk-name=org.freedesktop.login1` (logind on the system bus, to lock secrets on sleep and screen lock), and "network" is `--share=network`, which Flatpak grants all-or-nothing: NineSQL itself limits network use to the user's connections and their SSH / proxy hops (I2). See the [amendment of ADR-0005](0005-secrets-storage.md#amendment-p1-d-wiring-2026-11-15) and [docs/10](../10-supported-platforms.md#flatpak-permissions). [Amendment (P6-A packaging, 2026-11-19)](#amendment-p6-a-packaging-2026-11-19): proposed.
+- **Status**: Accepted. Note (P1-D wiring, 2026-11-15): the Flatpak permissions of §3 also include `--system-talk-name=org.freedesktop.login1` (logind on the system bus, to lock secrets on sleep and screen lock), and "network" is `--share=network`, which Flatpak grants all-or-nothing: NineSQL itself limits network use to the user's connections and their SSH / proxy hops (I2). See the [amendment of ADR-0005](0005-secrets-storage.md#amendment-p1-d-wiring-2026-11-15) and [docs/10](../10-supported-platforms.md#flatpak-permissions). [Amendment (P6-A packaging, 2026-11-19)](#amendment-p6-a-packaging-2026-11-19): Accepted (maintainer, 2026-11-19).
 - **Date**: 2026-11-14
 
 ## Context
@@ -25,7 +25,7 @@ NineSQL targets Debian and Ubuntu desktops. Users of a security-minded database 
 - **Upstream Debian packaging first**: the long-term goal, but Debian's Rust packaging policy (every crate packaged) makes it a post-1.0 effort.
 
 ## Amendment (P6-A packaging, 2026-11-19)
-- **Status**: **Proposed**, to be accepted by the maintainer. It records the decisions the P6-A packaging work took ([packaging/README.md](../../packaging/README.md), `packaging/`, `.github/workflows/release.yml`) and the follow-ups of its security review. It adds to the decision above; where it departs from this ADR or from the [ADR-0005 P1-D amendment](0005-secrets-storage.md#amendment-p1-d-wiring-2026-11-15), it says so.
+- **Status**: **Accepted (maintainer, 2026-11-19)**. It records the decisions the P6-A packaging work took ([packaging/README.md](../../packaging/README.md), `packaging/`, `.github/workflows/release.yml`) and the follow-ups of its security review. It adds to the decision above; where it departs from this ADR or from the [ADR-0005 P1-D amendment](0005-secrets-storage.md#amendment-p1-d-wiring-2026-11-15), it says so.
 
 **Context.** The first `.deb`, Flatpak manifest and release workflow (P6-A) had to settle points this ADR leaves open (the application id, the Flatpak's file access, how far reproducibility goes, who can produce a release signature), and the security review of that work found that a file chosen through the Flatpak document portal escaped the DBeaver check (I4).
 
