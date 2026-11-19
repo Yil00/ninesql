@@ -32,6 +32,20 @@ impl Link {
         self.internal_limited(sql, verify, None, None).await
     }
 
+    /// A navigator read ([`MyMetadata`]): like
+    /// [`internal_limited`](Self::internal_limited) with the control connection, and in
+    /// manual-commit mode the transaction the read started by itself is rolled back
+    /// afterwards; a transaction the user opened stays open, untouched.
+    pub(crate) async fn navigator(
+        &self,
+        sql: &str,
+        value_limit: Option<u64>,
+        control: &Arc<Control>,
+    ) -> DriverResult<Rows> {
+        self.send_internal(sql, false, value_limit, Some(control), true)
+            .await
+    }
+
     /// [`internal`](Self::internal) with a value limit (`Command::Internal::value_limit`) and,
     /// for navigator calls, the control connection: if the caller drops the future before the
     /// answer, the statement is stopped with `KILL QUERY` (scoped to this execution).
@@ -41,6 +55,18 @@ impl Link {
         verify: bool,
         value_limit: Option<u64>,
         cancel_on_drop: Option<&Arc<Control>>,
+    ) -> DriverResult<Rows> {
+        self.send_internal(sql, verify, value_limit, cancel_on_drop, false)
+            .await
+    }
+
+    async fn send_internal(
+        &self,
+        sql: &str,
+        verify: bool,
+        value_limit: Option<u64>,
+        cancel_on_drop: Option<&Arc<Control>>,
+        navigator: bool,
     ) -> DriverResult<Rows> {
         if self.shared.closed.load(Ordering::SeqCst) {
             return Err(self.shared.closed_error());
@@ -58,6 +84,7 @@ impl Link {
                 sql: sql.to_owned(),
                 value_limit,
                 verify,
+                navigator,
                 guard,
                 reply,
             })

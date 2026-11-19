@@ -723,3 +723,191 @@ async fn oversized_listing_fails_without_closing_the_session() {
         admin.close().await.unwrap();
     }
 }
+
+/// The first column of the first row of `sql`, as text.
+async fn scalar(s: &mut dyn Session, sql: &str) -> Option<String> {
+    use ninesql_driver_api::ResultItem;
+    use ninesql_driver_api::arrow_array::Array;
+    use ninesql_driver_api::arrow_array::cast::AsArray;
+    let mut stream = s
+        .execute(Statement::sql(sql), ExecOptions::default())
+        .await
+        .unwrap_or_else(|e| panic!("{sql}: {e}"));
+    let mut out = None;
+    while let Some(item) = stream.next().await {
+        if let ResultItem::Rows(b) = item.unwrap_or_else(|e| panic!("{sql}: {e}"))
+            && out.is_none()
+            && b.num_rows() > 0
+            && !b.column(0).is_null(0)
+        {
+            out = Some(b.column(0).as_string::<i32>().value(0).to_owned());
+        }
+    }
+    out
+}
+
+const TXN_TABLE: &str = "ninesql_meta_txn";
+
+/// Every kind of navigator call on `TXN_TABLE`; after each one, `in_transaction()` must still
+/// be `expected`.
+async fn browse_txn_table(s: &dyn Session, dev: &Dev, expected: bool, case: &str) {
+    let e = &dev.engine;
+    let m = s.metadata();
+    let check = |what: &str| {
+        assert_eq!(
+            s.in_transaction(),
+            expected,
+            "{e} {case}: in_transaction after {what}"
+        );
+    };
+    let schemas = m
+        .list(
+            &ObjectPath::root(),
+            ObjectKind::Schema,
+            PageRequest::first(),
+        )
+        .await
+        .unwrap();
+    assert!(names(&schemas.items).contains(&dev.database.as_str()));
+    check("listing schemas");
+    let sch = ObjectPath::root().child(ObjectKind::Schema, &dev.database);
+    let tables = m
+        .list(
+            &sch,
+            ObjectKind::Table,
+            PageRequest::first().with_filter(Some(TXN_TABLE.into())),
+        )
+        .await
+        .unwrap();
+    assert_eq!(names(&tables.items), [TXN_TABLE], "{e} {case}");
+    check("listing tables");
+    let table = sch.child(ObjectKind::Table, TXN_TABLE);
+    for kind in [
+        ObjectKind::Column,
+        ObjectKind::Constraint,
+        ObjectKind::Index,
+        ObjectKind::ForeignKey,
+        ObjectKind::Trigger,
+        ObjectKind::Partition,
+    ] {
+        m.list(&table, kind, PageRequest::first())
+            .await
+            .unwrap_or_else(|err| panic!("{e} {case} {kind:?}: {err}"));
+        check(&format!("listing {kind:?}"));
+    }
+    let ddl = m.ddl(&table).await.unwrap();
+    assert!(ddl.contains(TXN_TABLE), "{e} {case}: {ddl}");
+    check("the table's DDL");
+    m.ddl(&sch).await.unwrap();
+    check("the schema's DDL");
+    // A failing call (an object that does not exist) does not leave one either.
+    assert!(
+        m.ddl(&sch.child(ObjectKind::Table, "ninesql_meta_txn_missing"))
+            .await
+            .is_err()
+    );
+    check("a failed DDL call");
+}
+
+/// Real-engine UI test finding: in manual-commit mode (`autocommit = 0`, the production
+/// default) a navigator read implicitly started a transaction, so browsing alone showed "in
+/// transaction" and closing asked to commit or roll back. Navigator reads now end the
+/// transaction they started, never one the user started; another session's DDL on a browsed
+/// table does not wait (short `lock_wait_timeout`).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn navigator_reads_leave_no_transaction_and_keep_the_users() {
+    let _serial = SERIAL.lock().await;
+    for dev in devs() {
+        let e = &dev.engine;
+        let mut admin = connect(&dev, false).await;
+        exec_all(
+            admin.as_mut(),
+            e,
+            &[
+                "DROP TABLE IF EXISTS ninesql_meta_txn",
+                "CREATE TABLE ninesql_meta_txn (id INT PRIMARY KEY, v INT, KEY v_idx (v)) \
+                 ENGINE = InnoDB",
+                "SET SESSION lock_wait_timeout = 2",
+                "SET SESSION innodb_lock_wait_timeout = 2",
+            ],
+        )
+        .await;
+
+        // Manual commit, no user statement: browsing leaves no transaction.
+        let mut s = connect(&dev, false).await;
+        s.set_auto_commit(false).await.unwrap();
+        assert!(!s.auto_commit() && !s.in_transaction(), "{e}");
+        browse_txn_table(s.as_ref(), &dev, false, "manual commit").await;
+        // No snapshot or metadata lock is held: another session's DDL does not wait.
+        let started = std::time::Instant::now();
+        exec_all(
+            admin.as_mut(),
+            e,
+            &[
+                "ALTER TABLE ninesql_meta_txn ADD COLUMN extra INT",
+                "ALTER TABLE ninesql_meta_txn DROP COLUMN extra",
+            ],
+        )
+        .await;
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "{e}: DDL waited"
+        );
+        assert!(!s.in_transaction(), "{e}");
+
+        // A transaction the user started implicitly (manual commit) stays open, with its row.
+        exec(s.as_mut(), "INSERT INTO ninesql_meta_txn VALUES (1, 10)")
+            .await
+            .unwrap();
+        assert!(s.in_transaction(), "{e}");
+        browse_txn_table(s.as_ref(), &dev, true, "manual commit, user transaction").await;
+        let count = "SELECT CAST(COUNT(*) AS CHAR) FROM ninesql_meta_txn";
+        assert_eq!(scalar(s.as_mut(), count).await.as_deref(), Some("1"), "{e}");
+        assert_eq!(
+            scalar(admin.as_mut(), count).await.as_deref(),
+            Some("0"),
+            "{e}"
+        );
+        s.rollback().await.unwrap();
+        assert!(!s.in_transaction(), "{e}");
+        assert_eq!(scalar(s.as_mut(), count).await.as_deref(), Some("0"), "{e}");
+        // That `SELECT` (a user statement) opened a transaction of its own: the user's.
+        assert!(s.in_transaction(), "{e}");
+        browse_txn_table(s.as_ref(), &dev, true, "manual commit, user read").await;
+        s.rollback().await.unwrap();
+
+        // An explicit transaction in auto-commit mode stays open too, and commits its row.
+        s.set_auto_commit(true).await.unwrap();
+        browse_txn_table(s.as_ref(), &dev, false, "auto-commit").await;
+        s.begin().await.unwrap();
+        exec(s.as_mut(), "INSERT INTO ninesql_meta_txn VALUES (2, 20)")
+            .await
+            .unwrap();
+        browse_txn_table(s.as_ref(), &dev, true, "explicit transaction").await;
+        s.commit().await.unwrap();
+        assert!(!s.in_transaction(), "{e}");
+        assert_eq!(
+            scalar(admin.as_mut(), count).await.as_deref(),
+            Some("1"),
+            "{e}"
+        );
+        s.close().await.unwrap();
+
+        // A read-only session in manual-commit mode: no transaction, and writes still fail.
+        let mut ro = connect(&dev, true).await;
+        ro.set_auto_commit(false).await.unwrap();
+        browse_txn_table(ro.as_ref(), &dev, false, "read-only manual commit").await;
+        assert!(ro.is_read_only(), "{e}");
+        assert!(
+            matches!(
+                exec(ro.as_mut(), "INSERT INTO ninesql_meta_txn VALUES (3, 30)").await,
+                Err(DriverError::ReadOnly(_))
+            ),
+            "{e}"
+        );
+        ro.close().await.unwrap();
+
+        exec_all(admin.as_mut(), e, &["DROP TABLE ninesql_meta_txn"]).await;
+        admin.close().await.unwrap();
+    }
+}
