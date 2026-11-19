@@ -614,7 +614,12 @@ impl CoreServices {
                     "the import preview task failed".into(),
                 ))
             });
-            let _ = tx.send(result);
+            if tx.send(result).is_err() {
+                // The reply was dropped while the preview was finishing: the caller abandoned
+                // it, so report it as cancelled like an abandon seen before completion (the
+                // `select!` above cannot tell which came first when both are ready).
+                on_drop.cancel();
+            }
         });
         (reply, cancel)
     }
