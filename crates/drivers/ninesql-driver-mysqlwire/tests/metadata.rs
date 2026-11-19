@@ -911,3 +911,279 @@ async fn navigator_reads_leave_no_transaction_and_keep_the_users() {
         admin.close().await.unwrap();
     }
 }
+
+/// Creates `TXN_TABLE` with the committed row `(1, 10)`; returns the admin session, whose DDL
+/// and row locks give up after one or two seconds.
+async fn txn_fixture(dev: &Dev) -> Box<dyn Session> {
+    let mut admin = connect(dev, false).await;
+    exec_all(
+        admin.as_mut(),
+        &dev.engine,
+        &[
+            "DROP TABLE IF EXISTS ninesql_meta_txn",
+            "CREATE TABLE ninesql_meta_txn (id INT PRIMARY KEY, v INT, KEY v_idx (v)) \
+             ENGINE = InnoDB",
+            "INSERT INTO ninesql_meta_txn VALUES (1, 10)",
+            "SET SESSION lock_wait_timeout = 2",
+            "SET SESSION innodb_lock_wait_timeout = 1",
+        ],
+    )
+    .await;
+    admin
+}
+
+/// Security re-review L2-a: a user's one-shot `SET TRANSACTION …` (next transaction only) was
+/// consumed by a navigator read's implicit transaction and then discarded by the navigator's
+/// rollback, so the user's next transaction ran read-write or at the default isolation level.
+/// The driver now sets the same characteristics again after a navigator read; a form it cannot
+/// restore makes navigator reads refuse until the pending settings are consumed or dropped.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn navigator_reads_keep_one_shot_transaction_settings() {
+    let _serial = SERIAL.lock().await;
+    for dev in devs() {
+        let e = &dev.engine;
+        let mut admin = txn_fixture(&dev).await;
+        let insert = "INSERT INTO ninesql_meta_txn VALUES (2, 20)";
+        let mut s = connect(&dev, false).await;
+
+        // Manual commit: a one-shot READ ONLY survives browsing, so the INSERT that starts the
+        // next transaction fails as it would have without the browse.
+        s.set_auto_commit(false).await.unwrap();
+        exec(s.as_mut(), "SET TRANSACTION READ ONLY").await.unwrap();
+        browse_txn_table(s.as_ref(), &dev, false, "one-shot read only").await;
+        assert!(
+            matches!(
+                exec(s.as_mut(), insert).await,
+                Err(DriverError::ReadOnly(_))
+            ),
+            "{e}: the one-shot READ ONLY was lost"
+        );
+        s.rollback().await.unwrap();
+        // Consumed by that transaction: the next one is read-write again.
+        exec(s.as_mut(), insert).await.unwrap();
+        s.rollback().await.unwrap();
+
+        // Isolation and access mode together, set in two statements (they accumulate), with
+        // an unrelated session statement in between.
+        exec(s.as_mut(), "SET TRANSACTION READ ONLY").await.unwrap();
+        exec(s.as_mut(), "SET @ninesql_x = 1").await.unwrap();
+        exec(s.as_mut(), "SET TRANSACTION ISOLATION LEVEL SERIALIZABLE")
+            .await
+            .unwrap();
+        browse_txn_table(s.as_ref(), &dev, false, "one-shot serializable").await;
+        // SERIALIZABLE turns this plain read into a locking read: the admin's UPDATE of the
+        // row waits and times out (it would not under REPEATABLE READ).
+        assert_eq!(
+            scalar(
+                s.as_mut(),
+                "SELECT CAST(v AS CHAR) FROM ninesql_meta_txn WHERE id = 1"
+            )
+            .await
+            .as_deref(),
+            Some("10"),
+            "{e}"
+        );
+        assert!(s.in_transaction(), "{e}");
+        match exec(
+            admin.as_mut(),
+            "UPDATE ninesql_meta_txn SET v = 11 WHERE id = 1",
+        )
+        .await
+        {
+            Err(DriverError::Query { code, .. }) => {
+                assert_eq!(
+                    code.as_deref(),
+                    Some("1205"),
+                    "{e}: not a lock wait timeout"
+                );
+            }
+            other => panic!("{e}: the one-shot SERIALIZABLE was lost: {other:?}"),
+        }
+        assert!(
+            matches!(
+                exec(s.as_mut(), insert).await,
+                Err(DriverError::ReadOnly(_))
+            ),
+            "{e}: the one-shot READ ONLY was lost"
+        );
+        s.rollback().await.unwrap();
+
+        // `SET SESSION TRANSACTION READ WRITE` replaces the pending READ ONLY: the driver must
+        // not bring it back.
+        exec(s.as_mut(), "SET TRANSACTION READ ONLY").await.unwrap();
+        exec(s.as_mut(), "SET SESSION TRANSACTION READ WRITE")
+            .await
+            .unwrap();
+        browse_txn_table(s.as_ref(), &dev, false, "one-shot replaced").await;
+        exec(s.as_mut(), insert).await.unwrap();
+        s.rollback().await.unwrap();
+
+        // Auto-commit: the navigator's own reads are transactions of their own; the explicit
+        // transaction the user starts next still gets the one-shot READ ONLY.
+        s.set_auto_commit(true).await.unwrap();
+        exec(s.as_mut(), "SET TRANSACTION READ ONLY").await.unwrap();
+        browse_txn_table(s.as_ref(), &dev, false, "auto-commit one-shot").await;
+        s.begin().await.unwrap();
+        assert!(
+            matches!(
+                exec(s.as_mut(), insert).await,
+                Err(DriverError::ReadOnly(_))
+            ),
+            "{e}: the one-shot READ ONLY was lost in auto-commit mode"
+        );
+        s.rollback().await.unwrap();
+
+        // A form the driver cannot restore: navigator reads are refused (nothing sent), the
+        // pending setting stays, and browsing works again once it is consumed.
+        s.set_auto_commit(false).await.unwrap();
+        exec(s.as_mut(), "SET @@transaction_read_only = 1")
+            .await
+            .unwrap();
+        let sch = ObjectPath::root().child(ObjectKind::Schema, &dev.database);
+        let refused = s
+            .metadata()
+            .list(&sch, ObjectKind::Table, PageRequest::first())
+            .await;
+        assert!(
+            matches!(&refused, Err(DriverError::Query { message, .. }) if message.contains("pending")),
+            "{e}: {refused:?}"
+        );
+        assert!(
+            matches!(
+                exec(s.as_mut(), insert).await,
+                Err(DriverError::ReadOnly(_))
+            ),
+            "{e}: the pending setting was lost"
+        );
+        s.rollback().await.unwrap();
+        browse_txn_table(s.as_ref(), &dev, false, "after the unknown form").await;
+        exec(s.as_mut(), insert).await.unwrap();
+        s.rollback().await.unwrap();
+        s.close().await.unwrap();
+
+        exec_all(admin.as_mut(), e, &["DROP TABLE ninesql_meta_txn"]).await;
+        admin.close().await.unwrap();
+    }
+}
+
+/// Security re-review L2-b / L2-c: an error packet carries no status flags. A failed navigator
+/// read leaves no transaction (the rollback is sent whatever the stale flag says), and a user
+/// statement that fails but leaves work in the transaction (a procedure that inserts and then
+/// raises `SIGNAL`; on MariaDB also an anonymous `BEGIN NOT ATOMIC` block) is seen as an open
+/// transaction, so browsing never rolls that work back.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn failed_statements_neither_leave_nor_lose_a_transaction() {
+    let _serial = SERIAL.lock().await;
+    for dev in devs() {
+        let e = &dev.engine;
+        let mut admin = txn_fixture(&dev).await;
+        exec_all(
+            admin.as_mut(),
+            e,
+            &[
+                "DROP PROCEDURE IF EXISTS ninesql_meta_sig",
+                "CREATE PROCEDURE ninesql_meta_sig(IN n INT) BEGIN \
+                 INSERT INTO ninesql_meta_txn VALUES (n, n); \
+                 SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = 'ninesql test signal'; END",
+            ],
+        )
+        .await;
+        let count = "SELECT CAST(COUNT(*) AS CHAR) FROM ninesql_meta_txn";
+        let mut s = connect(&dev, false).await;
+        s.set_auto_commit(false).await.unwrap();
+        let sch = ObjectPath::root().child(ObjectKind::Schema, &dev.database);
+
+        // L2-b: a failed navigator call, then the server's own flag (a table-less SELECT
+        // carries it and starts nothing) and another session's DDL that does not wait.
+        assert!(
+            s.metadata()
+                .ddl(&sch.child(ObjectKind::Table, "ninesql_meta_txn_missing"))
+                .await
+                .is_err()
+        );
+        assert!(!s.in_transaction(), "{e}");
+        assert_eq!(scalar(s.as_mut(), "SELECT 'x'").await.as_deref(), Some("x"));
+        assert!(
+            !s.in_transaction(),
+            "{e}: a failed navigator read left a transaction"
+        );
+        let started = std::time::Instant::now();
+        exec_all(
+            admin.as_mut(),
+            e,
+            &[
+                "ALTER TABLE ninesql_meta_txn ADD COLUMN extra INT",
+                "ALTER TABLE ninesql_meta_txn DROP COLUMN extra",
+            ],
+        )
+        .await;
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "{e}: DDL waited"
+        );
+
+        // A failed plain statement: the driver's flag matches the server's after it.
+        assert!(
+            exec(s.as_mut(), "INSERT INTO ninesql_meta_txn VALUES (1, 1)")
+                .await
+                .is_err()
+        );
+        let after_error = s.in_transaction();
+        assert_eq!(scalar(s.as_mut(), "SELECT 'x'").await.as_deref(), Some("x"));
+        assert_eq!(
+            s.in_transaction(),
+            after_error,
+            "{e}: stale transaction flag after an error"
+        );
+        s.rollback().await.unwrap();
+
+        // L2-c: the procedure's INSERT stays in the user's transaction after the SIGNAL.
+        let mut blocks = vec![("CALL", "CALL ninesql_meta_sig(5)")];
+        if *e == EngineId::MARIADB {
+            blocks.push((
+                "BEGIN NOT ATOMIC",
+                "BEGIN NOT ATOMIC INSERT INTO ninesql_meta_txn VALUES (6, 6); \
+                 SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = 'ninesql test signal'; END",
+            ));
+        }
+        for (what, sql) in blocks {
+            assert!(!s.in_transaction(), "{e} {what}");
+            match exec(s.as_mut(), sql).await {
+                Err(DriverError::Query { code, .. }) => {
+                    assert_eq!(code.as_deref(), Some("1644"), "{e} {what}");
+                }
+                other => panic!("{e} {what}: {other:?}"),
+            }
+            assert!(
+                s.in_transaction(),
+                "{e} {what}: the insert's transaction is not seen"
+            );
+            browse_txn_table(s.as_ref(), &dev, true, what).await;
+            assert_eq!(
+                scalar(s.as_mut(), count).await.as_deref(),
+                Some("2"),
+                "{e} {what}: the user's row was rolled back by the navigator"
+            );
+            assert_eq!(
+                scalar(admin.as_mut(), count).await.as_deref(),
+                Some("1"),
+                "{e} {what}"
+            );
+            s.rollback().await.unwrap();
+            assert_eq!(scalar(s.as_mut(), count).await.as_deref(), Some("1"));
+            s.rollback().await.unwrap();
+        }
+        s.close().await.unwrap();
+
+        exec_all(
+            admin.as_mut(),
+            e,
+            &[
+                "DROP PROCEDURE ninesql_meta_sig",
+                "DROP TABLE ninesql_meta_txn",
+            ],
+        )
+        .await;
+        admin.close().await.unwrap();
+    }
+}
