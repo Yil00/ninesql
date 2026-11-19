@@ -1671,6 +1671,50 @@ mod tests {
         copy.validate().unwrap();
     }
 
+    /// TiDB declares no TLS and no client certificate (I8): the dialog offers no client
+    /// certificate, a certificate left in the form (an imported or edited connection) is not
+    /// saved, and no key passphrase is asked for.
+    #[test]
+    fn tidb_offers_no_client_certificate() {
+        let tidb = offer("tidb");
+        assert_eq!(tidb.tls_modes, [TlsMode::Disable]);
+        assert!(!tidb.client_certificates && !tidb.encrypted_client_keys);
+        let mut f = ConnectionForm::new("tidb");
+        f.name = "Analytics".into();
+        f.host = "tidb.example.test".into();
+        f.username = "app".into();
+        f.connection_type = Some(ConnectionTypeId::dev());
+        f.tls_mode = TlsMode::Disable;
+        f.client_cert = "/etc/ninesql/client.crt".into();
+        f.client_key = "/etc/ninesql/client.key".into();
+        f.client_key_has_passphrase = true;
+        assert!(
+            f.secret_slots(&tidb)
+                .iter()
+                .all(|(slot, _)| *slot != SecretSlot::TlsClientKey)
+        );
+        let built = f
+            .build(
+                &tidb,
+                vec![],
+                &ConnectionTypes::default(),
+                Some(StoreKind::Vault),
+            )
+            .unwrap();
+        assert!(built.connection.tls.client_certificate.is_none());
+        assert_eq!(built.connection.tls.mode, TlsMode::Disable);
+        f.tls_mode = TlsMode::Require;
+        assert!(
+            f.build(
+                &tidb,
+                vec![],
+                &ConnectionTypes::default(),
+                Some(StoreKind::Vault)
+            )
+            .is_err()
+        );
+    }
+
     #[test]
     fn url_fills_the_form() {
         let mut r = DriverRegistry::new();

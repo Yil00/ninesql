@@ -363,7 +363,7 @@ Items left by the phase 4 task reports, the security reviews of P4-A, P4-B and P
 | P4-B (core) | Filters of a deleted connection stay in `navigator.json` (orphaned entries, harmless) | Not scheduled |
 | P4-B (core) | Prefetch limits are not configurable ("Load metadata" uses 256 nodes, depth 4; `warm_schema` the defaults, 256 nodes, depth 2) | Not scheduled |
 | P4-B (core) | A metadata request cannot be pinned to one session: the service binds the connection's oldest open session | Not scheduled |
-| P4-C (TiDB) | TLS for TiDB: not declared (`disable` only) until the dev service has a test CA to prove `verify-full`; every TiDB connection is plaintext until then (use an SSH tunnel for a remote TiDB) | When the dev TiDB service has a test CA |
+| P4-C (TiDB) | TLS for TiDB: not declared (`disable` only) until the dev service has a test CA to prove `verify-full`; every TiDB connection is plaintext until then (use an SSH tunnel for a remote TiDB). Client certificates are not declared either (`client_certificates = false` since 2026-11-19, I8): declare them again with TLS | When the dev TiDB service has a test CA |
 | P4-C (QuestDB) | The read-only check (read-only user plus a write probe) is verified on open-source QuestDB only; QuestDB Enterprise has its own access control | Not scheduled |
 | P3 closing-PR review (L2) | The driver-declared idle limit for paused results (row in the [Phase 3 follow-ups](#phase-3-follow-ups)): still no driver-API field | With the next driver-API change |
 | P4 tests | The timing-sensitive pgwire test `paused_cursor_releases_locks_after_its_deadline` (`crates/drivers/ninesql-driver-pgwire/tests/postgres.rs`) failed once in 18 local runs; it passed 20 runs out of 20 during the P4 review | Not scheduled (watch it) |
@@ -470,7 +470,7 @@ Items left by the P6-A packaging work, its security review and re-review (2026-1
 | P6-A (ADR-0010 amendment §5) | No `MimeType=application/sql` in the desktop file until `ninesql` opens a file given on its command line (`ui-engineer`) | Not scheduled |
 | P6-A review M1 | Flatpak: a SQLite file picked through the portal opens read-only unless it lies directly in `$HOME` or its folder is granted with `flatpak override --filesystem=<folder>` (documented in [packaging/README.md](../packaging/README.md#permissions)) | Not scheduled |
 | P6-A re-review | Optional cache hardening of the document-portal check: key the cache on (document id, name), or shorten its TTL (10 min for a host path today) | Not scheduled |
-| P6-D capability pass | I8 oddity: the TiDB dialect of mysqlwire declares `client_certificates = true` while it allows only TLS `disable` (`driver-engineer`) | Before [P6-E](#phase-6--hardening-and-v010-release) |
+| P6-D capability pass | ~~I8 oddity: the TiDB dialect of mysqlwire declares `client_certificates = true` while it allows only TLS `disable` (`driver-engineer`)~~ **Fixed** (2026-11-19): `client_certificates = false` and no encrypted client keys for TiDB, with tests on the declaration, the driver connect check, the form and the core validation | Before [P6-E](#phase-6--hardening-and-v010-release) |
 
 ## Phase 7 – Analytical SQL engines (v0.2)
 | Workstream | Owner | Tasks |

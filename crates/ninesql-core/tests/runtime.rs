@@ -698,6 +698,45 @@ fn settings_the_driver_refuses_fail_validation() {
     assert_eq!(stats.connects(), 0);
 }
 
+/// A driver declaring no TLS and no client certificate (TiDB for now): a client certificate is
+/// ignored while TLS is `disable`, as the driver ignores it, and any other TLS mode is refused,
+/// so no saved or imported connection can use one.
+#[test]
+fn client_certificates_without_tls_are_ignored_or_refused() {
+    use ninesql_core::driver_api::{AuthKind, ConnectCapabilities, TlsMode as ApiTlsMode};
+    use ninesql_core::{ClientCertificate, TlsMode};
+    let tmp = tempfile::tempdir().unwrap();
+    let mut caps = mock_capabilities();
+    caps.tls = [ApiTlsMode::Disable].into();
+    let mut connect = ConnectCapabilities::default();
+    connect.auth = [AuthKind::Password].into();
+    connect.client_certificates = false;
+    connect.encrypted_client_keys = false;
+    caps.connect = connect;
+    let (manager, _) = manager(Arc::new(mock_driver().with_capabilities(caps)), tmp.path());
+    let mut c = mock_connection(ConnectionTypeId::dev());
+    c.auth = Auth::Username {
+        username: "nine".into(),
+    };
+    c.tls.mode = TlsMode::Disable;
+    c.tls.client_certificate = Some(ClientCertificate {
+        cert_file: "/c.pem".into(),
+        key_file: "/k.pem".into(),
+        passphrase: None,
+    });
+    manager.registry().validate_connection(&c).unwrap();
+    for mode in [TlsMode::Require, TlsMode::VerifyCa, TlsMode::VerifyFull] {
+        c.tls.mode = mode;
+        c.tls.ca_file = Some("/etc/ninesql/ca.pem".into());
+        match manager.registry().validate_connection(&c) {
+            Err(CoreError::InvalidConnection(ConnectionError::InvalidField { field, .. })) => {
+                assert_eq!(field, "tls.mode");
+            }
+            other => panic!("expected tls.mode to be refused, got {other:?}"),
+        }
+    }
+}
+
 fn ssh_connection(port: u16) -> ninesql_core::Connection {
     let mut c = mock_connection(ConnectionTypeId::dev());
     let mut server = SshHop::new(

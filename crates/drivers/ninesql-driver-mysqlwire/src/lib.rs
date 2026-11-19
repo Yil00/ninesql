@@ -555,6 +555,10 @@ fn tidb_capabilities(server_version: Option<&str>) -> Capabilities {
     // No stored procedures, so no `CALL` with several result sets.
     c.multiple_result_sets = false;
     c.tls = BTreeSet::from([TlsMode::Disable]);
+    // No TLS, so no client certificate either (I8): set back to MySQL's values when TLS is
+    // declared.
+    c.connect.client_certificates = false;
+    c.connect.encrypted_client_keys = false;
     let mut accepted = c.connect.accepted_properties.clone().unwrap_or_default();
     accepted.retain(|k| k != "max_statement_time");
     accepted.insert("max_execution_time".to_owned());
@@ -953,5 +957,51 @@ mod tests {
         assert!(!my.accepts_property("max_statement_time"));
         assert!(maria.accepts_property("max_statement_time"));
         assert!(!maria.accepts_property("max_execution_time"));
+    }
+
+    /// TiDB declares no TLS until the dev service has a test CA (ADR-0026 §3.6), so it
+    /// declares no client certificate either (I8), before and after connect.
+    #[test]
+    fn tidb_declares_no_client_certificates_while_it_has_no_tls() {
+        for version in [None, Some("8.0.11-TiDB-v8.5.8")] {
+            let tidb = capabilities_for(&EngineId::TIDB, version);
+            assert_eq!(tidb.tls, BTreeSet::from([TlsMode::Disable]));
+            assert!(!tidb.connect.client_certificates);
+            assert!(!tidb.connect.encrypted_client_keys);
+            // The TLS settings declared together.
+            assert_eq!(
+                tidb.tls.iter().any(|m| *m != TlsMode::Disable),
+                tidb.connect.client_certificates
+            );
+        }
+        // MySQL and MariaDB keep theirs.
+        assert!(
+            capabilities_for(&EngineId::MYSQL, None)
+                .connect
+                .client_certificates
+        );
+        assert!(
+            capabilities_for(&EngineId::MARIADB, None)
+                .connect
+                .client_certificates
+        );
+    }
+
+    /// A TiDB connection with a client certificate: ignored while TLS is `disable` (as for
+    /// every driver, TLS files are not looked at), refused with any other mode.
+    #[test]
+    fn tidb_connect_checks_ignore_or_refuse_client_certificates() {
+        use ninesql_driver_api::{Auth, ClientCertificate, ConnectParams, Endpoint, TlsConfig};
+        let connect = capabilities_for(&EngineId::TIDB, None).connect;
+        let mut tls = TlsConfig::default();
+        tls.mode = TlsMode::Disable;
+        tls.client_certificate = Some(ClientCertificate::new("/c.pem", "/k.pem"));
+        let mut p = ConnectParams::new(EngineId::TIDB, Endpoint::tcp("127.0.0.1", 4000));
+        p.auth = Auth::password("nine", None);
+        p.tls = tls;
+        connect.check_connect_params(&p).unwrap();
+        p.tls.mode = TlsMode::Require;
+        let msg = connect.check_connect_params(&p).unwrap_err().to_string();
+        assert!(msg.contains("client certificates"), "{msg}");
     }
 }
