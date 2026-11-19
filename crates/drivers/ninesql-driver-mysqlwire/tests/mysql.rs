@@ -24,6 +24,7 @@ use ninesql_driver_api::{
     Secret, Session, Statement, TRUNCATED_VALUES_METADATA_KEY, TlsMode, conformance,
 };
 use ninesql_driver_mysqlwire::MySqlWireDriver;
+use tokio::sync::{Mutex, OnceCell};
 
 struct Dev {
     engine: EngineId,
@@ -175,9 +176,32 @@ async fn run_when_idle(s: &mut dyn Session, sql: &str) -> Result<Collected, Driv
     Err(DriverError::Busy)
 }
 
-/// Test objects (idempotent): a table, a function that writes (invisible to the classifier),
-/// a function that lifts the read-only mode, a procedure with two result sets.
+/// Fixture state per engine: the objects of [`fixtures`] are created once per test binary.
+/// Cargo runs the tests of a binary in parallel, so dropping and re-creating them in every test
+/// let one test drop `ninesql_write_one` while another was creating or calling it.
+static MYSQL_FIXTURES: OnceCell<()> = OnceCell::const_new();
+static MARIADB_FIXTURES: OnceCell<()> = OnceCell::const_new();
+
+/// Held by every test that commits a row to `ninesql_written` and by every test that compares
+/// its row count before and after refused writes, so a committed write from one test never
+/// lands inside another test's before / after window.
+static WRITTEN: Mutex<()> = Mutex::const_new(());
+
+/// Test objects, created once per test binary and engine: a table, a function that writes
+/// (invisible to the classifier), a function that lifts the read-only mode, a procedure with
+/// two result sets. Each object is dropped and re-created, so a definition changed here
+/// replaces the one left by an earlier run; this binary is the only one that touches them, and
+/// runs on one Docker host are serialised (the host ports are fixed).
 async fn fixtures(dev: &Dev) {
+    let cell = if dev.engine == EngineId::MARIADB {
+        &MARIADB_FIXTURES
+    } else {
+        &MYSQL_FIXTURES
+    };
+    cell.get_or_init(|| create_fixtures(dev)).await;
+}
+
+async fn create_fixtures(dev: &Dev) {
     let mut s = connect(dev).await;
     for sql in [
         "CREATE TABLE IF NOT EXISTS ninesql_written (a INT)",
@@ -365,6 +389,8 @@ async fn statements_with_credentials_are_never_logged() {
 async fn read_only_refuses_writes_engine_side() {
     for dev in devs() {
         fixtures(&dev).await;
+        // Counts `ninesql_written` around refused writes, then commits a row to it.
+        let _written = WRITTEN.lock().await;
         let driver = MySqlWireDriver::new();
         let writes = conformance::writes_for(&dev.engine);
         conformance::assert_read_only_refuses_writes(&driver, params(&dev), &writes).await;
@@ -436,6 +462,7 @@ async fn one_shot_read_write_transaction_is_reset() {
     const ONE_SHOT: &str = "SET TRANSACTION ISOLATION LEVEL READ COMMITTED, READ WRITE";
     for dev in devs() {
         fixtures(&dev).await;
+        let _written = WRITTEN.lock().await;
         let mut p = params(&dev);
         p.read_only = true;
         let mut s = MySqlWireDriver::new().connect(p).await.unwrap();
