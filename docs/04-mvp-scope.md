@@ -13,7 +13,7 @@ The MVP is phases 0 to 6 of the [ROADMAP](ROADMAP.md). It is deliberately narrow
 - Navigator: tree, all object kinds, filters, search, object editor (read), DDL and SQL generation (F-NAV-01 to F-NAV-07).
 - Transfer: streamed export (CSV, TSV, JSON, SQL, Markdown, HTML) and CSV import (F-XFER-01, F-XFER-03).
 - Workspace: tabs and splits, command palette, themes, preferences, session restore (F-WS-01 to F-WS-04, F-WS-06).
-- Packaging: signed `.deb` and APT repository, Flatpak.
+- Packaging: a cosign-signed `.deb` attached to the GitHub release (decided by the maintainer, 2026-11-19; see the note under the exit criterion). The signed APT repository and the Flatpak on Flathub follow after v0.1.0.
 
 ## Out of scope for the MVP
 The other 12 engines; ER diagrams; visual explain plans; schema editing forms; admin tools; XLSX / Parquet export; cross-connection transfer; multiple projects. They are planned, not dropped.
@@ -33,8 +33,10 @@ These are targets for the reference machine (4-core x86-64 laptop, integrated GP
 ## Exit criterion
 v0.1.0 can be released when all of these hold:
 1. The exit criteria of phases 1 to 5 are met in CI or in a documented manual test.
-2. On a fresh Ubuntu 24.04 and Debian 12, installing the `.deb` from the signed APT repository, importing a DBeaver workspace and running a query over SSH against PostgreSQL takes under 10 minutes for a new user following the user guide.
+2. On a fresh Ubuntu 24.04 and Debian 12, downloading the `.deb` from the GitHub release, checking its cosign signature, installing it, importing a DBeaver workspace and running a query over SSH against PostgreSQL takes under 10 minutes for a new user following the user guide.
 3. No password is found under any NineSQL directory after the full test scenario (I1 test).
 4. The measurements table above is filled with real numbers (whatever they are), with method and commit.
-5. The end-of-MVP security review (P6-E) says "ready".
+5. The end-of-MVP security review (P6-E) says "ready". Its verdict (2026-11-19) is "ready for v0.1.0 with conditions"; the conditions are listed in the [ROADMAP](ROADMAP.md#phase-6--hardening-and-v010-release) (P6-E row).
 6. The final tests (P6-F) are done on Linux, with the tags and releases: a visual pass of the interface with screenshots on Wayland and X11, and a manual run of the exit scenarios of phases 1 to 5. Visual checks of earlier phases (P1-C) are deferred to it and do not block their phases.
+
+**Note (2026-11-19, maintainer decision).** v0.1.0 is published as a cosign-signed `.deb` attached to the GitHub release, with its `SHA256SUMS` and CycloneDX SBOM ([RELEASE.md](../RELEASE.md#3-artifacts-from-v010), [SECURITY.md](../SECURITY.md#release-signing)). The signed APT repository and the Flatpak on Flathub come in a later release. Criterion 2 was amended accordingly: it used to read "installing the `.deb` from the signed APT repository". The rest of the criterion is unchanged.

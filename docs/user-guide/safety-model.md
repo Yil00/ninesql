@@ -20,7 +20,7 @@ NineSQL never pretends: where an engine cannot enforce read-only, the read-only 
 ## Production connections
 A connection typed **Production** (or any type with the same rules) adds:
 - **Confirmations before anything is sent**: destructive statements (`DROP`, `TRUNCATE`, `DELETE` or `UPDATE` without `WHERE`, `ALTER`, `GRANT`, `CREATE OR REPLACE`…), every statement NineSQL cannot classify, init SQL, a save of edited rows and a CSV import. The dialog shows the exact text, its size and, when the end might be out of sight, its last line. One confirmation covers one statement, one save or one import, and is bound to exactly what was shown: if anything changes, or after 10 minutes for a save or an import, NineSQL asks again.
-- **Manual commit** for new sessions: your changes stay in a transaction until you commit. Closing a tab or disconnecting with an open transaction always asks.
+- **Manual commit** for new sessions: your changes stay in a transaction until you commit, which leaves you a chance to roll back a mistake the confirmations did not catch. Closing a tab or disconnecting with an open transaction always asks.
 - **No statement text** in logs or in the query history.
 - **Visual cues**: the type color in the navigator and the status bar, and a frame around the editor area while the production connection is active.
 
@@ -44,6 +44,7 @@ Types can also confirm **every** write, or turn off statement logging, without b
 
 ## The limits of the statement checks
 The confirmations and the client-side read-only refusals rely on a **lexical classifier**: NineSQL reads the statement's words, the way the engine's own lexer would, but does not know what your functions do.
+- **Production confirms destructive statements, not every write.** An `UPDATE` or `DELETE` is confirmed when it has **no** `WHERE` at its top level. A `WHERE` that filters nothing (`DELETE FROM t WHERE 1=1`, `UPDATE t SET a = 0 WHERE true`) makes it an ordinary write, which is not confirmed; so is a `MERGE … WHEN MATCHED THEN DELETE`, an `INSERT … ON CONFLICT DO UPDATE` or a `REPLACE`. On production, manual commit is your safety net: check the update count and roll back if it is wrong. A connection type can be set to confirm **every** write.
 - **A user-defined function or procedure called from a `SELECT` reads as a read.** On a production connection it is not confirmed. On a read-only connection the engine still refuses its writes. Functions with known side effects (sequences, advisory locks, `pg_sleep`, server file access, replication controls, TimescaleDB data functions, MySQL `SLEEP`, `GET_LOCK`, `LOAD_FILE`…) are treated as unknown and confirmed; a function missing from those lists is not ([docs/08](../08-engine-capabilities.md#capability-model)).
 - **It errs on the side of asking**: some harmless statements need confirmation on production, for example an `EXPLAIN` with options, MySQL dump headers with conditional comments, or any statement starting with `ANALYZE`.
 - **A statement over 64 KiB** is shown in the confirmation as its first and last 24 KiB; the part that makes it destructive can sit in the hidden middle. The reason for the confirmation is still shown.
@@ -55,6 +56,8 @@ The confirmations and the client-side read-only refusals rely on a **lexical cla
 - What the database account is allowed to do: use least-privilege accounts.
 - Data you export or copy: once written, the file or the clipboard is yours to protect.
 - Someone who replaces `vault.bin` with an older copy: NineSQL does not notice.
+- **Someone on the network path of a TiDB connection.** TiDB connections have no TLS. The password is not sent in clear, but the login exchange (`mysql_native_password` or `caching_sha2_password` scramble) can be captured and a weak password guessed offline; queries and results cross in clear and can be read or **altered**, including the answers to the checks that keep a read-only TiDB session read-only. Reach a remote TiDB through an SSH tunnel.
+- **Other users of the same machine while an SSH tunnel is open.** The tunnel's local end listens on `127.0.0.1` on a random port, and any local user can connect to it and reach the database through your tunnel. They do not get your credentials (the database still asks them to log in), but on a shared multi-user machine the tunnel gives them a network path they may not otherwise have ([docs/05](../05-security.md#accepted-risks)).
 
 ## Next
 - [Known limitations](known-limitations.md).

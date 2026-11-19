@@ -19,10 +19,17 @@ Inspired by [Portabase](https://github.com/Portabase/portabase) and DataBastion:
 - Pre-releases: `0.1.0-alpha.N`, `-beta.N`, `-rc.N`.
 
 ## 3. Artifacts (from v0.1.0)
-Built only by the tag-push workflow ([ADR-0010](docs/adr/0010-packaging-and-distribution.md)): `.deb` (amd64), `SHA256SUMS`, cosign signatures, CycloneDX SBOM, Flatpak bundle; the APT repository is updated from the same run.
+Built only by the tag-push workflow [`release.yml`](.github/workflows/release.yml) ([ADR-0010](docs/adr/0010-packaging-and-distribution.md) and its [P6-A amendment](docs/adr/0010-packaging-and-distribution.md#amendment-p6-a-packaging-2026-11-19)), started when the maintainer pushes a `vX.Y.Z` tag:
+- the `.deb` (amd64), built twice from two checkouts and required to be byte-identical (reproducible within one run), then install-tested on Debian 12 / 13 and Ubuntu 22.04 / 24.04;
+- a CycloneDX SBOM of the linked crates;
+- `SHA256SUMS` of the `.deb` and the SBOM;
+- a cosign keyless signature bundle (`<file>.sigstore.json`) for each of these files;
+- a **draft** GitHub release holding them, with the commit the signatures are bound to in its notes; the maintainer publishes it (§4).
+
+v0.1.0 ships as this signed `.deb` on the GitHub release (maintainer decision, 2026-11-19). The workflow does not build a Flatpak bundle and does not update an APT repository: the signed APT repository and Flathub come in a later release, and will be fed from the published draft by hand ([packaging/README.md](packaging/README.md#p6-b-hooks-maintainer)).
 
 ## 4. Release steps
-1. Open a release PR `dev` → `main`; CI green; CHANGELOG section generated.
+1. Bump `[workspace.package] version` in `Cargo.toml` to `X.Y.Z` (the workflow refuses a tag that does not match it). Open a release PR `dev` → `main`; CI green; CHANGELOG section generated.
 2. Merge with a merge commit.
 3. The maintainer creates and pushes the tag `vX.Y.Z` on the merge commit, from their own account (a tag pushed with `GITHUB_TOKEN` does not start workflows; the tag ruleset lets only the maintainer push `v*` tags).
 4. The release workflow ([`release.yml`](.github/workflows/release.yml)) builds the `.deb` twice and compares the builds, runs the install test, then waits for the maintainer's approval of the `release` environment, signs the files and creates a **draft** release whose notes print the commit the signatures are bound to.

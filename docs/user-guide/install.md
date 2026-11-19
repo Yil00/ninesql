@@ -1,9 +1,7 @@
 # Install
 
 ## Packages (v0.1.0, not released yet)
-No version of NineSQL has been released, and no package is published yet. The v0.1.0 MVP is planned to ship as ([ADR-0010](../adr/0010-packaging-and-distribution.md)):
-- a signed **`.deb`** package for Debian 12 / 13 and Ubuntu 22.04 / 24.04 (amd64), attached to each GitHub release and later served from a signed APT repository;
-- a **Flatpak**, later on Flathub.
+No version of NineSQL has been released, and no package is published yet. v0.1.0 will ship as a signed **`.deb`** package for Debian 12 / 13 and Ubuntu 22.04 / 24.04 (amd64), attached to the GitHub release with its SBOM, `SHA256SUMS` and cosign signatures (decided by the maintainer on 2026-11-19, [ADR-0010](../adr/0010-packaging-and-distribution.md#note-on-the-p6-a-amendment-what-v010-ships-2026-11-19)). A signed APT repository and a **Flatpak** on Flathub come in a later release; until then, you download each new version and [verify it](#verify-a-release-file) yourself.
 
 There is deliberately no `curl … | bash` installer. The packaging files and their details are in [packaging/README.md](../../packaging/README.md).
 
@@ -12,7 +10,7 @@ The package exists in the repository (phase 6, P6-A) but no release has been mad
 
 The package installs `/usr/bin/ninesql`, a desktop entry (NineSQL appears in the applications menu), icons, AppStream metadata, a man page (`man ninesql`) and the licenses of the bundled crates. It has no install or removal script and adds no service, update check or APT source. `ninesql --version` and `ninesql --help` work without a display. `sudo apt purge ninesql` removes it; your workspace, settings and vault stay in your home directory ([below](#where-ninesql-keeps-its-files)).
 
-What has been checked: the install test (install, `--version` / `--help`, desktop and AppStream validation, man page, purge) passed in Ubuntu 22.04 and 24.04 containers; Debian 12 and 13 were not reachable from the build sandbox and are checked by the release workflow. Opening a window from the package on each distribution is part of the final tests (P6-F). The APT repository and its signing key do not exist yet (P6-B).
+What has been checked: the install test (install, `--version` / `--help`, desktop and AppStream validation, man page, purge) passed in Ubuntu 22.04 and 24.04 containers; Debian 12 and 13 were not reachable from the build sandbox and are checked by the release workflow. Opening a window from the package on each distribution is part of the final tests (P6-F). The APT repository and its signing key do not exist yet; they come after v0.1.0.
 
 ### The Flatpak
 The manifest (`packaging/flatpak/io.github.yil00.NineSQL.yml`, application id `io.github.yil00.NineSQL`) exists and passes its lint, but **the Flatpak has not been built yet** and is not on Flathub. [packaging/README.md](../../packaging/README.md#flatpak) gives the local build commands for those who want to try it. Its permissions are below.

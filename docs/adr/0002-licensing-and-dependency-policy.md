@@ -1,6 +1,6 @@
 # ADR-0002: Licensing and dependency policy
 
-- **Status**: Accepted. Partially superseded by [ADR-0013](0013-gpui-source-and-supply-chain.md) for Decision §6 (git source allow-list: only sources actually used; GPUI is no longer a git dependency). Partially amended by [ADR-0015](0015-allow-0bsd-license.md) for Decision §2 (`0BSD` added to the license allow-list). Partially amended by [ADR-0018](0018-patched-third-party-crates.md): path patches of third-party crates.
+- **Status**: Accepted. Partially superseded by [ADR-0013](0013-gpui-source-and-supply-chain.md) for Decision §6 (git source allow-list: only sources actually used; GPUI is no longer a git dependency). Partially amended by [ADR-0015](0015-allow-0bsd-license.md) for Decision §2 (`0BSD` added to the license allow-list). Partially amended by [ADR-0018](0018-patched-third-party-crates.md): path patches of third-party crates. Partially amended by [ADR-0028](0028-freetype-license-and-bundled-icon-licenses.md) for Decision §2 and §5 (the FreeType License allowed for the statically bundled FreeType; Lucide and Feather icon notices), 2026-11-19.
 - **Date**: 2026-11-14
 
 ## Context
