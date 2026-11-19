@@ -8,6 +8,7 @@ Step by step, with every screen: [Import from DBeaver](../tutorials/import-from-
 - **First start**: when the project is empty and a DBeaver workspace is found, NineSQL offers "Import your DBeaver connections?".
 - **Any time**: "Import from DBeaver" (`Ctrl+K` then `Ctrl+I`) looks in the three usual places: the `.deb` / tarball install, the Flatpak and the Snap.
 - **Another folder**: "Import from DBeaver: choose folder" (`Ctrl+K` then `Ctrl+Shift+I`) takes a workspace folder (such as `workspace6`) or a single project folder.
+- **In the Flatpak**: only the native location (`~/.local/share/DBeaverData`, the `.deb` / tarball install) is visible to the sandbox, read-only, so only it is found automatically. A DBeaver Flatpak (`~/.var/app/io.dbeaver.DBeaverCommunity/…`) or Snap (`~/snap/dbeaver-ce/…`) workspace, or any other folder, needs "Import from DBeaver: choose folder", which goes through the folder picker.
 
 ## The preview
 The preview lists, before anything is written:

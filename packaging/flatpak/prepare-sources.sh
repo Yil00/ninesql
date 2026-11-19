@@ -7,9 +7,13 @@
 #   packaging/flatpak/prepare-sources.sh
 #
 # Network: downloads flatpak-cargo-generator.py from flatpak-builder-tools at a pinned commit
-# (its SHA-256 is checked) and its two Python dependencies from PyPI into a throwaway virtual
-# environment; crates.io entries are generated from Cargo.lock alone. Needs python3 with venv,
-# curl, sha256sum and cargo-about 0.9.3 (`cargo install --locked cargo-about@0.9.3 --features cli`).
+# (its SHA-256 is checked) and its two Python dependencies from PyPI, at exact versions, into a
+# throwaway virtual environment. The PyPI packages are pinned by version, not by hash (their
+# dependencies are resolved by pip), so this script is meant for the maintainer's machine, not
+# for CI. Its output does not depend on trusting them: verify-sources.py (standard library only)
+# then checks that cargo-sources.json is exactly what Cargo.lock implies, and the script fails
+# otherwise. Needs python3 (3.11 or newer) with venv, curl, sha256sum and cargo-about 0.9.3
+# (`cargo install --locked cargo-about@0.9.3 --features cli`).
 set -euo pipefail
 
 REPO=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
@@ -26,10 +30,14 @@ curl -sSfL -o "$WORK/tool/flatpak-cargo-generator.py" \
 echo "$GENERATOR_SHA256  $WORK/tool/flatpak-cargo-generator.py" | sha256sum -c --quiet
 
 python3 -m venv "$WORK/venv"
-"$WORK/venv/bin/pip" install --quiet --disable-pip-version-check "aiohttp>=3.9,<4" "tomlkit>=0.12,<1"
+# Exact versions (PyPI, 2026-11-19); bump them by hand.
+"$WORK/venv/bin/pip" install --quiet --disable-pip-version-check "aiohttp==3.14.5" "tomlkit==0.15.2"
 # -I: isolated mode (no current directory or user site on sys.path).
 "$WORK/venv/bin/python" -I "$WORK/tool/flatpak-cargo-generator.py" \
-    "$REPO/Cargo.lock" -o "$HERE/cargo-sources.json"
+    "$REPO/Cargo.lock" -o "$WORK/cargo-sources.json"
+# The generator's output, checked against Cargo.lock with the system Python only.
+python3 -I "$HERE/verify-sources.py" "$WORK/cargo-sources.json" "$REPO/Cargo.lock"
+mv "$WORK/cargo-sources.json" "$HERE/cargo-sources.json"
 
 cd "$REPO"
 cargo about generate --frozen --fail \

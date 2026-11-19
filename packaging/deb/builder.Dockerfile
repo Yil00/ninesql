@@ -5,12 +5,14 @@
 # linked on a newer system (Ubuntu 24.04: glibc 2.39) would not start on Debian 12 or
 # Ubuntu 22.04.
 #
-# The image holds no Rust toolchain and no crate: build-in-container.sh mounts the host's
-# rustup toolchain and cargo registry read-write caches and runs cargo with `--offline`
-# under `--network none`, so the build itself never touches the network.
+# The image holds no Rust toolchain and no crate: packaging/deb/build.sh mounts the host's
+# rustup toolchain, the source tree and the host's cargo registry cache and index read-only,
+# gives the container its own cargo home (extracted crate sources) and target directory under
+# the build dir, and runs cargo with `--offline` under `--network none`, so the build itself
+# never touches the network.
 #
-# The base image is pinned by digest (the multi-arch index of ubuntu:22.04). Override BASE to
-# pull the same digest from a mirror, e.g.
+# The base image is pinned by digest (the multi-arch index of ubuntu:22.04). BASE may name the
+# same digest from a mirror (build.sh's NINESQL_BUILDER_BASE, which refuses any other digest), e.g.
 #   --build-arg BASE=mirror.gcr.io/library/ubuntu@sha256:<same digest>
 # Follow-up (docs, packaging/README.md): pin the apt packages too, through snapshot.ubuntu.com,
 # so that a third party rebuilding a tag months later gets the same linker and libraries.

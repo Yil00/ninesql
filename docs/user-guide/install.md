@@ -5,7 +5,9 @@ No version of NineSQL has been released. The v0.1.0 MVP is planned to ship as ([
 - a signed **`.deb`** package for Debian 12 / 13 and Ubuntu 22.04 / 24.04 (amd64), from a signed APT repository;
 - a **Flatpak** on Flathub.
 
-The packages are being built in phase 6 (ROADMAP P6-A, P6-B); installation commands will be added here once they exist and have been tested. There is deliberately no `curl … | bash` installer.
+The packages are being built in phase 6 (ROADMAP P6-A, P6-B); installation commands will be added here once they are published. There is deliberately no `curl … | bash` installer.
+
+Until then you can build the `.deb` yourself from the repository and install it with `apt`: [Build and install the `.deb`](../tutorials/build-and-run.md#5-build-and-install-the-deb) (needs Docker; details in [packaging/README.md](../../packaging/README.md#the-deb)).
 
 ## Build from source (today)
 Until a release exists, build NineSQL from the repository: [Build and run NineSQL from source](../tutorials/build-and-run.md) gives the toolchain (Rust 1.89 or newer through rustup), the Debian / Ubuntu packages to install, and the `make build` / `make run` commands. An optimised binary comes from `make release` (`target/release/ninesql`).
@@ -19,7 +21,7 @@ To try NineSQL without your own servers, [Start the dev databases](../tutorials/
 - **Optional**: systemd-logind on the system bus, so saved passwords are locked when the computer sleeps or the screen locks. Without it only the idle lock and "Lock secrets now" apply.
 - **macOS** builds are kept compiling for interface development only; it is not a release target. **Windows** is not supported.
 
-The Flatpak will need network access (used only for your own connections), the Secret Service and logind on the system bus; the reasons are in [docs/10](../10-supported-platforms.md#flatpak-permissions).
+The Flatpak will need network access (used only for your own connections) and logind on the system bus. It does not get the Secret Service while NineSQL's keyring backend is off, so the Flatpak keeps saved passwords in the encrypted vault. It reads `~/.ssh/known_hosts` and `~/.local/share/DBeaverData` read-only, and any other file only through the file chooser. The reasons are in [docs/10](../10-supported-platforms.md#flatpak-permissions) and [packaging/README.md](../../packaging/README.md#permissions).
 
 ## What NineSQL needs from the network
 Nothing but your own connections. NineSQL sends no telemetry, has no account, checks for no updates and contacts no server except the databases you declare and their SSH hops ([invariant I2](../../CONTEXT.md#invariants-non-negotiable)).

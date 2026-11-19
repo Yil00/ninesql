@@ -7,8 +7,9 @@
 #   1. `cargo fetch --locked` on the host (the only step that uses the network: crates.io).
 #   2. Build the builder image (packaging/deb/builder.Dockerfile, Ubuntu 22.04, glibc 2.35).
 #   3. `cargo build --release --locked --offline -p ninesql-ui --bin ninesql` in that image under
-#      `--network none`, with the host's Rust toolchain mounted read-only and the source tree
-#      mounted read-only. Paths inside the container are fixed (/src, /cargo, /toolchain,
+#      `--network none`, with the host's Rust toolchain, the source tree and the host's cargo
+#      registry cache and index mounted read-only (the extracted crate sources are the
+#      container's own, under the build dir). Paths inside the container are fixed (/src, /cargo, /toolchain,
 #      /target) and remapped with --remap-path-prefix, so the binary does not depend on where
 #      the checkout or the cargo home lives on the host.
 #   4. Check that the binary needs no glibc symbol newer than 2.35 (Ubuntu 22.04).
@@ -23,13 +24,18 @@
 #                         builds twice with two different values
 #   NINESQL_DEB_OUT       output directory of the .deb (default $CARGO_TARGET_DIR/debian)
 #   SOURCE_DATE_EPOCH     default: the commit time of HEAD
-#   NINESQL_BUILDER_BASE  base image override, e.g. the same digest from a mirror
-#   NINESQL_RUST_TOOLCHAIN rustup toolchain to mount (default: the one rust-toolchain.toml selects)
+#   NINESQL_BUILDER_BASE  base image override: the same image from a mirror, which must name the
+#                         digest pinned in builder.Dockerfile (`<registry>/ubuntu@sha256:<digest>`);
+#                         any other value is refused. Another base image means editing the
+#                         Dockerfile, and the result is then no longer the release build.
+#   NINESQL_RUST_TOOLCHAIN rustup toolchain to mount (default: the one rust-toolchain.toml selects,
+#                         `stable`). To reproduce a release, set it to the toolchain pinned in
+#                         .github/workflows/release.yml: NINESQL_RUST_TOOLCHAIN=1.100.0
 #   TIMEOUT               time limit of the container build, in seconds (default 3000)
 #
-# Tools needed on the host: docker, rustup with the toolchain installed, cargo-deb 3.8.0 and
-# cargo-about 0.9.3 (`cargo install --locked cargo-deb@3.8.0` and
-# `cargo install --locked cargo-about@0.9.3 --features cli`), gzip, sha256sum.
+# Tools needed on the host: docker, rustup with the toolchain installed, exactly cargo-deb 3.8.0
+# and cargo-about 0.9.3 (`cargo install --locked cargo-deb@3.8.0` and
+# `cargo install --locked cargo-about@0.9.3 --features cli`; checked), gzip, sha256sum.
 set -euo pipefail
 
 REPO=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
@@ -48,9 +54,18 @@ die() { printf 'error: %s\n' "$*" >&2; exit 1; }
 for tool in docker rustup cargo gzip sha256sum; do
     command -v "$tool" >/dev/null 2>&1 || die "$tool is not installed"
 done
-cargo deb --version >/dev/null 2>&1 || die "cargo-deb is not installed (cargo install --locked cargo-deb@3.8.0)"
-cargo about --version >/dev/null 2>&1 \
-    || die "cargo-about is not installed (cargo install --locked cargo-about@0.9.3 --features cli)"
+# The packaging tools shape the .deb and its license file: exact versions, the same as the release
+# workflow's CARGO_DEB_VERSION / CARGO_ABOUT_VERSION (bump both together).
+CARGO_DEB_VERSION=3.8.0
+CARGO_ABOUT_VERSION=0.9.3
+# Toolchain of release builds (RUSTUP_TOOLCHAIN in .github/workflows/release.yml).
+RELEASE_TOOLCHAIN=1.100.0
+have=$(cargo deb --version 2>/dev/null | awk '{print $2}') || true
+[ "$have" = "$CARGO_DEB_VERSION" ] || die "cargo-deb $CARGO_DEB_VERSION is required, found ${have:-none} \
+(cargo install --locked --force cargo-deb@$CARGO_DEB_VERSION)"
+have=$(cargo about --version 2>/dev/null | awk '{print $2}') || true
+[ "$have" = "$CARGO_ABOUT_VERSION" ] || die "cargo-about $CARGO_ABOUT_VERSION is required, found ${have:-none} \
+(cargo install --locked --force cargo-about@$CARGO_ABOUT_VERSION --features cli)"
 
 cd "$REPO"
 export SOURCE_DATE_EPOCH=${SOURCE_DATE_EPOCH:-$(git log -1 --format=%ct)}
@@ -61,29 +76,47 @@ else
 fi
 TOOLCHAIN_DIR=$(cd "$(dirname "$RUSTC")/.." && pwd)
 log "toolchain: $("$RUSTC" -V) ($TOOLCHAIN_DIR)"
+case "$("$RUSTC" -V)" in
+    "rustc $RELEASE_TOOLCHAIN "*) ;;
+    *) log "warning: not the release toolchain $RELEASE_TOOLCHAIN: the .deb will not match a release \
+(NINESQL_RUST_TOOLCHAIN=$RELEASE_TOOLCHAIN to reproduce one)" ;;
+esac
 log "SOURCE_DATE_EPOCH=$SOURCE_DATE_EPOCH"
 
 log "1/6 cargo fetch --locked"
 cargo fetch --locked
 
 log "2/6 builder image"
+PINNED_DIGEST=$(sed -n 's/^ARG BASE=.*@\(sha256:[0-9a-f]\{64\}\)$/\1/p' packaging/deb/builder.Dockerfile)
+[ -n "$PINNED_DIGEST" ] || die "builder.Dockerfile does not pin its base image by digest"
 build_args=()
 if [ -n "${NINESQL_BUILDER_BASE:-}" ]; then
+    case "$NINESQL_BUILDER_BASE" in
+        *@"$PINNED_DIGEST") ;;
+        *) die "NINESQL_BUILDER_BASE must name the pinned digest (…@$PINNED_DIGEST): another base \
+image is not the release build (edit builder.Dockerfile instead)" ;;
+    esac
     build_args+=(--build-arg "BASE=$NINESQL_BUILDER_BASE")
 fi
 docker build -q -t "$IMAGE" "${build_args[@]}" -f packaging/deb/builder.Dockerfile packaging/deb >/dev/null
 
 log "3/6 cargo build in the builder (no network)"
-mkdir -p "$BUILD_DIR" "$BUILD_DIR/.cargo-home" "$CARGO_HOME_DIR/registry"
+# The host's downloaded crates (registry/cache) and index (registry/index) are mounted
+# read-only: the build cannot change what the host's cargo later trusts. The extracted sources
+# (registry/src) and the rest of the cargo home are the container's own, under the build dir.
+[ -d "$CARGO_HOME_DIR/registry/cache" ] && [ -d "$CARGO_HOME_DIR/registry/index" ] \
+    || die "no cargo registry in $CARGO_HOME_DIR (cargo fetch failed?)"
+mkdir -p "$BUILD_DIR" "$BUILD_DIR/.cargo-home/registry/src"
 mounts=(
     -v "$REPO:/src:ro"
     -v "$TOOLCHAIN_DIR:/toolchain:ro"
     -v "$BUILD_DIR:/target"
     -v "$BUILD_DIR/.cargo-home:/cargo"
-    -v "$CARGO_HOME_DIR/registry:/cargo/registry"
+    -v "$CARGO_HOME_DIR/registry/cache:/cargo/registry/cache:ro"
+    -v "$CARGO_HOME_DIR/registry/index:/cargo/registry/index:ro"
 )
-if [ -d "$CARGO_HOME_DIR/git" ]; then
-    mounts+=(-v "$CARGO_HOME_DIR/git:/cargo/git")
+if [ -d "$CARGO_HOME_DIR/git/db" ]; then
+    mounts+=(-v "$CARGO_HOME_DIR/git/db:/cargo/git/db:ro")
 fi
 remap="--remap-path-prefix=/src=/ninesql --remap-path-prefix=/cargo=/cargo --remap-path-prefix=/toolchain=/rust --remap-path-prefix=/target=/target"
 docker run --rm --network none \

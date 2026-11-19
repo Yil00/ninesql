@@ -6,6 +6,11 @@ name: Release
 # GitHub OIDC). Runs on the push of a version tag only: never on pull requests or branches, and
 # nothing is published from any other event.
 #
+# Signing and release creation are two jobs, each with only the permission it needs (`sign`:
+# `id-token: write`; `release`: `contents: write`), both in the `release` environment, which the
+# maintainer configures with a required reviewer and a `v*` tag deployment policy, next to a tag
+# ruleset that lets only the maintainer push `refs/tags/v*` (packaging/README.md, P6-B).
+#
 # The release is created as a DRAFT: the maintainer checks it and publishes it (P6-B). The APT
 # repository on GitHub Pages and the Flatpak bundle are P6-B hooks, not done here
 # (packaging/README.md).
@@ -136,15 +141,18 @@ jobs:
           path: artifacts
       - run: packaging/deb/install-test.sh artifacts/*.deb
 
-  publish:
-    name: Sign and create the draft release
+  sign:
+    name: Sign the release files
     needs: [build, reproducible, install-test]
     runs-on: ubuntu-24.04
     timeout-minutes: 15
+    # The `release` environment (repository settings, P6-B): a required reviewer (the
+    # maintainer) and a deployment policy limited to `v*` tags, so no signature exists before
+    # the maintainer approves this run (packaging/README.md, "Who can sign a release").
+    environment: release
     permissions:
-      # The draft release and its assets.
-      contents: write
-      # The OIDC token cosign exchanges for a short-lived Sigstore certificate (keyless).
+      # Only the OIDC token cosign exchanges for a short-lived Sigstore certificate (keyless):
+      # no write access to the repository in the job that can sign.
       id-token: write
     steps:
       - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
@@ -162,6 +170,43 @@ jobs:
           for file in *.deb *.cdx.json SHA256SUMS; do
             cosign sign-blob --yes --bundle "$file.sigstore.json" "$file"
           done
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: signed
+          path: dist/
+          if-no-files-found: error
+          retention-days: 7
+
+  release:
+    name: Create the draft release
+    needs: sign
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    environment: release
+    permissions:
+      # The draft release and its assets; no OIDC token, so this job cannot sign.
+      contents: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          sparse-checkout: packaging/release-notes.md
+          sparse-checkout-cone-mode: false
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: signed
+          path: dist
+      - name: Release notes (with the commit the signatures are bound to)
+        run: |
+          sed -e "s|@VERSION@|${GITHUB_REF_NAME#v}|g" \
+              -e "s|@TAG@|$GITHUB_REF_NAME|g" \
+              -e "s|@COMMIT@|$GITHUB_SHA|g" \
+              -e "s|@REPOSITORY@|$GITHUB_REPOSITORY|g" \
+              packaging/release-notes.md > "$RUNNER_TEMP/notes.md"
+          if grep -q '@[A-Z]*@' "$RUNNER_TEMP/notes.md"; then
+            echo "::error::unreplaced placeholder in packaging/release-notes.md"
+            exit 1
+          fi
       - name: Draft release
         working-directory: dist
         env:
@@ -172,5 +217,5 @@ jobs:
           case "$GITHUB_REF_NAME" in *-*) prerelease=(--prerelease) ;; esac
           gh release create "$GITHUB_REF_NAME" --draft --verify-tag "${prerelease[@]}" \
             --title "NineSQL ${GITHUB_REF_NAME#v}" \
-            --notes "Draft created by the release workflow. Verify with: cosign verify-blob --bundle <file>.sigstore.json --certificate-identity https://github.com/${GITHUB_REPOSITORY}/.github/workflows/release.yml@${GITHUB_REF} --certificate-oidc-issuer https://token.actions.githubusercontent.com <file>" \
+            --notes-file "$RUNNER_TEMP/notes.md" \
             -- *.deb *.cdx.json SHA256SUMS *.sigstore.json

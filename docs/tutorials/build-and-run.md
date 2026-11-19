@@ -66,15 +66,16 @@ On macOS the default bindings use **Ctrl** too, not Cmd: the defaults are the Li
 ## 5. Build and install the `.deb`
 NineSQL has no published package yet (the signed APT repository and Flathub come with the first release). You can build the Debian package from the repository and install it on Debian 12 or 13, or Ubuntu 22.04 or 24.04 ([packaging/README.md](../../packaging/README.md)).
 
-1. Install Docker and the two packaging tools:
+1. Install Docker and the two packaging tools, at exactly these versions (`make deb` checks them):
    ```bash
    cargo install --locked cargo-deb@3.8.0
    cargo install --locked cargo-about@0.9.3 --features cli
    ```
-2. Build the package. The binary is linked in an Ubuntu 22.04 container, so it also runs on the older targets; the build itself has no network access:
+2. Build the package. The binary is linked in an Ubuntu 22.04 container, so it also runs on the older targets. `make deb` uses the network to pull the container's base image and its apt packages and to download the crates (`cargo fetch`); only the compile step itself runs offline, in a container without network:
    ```bash
    make deb TIMEOUT=3000     # writes target/debian/ninesql_<version>-1_amd64.deb
    ```
+   To rebuild a release bit for bit, use the release toolchain: `rustup toolchain install 1.100.0`, then `NINESQL_RUST_TOOLCHAIN=1.100.0 make deb TIMEOUT=3000` ([packaging/README.md](../../packaging/README.md#the-deb)).
 3. Install it with apt, which pulls the dependencies (Vulkan loader, xkbcommon, Wayland and fontconfig libraries):
    ```bash
    sudo apt install ./target/debian/ninesql_0.0.0-1_amd64.deb

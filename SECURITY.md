@@ -24,4 +24,18 @@ In scope: the `ninesql` binary and its crates, the stored workspace files, the e
 Out of scope: vulnerabilities of the database engines themselves, the `dev/` test environment (dev-only passwords by design), and setups that turn off a documented safeguard (TLS `require` / `disable`, accepted unknown SSH host keys, read-only off on a production connection).
 
 ## Release signing
-Release assets are signed from the tag-push workflow (cosign keyless). The APT repository signing key fingerprint will be published here with v0.1.0.
+Release assets (the `.deb`, its CycloneDX SBOM and `SHA256SUMS`) are signed by the tag-push workflow with cosign keyless signatures (Sigstore, GitHub Actions OIDC). Each file has a `<file>.sigstore.json` bundle. A valid signature must have:
+- certificate identity `https://github.com/Yil00/ninesql/.github/workflows/release.yml@refs/tags/vX.Y.Z` (the release's tag);
+- certificate OIDC issuer `https://token.actions.githubusercontent.com`;
+- the commit the release was built from, printed in the release notes, as the workflow SHA.
+
+```bash
+cosign verify-blob --bundle ninesql_X.Y.Z-1_amd64.deb.sigstore.json \
+  --certificate-identity "https://github.com/Yil00/ninesql/.github/workflows/release.yml@refs/tags/vX.Y.Z" \
+  --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+  --certificate-github-workflow-sha <commit from the release notes> \
+  ninesql_X.Y.Z-1_amd64.deb
+sha256sum -c SHA256SUMS --ignore-missing
+```
+
+Do not accept a signature checked with a looser identity (a regular expression, another workflow or another ref). Only the maintainer can push `v*` tags (tag ruleset) and the signing job runs in a `release` environment that needs the maintainer's approval ([packaging/README.md](packaging/README.md#who-can-sign-a-release)). The APT repository signing key fingerprint will be published here with v0.1.0.

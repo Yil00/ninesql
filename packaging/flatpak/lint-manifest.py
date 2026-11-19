@@ -96,7 +96,12 @@ def check(manifest_path: Path) -> list[str]:
         for command in module.get("build-commands", [])
     ]
     joined = "\n".join(build_commands)
-    secret_service_built = "secret-service" in joined
+    # The feature is enabled only on the `cargo build` line (review L4): a comment or another
+    # command naming secret-service does not count.
+    secret_service_built = any(
+        re.search(r"\bcargo\b.*\bbuild\b", line) and re.search(r"--features[= ].*secret-service", line)
+        for line in joined.splitlines()
+    )
 
     for arg in data["finish-args"]:
         for pattern, why in FORBIDDEN_PATTERNS:
@@ -144,7 +149,8 @@ def main() -> int:
         print(f"error: {error}", file=sys.stderr)
     if errors:
         return 1
-    print(f"ok: {manifest.relative_to(REPO)} ({len(ALLOWED_FINISH_ARGS)} permissions on the list)")
+    shown = manifest.relative_to(REPO) if manifest.is_relative_to(REPO) else manifest
+    print(f"ok: {shown} ({len(ALLOWED_FINISH_ARGS)} permissions on the list)")
     return 0
 
 
