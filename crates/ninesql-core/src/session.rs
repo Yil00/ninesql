@@ -37,8 +37,9 @@
 //! timeout) instead of getting `Busy`. That wait counts toward the statement's timeout, ends at
 //! once on cancel, close or a lost tunnel, sends [`ExecEvent::WaitingForMetadata`] once past
 //! 250 ms, and runs on the driver runtime; a cancel seen as the gate opens still stops the
-//! statement before it is sent. A transaction command waiting at the gate is not sent when the
-//! session is closed or its tunnel lost meanwhile (`SessionClosed`). The gate is
+//! statement before it is sent. A statement or a transaction command waiting at the gate is not
+//! sent when the session is closed or its tunnel lost meanwhile (`SessionClosed`), even when
+//! the close's cancel missed the statement; the session then closes in order. The gate is
 //! released once the driver accepted the statement; a load that starts while the statement's
 //! result is still open fails fast with `Busy` (see the metadata service). The keep-alive ping
 //! is skipped while a load runs.
@@ -2640,7 +2641,7 @@ impl SessionTask {
             } => {
                 *lock(&self.handle.inner.current) = Some(cancel.clone());
                 let mut out = Output::new(events, cancel.clone());
-                let flow = self.execute(request, &mut out, &cancel).await;
+                let flow = self.execute(request, &mut out, &cancel, close).await;
                 self.set_driver_active(false);
                 *lock(&self.handle.inner.current) = None;
                 // The terminal event leaves after the state is recorded, so a consumer that
@@ -2730,6 +2731,7 @@ impl SessionTask {
         request: ExecuteRequest,
         out: &mut Output,
         cancel: &CancelToken,
+        close: &mut CloseReceiver,
     ) -> Flow {
         let id = self.id();
         // Cancelled (or its execution dropped) while it waited in the queue: never sent.
@@ -2787,10 +2789,10 @@ impl SessionTask {
         } = request;
         // Behind an in-flight metadata load of this session (FIFO with the loads, each bounded
         // by its own timeout): the wait counts toward the statement's timeout and ends at once
-        // on cancel (closing the session cancels too) or a lost tunnel. Past 250 ms the
-        // consumer is told once (`WaitingForMetadata`). The gate is held until the driver
-        // accepted the statement, so no load starts in between; a load that starts later sees
-        // `driver_active` and fails fast.
+        // on cancel (closing the session cancels too), a close request or a lost tunnel. Past
+        // 250 ms the consumer is told once (`WaitingForMetadata`). The gate is held until the
+        // driver accepted the statement, so no load starts in between; a load that starts later
+        // sees `driver_active` and fails fast.
         let gate_wait = Instant::now();
         let gate = self.handle.metadata_gate();
         let acquire = gate.acquire_owned();
@@ -2812,6 +2814,17 @@ impl SessionTask {
                         out.finish(ExecEvent::Failed(CoreError::Driver(DriverError::Cancelled)));
                         return Flow::Continue;
                     }
+                    // A close request whose cancel missed this statement (it arrived after the
+                    // task took the command but before `current` was set) still ends the wait
+                    // (review I-a): the statement is **not sent**, answers `SessionClosed`, and
+                    // the session closes in order like any close. Ahead of `acquire`, so a free
+                    // gate does not let it through either. The receiver is never polled again
+                    // after it resolved: the task loop ends on `Flow::Close`.
+                    request = &mut *close => {
+                        tracing::debug!(session = %id, "closed while a statement waited at the metadata gate");
+                        out.finish(ExecEvent::Failed(CoreError::SessionClosed));
+                        return Flow::Close(request.ok());
+                    }
                     () = &mut lost => {
                         out.finish(ExecEvent::Failed(CoreError::SessionClosed));
                         return Flow::TunnelLost;
@@ -2826,9 +2839,11 @@ impl SessionTask {
                     () = &mut notice, if !noticed => {
                         noticed = true;
                         tracing::debug!(session = %id, "statement waiting behind a metadata load");
-                        // The first event of the execution, so its queue has room; a cancel or a
-                        // gone consumer ends the send and the next turn sees it.
-                        out.send(ExecEvent::WaitingForMetadata).await;
+                        // Never awaited (review I-c), so the deadline, a cancel and a close are
+                        // observed while it goes out: the first event of the execution, so its
+                        // queue has room (the terminal slot is reserved apart); a gone consumer
+                        // drops it and the next turn sees the cancel.
+                        let _ = out.try_send(ExecEvent::WaitingForMetadata);
                     }
                 }
             }
@@ -2982,6 +2997,12 @@ impl Output {
         }
     }
 
+    /// A non-terminal event that never waits: `false` when the queue is full or the consumer is
+    /// gone (the event is dropped).
+    fn try_send(&self, event: ExecEvent) -> bool {
+        self.events.try_send(event).is_ok()
+    }
+
     /// The terminal event, through the reserved slot when the output is dropped: never waits.
     fn finish(&mut self, event: ExecEvent) {
         self.pending = Some(event);
@@ -3069,6 +3090,229 @@ mod tests {
             Some(ExecEvent::WaitingForPreviousCancel)
         ));
         assert!(matches!(rx.recv().await, Some(ExecEvent::Failed(_))));
+        assert!(rx.recv().await.is_none());
+    }
+
+    /// Counts what reaches the driver: statements sent and sessions closed.
+    #[derive(Default)]
+    struct Counts {
+        statements: AtomicU64,
+        closes: AtomicU64,
+    }
+
+    struct CountingDriver {
+        mock: ninesql_driver_api::mock::MockDriver,
+        counts: Arc<Counts>,
+    }
+
+    struct CountingSession {
+        inner: Box<dyn Session>,
+        counts: Arc<Counts>,
+    }
+
+    #[async_trait::async_trait]
+    impl ninesql_driver_api::Driver for CountingDriver {
+        fn family(&self) -> &'static str {
+            "counting-mock"
+        }
+        fn engines(&self) -> &[ninesql_driver_api::EngineId] {
+            self.mock.engines()
+        }
+        fn capabilities(
+            &self,
+            engine: &ninesql_driver_api::EngineId,
+            v: Option<&str>,
+        ) -> ninesql_driver_api::DriverResult<Capabilities> {
+            self.mock.capabilities(engine, v)
+        }
+        fn dialect(
+            &self,
+            engine: &ninesql_driver_api::EngineId,
+        ) -> ninesql_driver_api::DriverResult<Arc<dyn ninesql_driver_api::Dialect>> {
+            self.mock.dialect(engine)
+        }
+        async fn connect(
+            &self,
+            params: ninesql_driver_api::ConnectParams,
+        ) -> ninesql_driver_api::DriverResult<Box<dyn Session>> {
+            let inner = self.mock.connect(params).await?;
+            Ok(Box::new(CountingSession {
+                inner,
+                counts: Arc::clone(&self.counts),
+            }))
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl Session for CountingSession {
+        fn capabilities(&self) -> &Capabilities {
+            self.inner.capabilities()
+        }
+        fn server_version(&self) -> Option<&str> {
+            self.inner.server_version()
+        }
+        fn dialect(&self) -> Arc<dyn ninesql_driver_api::Dialect> {
+            self.inner.dialect()
+        }
+        fn metadata(&self) -> Arc<dyn ninesql_driver_api::Metadata> {
+            self.inner.metadata()
+        }
+        async fn execute(
+            &mut self,
+            s: Statement,
+            o: ExecOptions,
+        ) -> ninesql_driver_api::DriverResult<ninesql_driver_api::ResultStream> {
+            self.counts.statements.fetch_add(1, Ordering::SeqCst);
+            self.inner.execute(s, o).await
+        }
+        fn cancel_handle(&self) -> Arc<dyn ninesql_driver_api::CancelHandle> {
+            self.inner.cancel_handle()
+        }
+        fn auto_commit(&self) -> bool {
+            self.inner.auto_commit()
+        }
+        fn in_transaction(&self) -> bool {
+            self.inner.in_transaction()
+        }
+        async fn set_auto_commit(&mut self, on: bool) -> ninesql_driver_api::DriverResult<()> {
+            self.inner.set_auto_commit(on).await
+        }
+        fn is_read_only(&self) -> bool {
+            self.inner.is_read_only()
+        }
+        async fn set_read_only(&mut self, ro: bool) -> ninesql_driver_api::DriverResult<()> {
+            self.inner.set_read_only(ro).await
+        }
+        async fn ping(&mut self) -> ninesql_driver_api::DriverResult<()> {
+            self.inner.ping().await
+        }
+        async fn close(self: Box<Self>) -> ninesql_driver_api::DriverResult<()> {
+            self.counts.closes.fetch_add(1, Ordering::SeqCst);
+            self.inner.close().await
+        }
+    }
+
+    /// Review I-a: a close whose cancel misses a statement (the close lands after the session
+    /// task took the `Execute` but before it recorded the statement as current) while that
+    /// statement waits at the metadata gate. The statement is never sent, ends with
+    /// `SessionClosed`, and the session closes once, in order, with the close answered; the
+    /// gate stays held by the "load" the whole time.
+    #[test]
+    fn a_close_that_misses_the_cancel_still_ends_a_statement_at_the_gate() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut caps = ninesql_driver_api::mock::full_capabilities();
+        caps.tls = [
+            ninesql_driver_api::TlsMode::Disable,
+            ninesql_driver_api::TlsMode::Require,
+            ninesql_driver_api::TlsMode::VerifyCa,
+            ninesql_driver_api::TlsMode::VerifyFull,
+        ]
+        .into_iter()
+        .collect();
+        let counts = Arc::new(Counts::default());
+        let mut registry = DriverRegistry::new();
+        registry.register(Arc::new(CountingDriver {
+            mock: ninesql_driver_api::mock::MockDriver::new().with_capabilities(caps),
+            counts: Arc::clone(&counts),
+        }));
+        let mut stores = SecretStores::new();
+        stores.register(Arc::new(ninesql_secrets::MemoryStore::new(
+            StoreKind::Keyring,
+        )));
+        let mut config = ManagerConfig::with_known_hosts(KnownHostsFiles {
+            own: tmp.path().join("known_hosts"),
+            user: None,
+        });
+        config.workers = 2;
+        let manager = SessionManager::new(config, registry, stores).unwrap();
+        let types = ConnectionTypes::default();
+        let ui = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        ui.block_on(async {
+            for round in 0..5_u64 {
+                let c = Connection::new(
+                    "Mock",
+                    EngineId::new(ninesql_driver_api::mock::MOCK_ENGINE.as_str()).unwrap(),
+                    Endpoint::Tcp {
+                        host: "mock.example.test".into(),
+                        port: Some(5000),
+                        database: Some("app".into()),
+                    },
+                    crate::connection::Auth::None,
+                    crate::connection_type::ConnectionTypeId::dev(),
+                );
+                let opened = within(manager.open(OpenRequest::new(c, &types)))
+                    .await
+                    .unwrap()
+                    .unwrap();
+                let OpenOutcome::Opened(h) = opened else {
+                    panic!("round {round}: not opened: {opened:?}");
+                };
+                let closes = counts.closes.load(Ordering::SeqCst);
+                // A metadata load holds the gate and does not end during the test.
+                let load = h.metadata_gate().acquire_owned().await.unwrap();
+                let mut exec = h.execute(ExecuteRequest::sql("SELECT * FROM numbers(3)"));
+                // The statement reaches the session task and waits at the gate.
+                within(async {
+                    while lock(&h.inner.current).is_none() {
+                        tokio::time::sleep(Duration::from_millis(2)).await;
+                    }
+                })
+                .await;
+                tokio::time::sleep(Duration::from_millis(20 + 10 * round)).await;
+                // The race: the `cancel_current()` of `close()` finds no current statement.
+                *lock(&h.inner.current) = None;
+                let started = Instant::now();
+                within(h.close()).await.unwrap().unwrap();
+                assert!(started.elapsed() < Duration::from_secs(2), "round {round}");
+                let mut last = None;
+                while let Some(e) = within(exec.next()).await {
+                    assert!(
+                        matches!(e, ExecEvent::WaitingForMetadata | ExecEvent::Failed(_)),
+                        "round {round}: {e:?}"
+                    );
+                    last = Some(e);
+                }
+                assert!(
+                    matches!(last, Some(ExecEvent::Failed(CoreError::SessionClosed))),
+                    "round {round}: {last:?}"
+                );
+                within(h.closed()).await;
+                within(h.close()).await.unwrap().unwrap();
+                assert_eq!(counts.statements.load(Ordering::SeqCst), 0, "round {round}");
+                assert_eq!(
+                    counts.closes.load(Ordering::SeqCst),
+                    closes + 1,
+                    "round {round}"
+                );
+                drop(load);
+            }
+        });
+    }
+
+    async fn within<F: Future>(f: F) -> F::Output {
+        tokio::time::timeout(Duration::from_secs(10), f)
+            .await
+            .expect("timed out")
+    }
+
+    /// Review I-c: the "waiting for metadata" notice never waits for room in the queue.
+    #[tokio::test]
+    async fn the_waiting_notice_never_blocks() {
+        let (tx, mut rx) = mpsc::channel(2);
+        let out = Output::new(tx, CancelToken::new());
+        assert!(out.try_send(ExecEvent::WaitingForMetadata));
+        assert!(
+            !out.try_send(ExecEvent::WaitingForMetadata),
+            "full: dropped"
+        );
+        drop(out);
+        assert!(matches!(
+            rx.recv().await,
+            Some(ExecEvent::WaitingForMetadata)
+        ));
         assert!(rx.recv().await.is_none());
     }
 
