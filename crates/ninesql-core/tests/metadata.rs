@@ -57,6 +57,12 @@ struct Fake {
     busy: AtomicU64,
     /// Statements the driver accepted.
     statements: AtomicU64,
+    /// While set, a running metadata call does not finish (released by clearing it).
+    hold: AtomicBool,
+    /// `begin` / `commit` / `rollback` / `set_auto_commit` calls the driver session received.
+    tx_calls: AtomicU64,
+    /// Orderly closes of a driver session.
+    closes: AtomicU64,
 }
 
 struct Abandon<'a>(&'a Fake, bool);
@@ -184,6 +190,9 @@ impl Fake {
     async fn pause(&self) {
         if self.hang.load(Ordering::SeqCst) {
             std::future::pending::<()>().await;
+        }
+        while self.hold.load(Ordering::SeqCst) {
+            tokio::time::sleep(Duration::from_millis(1)).await;
         }
         let ms = self.delay_ms.load(Ordering::SeqCst);
         if ms > 0 {
@@ -342,7 +351,24 @@ impl Session for FakeSession {
         self.inner.in_transaction()
     }
     async fn set_auto_commit(&mut self, on: bool) -> DriverResult<()> {
+        let _active = self.fake.enter()?;
+        self.fake.tx_calls.fetch_add(1, Ordering::SeqCst);
         self.inner.set_auto_commit(on).await
+    }
+    async fn begin(&mut self) -> DriverResult<()> {
+        let _active = self.fake.enter()?;
+        self.fake.tx_calls.fetch_add(1, Ordering::SeqCst);
+        self.inner.begin().await
+    }
+    async fn commit(&mut self) -> DriverResult<()> {
+        let _active = self.fake.enter()?;
+        self.fake.tx_calls.fetch_add(1, Ordering::SeqCst);
+        self.inner.commit().await
+    }
+    async fn rollback(&mut self) -> DriverResult<()> {
+        let _active = self.fake.enter()?;
+        self.fake.tx_calls.fetch_add(1, Ordering::SeqCst);
+        self.inner.rollback().await
     }
     fn is_read_only(&self) -> bool {
         self.inner.is_read_only()
@@ -355,6 +381,7 @@ impl Session for FakeSession {
         self.inner.ping().await
     }
     async fn close(self: Box<Self>) -> DriverResult<()> {
+        self.fake.closes.fetch_add(1, Ordering::SeqCst);
         self.inner.close().await
     }
 }
@@ -1493,5 +1520,158 @@ fn the_wait_behind_a_load_is_timed_and_cancellable() {
             events.last(),
             Some(ExecEvent::Finished { rows: 2, .. })
         ));
+    });
+}
+
+/// Review L4: a transaction command waiting at the gate behind a load that will not end soon
+/// (here it never ends; its timeout is 30 s) no longer holds a close back. The close returns at
+/// once, the command is not sent (`SessionClosed`, nothing committed nor rolled back through
+/// it) and the driver session is closed in order (the driver rolls back the open transaction).
+#[test]
+fn closing_ends_a_transaction_command_waiting_behind_a_load() {
+    let env = env();
+    env.fake.exclusive.store(true, Ordering::SeqCst);
+    let svc = MetadataService::new(env.manager.clone(), MetadataConfig::default());
+    ui(async {
+        let (id, h) = env.open().await;
+        within(h.set_auto_commit(false)).await.unwrap().unwrap();
+        within(h.begin()).await.unwrap().unwrap();
+        assert!(h.transaction_state().in_transaction);
+        let tx_calls = env.fake.tx_calls.load(Ordering::SeqCst);
+        env.fake.hang.store(true, Ordering::SeqCst);
+        let load = svc.children(id, tables("public"));
+        let checks = async {
+            until_a_call_runs(&env.fake).await;
+            let commit = h.commit();
+            // The commit reaches the session task and waits at the gate.
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            let started = Instant::now();
+            within(h.close()).await.unwrap().unwrap();
+            assert!(
+                started.elapsed() < Duration::from_secs(2),
+                "{:?}",
+                started.elapsed()
+            );
+            assert!(matches!(
+                within(commit).await,
+                Some(Err(ninesql_core::CoreError::SessionClosed))
+            ));
+            within(h.close()).await.unwrap().unwrap();
+        };
+        let (node, ()) = within(async { tokio::join!(load, checks) }).await;
+        assert!(node.is_err(), "{node:?}");
+        assert_eq!(env.fake.tx_calls.load(Ordering::SeqCst), tx_calls);
+        assert_eq!(env.fake.closes.load(Ordering::SeqCst), 1);
+        assert_eq!(env.fake.busy.load(Ordering::SeqCst), 0);
+    });
+}
+
+/// Review L5: a confirmed production `DELETE` queued behind a load and cancelled at the moment
+/// the load ends (the cancel and the release happen together, before the session task runs
+/// again) is never sent, whichever the session task sees first; nor is one whose execution
+/// was dropped instead.
+#[test]
+fn a_cancel_as_the_gate_opens_never_reaches_the_driver() {
+    let env = env();
+    env.fake.exclusive.store(true, Ordering::SeqCst);
+    let svc = MetadataService::new(env.manager.clone(), MetadataConfig::default());
+    ui(async {
+        let c = mock_connection(ConnectionTypeId::prod());
+        let id = c.id;
+        let h = open_ok(&env.manager, c, &env.types).await;
+        let sql = "DELETE FROM orders";
+        for round in 0..20 {
+            let ev = run(&h, sql).await;
+            let ExecEvent::NeedsConfirmation(req) = terminal(&ev) else {
+                panic!("round {round}: {ev:?}");
+            };
+            let token = req.token;
+            svc.invalidate(id, &ObjectPath::root());
+            env.fake.hold.store(true, Ordering::SeqCst);
+            let load = svc.children(id, tables("public"));
+            let checks = async {
+                until_a_call_runs(&env.fake).await;
+                let mut exec = h.execute(ExecuteRequest::sql(sql).confirmed(token));
+                tokio::time::sleep(Duration::from_millis(20)).await;
+                if round % 2 == 0 {
+                    exec.cancel();
+                    env.fake.hold.store(false, Ordering::SeqCst);
+                    let events = drain(&mut exec).await;
+                    assert!(
+                        matches!(
+                            events.last(),
+                            Some(ExecEvent::Failed(ninesql_core::CoreError::Driver(
+                                DriverError::Cancelled
+                            )))
+                        ),
+                        "round {round}: {events:?}"
+                    );
+                } else {
+                    env.fake.hold.store(false, Ordering::SeqCst);
+                    drop(exec);
+                }
+            };
+            let (node, ()) = within(async { tokio::join!(load, checks) }).await;
+            node.unwrap_or_else(|e| panic!("round {round}: {e:?}"));
+        }
+        // The session is idle again and still works; nothing was sent.
+        within(async {
+            while env.fake.active.load(Ordering::SeqCst) > 0 {
+                tokio::time::sleep(Duration::from_millis(2)).await;
+            }
+        })
+        .await;
+        assert_eq!(env.fake.statements.load(Ordering::SeqCst), 0);
+        let ev = run(&h, "SELECT * FROM numbers(2)").await;
+        assert!(
+            matches!(terminal(&ev), ExecEvent::Finished { rows: 2, .. }),
+            "{ev:?}"
+        );
+        assert_eq!(env.fake.statements.load(Ordering::SeqCst), 1);
+    });
+}
+
+/// A statement that waits more than 250 ms behind a load says so once
+/// (`WaitingForMetadata`), then runs; one that waits less says nothing.
+#[test]
+fn a_long_wait_behind_a_load_is_reported_once() {
+    let env = env();
+    env.fake.exclusive.store(true, Ordering::SeqCst);
+    let svc = MetadataService::new(env.manager.clone(), MetadataConfig::default());
+    ui(async {
+        let (id, h) = env.open().await;
+        for (delay, reported) in [(800, true), (0, false)] {
+            svc.invalidate(id, &ObjectPath::root());
+            env.fake.delay_ms.store(delay, Ordering::SeqCst);
+            let events = if delay > 0 {
+                let load = svc.children(id, tables("public"));
+                let statement = async {
+                    until_a_call_runs(&env.fake).await;
+                    let mut exec = h.execute(ExecuteRequest::sql("SELECT * FROM numbers(3)"));
+                    drain(&mut exec).await
+                };
+                let (node, events) = within(async { tokio::join!(load, statement) }).await;
+                node.unwrap();
+                events
+            } else {
+                let mut exec = h.execute(ExecuteRequest::sql("SELECT * FROM numbers(3)"));
+                drain(&mut exec).await
+            };
+            let waits = events
+                .iter()
+                .filter(|e| matches!(e, ExecEvent::WaitingForMetadata))
+                .count();
+            assert_eq!(waits, usize::from(reported), "{events:?}");
+            if reported {
+                assert!(
+                    matches!(events[0], ExecEvent::WaitingForMetadata),
+                    "{events:?}"
+                );
+            }
+            assert!(
+                matches!(events.last(), Some(ExecEvent::Finished { rows: 3, .. })),
+                "{events:?}"
+            );
+        }
     });
 }

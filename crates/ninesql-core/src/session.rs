@@ -35,7 +35,10 @@
 //! session's metadata gate before it starts a statement or a transaction command, so a
 //! statement sent while a load runs waits behind it (FIFO, each load bounded by its own
 //! timeout) instead of getting `Busy`. That wait counts toward the statement's timeout, ends at
-//! once on cancel or close, sends no event, and runs on the driver runtime. The gate is
+//! once on cancel, close or a lost tunnel, sends [`ExecEvent::WaitingForMetadata`] once past
+//! 250 ms, and runs on the driver runtime; a cancel seen as the gate opens still stops the
+//! statement before it is sent. A transaction command waiting at the gate is not sent when the
+//! session is closed or its tunnel lost meanwhile (`SessionClosed`). The gate is
 //! released once the driver accepted the statement; a load that starts while the statement's
 //! result is still open fails fast with `Busy` (see the metadata service). The keep-alive ping
 //! is skipped while a load runs.
@@ -89,6 +92,9 @@ use crate::runtime::{DEFAULT_WORKERS, DriverRuntime};
 
 /// Pause between two attempts while the previous execution is still being cancelled.
 const BUSY_RETRY: Duration = Duration::from_millis(25);
+/// A statement waiting this long behind a metadata load of its session tells its consumer
+/// ([`ExecEvent::WaitingForMetadata`]); a shorter wait sends nothing.
+const GATE_WAIT_NOTICE: Duration = Duration::from_millis(250);
 /// Extra time given to the driver on top of its own connect timeout.
 const CONNECT_MARGIN: Duration = Duration::from_secs(5);
 /// Confirmation tokens kept per session.
@@ -1938,6 +1944,10 @@ pub enum ExecEvent {
     /// The previous statement was cancelled and the server has not confirmed its end yet; this
     /// statement waits (at most [`ManagerConfig::busy_wait`]).
     WaitingForPreviousCancel,
+    /// Not sent yet: the statement has waited more than 250 ms behind a metadata load of the
+    /// same session (the navigator, completion, a table description). Sent at most once; the
+    /// wait counts toward the statement's timeout and a cancel or a close ends it at once.
+    WaitingForMetadata,
     /// Not sent: the statement needs the user's confirmation (terminal).
     NeedsConfirmation(ConfirmationRequest),
     /// The statement was sent.
@@ -2445,7 +2455,15 @@ struct SessionTask {
 enum Flow {
     Continue,
     Lost(DriverError),
+    /// A close request arrived while the command waited at the metadata gate (the command was
+    /// not sent): the loop closes the session and answers the request, if it still waits.
+    Close(Option<oneshot::Sender<Result<(), CoreError>>>),
+    /// The SSH tunnel closed while the command waited at the metadata gate (not sent).
+    TunnelLost,
 }
+
+/// The close request receiver of a session task.
+type CloseReceiver = oneshot::Receiver<oneshot::Sender<Result<(), CoreError>>>;
 
 async fn tunnel_lost(tunnel: Option<&Tunnel>) {
     match tunnel {
@@ -2472,7 +2490,7 @@ impl SessionTask {
     async fn run(
         mut self,
         mut commands: mpsc::Receiver<Command>,
-        mut close: oneshot::Receiver<oneshot::Sender<Result<(), CoreError>>>,
+        mut close: CloseReceiver,
     ) -> CloseReason {
         let mut last_activity = tokio::time::Instant::now();
         let reason = loop {
@@ -2504,7 +2522,7 @@ impl SessionTask {
                         let _ = self.shutdown().await;
                         break CloseReason::Requested;
                     };
-                    let flow = self.handle_command(command).await;
+                    let flow = self.handle_command(command, &mut close).await;
                     self.update_transaction_state();
                     self.handle.inner.pending.fetch_sub(1, Ordering::SeqCst);
                     last_activity = tokio::time::Instant::now();
@@ -2513,6 +2531,18 @@ impl SessionTask {
                         Flow::Lost(e) => {
                             let _ = self.shutdown().await;
                             break CloseReason::Lost(e);
+                        }
+                        Flow::Close(reply) => {
+                            let result = self.shutdown().await;
+                            if let Some(reply) = reply {
+                                let _ = reply.send(result);
+                            }
+                            break CloseReason::Requested;
+                        }
+                        Flow::TunnelLost => {
+                            tracing::warn!(session = %self.id(), "SSH tunnel lost");
+                            let _ = self.shutdown().await;
+                            break CloseReason::TunnelLost;
                         }
                     }
                 }
@@ -2601,7 +2631,7 @@ impl SessionTask {
         result
     }
 
-    async fn handle_command(&mut self, command: Command) -> Flow {
+    async fn handle_command(&mut self, command: Command, close: &mut CloseReceiver) -> Flow {
         match command {
             Command::Execute {
                 request,
@@ -2619,7 +2649,7 @@ impl SessionTask {
                 drop(out);
                 flow
             }
-            Command::Transaction { op, reply } => self.transaction_command(op, reply).await,
+            Command::Transaction { op, reply } => self.transaction_command(op, reply, close).await,
         }
     }
 
@@ -2627,6 +2657,7 @@ impl SessionTask {
         &mut self,
         op: TxOp,
         reply: oneshot::Sender<Result<TransactionState, CoreError>>,
+        close: &mut CloseReceiver,
     ) -> Flow {
         let Some(session) = self.session.as_mut() else {
             let _ = reply.send(Err(CoreError::SessionClosed));
@@ -2643,8 +2674,26 @@ impl SessionTask {
         }
         // Behind an in-flight metadata load of this session (bounded by that load's own
         // timeout), so the driver does not answer `Busy`; a statement never holds the gate past
-        // its start, so it is free here.
-        let _permit = self.handle.metadata_gate().acquire_owned().await.ok();
+        // its start, so it is free here. The wait ends at once on a close request or a lost
+        // tunnel (review L4): the command is then **not sent** and answers `SessionClosed`, and
+        // the session closes as any close does (the driver rolls back an open transaction), so
+        // closing never commits nor rolls back through a command whose answer nobody waits for
+        // any more. A close that arrives once the permit is granted waits for the command,
+        // which is then short (nothing else holds the driver session).
+        let gate = self.handle.metadata_gate();
+        let _permit = tokio::select! {
+            biased;
+            request = &mut *close => {
+                tracing::debug!(session = %self.id(), "closed while a transaction command waited behind a metadata load");
+                let _ = reply.send(Err(CoreError::SessionClosed));
+                return Flow::Close(request.ok());
+            }
+            () = tunnel_lost(self.tunnel.as_ref()) => {
+                let _ = reply.send(Err(CoreError::SessionClosed));
+                return Flow::TunnelLost;
+            }
+            permit = gate.acquire_owned() => permit.ok(),
+        };
         self.set_driver_active(true);
         let Some(session) = self.session.as_mut() else {
             self.set_driver_active(false);
@@ -2738,9 +2787,10 @@ impl SessionTask {
         } = request;
         // Behind an in-flight metadata load of this session (FIFO with the loads, each bounded
         // by its own timeout): the wait counts toward the statement's timeout and ends at once
-        // on cancel (closing the session cancels too). No event: the wait is short and is not
-        // a cancel tail. The gate is held until the driver accepted the statement, so no load
-        // starts in between; a load that starts later sees `driver_active` and fails fast.
+        // on cancel (closing the session cancels too) or a lost tunnel. Past 250 ms the
+        // consumer is told once (`WaitingForMetadata`). The gate is held until the driver
+        // accepted the statement, so no load starts in between; a load that starts later sees
+        // `driver_active` and fails fast.
         let gate_wait = Instant::now();
         let gate = self.handle.metadata_gate();
         let acquire = gate.acquire_owned();
@@ -2750,20 +2800,48 @@ impl SessionTask {
                 None => std::future::pending::<()>().await,
             }
         };
-        let permit = tokio::select! {
-            biased;
-            () = cancel.cancelled() => {
-                out.finish(ExecEvent::Failed(CoreError::Driver(DriverError::Cancelled)));
-                return Flow::Continue;
-            }
-            permit = acquire => permit.ok(),
-            () = deadline => {
-                let t = timeout.unwrap_or_default();
-                tracing::debug!(session = %id, "statement timed out behind a metadata load");
-                out.finish(ExecEvent::Failed(CoreError::Driver(DriverError::Timeout(t))));
-                return Flow::Continue;
+        let notice = tokio::time::sleep(GATE_WAIT_NOTICE);
+        let permit = {
+            let lost = tunnel_lost(self.tunnel.as_ref());
+            tokio::pin!(acquire, deadline, notice, lost);
+            let mut noticed = false;
+            loop {
+                tokio::select! {
+                    biased;
+                    () = cancel.cancelled() => {
+                        out.finish(ExecEvent::Failed(CoreError::Driver(DriverError::Cancelled)));
+                        return Flow::Continue;
+                    }
+                    () = &mut lost => {
+                        out.finish(ExecEvent::Failed(CoreError::SessionClosed));
+                        return Flow::TunnelLost;
+                    }
+                    permit = &mut acquire => break permit.ok(),
+                    () = &mut deadline => {
+                        let t = timeout.unwrap_or_default();
+                        tracing::debug!(session = %id, "statement timed out behind a metadata load");
+                        out.finish(ExecEvent::Failed(CoreError::Driver(DriverError::Timeout(t))));
+                        return Flow::Continue;
+                    }
+                    () = &mut notice, if !noticed => {
+                        noticed = true;
+                        tracing::debug!(session = %id, "statement waiting behind a metadata load");
+                        // The first event of the execution, so its queue has room; a cancel or a
+                        // gone consumer ends the send and the next turn sees it.
+                        out.send(ExecEvent::WaitingForMetadata).await;
+                    }
+                }
             }
         };
+        // A cancel (or a dropped execution) that landed while the permit was being granted is
+        // honoured here: the statement is never sent (review L5: a confirmed production
+        // `DELETE` cancelled at that instant must not run).
+        if cancel.is_cancelled() || out.consumer_gone() {
+            drop(permit);
+            tracing::debug!(session = %id, "statement cancelled as the metadata gate opened");
+            out.finish(ExecEvent::Failed(CoreError::Driver(DriverError::Cancelled)));
+            return Flow::Continue;
+        }
         self.set_driver_active(true);
         let full_timeout = timeout;
         let timeout = timeout.map(|t| t.saturating_sub(gate_wait.elapsed()));
