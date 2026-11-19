@@ -15,6 +15,10 @@ The script is [`scripts/e2e-local.sh`](../../scripts/e2e-local.sh). It calls the
   - `dbus-daemon` (`sudo apt install dbus-daemon`), so the lock-watcher tests run instead of skipping;
   - `mesa-utils` (`glxinfo`) and `vulkan-tools` (`vulkaninfo`), so the report names your GPU;
   - only if you want a screenshot (`--screenshot`): `xdotool` or `wmctrl` and ImageMagick (`import`), which capture the window of the process the script started, alone, on X11 or XWayland. There is no whole-screen fallback: without them, or on a Wayland-native window, no screenshot is taken.
+- One command for the optional tools on Ubuntu 24.04 or Debian 13 (on older releases, where `gitleaks` has no package, take the binary from the [gitleaks releases](https://github.com/gitleaks/gitleaks/releases)):
+  ```bash
+  sudo apt install gitleaks dbus-daemon mesa-utils vulkan-tools xdotool imagemagick
+  ```
 - Free disk space: the script warns below 15 GiB. The debug build, the release build and the engine images all take room.
 - Nothing listening on the dev engines' host ports (15432, 13306, 13307, 15433, 15434, 18812, 19000, 14000, 14080). Stop your own dev containers first (`make dev-down`), or reuse them with `--engines-running` ([section 3](#3-options)).
 
@@ -24,6 +28,11 @@ From the repository root, on the commit you were asked to test:
 git switch dev && git pull      # or the branch the agent named
 make e2e-local                  # = scripts/e2e-local.sh
 ```
+To also capture the NineSQL window (X11 or XWayland, see the prerequisites):
+```bash
+make e2e-local E2E_ARGS="--screenshot"
+```
+At the end the script prints the paths of `summary.md` and `report.tar.gz`; send `summary.md` back to the session ([section 5](#5-what-to-send-back)).
 The terminal shows one line per stage and step, and a `PASS`, `FAIL` or `SKIP` line when each stage ends. The command output goes to the log files, not to the terminal; add `--verbose` to see it too.
 
 | Stage | What it runs |
