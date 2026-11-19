@@ -78,9 +78,7 @@ The 20 most used **open-source, self-hostable** engines. Cloud-only services (Sn
 What each engine supports (metadata, editing, explain plans…) is listed in the [capability matrix](docs/08-engine-capabilities.md).
 
 ## Installation
-No release yet. The v0.1.0 MVP will ship as:
-- a signed **`.deb`** for Debian 12 / 13 and Ubuntu 22.04 / 24.04, from a signed APT repository;
-- a **Flatpak** (Flathub).
+No release yet. The v0.1.0 MVP will ship as a **`.deb`** for Debian 12 / 13 and Ubuntu 22.04 / 24.04 (amd64), attached to the GitHub release with its SBOM and cosign signatures ([verification](SECURITY.md#release-signing)). A signed APT repository and a Flatpak on Flathub come in a later release.
 
 There is deliberately no `curl … | bash` installer ([ADR-0010](docs/adr/0010-packaging-and-distribution.md)).
 

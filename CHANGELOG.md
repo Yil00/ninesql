@@ -3,7 +3,7 @@
 All notable changes to this project are documented here. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project uses [Semantic Versioning](https://semver.org/). Released sections are generated at release time from Conventional Commits ([RELEASE.md](RELEASE.md)).
 
 ## [Unreleased]
-No version has been released yet. This section summarizes, for users, everything since the start of the project: phases 0 to 5, the follow-ups done before phase 6 and the phase 6 packaging and documentation. "Changed", "Fixed" and "Security" describe changes to the behaviour of earlier development builds. What does not work yet is listed in the [known limitations](docs/user-guide/known-limitations.md); measurements of start time, memory and scrolling on real hardware are not available yet.
+No version has been released yet. This section summarizes, for users, everything since the start of the project: phases 0 to 5, the follow-ups done before phase 6, the phase 6 packaging and documentation, and the fixes of the end-of-MVP security review. "Changed", "Fixed" and "Security" describe changes to the behaviour of earlier development builds. What does not work yet is listed in the [known limitations](docs/user-guide/known-limitations.md); measurements of start time, memory and scrolling on real hardware are not available yet.
 
 ### Added
 - **Application window** (GPUI, rendered on the GPU): database navigator, editor tabs and splits, several windows, status bar, a command palette listing every action, default key bindings for every action and overrides in `settings.toml`, light / dark / system themes, font sizes and zoom saved back to `settings.toml` (comments kept), "Show settings problems".
@@ -65,3 +65,6 @@ No version has been released yet. This section summarizes, for users, everything
 - The plain `Ctrl+C` copy now has the spreadsheet formula guard, as the CSV copy and export do.
 - GIF and animated PNG values are no longer decoded for preview (an unbounded decode); PNG and JPEG previews are limited in size and pixels, and images no longer shown are released from memory.
 - The CSV import confirmation is bound to the file, the target table and the CSV options as shown.
+- A crash of a release build prints only a fixed message and where in NineSQL it happened, never the panic message, which could hold values from your queries or connections and would reach the system journal on disk.
+- The packages now ship the license notices of FreeType (the font library compiled into NineSQL, under the FreeType License) and of the Lucide (ISC) and Feather (MIT) icons, and the package build fails if they are missing. The bundled FreeType is listed in the SBOM; it does not receive Debian or Ubuntu security updates, so a FreeType fix comes with a NineSQL release.
+- The release workflow runs `cargo deny` and the check of the patched third-party crates before building.

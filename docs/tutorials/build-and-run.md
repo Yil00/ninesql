@@ -64,7 +64,7 @@ The connection actions are in [Create your first connection](first-connection.md
 On macOS the default bindings use **Ctrl** too, not Cmd: the defaults are the Linux ones on every platform.
 
 ## 5. Build and install the `.deb`
-NineSQL has no published package yet (the signed APT repository and Flathub come with the first release). You can build the Debian package from the repository and install it on Debian 12 or 13, or Ubuntu 22.04 or 24.04 ([packaging/README.md](../../packaging/README.md)).
+NineSQL has no published package yet (v0.1.0 will be a signed `.deb` on the GitHub release; the signed APT repository and Flathub come later). You can build the Debian package from the repository and install it on Debian 12 or 13, or Ubuntu 22.04 or 24.04 ([packaging/README.md](../../packaging/README.md)).
 
 1. Install Docker and the two packaging tools, at exactly these versions (`make deb` checks them):
    ```bash
