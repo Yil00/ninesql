@@ -19,13 +19,30 @@
 //! characteristics survive `SET autocommit`, `SET @user_var`, `USE` and table-less `SELECT`s;
 //! `COMMIT`, `ROLLBACK` (even with no transaction), `START TRANSACTION` and any statement that
 //! starts a transaction consume them; `SET SESSION TRANSACTION <x>` replaces only the pending
-//! characteristic `x`; two `SET TRANSACTION` statements accumulate.
+//! characteristic `x`; two `SET TRANSACTION` statements accumulate; an assignment to
+//! `transaction_isolation` / `transaction_read_only` (or the `tx_…` aliases) in session scope
+//! also replaces the next transaction's value.
 //!
-//! Residuals: a stored routine that runs `SET TRANSACTION` is not seen (the `CALL` text does not
-//! say so), and in auto-commit mode a table-less user `SELECT` is taken as consuming the
+//! The tracker must never re-issue characteristics the server no longer has pending (the
+//! user's next transaction could then run at a weaker level than the server would have used;
+//! final review L-1). So, while characteristics are pending, the state becomes unknown after
+//! any statement that may have overwritten or consumed them without the tracker knowing: an
+//! assignment to one of those variables in any scope, case or quoting
+//! ([`tx_var_assignment`]); any `Unknown` statement, succeeded or failed (`CALL`, `LOCK
+//! TABLES`, `ANALYZE` / `OPTIMIZE` / `CHECK TABLE`, `FLUSH`, `CACHE INDEX`, `LOAD INDEX`…,
+//! which commit implicitly or may start and end transactions), those words whatever the
+//! classifier says, a session statement with a `SELECT`, and a read or write that failed
+//! (it may have started its transaction first). With nothing pending, only a form that may
+//! leave characteristics pending makes it unknown (a scope-less `@@transaction_isolation`
+//! assignment, any assignment without its own `SESSION` / `LOCAL`); a plain read of such a
+//! variable (`SET @a = @@tx_isolation`) does not.
+//!
+//! Residuals: a stored routine or prepared statement that runs `SET TRANSACTION` or assigns a
+//! transaction variable is not seen when nothing is pending (the `CALL` / `EXECUTE` text does
+//! not say so), and in auto-commit mode a table-less user `SELECT` is taken as consuming the
 //! pending characteristics (a later navigator read may then consume them).
 
-use ninesql_driver_api::{CodeTokenKind, LexicalRules, StatementClass, code_tokens};
+use ninesql_driver_api::{CodeToken, CodeTokenKind, LexicalRules, StatementClass, code_tokens};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Access {
@@ -152,33 +169,166 @@ pub(crate) fn parse_set_transaction(text: &str) -> Option<SetTransaction> {
     })
 }
 
-/// `true` when `text` may leave transaction characteristics pending in a form
-/// [`parse_set_transaction`] does not read: the word `TRANSACTION` outside strings and quoted
-/// names, or a system variable `@@transaction_…` / `@@tx_…` with no scope (MySQL applies
-/// such an assignment to the next transaction only).
-fn may_set_next(text: &str) -> bool {
-    let lower = text.to_ascii_lowercase();
-    lower.contains("@@transaction_")
-        || lower.contains("@@tx_")
-        || code_tokens(text, LexicalRules::MYSQL)
-            .iter()
-            .any(|t| t.is_word(text, "TRANSACTION"))
+/// The system variables whose assignment changes the characteristics of the next
+/// transaction. MySQL's `Sys_var_transaction_isolation::session_update` (and its
+/// `transaction_read_only` counterpart) writes the session value *and* the next transaction's,
+/// so even a session-scope assignment overwrites a pending one-shot characteristic; with `@@`
+/// and no scope the assignment applies to the next transaction only.
+const TX_VARIABLES: [&str; 4] = [
+    "transaction_isolation",
+    "transaction_read_only",
+    "tx_isolation",
+    "tx_read_only",
+];
+
+/// A token's text as a name: lower-cased, one pair of backticks or double or single quotes
+/// removed (a string in a target position is not valid SQL, but an `ANSI_QUOTES` session reads
+/// `"…"` as a name).
+fn as_name(tok: &str) -> String {
+    let b = tok.as_bytes();
+    let inner = match (b.first(), b.last()) {
+        (Some(q @ (b'`' | b'"' | b'\'')), Some(e)) if b.len() >= 2 && q == e => {
+            &tok[1..tok.len() - 1]
+        }
+        _ => tok,
+    };
+    inner.to_ascii_lowercase()
 }
+
+/// How a statement assigns one of [`TX_VARIABLES`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum TxVarAssignment {
+    /// Every such assignment names `SESSION` / `LOCAL` in its own target (`SET SESSION
+    /// transaction_isolation = …`, `SET @@session.tx_isolation = …`): the session value and
+    /// the next transaction's are both replaced, nothing new is left pending.
+    Session,
+    /// Any other form: `@@` with no scope (next transaction only), no scope keyword in its own
+    /// target (one may come from an earlier assignment of the list), `GLOBAL`, `PERSIST`,
+    /// MariaDB `SET STATEMENT … FOR`, or a segment the scan cannot split.
+    Other,
+}
+
+/// Scans a `SET` statement (an executable comment's content included, comments otherwise
+/// skipped) for an assignment to one of [`TX_VARIABLES`], in any scope, case or quoting. Only
+/// assignment *targets* count, so `SET @a = @@tx_isolation` (a read) does not, nor does a user
+/// variable of the same name (`SET @tx_isolation = 1`). A segment of the list with no `=` /
+/// `:=` is a target as a whole (fails closed).
+pub(crate) fn tx_var_assignment(text: &str) -> Option<TxVarAssignment> {
+    let toks = code_tokens(text, LexicalRules::MYSQL);
+    if !toks.first().is_some_and(|t| t.is_word(text, "SET")) {
+        return None;
+    }
+    // The assignment list, split at top-level commas.
+    let mut segments: Vec<&[CodeToken]> = Vec::new();
+    let mut depth = 0usize;
+    let mut start = 1;
+    for (i, t) in toks.iter().enumerate().skip(1) {
+        match t.kind {
+            CodeTokenKind::OpenParen => depth += 1,
+            CodeTokenKind::CloseParen => depth = depth.saturating_sub(1),
+            CodeTokenKind::Other if depth == 0 && t.text(text) == "," => {
+                segments.push(&toks[start..i]);
+                start = i + 1;
+            }
+            _ => {}
+        }
+    }
+    segments.push(&toks[start..]);
+    let mut found = None;
+    for seg in segments {
+        // The target: the tokens before the first top-level `=` (`:=` lexes as `:` and `=`).
+        let mut depth = 0usize;
+        let mut end = seg.len();
+        for (i, t) in seg.iter().enumerate() {
+            match t.kind {
+                CodeTokenKind::OpenParen => depth += 1,
+                CodeTokenKind::CloseParen => depth = depth.saturating_sub(1),
+                CodeTokenKind::Other if depth == 0 && t.text(text) == "=" => {
+                    end = i;
+                    break;
+                }
+                _ => {}
+            }
+        }
+        let target = &seg[..end];
+        let at = |i: usize| {
+            target
+                .get(i)
+                .is_some_and(|t| t.kind == CodeTokenKind::Other && t.text(text) == "@")
+        };
+        let (mut session, mut other_scope, mut assigns) = (false, false, false);
+        for (i, t) in target.iter().enumerate() {
+            if !matches!(
+                t.kind,
+                CodeTokenKind::Word | CodeTokenKind::QuotedIdent | CodeTokenKind::Str
+            ) {
+                continue;
+            }
+            match as_name(t.text(text)).as_str() {
+                "session" | "local" => session = true,
+                "global" | "persist" | "persist_only" | "statement" => other_scope = true,
+                n if TX_VARIABLES.contains(&n) => {
+                    // `@name` (a single `@`) is a user variable.
+                    let user_variable = i >= 1 && at(i - 1) && !(i >= 2 && at(i - 2));
+                    assigns |= !user_variable;
+                }
+                _ => {}
+            }
+        }
+        if assigns {
+            found = Some(
+                if session && !other_scope && found != Some(TxVarAssignment::Other) {
+                    TxVarAssignment::Session
+                } else {
+                    TxVarAssignment::Other
+                },
+            );
+        }
+    }
+    found
+}
+
+/// First words of statements that commit implicitly, or may start, commit or end a
+/// transaction, although the classifier does not read them as DDL or transaction control:
+/// `LOCK TABLES`, `UNLOCK TABLES`, `ANALYZE` / `OPTIMIZE` / `CHECK` / `REPAIR TABLE`, `FLUSH`,
+/// `CACHE INDEX`, `LOAD INDEX` and `CALL`.
+const IMPLICIT_COMMIT_WORDS: [&str; 10] = [
+    "LOCK", "UNLOCK", "ANALYZE", "OPTIMIZE", "CHECK", "REPAIR", "FLUSH", "CACHE", "LOAD", "CALL",
+];
 
 /// What one user statement may do to the pending characteristics, computed from its text
 /// before it is sent.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct Effect {
     parsed: Option<SetTransaction>,
+    /// Not parsed, and may leave characteristics pending in a form the driver cannot read: the
+    /// word `TRANSACTION` outside strings and quoted names (`SET TRANSACTION /* c */ …`), or
+    /// an assignment to a transaction variable that is not explicitly session-scope.
     may_set_next: bool,
+    /// Not parsed, and assigns a transaction variable in some scope ([`tx_var_assignment`]).
+    assigns_tx_var: bool,
+    /// Its first word is in [`IMPLICIT_COMMIT_WORDS`].
+    implicit_commit: bool,
+    /// Has a `SELECT`: a subquery (`SET @a = (SELECT … FROM t)`) may read a transactional
+    /// table, which in auto-commit mode is a transaction of its own.
+    has_select: bool,
 }
 
 impl Effect {
     pub(crate) fn of(text: &str) -> Self {
         let parsed = parse_set_transaction(text);
+        let toks = code_tokens(text, LexicalRules::MYSQL);
+        let assignment = parsed.is_none().then(|| tx_var_assignment(text)).flatten();
         Self {
             parsed,
-            may_set_next: parsed.is_none() && may_set_next(text),
+            may_set_next: parsed.is_none()
+                && (assignment == Some(TxVarAssignment::Other)
+                    || toks.iter().any(|t| t.is_word(text, "TRANSACTION"))),
+            assigns_tx_var: assignment.is_some(),
+            implicit_commit: toks
+                .first()
+                .is_some_and(|t| IMPLICIT_COMMIT_WORDS.iter().any(|w| t.is_word(text, w))),
+            has_select: toks.iter().any(|t| t.is_word(text, "SELECT")),
         }
     }
 }
@@ -269,6 +419,24 @@ impl Pending {
             }
             return;
         }
+        let pending = self.chars != Chars::default();
+        // An assignment to a transaction variable, whether or not it succeeded (a list of
+        // assignments may be applied in part): a scope-less `@@` form leaves characteristics
+        // pending, and any form, a session-scope one included, overwrites the ones the driver
+        // tracked, so re-issuing those would re-apply stale (possibly weaker) settings.
+        // Whatever the class of an assignment; the word `TRANSACTION` alone says nothing in
+        // transaction control and DDL, which consume them anyway (below): `START
+        // TRANSACTION`, a table named `transaction`.
+        let consumes = matches!(
+            class,
+            StatementClass::Transaction | StatementClass::Ddl | StatementClass::Destructive
+        );
+        if (effect.assigns_tx_var && (pending || effect.may_set_next))
+            || (effect.may_set_next && !consumes)
+        {
+            self.unknown = true;
+            return;
+        }
         match class {
             // `COMMIT` / `ROLLBACK` / `START TRANSACTION` consume them, and DDL commits
             // implicitly before it runs (whether or not it then fails).
@@ -276,15 +444,27 @@ impl Pending {
                 self.clear();
             }
             // In auto-commit mode a statement on a transactional table is a transaction of its
-            // own. (In manual-commit mode such a statement leaves `in_trans` set, above.)
+            // own. (In manual-commit mode such a statement leaves `in_trans` set, above.) A
+            // statement that failed may have started its transaction, consuming them, before
+            // it failed, or had it rolled back whole (a deadlock): the driver cannot tell.
             StatementClass::Read | StatementClass::Write => {
-                if ok && auto_commit {
+                if !ok && pending {
+                    self.unknown = true;
+                } else if ok && auto_commit {
                     self.clear();
                 }
             }
-            // Session statements, `ChangesAccessMode`, `Unknown` (`CALL`…).
+            // Session statements, `ChangesAccessMode`, `Unknown` (`CALL`, `LOCK TABLES`,
+            // `ANALYZE TABLE`, `FLUSH`…), succeeded or failed. Several of these commit
+            // implicitly, a `CALL` may start, commit or fail inside a transaction, and a `SET`
+            // with a subquery reads a table: with characteristics pending, the driver cannot
+            // tell whether they were consumed.
             _ => {
-                if ok && effect.may_set_next {
+                if pending
+                    && (class == StatementClass::Unknown
+                        || effect.implicit_commit
+                        || effect.has_select)
+                {
                     self.unknown = true;
                 }
             }
@@ -388,6 +568,8 @@ mod tests {
         assert!(!Effect::of("SET TRANSACTION READ ONLY").may_set_next);
         assert!(!Effect::of("SET @@SESSION.transaction_isolation = 'READ-COMMITTED'").may_set_next);
         assert!(!Effect::of("SET @a = 'TRANSACTION'").may_set_next);
+        assert!(!Effect::of("SET @a = @@tx_isolation").may_set_next);
+        assert!(Effect::of("SET @@`tx_read_only` = 1").may_set_next);
         assert!(!Effect::of("SET sql_mode = ''").may_set_next);
     }
 
@@ -502,6 +684,228 @@ mod tests {
         );
         p.after_driver_statement("ROLLBACK", true);
         assert!(!p.blocks_navigator());
+    }
+
+    #[test]
+    fn finds_transaction_variable_assignments() {
+        use TxVarAssignment::{Other, Session};
+        for (text, expected) in [
+            (
+                "SET SESSION transaction_isolation = 'SERIALIZABLE'",
+                Some(Session),
+            ),
+            ("set local TX_ISOLATION='SERIALIZABLE'", Some(Session)),
+            ("SET @@SESSION.tx_isolation = 'SERIALIZABLE'", Some(Session)),
+            ("SET @@local.transaction_read_only = 0", Some(Session)),
+            // Backticks, any case (C).
+            ("SET @@`session`.`tx_isolation` = 'x'", Some(Session)),
+            ("SET SESSION `Transaction_Isolation` = 'x'", Some(Session)),
+            ("SET @@`SESSION` . `TX_READ_ONLY` := 0", Some(Session)),
+            // No scope of its own, `@@` with no scope, other scopes.
+            ("SET transaction_isolation = 'SERIALIZABLE'", Some(Other)),
+            ("SET `tx_read_only` = 0", Some(Other)),
+            (
+                "SET @@transaction_isolation = 'READ-UNCOMMITTED'",
+                Some(Other),
+            ),
+            ("SET @@`tx_isolation` = 'READ-UNCOMMITTED'", Some(Other)),
+            ("SET GLOBAL transaction_isolation = 'x'", Some(Other)),
+            ("SET PERSIST transaction_read_only = 1", Some(Other)),
+            ("SET STATEMENT tx_isolation = 'x' FOR SELECT 1", Some(Other)),
+            (
+                "SET SESSION sql_mode = '', transaction_isolation = 'x'",
+                Some(Other),
+            ),
+            (
+                "SET SESSION tx_isolation = 'x', @@tx_read_only = 0",
+                Some(Other),
+            ),
+            (
+                "SET SESSION tx_isolation = 'x', SESSION tx_read_only = 0",
+                Some(Session),
+            ),
+            (
+                "SET /*!80000 SESSION transaction_isolation = 'SERIALIZABLE' */",
+                Some(Session),
+            ),
+            ("SET @a = 1, tx_isolation = (SELECT 'x')", Some(Other)),
+            ("SET tx_isolation", Some(Other)),
+            // Reads, user variables, strings, comments, other statements.
+            ("SET @a = @@tx_isolation", None),
+            ("SET @a = @@SESSION.transaction_isolation, @b = 1", None),
+            ("SET @tx_isolation = 1", None),
+            ("SET @`tx_isolation` = 1", None),
+            ("SET @a = 'tx_isolation'", None),
+            ("SET sql_mode = '' -- tx_isolation = 1", None),
+            ("SET @a = (SELECT tx_isolation FROM t)", None),
+            ("SELECT @@tx_isolation", None),
+            ("SET TRANSACTION ISOLATION LEVEL SERIALIZABLE", None),
+        ] {
+            assert_eq!(tx_var_assignment(text), expected, "{text}");
+        }
+    }
+
+    fn pending_read_uncommitted() -> Pending {
+        let mut p = Pending::default();
+        user(
+            &mut p,
+            "SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED",
+            StatementClass::Session,
+            false,
+            false,
+        );
+        assert!(p.reissue_sql(false).is_some());
+        p
+    }
+
+    #[test]
+    fn a_session_assignment_overwrites_pending_characteristics() {
+        // A: the server's next-transaction level is now SERIALIZABLE; re-issuing READ
+        // UNCOMMITTED would weaken it.
+        for text in [
+            "SET SESSION transaction_isolation = 'SERIALIZABLE'",
+            "SET transaction_isolation='SERIALIZABLE'",
+            "SET @@SESSION.tx_isolation = 'SERIALIZABLE'",
+            "SET @@local.tx_isolation = 'SERIALIZABLE'",
+            "SET SESSION transaction_read_only = 1",
+            "SET @@session.tx_read_only = 1",
+            // C: backticks.
+            "SET @@`session`.`transaction_isolation` = 'SERIALIZABLE'",
+            "SET SESSION `TX_ISOLATION` = 'SERIALIZABLE'",
+        ] {
+            for class in [
+                StatementClass::ChangesAccessMode,
+                StatementClass::Session,
+                StatementClass::Unknown,
+            ] {
+                for ok in [true, false] {
+                    let mut p = pending_read_uncommitted();
+                    p.after_user_statement(Effect::of(text), class, ok, false, false);
+                    assert!(p.blocks_navigator(), "{text} {class:?} {ok}");
+                }
+            }
+        }
+        // With nothing pending, a session-scope assignment leaves nothing pending...
+        let mut p = Pending::default();
+        user(
+            &mut p,
+            "SET SESSION transaction_isolation = 'SERIALIZABLE'",
+            StatementClass::ChangesAccessMode,
+            false,
+            false,
+        );
+        assert!(!p.blocks_navigator() && p.reissue_sql(false).is_none());
+        // ...but a next-transaction form does (in any quoting).
+        for text in [
+            "SET @@`transaction_isolation` = 'READ-UNCOMMITTED'",
+            "SET tx_isolation = 'READ-UNCOMMITTED'",
+        ] {
+            let mut p = Pending::default();
+            user(
+                &mut p,
+                text,
+                StatementClass::ChangesAccessMode,
+                false,
+                false,
+            );
+            assert!(p.blocks_navigator(), "{text}");
+        }
+        // I-2: reading the variable is not an assignment.
+        let mut p = pending_read_uncommitted();
+        user(
+            &mut p,
+            "SET @a = @@tx_isolation",
+            StatementClass::Session,
+            false,
+            false,
+        );
+        assert!(!p.blocks_navigator() && p.reissue_sql(false).is_some());
+    }
+
+    #[test]
+    fn implicit_commits_make_pending_characteristics_unknown() {
+        // B: these commit implicitly or may start and end a transaction.
+        for text in [
+            "LOCK TABLES t READ",
+            "UNLOCK TABLES",
+            "ANALYZE TABLE t",
+            "OPTIMIZE TABLE t",
+            "CHECK TABLE t",
+            "REPAIR TABLE t",
+            "FLUSH TABLES",
+            "CACHE INDEX t IN hot",
+            "LOAD INDEX INTO CACHE t",
+            "CALL p()",
+            "DO 1",
+        ] {
+            for ok in [true, false] {
+                for ac in [true, false] {
+                    // As the classifier reads them, and whatever it would say.
+                    for class in [StatementClass::Unknown, StatementClass::Session] {
+                        let mut p = pending_read_uncommitted();
+                        p.after_user_statement(Effect::of(text), class, ok, false, ac);
+                        let expected = class == StatementClass::Unknown || text != "DO 1";
+                        assert_eq!(p.blocks_navigator(), expected, "{text} {ok} {ac} {class:?}");
+                    }
+                }
+            }
+        }
+        // A read or write that failed may have started (and ended) its transaction.
+        for class in [StatementClass::Read, StatementClass::Write] {
+            for ac in [true, false] {
+                let mut p = pending_read_uncommitted();
+                p.after_user_statement(
+                    Effect::of("INSERT INTO t VALUES (1)"),
+                    class,
+                    false,
+                    false,
+                    ac,
+                );
+                assert!(p.blocks_navigator());
+            }
+        }
+        // A `SET` with a subquery reads a table.
+        let mut p = pending_read_uncommitted();
+        user(
+            &mut p,
+            "SET @a = (SELECT x FROM t)",
+            StatementClass::Session,
+            false,
+            true,
+        );
+        assert!(p.blocks_navigator());
+        // Nothing pending: nothing to lose, the navigator stays available.
+        let mut p = Pending::default();
+        user(
+            &mut p,
+            "LOCK TABLES t READ",
+            StatementClass::Unknown,
+            false,
+            true,
+        );
+        p.after_user_statement(
+            Effect::of("CALL p()"),
+            StatementClass::Unknown,
+            false,
+            false,
+            true,
+        );
+        assert!(!p.blocks_navigator());
+        // Still fine: harmless session statements keep the pending characteristics.
+        let mut p = pending_read_uncommitted();
+        for text in ["SET @a = 1", "USE nine", "SET autocommit = 0"] {
+            user(&mut p, text, StatementClass::Session, false, false);
+        }
+        assert!(!p.blocks_navigator() && p.reissue_sql(false).is_some());
+        // DDL and transaction control consume them, a `transaction` name included.
+        user(
+            &mut p,
+            "CREATE TABLE transaction (id INT)",
+            StatementClass::Ddl,
+            false,
+            false,
+        );
+        assert!(!p.blocks_navigator() && p.reissue_sql(false).is_none());
     }
 
     #[test]

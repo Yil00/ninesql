@@ -414,7 +414,13 @@ impl Actor {
         if self.shared.closed.load(Ordering::SeqCst) {
             return Ok(());
         }
-        match tokio::time::timeout(INTERNAL_TIMEOUT, self.conn.ping()).await {
+        let mut r = tokio::time::timeout(INTERNAL_TIMEOUT, self.conn.ping()).await;
+        // A late `KILL QUERY` (the statement was cancelled) can interrupt the ping itself, as
+        // it can the other driver statements: try once more.
+        if matches!(&r, Ok(Ok(Err(e))) if e.code == 1317) {
+            r = tokio::time::timeout(INTERNAL_TIMEOUT, self.conn.ping()).await;
+        }
+        match r {
             Ok(Ok(Ok(()))) => {
                 self.sync_status();
                 Ok(())
