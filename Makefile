@@ -39,6 +39,12 @@ WIRE_SERVICES ?= timescaledb yugabytedb questdb tidb
 ENGINE_TEST_CRATES ?= -p ninesql-driver-pgwire -p ninesql-driver-mysqlwire \
                       -p ninesql-driver-sqlite -p ninesql-core -p ninesql-ssh
 
+# Extra arguments appended to `cargo test` in test and test-engines-run (empty by default, as
+# in CI), e.g. TEST_ARGS=--no-fail-fast to run every test binary even after a failure.
+TEST_ARGS ?=
+# Options of scripts/e2e-local.sh for `make e2e-local`, e.g. E2E_ARGS="--only engines".
+E2E_ARGS ?=
+
 COMPOSE_FILE_ARGS = -f dev/compose.yaml
 
 # Runs a command under `timeout $(TIMEOUT)`, or `gtimeout` (macOS with GNU coreutils), or
@@ -49,7 +55,7 @@ WITH_TIMEOUT = sh -c 'if command -v timeout >/dev/null 2>&1; then exec timeout "
 
 # The driver-integration test command. Not run through $(MAKE), so `make -n test-engines`
 # only prints it.
-ENGINE_TESTS = NINESQL_REQUIRE_ENGINES=$(REQUIRE_ENGINES) $(WITH_TIMEOUT) $(CARGO) test --locked $(ENGINE_TEST_CRATES)
+ENGINE_TESTS = NINESQL_REQUIRE_ENGINES=$(REQUIRE_ENGINES) $(WITH_TIMEOUT) $(CARGO) test --locked $(ENGINE_TEST_CRATES) $(TEST_ARGS)
 
 # Forbidden GPUI APIs under crates/ (ADR-0013), as checked by the deny CI job.
 FORBIDDEN_GPUI_APIS = set_http_client|with_http_client|read_credentials|write_credentials|delete_credentials
@@ -58,7 +64,7 @@ FORBIDDEN_GPUI_APIS = set_http_client|with_http_client|read_credentials|write_cr
 	build run release \
 	fmt fmt-check clippy test deny md-links verify-patches verify-gpui-snapshot forbidden-apis check \
 	dev-up dev-up-all dev-down dev-check dev-ps \
-	test-engines test-engines-run \
+	test-engines test-engines-run e2e-local \
 	deb deb-install-test deb-reproducible sbom flatpak-lint \
 	clean deps-debian deps-macos
 
@@ -77,6 +83,7 @@ help: ## List the targets (default)
 	@echo "  PROFILE=$(PROFILE)  TIMEOUT=$(TIMEOUT)  DEV_TIMEOUT=$(DEV_TIMEOUT)"
 	@echo "  REQUIRE_ENGINES=$(REQUIRE_ENGINES)"
 	@echo "  WIRE_ENGINES=$(WIRE_ENGINES)"
+	@echo "  TEST_ARGS=$(TEST_ARGS)  E2E_ARGS=$(E2E_ARGS)"
 
 # ---------------------------------------------------------------------------------------------
 ##@ Build and run
@@ -105,7 +112,7 @@ clippy: ## Lint the workspace, warnings as errors
 	$(WITH_TIMEOUT) $(CARGO) clippy --workspace --all-targets --all-features --locked -- -D warnings
 
 test: ## Run the workspace tests (engine tests skip unreachable engines)
-	$(WITH_TIMEOUT) $(CARGO) test --workspace --locked
+	$(WITH_TIMEOUT) $(CARGO) test --workspace --locked $(TEST_ARGS)
 
 deny: ## cargo-deny: licenses, bans, sources, advisories (needs cargo-deny)
 	$(WITH_TIMEOUT) $(CARGO) deny --locked check
@@ -165,6 +172,13 @@ test-engines-run: ## Run the same tests against engines that are already up
 	$(ENGINE_TESTS)
 
 # ---------------------------------------------------------------------------------------------
+##@ Local end-to-end run (docs/tutorials/local-e2e.md; a Linux desktop with Docker)
+# ---------------------------------------------------------------------------------------------
+
+e2e-local: ## Checks, engine tests and a GUI smoke test, with a report to send back (E2E_ARGS=...)
+	scripts/e2e-local.sh $(E2E_ARGS)
+
+# ---------------------------------------------------------------------------------------------
 ##@ Packaging (packaging/README.md; Docker, cargo-deb and cargo-about)
 # ---------------------------------------------------------------------------------------------
 
@@ -195,6 +209,7 @@ deps-debian: ## Print the system packages for Debian / Ubuntu (does not install)
 	@echo "System packages (docs/10-supported-platforms.md), run as yourself:"
 	@echo "  sudo apt install build-essential pkg-config clang cmake libvulkan-dev libwayland-dev libxkbcommon-dev libxkbcommon-x11-dev libx11-xcb-dev libxcb1-dev libfontconfig-dev libfreetype-dev libzstd-dev libasound2-dev"
 	@echo "Dev databases: Docker Engine with the Compose v2 plugin, Python 3.9 or newer."
+	@echo "make check, verify-patches and e2e-local: Python 3.11 or newer (tomllib), cargo-deny."
 
 deps-macos: ## Print the macOS requirements for UI iteration (does not install)
 	@echo "macOS is a development platform only (docs/10-supported-platforms.md)."

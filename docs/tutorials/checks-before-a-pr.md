@@ -21,7 +21,7 @@ make check
 
 Each target also runs alone (`make clippy`, `make md-links`…). To fix formatting, `make fmt`.
 
-Requirements: the [build requirements](build-and-run.md#1-install-the-toolchain) (clippy and the tests build GPUI), [`cargo-deny`](https://github.com/EmbarkStudios/cargo-deny) (`cargo install cargo-deny --locked`; CI uses 0.20.2), Python 3.11 or newer for `verify-patches`. The long cargo commands stop after `TIMEOUT` seconds (900 by default; `make check TIMEOUT=1800` on a slow machine).
+Requirements: the [build requirements](build-and-run.md#1-install-the-toolchain) (clippy and the tests build GPUI), [`cargo-deny`](https://github.com/EmbarkStudios/cargo-deny) (`cargo install cargo-deny --locked`; CI uses 0.20.2), Python **3.11 or newer** for `verify-patches`: `scripts/verify-patches.sh` reads `Cargo.toml` with `tomllib`. On Python 3.10 (Ubuntu 22.04) it fails, even though the dev databases run with 3.9. The long cargo commands stop after `TIMEOUT` seconds (900 by default; `make check TIMEOUT=1800` on a slow machine).
 
 In `make test`, the integration tests of PostgreSQL, MySQL, MariaDB, TimescaleDB, YugabyteDB, QuestDB, TiDB and SSH **skip themselves** when their engine is not reachable. That is why the next step exists. The `ninesql-secrets` tests of the sleep and screen-lock watcher run on a private D-Bus bus and skip themselves too when `dbus-daemon` is not installed (`sudo apt-get install dbus-daemon`); CI installs it and sets `NINESQL_REQUIRE_DBUS=1`, so they fail there instead of skipping. Run `NINESQL_REQUIRE_DBUS=1 make test` to do the same locally.
 
@@ -36,7 +36,10 @@ This does what the `driver-integration` CI job does:
 
 It needs Docker ([Start the dev databases](dev-databases.md#1-requirements)) and none of the GPUI system packages. If you already started the engines, run only the tests with `make test-engines-run` and stop the engines yourself with `make dev-down`. With only the `core` profile up (`make dev-up`), narrow the required list: `make test-engines-run REQUIRE_ENGINES=postgresql,mysql,mariadb,ssh` (the tests of the other engines then skip). Note that `make test-engines` stops them at the end too.
 
+To run every test binary even after a failure, so you see all the failures at once, add `TEST_ARGS=--no-fail-fast` (`make test TEST_ARGS=--no-fail-fast`, also accepted by `make test-engines` and `make test-engines-run`).
+
 ## 3. Optional checks
+- `make e2e-local`: all of the above plus a GUI smoke test on your desktop, with one report to send back to a cloud agent session ([local end-to-end check](local-e2e.md)).
 - `make verify-gpui-snapshot`: compares the GPUI crates in Cargo's cache with their upstream sources ([ADR-0013](../adr/0013-gpui-source-and-supply-chain.md)). It needs network access to GitHub and crates.io. Its output is required in a PR that bumps GPUI.
 - `make release`: the optimised `ninesql` binary.
 
