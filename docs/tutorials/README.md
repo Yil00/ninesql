@@ -22,4 +22,6 @@ Conventions used in these pages:
 - `make <target>` commands come from the root [`Makefile`](../../Makefile); `make help` lists them. Each target prints the plain command it runs, so you can also run that command directly.
 - Labels in quotes ("Test connection") are the exact texts of the interface.
 
+For an overview of each feature written for end users, with its limits, see the [user guide](../user-guide/README.md); its [known limitations](../user-guide/known-limitations.md) page lists what does not work yet.
+
 For the design behind these steps, see [docs/02](../02-architecture.md) (architecture), [docs/05](../05-security.md) (security) and [docs/08](../08-engine-capabilities.md) (per-engine capabilities).

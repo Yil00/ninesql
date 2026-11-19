@@ -12,6 +12,7 @@
 | [08-engine-capabilities.md](08-engine-capabilities.md) | The 20 engines: families, containers, read-only, capabilities |
 | [09-agent-workflow.md](09-agent-workflow.md) | How AI agents work on NineSQL, locally and in the cloud |
 | [10-supported-platforms.md](10-supported-platforms.md) | Distributions, runtime and build requirements |
-| [tutorials/](tutorials/README.md) | Step-by-step guides: build and run, dev databases, first connection, secrets, checks before a PR |
+| [user-guide/](user-guide/README.md) | User guide for end users: install, secrets, DBeaver import, connections, SQL editor, results and editing, navigator, safety model, keyboard shortcuts, troubleshooting, known limitations |
+| [tutorials/](tutorials/README.md) | Step-by-step guides: build and run, dev databases, first connection, run SQL, browse a database, edit data, export and import, import from DBeaver, secrets, checks before a PR |
 | [ROADMAP.md](ROADMAP.md) | Phases, workstreams, owners, exit criteria |
 | [adr/](adr/README.md) | Architecture decision records |
