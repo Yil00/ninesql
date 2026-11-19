@@ -39,7 +39,9 @@
 //! 250 ms, and runs on the driver runtime; a cancel seen as the gate opens still stops the
 //! statement before it is sent. A statement or a transaction command waiting at the gate is not
 //! sent when the session is closed or its tunnel lost meanwhile (`SessionClosed`), even when
-//! the close's cancel missed the statement; the session then closes in order. The gate is
+//! the close's cancel missed the statement; the session then closes in order. A close marks
+//! the session closing before it cancels the running statement, so a statement the task takes
+//! after that mark is never sent either, even through a free gate (`SessionClosed`). The gate is
 //! released once the driver accepted the statement; a load that starts while the statement's
 //! result is still open fails fast with `Busy` (see the metadata service). The keep-alive ping
 //! is skipped while a load runs.
@@ -1703,6 +1705,7 @@ async fn open_session(
             pending: std::sync::atomic::AtomicUsize::new(0),
             metadata_gate: Arc::new(tokio::sync::Semaphore::new(1)),
             driver_active: std::sync::atomic::AtomicBool::new(false),
+            closing: std::sync::atomic::AtomicBool::new(false),
         }),
     };
     lock(&shared.sessions).insert(id, handle.clone());
@@ -2079,6 +2082,12 @@ struct HandleInner {
     /// ended (a paged result paused for the grid included). Read by the metadata service once
     /// it holds the gate itself, to fail fast instead of colliding with a running result.
     driver_active: std::sync::atomic::AtomicBool,
+    /// Set by [`SessionHandle::close`] **before** it cancels the running statement and sends
+    /// the close request; never cleared. The session task checks it once it recorded a
+    /// statement as current: a statement the close's cancel missed is then not sent (review
+    /// I-4). The mutex on `current` orders the two: either the cancel sees the statement or the
+    /// task sees the flag.
+    closing: std::sync::atomic::AtomicBool,
 }
 
 /// Exclusive use of a session by one transfer ([`SessionHandle::lease`]); released on drop.
@@ -2353,7 +2362,21 @@ impl SessionHandle {
     /// Closes the session: cancels the running statement, closes the driver session (rolling
     /// back an open transaction) and then the SSH tunnel. Idempotent.
     pub fn close(&self) -> Reply<Result<(), CoreError>> {
+        self.mark_closing();
+        self.send_close()
+    }
+
+    /// The first half of [`Self::close`]: marks the session closing, then cancels the running
+    /// statement. In this order (review I-4): a statement the session task records as current
+    /// after the cancel looked sees the mark and is not sent, so it cannot slip through a free
+    /// metadata gate before the close request is in the channel.
+    fn mark_closing(&self) {
+        self.inner.closing.store(true, Ordering::SeqCst);
         self.cancel_current();
+    }
+
+    /// The second half of [`Self::close`]: hands the close request to the session task, once.
+    fn send_close(&self) -> Reply<Result<(), CoreError>> {
         let Some(close) = lock(&self.inner.close).take() else {
             return Reply::ready(Ok(()));
         };
@@ -2641,6 +2664,19 @@ impl SessionTask {
             } => {
                 *lock(&self.handle.inner.current) = Some(cancel.clone());
                 let mut out = Output::new(events, cancel.clone());
+                // A close that started before `current` was set (its cancel found nothing) is
+                // seen here, after the store (review I-4): the statement is **not sent**, even
+                // when the gate is free and the close request is not in the channel yet. The
+                // loop then takes the close request and closes in order (driver close, which
+                // rolls back, then the tunnel), once. A statement already past this check is
+                // current, so the close's cancel reaches it.
+                if self.handle.inner.closing.load(Ordering::SeqCst) {
+                    *lock(&self.handle.inner.current) = None;
+                    tracing::debug!(session = %self.id(), "statement taken while the session was closing; not sent");
+                    out.finish(ExecEvent::Failed(CoreError::SessionClosed));
+                    drop(out);
+                    return Flow::Continue;
+                }
                 let flow = self.execute(request, &mut out, &cancel, close).await;
                 self.set_driver_active(false);
                 *lock(&self.handle.inner.current) = None;
@@ -3289,6 +3325,106 @@ mod tests {
                 );
                 drop(load);
             }
+        });
+    }
+
+    /// Review I-4: `close()` marks the session closing before its cancel, so a statement the
+    /// session task takes after the cancel looked (nothing was current) and before the close
+    /// request is in the channel is not sent, even though the metadata gate is free. The window
+    /// is reproduced by running the two halves of `close()` apart. The statement ends with
+    /// `SessionClosed`, a second one queued meanwhile too, and the close then completes in
+    /// order: the driver session closed exactly once, a second close a no-op.
+    #[test]
+    fn a_statement_taken_while_closing_is_not_sent_through_a_free_gate() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut caps = ninesql_driver_api::mock::full_capabilities();
+        caps.tls = [
+            ninesql_driver_api::TlsMode::Disable,
+            ninesql_driver_api::TlsMode::Require,
+            ninesql_driver_api::TlsMode::VerifyCa,
+            ninesql_driver_api::TlsMode::VerifyFull,
+        ]
+        .into_iter()
+        .collect();
+        let counts = Arc::new(Counts::default());
+        let mut registry = DriverRegistry::new();
+        registry.register(Arc::new(CountingDriver {
+            mock: ninesql_driver_api::mock::MockDriver::new().with_capabilities(caps),
+            counts: Arc::clone(&counts),
+        }));
+        let mut stores = SecretStores::new();
+        stores.register(Arc::new(ninesql_secrets::MemoryStore::new(
+            StoreKind::Keyring,
+        )));
+        let mut config = ManagerConfig::with_known_hosts(KnownHostsFiles {
+            own: tmp.path().join("known_hosts"),
+            user: None,
+        });
+        config.workers = 2;
+        let manager = SessionManager::new(config, registry, stores).unwrap();
+        let types = ConnectionTypes::default();
+        let ui = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        ui.block_on(async {
+            let c = Connection::new(
+                "Mock",
+                EngineId::new(ninesql_driver_api::mock::MOCK_ENGINE.as_str()).unwrap(),
+                Endpoint::Tcp {
+                    host: "mock.example.test".into(),
+                    port: Some(5000),
+                    database: Some("app".into()),
+                },
+                crate::connection::Auth::None,
+                crate::connection_type::ConnectionTypeId::dev(),
+            );
+            let opened = within(manager.open(OpenRequest::new(c, &types)))
+                .await
+                .unwrap()
+                .unwrap();
+            let OpenOutcome::Opened(h) = opened else {
+                panic!("not opened: {opened:?}");
+            };
+            // The session works before the close.
+            let mut warm = h.execute(ExecuteRequest::sql("SELECT * FROM numbers(1)"));
+            while let Some(e) = within(warm.next()).await {
+                assert!(!matches!(e, ExecEvent::Failed(_)), "{e:?}");
+            }
+            assert_eq!(counts.statements.load(Ordering::SeqCst), 1);
+            let closes = counts.closes.load(Ordering::SeqCst);
+
+            // The first half of `close()`: nothing is current, so the cancel finds nothing.
+            assert!(lock(&h.inner.current).is_none());
+            h.mark_closing();
+            // The gate is free and the close request is not in the channel yet.
+            assert_eq!(h.metadata_gate().available_permits(), 1);
+            let mut first = h.execute(ExecuteRequest::sql("SELECT * FROM numbers(3)"));
+            let mut second = h.execute(ExecuteRequest::sql("SELECT * FROM numbers(4)"));
+            for exec in [&mut first, &mut second] {
+                let mut last = None;
+                while let Some(e) = within(exec.next()).await {
+                    assert!(matches!(e, ExecEvent::Failed(_)), "{e:?}");
+                    last = Some(e);
+                }
+                assert!(
+                    matches!(last, Some(ExecEvent::Failed(CoreError::SessionClosed))),
+                    "{last:?}"
+                );
+            }
+            assert_eq!(
+                counts.statements.load(Ordering::SeqCst),
+                1,
+                "a statement taken while closing reached the driver"
+            );
+            assert_eq!(counts.closes.load(Ordering::SeqCst), closes);
+
+            // The second half: the close completes in order, once.
+            within(h.send_close()).await.unwrap().unwrap();
+            within(h.closed()).await;
+            within(h.close()).await.unwrap().unwrap();
+            assert_eq!(counts.closes.load(Ordering::SeqCst), closes + 1);
+            assert_eq!(counts.statements.load(Ordering::SeqCst), 1);
         });
     }
 
