@@ -540,11 +540,9 @@ fn production_delete_is_confirmed(cx: &mut TestAppContext, engine: Engine) {
     assert!(!tab.read_with(&app.vcx, |t, _| t.is_running()));
     let said = message(&app, &tab);
     assert!(said.contains("not confirmed"), "{said}");
-    // On PostgreSQL and SQLite no transaction was opened. The MySQL family is not checked:
-    // with `autocommit = 0` the metadata reads the editor makes while typing open one there.
-    if matches!(engine, Engine::Postgresql | Engine::Sqlite) {
-        assert!(!session.transaction_state().in_transaction, "nothing ran");
-    }
+    // No transaction was opened: the metadata reads the editor makes while typing end the
+    // transaction they start with `autocommit = 0` on the MySQL family (mysqlwire).
+    assert!(!session.transaction_state().in_transaction, "nothing ran");
     assert!(update_counts(&app, &tab).is_empty(), "declined: not run");
     assert_eq!(admin.count(&table), 3, "nothing was deleted");
 

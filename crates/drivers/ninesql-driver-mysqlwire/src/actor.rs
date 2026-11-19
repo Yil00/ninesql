@@ -149,6 +149,9 @@ pub(crate) enum Command {
         /// statement when a value is longer than `n` (DDL text is never returned cut).
         value_limit: Option<u64>,
         verify: bool,
+        /// A navigator read (`MyMetadata`): it must neither leave a transaction open that the
+        /// user did not start nor end one the user started ([`Actor::end_implicit_transaction`]).
+        navigator: bool,
         guard: ExecutionGuard,
         reply: oneshot::Sender<DriverResult<Rows>>,
     },
@@ -308,12 +311,22 @@ impl Actor {
                     sql,
                     value_limit,
                     verify,
+                    navigator,
                     guard,
                     reply,
                 } => {
+                    // The server's own flag, from the last response: a transaction the user
+                    // opened (explicitly, or implicitly by a statement in manual-commit mode).
+                    let user_transaction = self.conn.status & STATUS_IN_TRANS != 0;
                     let mut result = self.internal_limited(&sql, value_limit).await;
                     if result.is_ok()
                         && let Err(e) = self.verify_session(verify).await
+                    {
+                        result = Err(e);
+                    }
+                    if navigator
+                        && !user_transaction
+                        && let Err(e) = self.end_implicit_transaction().await
                     {
                         result = Err(e);
                     }
@@ -415,6 +428,39 @@ impl Actor {
             Ok(rows) => Ok(rows.rows),
             Err(e) => Err(statement_error(&e, false)),
         }
+    }
+
+    /// Ends the transaction a navigator read started by itself. In manual-commit mode
+    /// (`autocommit = 0`) any statement that reads a transactional table, `information_schema`
+    /// included (MySQL 8 reads its data dictionary through InnoDB), implicitly starts a
+    /// transaction, which would hold a snapshot and data-dictionary metadata locks and show
+    /// as "in transaction" until the user commits. Called only when no transaction was open
+    /// before the read, so only the driver's own reads are rolled back (nothing was written:
+    /// navigator statements are reads). Explicit `AND NO CHAIN NO RELEASE`, so a session
+    /// `completion_type` neither chains a new transaction nor disconnects. A failed rollback
+    /// closes the session: the driver cannot leave a transaction the user did not start.
+    async fn end_implicit_transaction(&mut self) -> DriverResult<()> {
+        if self.shared.closed.load(Ordering::SeqCst) || self.conn.status & STATUS_IN_TRANS == 0 {
+            return Ok(());
+        }
+        let sql = "ROLLBACK AND NO CHAIN NO RELEASE";
+        let mut r = self.internal(sql).await;
+        // A late `KILL QUERY` (the navigator call was abandoned) can interrupt the rollback.
+        if matches!(&r, Err(DriverError::Query { code: Some(c), .. }) if c == "1317") {
+            r = self.internal(sql).await;
+        }
+        if r.is_ok() && self.conn.status & STATUS_IN_TRANS == 0 {
+            return Ok(());
+        }
+        if let Err(e) = &r {
+            tracing::warn!(error = ?std::mem::discriminant(e), "navigator rollback failed");
+        }
+        self.close_session("the transaction of a navigator read could not be ended");
+        Err(DriverError::Closed(
+            "the transaction started by a navigator read could not be ended; the session was \
+             closed"
+                .into(),
+        ))
     }
 
     /// Closes the session: the connection task stops after the current command.
