@@ -92,7 +92,7 @@ Select the connection in the navigator (`Ctrl+K` then `Ctrl+N` moves the focus t
 To browse the connection's schemas and tables, expand it in the navigator: see [Browse a database](browse-database.md). To run statements on the connection, open an SQL editor (`Ctrl+T`): see [Run SQL and read results](run-sql.md). On a production connection, destructive statements open the "Run on production?" confirmation first.
 
 ## 8. TimescaleDB, YugabyteDB, QuestDB and TiDB
-These engines speak the PostgreSQL protocol (TimescaleDB, YugabyteDB, QuestDB) or the MySQL protocol (TiDB) and have their own entries in "Engine". Their dev services ([Start the dev databases](dev-databases.md#4-connection-details)) need `make dev-up PROFILE=sql`; none of them has TLS in the dev environment.
+These engines speak the PostgreSQL protocol (TimescaleDB, YugabyteDB, QuestDB) or the MySQL protocol (TiDB) and have their own entries in "Engine". Their dev services ([Start the dev databases](dev-databases.md#4-connection-details)) need `make dev-up PROFILE=sql`. TimescaleDB and YugabyteDB accept TLS with a throwaway test CA (the query that reads each one's CA is its `ca_sql` entry in [`dev/engines.json`](../../dev/engines.json)); QuestDB and TiDB have no TLS.
 
 | Engine (dev) | Endpoint | User / password | TLS modes offered | Read-only |
 |---|---|---|---|---|

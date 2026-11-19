@@ -1,6 +1,6 @@
 # Engine capabilities
 
-The human-readable mirror of each driver's `Capabilities` ([ADR-0004](adr/0004-driver-api-runtime-and-results.md)). The UI only offers what a driver declares (I8). The capability model exists (P0-B). The first drivers are `ninesql-driver-pgwire` for **PostgreSQL** (P1-B, [details below](#pgwire-postgresql-p1-b)) and, since P4-C, **TimescaleDB**, **YugabyteDB** and **QuestDB** ([details below](#wire-compatible-engines-p4-c)), `ninesql-driver-mysqlwire` for **MySQL** and **MariaDB** (P1-B, [details below](#mysqlwire-mysql-and-mariadb-p1-b)) and, since P4-C, **TiDB**, and `ninesql-driver-sqlite` for **SQLite** (P1-B, [details below](#sqlite-sqlite-p1-b)); every other engine row is still the plan. A driver PR updates its row with what its integration tests prove.
+The human-readable mirror of each driver's `Capabilities` ([ADR-0004](adr/0004-driver-api-runtime-and-results.md)). The UI only offers what a driver declares (I8). The capability model exists since P0-B. The eight MVP engines are served by three drivers: `ninesql-driver-pgwire` for **PostgreSQL** (P1-B, [details below](#pgwire-postgresql-p1-b)) and, since P4-C, **TimescaleDB**, **YugabyteDB** and **QuestDB** ([details below](#wire-compatible-engines-p4-c)); `ninesql-driver-mysqlwire` for **MySQL** and **MariaDB** (P1-B, [details below](#mysqlwire-mysql-and-mariadb-p1-b)) and, since P4-C, **TiDB**; and `ninesql-driver-sqlite` for **SQLite** (P1-B, [details below](#sqlite-sqlite-p1-b)). Every other engine row is still the plan. A driver PR updates its row with what its integration tests prove. The MVP rows were checked against each driver's declared `Capabilities` in the P6-D final pass ([summary below](#mvp-engines-at-a-glance-p6-d-final-pass)).
 
 Legend: ✅ supported · ◐ partial (see note) · ❌ not supported by the engine · 🗓 planned · — not applicable.
 
@@ -17,7 +17,7 @@ Defined in `crates/ninesql-driver-api/src/capabilities.rs` (`Capabilities`, P0-B
 | `transactions` | `manual_commit`, `savepoints`, `isolation_levels` | Manual commit mode, savepoints, selectable isolation levels | Commit / rollback toolbar hidden, auto-commit forced |
 | `read_only` | `ReadOnlyMechanism` (below) | How a read-only session is enforced (I3) | `ClientSideOnly` is shown in plain words with a read-only account recommendation |
 | `cancel` | `ServerSide` / `LocalOnly` | Whether cancel reaches the server | Cancel still offered; `LocalOnly` is labelled "stop fetching" |
-| `explain` | set of `Text`, `Json`, `Analyze` | Explain formats (`Analyze` runs the statement) | "Explain" hidden |
+| `explain` | set of `Text`, `Json`, `Analyze` | Explain formats (`Analyze` runs the statement) | "Explain" hidden. *The UI has no "Explain" action yet (visual plans are F-SQL-13, phase 10): today the field is informational, and a user types `EXPLAIN` like any statement, classified as described [below](#capability-model)* |
 | `multiple_result_sets` | bool | One statement may yield several result sets | Single result tab |
 | `server_side_timeout` | bool | The engine also enforces statement timeouts | Timeout enforced by the result stream only |
 | `tls` | set of `TlsMode` | TLS modes offered (`disable`, `require`, `verify-ca`, `verify-full`); empty for file engines | TLS section disabled |
@@ -37,7 +37,7 @@ Defined in `crates/ninesql-driver-api/src/capabilities.rs` (`Capabilities`, P0-B
 |---|---|---|---|---|---|---|
 | pgwire (PostgreSQL, TimescaleDB, YugabyteDB) | `search_path`, `TimeZone`, `statement_timeout`, `lock_timeout`, `work_mem`, `client_min_messages` | `Password` (user name, password optional) | `Any`, `ScramOnly` | yes | yes (PEM chain, unencrypted PEM key) | no |
 | pgwire (QuestDB) | none (QuestDB ignores PostgreSQL session settings) | `Password` | `Any` only: QuestDB asks for a cleartext password | — (no TLS) | no | no |
-| mysqlwire | `time_zone`, `lock_wait_timeout`, `innodb_lock_wait_timeout`, `group_concat_max_len`; `max_execution_time` (MySQL, TiDB) or `max_statement_time` (MariaDB) | `Password` | `Any` only: no MySQL exchange proves that the server knows the password verifier (`caching_sha2_password` is not SCRAM) | yes (TiDB: — , no TLS declared yet) | yes (PEM chain, unencrypted PEM key) | no |
+| mysqlwire | `time_zone`, `lock_wait_timeout`, `innodb_lock_wait_timeout`, `group_concat_max_len`; `max_execution_time` (MySQL, TiDB) or `max_statement_time` (MariaDB) | `Password` | `Any` only: no MySQL exchange proves that the server knows the password verifier (`caching_sha2_password` is not SCRAM) | yes (TiDB: — , no TLS declared yet) | yes (PEM chain, unencrypted PEM key); TiDB inherits the MySQL value, but with `tls` = `disable` only a client certificate is never used | no |
 | sqlite | `busy_timeout`, `cache_size`, `foreign_keys` | `None` | `Any` | — (no TLS) | no | no |
 
 `ninesql-core` checks a saved connection against these fields in `Connection::validate_for_driver` (called by `DriverRegistry::validate_connection` and again by the connect flow): a property off the allowlist, an authentication method not listed, a password-exchange policy not listed, a TLS mode outside `Capabilities::tls` (a driver without TLS accepts only `disable` on network endpoints; a driver declaring TLS without `disable` refuses it), and, on network endpoints with TLS enabled, `verify-ca` without a CA file, a client certificate or an encrypted client key the driver does not support are refused with `ConnectionError::InvalidField`, naming the field, never the value. `Workspace::save_connections_checked` and `create_connection_checked` run these checks on every connection before saving. The password-exchange policy is the connection's `password_exchange` field (`connections.json` schema 3), passed to `ConnectParams::password_exchange`.
@@ -197,6 +197,22 @@ Declared per driver in `Capabilities::retains_secret_after_connect`. It covers *
 | duckdb | No secret (file engine) | 🗓 |
 | Other families | Declared by each driver PR | 🗓 |
 
+## MVP engines at a glance (P6-D final pass)
+Checked on 2026-11-19 against the `Capabilities` each driver declares (`capabilities()` and `questdb_capabilities()` in `crates/drivers/ninesql-driver-pgwire/src/engine.rs`, `capabilities_for()` and `tidb_capabilities()` in `crates/drivers/ninesql-driver-mysqlwire/src/lib.rs`, `capabilities_for()` in `crates/drivers/ninesql-driver-sqlite/src/lib.rs`). Values are the session values after connect; where the pre-connect value differs, it is stated. The tables below give the details.
+
+| Engine | `tls` | `read_only` | `transactions` | `editing` | `explain` | `cancel` |
+|---|---|---|---|---|---|---|
+| PostgreSQL | `disable`, `require`, `verify-ca`, `verify-full` | `SessionSetting { liftable: true }` | manual commit, savepoints; read committed, repeatable read, serializable | insert, update, delete; unique key required | text, JSON, analyze | `ServerSide` |
+| TimescaleDB | as PostgreSQL | as PostgreSQL | as PostgreSQL | as PostgreSQL | as PostgreSQL | `ServerSide` |
+| YugabyteDB | as PostgreSQL | as PostgreSQL | manual commit, savepoints; repeatable read, serializable; read committed only when the server runs it (never before connect) | as PostgreSQL | as PostgreSQL | `ServerSide` |
+| QuestDB | `disable` only | `ServerSetting { liftable: false }` | none | none | text, JSON | `ServerSide` when the server sent a backend key; `LocalOnly` otherwise and before connect |
+| MySQL | as PostgreSQL | `SessionSetting { liftable: true }` | manual commit, savepoints; read uncommitted, read committed, repeatable read, serializable | insert, update, delete; unique key required | text, JSON, analyze | `ServerSide` |
+| MariaDB | as PostgreSQL | as MySQL | as MySQL | as MySQL | text, JSON | `ServerSide` |
+| TiDB | `disable` only | `ServerSetting { liftable: true }` | manual commit, savepoints; read committed, repeatable read | as MySQL | text, JSON (`tidb_json`), analyze | `ServerSide` |
+| SQLite | none (file) | `OpenMode` | manual commit, savepoints; serializable | insert, update, delete; unique key required | text | `ServerSide` (`sqlite3_interrupt`) |
+
+Every MVP driver declares `parameters = true`, `server_side_timeout = false` and `retains_secret_after_connect = false`; `multiple_result_sets` is true for MySQL and MariaDB only. The UI uses `editing`, `transactions`, `read_only`, `cancel`, `tls`, `parameters`, `metadata` and `connect`; it has no "Explain" action yet, so `explain` is informational.
+
 ## Feature capabilities
 | Engine | Metadata tree | DDL | Edit data | Transactions | Server-side cancel | Explain | Multiple result sets |
 |---|---|---|---|---|---|---|---|
@@ -205,7 +221,7 @@ Declared per driver in `Capabilities::retains_secret_after_connect`. It covers *
 | SQLite | ✅ schemas (`main`, `temp`), tables (incl. virtual), views, columns, foreign keys, indexes, triggers | ✅ tables, views, indexes and triggers (the `CREATE` text from `sqlite_schema`) | ✅ insert / update / delete, unique key required | ✅ manual commit, savepoints, serializable only | ✅ `sqlite3_interrupt` | ✅ text (`EXPLAIN QUERY PLAN`) | ❌ |
 | TimescaleDB | ✅ as PostgreSQL; hypertables listed as tables (flavour `hypertable`), continuous aggregates as views (flavour `continuous aggregate`), chunks not listed | ✅ as PostgreSQL (a hypertable's DDL is its `CREATE TABLE`, without `create_hypertable`; a continuous aggregate's is its user view) | ✅ as PostgreSQL | ✅ as PostgreSQL | ✅ cancel request | ✅ text, JSON, analyze | ❌ |
 | YugabyteDB | ✅ as PostgreSQL (the YSQL catalog has every query P4-A uses) | ✅ as PostgreSQL | ✅ as PostgreSQL | ✅ manual commit, savepoints, repeatable read, serializable; read committed when the server runs it (`yb_effective_transaction_isolation_level`, read at connect) | ✅ cancel request | ✅ text, JSON, analyze | ❌ |
-| QuestDB | ✅ tables, views, materialized views (no schemas), columns, time partitions | ✅ `SHOW CREATE TABLE \| VIEW \| MATERIALIZED VIEW` | ❌ (no unique keys, no `DELETE`) | ❌ (`BEGIN`, `COMMIT`, `ROLLBACK`, `SAVEPOINT` refused with `Unsupported`) | ✅ cancel request | ✅ text, JSON | ❌ |
+| QuestDB | ✅ tables, views, materialized views (no schemas), columns, time partitions | ✅ `SHOW CREATE TABLE \| VIEW \| MATERIALIZED VIEW` | ❌ (no unique keys, no `DELETE`) | ❌ (`BEGIN`, `COMMIT`, `ROLLBACK`, `SAVEPOINT` refused with `Unsupported`) | ◐ cancel request when the server sent a backend key at connect (`ServerSide`); otherwise, and before connect, `LocalOnly` ("Stop fetching") | ✅ text, JSON | ❌ |
 | TiDB | ✅ schemas, tables, views, sequences, columns, constraints, foreign keys, indexes, partitions (no triggers, routines or events in TiDB) | ✅ `SHOW CREATE`: schemas, tables, views, sequences | ✅ insert / update / delete, unique key required | ✅ manual commit, savepoints, read committed / repeatable read | ✅ `KILL QUERY` (control connection) | ✅ text, JSON (`FORMAT = 'tidb_json'`), analyze | ❌ (no stored procedures) |
 | DuckDB | 🗓 | 🗓 | 🗓 | 🗓 | 🗓 interrupt | 🗓 | ❌ |
 | ClickHouse | 🗓 | 🗓 `SHOW CREATE` | ◐ (mutations) | ❌ | 🗓 `KILL QUERY` | 🗓 | ❌ |
