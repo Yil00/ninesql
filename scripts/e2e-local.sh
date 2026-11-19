@@ -87,15 +87,17 @@ Options:
   --timeout SECS       Time limit of each long cargo command (default 2700)
   --dev-timeout SECS   Time limit of image pulls and engine readiness (default 900)
   --gui-wait SECS      How long the window stays open in gui-smoke (default 15)
-  --screenshot         Take a screenshot in gui-smoke (off by default): the NineSQL window on
-                       X11 / XWayland (xdotool or wmctrl, and ImageMagick import); otherwise,
-                       with a warning, the whole screen
+  --screenshot         Take a screenshot in gui-smoke (off by default): the window of the
+                       launched process only, found by its pid on X11 / XWayland (xdotool or
+                       wmctrl, and ImageMagick import); when no single window matches, none is
+                       taken (never the whole screen) and the summary says why
   --no-screenshot      Accepted for compatibility; no screenshot is the default
   --no-secret-scan     Write the archive without a gitleaks scan (by default the archive is
                        written only when gitleaks scanned the report clean)
   --keep-temp          Keep gui-smoke's temporary HOME and XDG directories
-  --check-report DIR   Run no stage: scrub and secret-check an existing report directory under
-                       target/e2e-reports/ (or any directory you own), then archive it
+  --check-report DIR   Run no stage: scrub and secret-check an existing report directory (one
+                       you own, with the summary.md this script writes), then archive it;
+                       symbolic links and other non-regular files are skipped
   -h, --help           Show this help
 
 Environment: CARGO_TARGET_DIR is respected; E2E_COMPOSE_PROJECT names the compose project of
@@ -172,9 +174,26 @@ STARTED_EPOCH="$(date -u +%s)"
 STARTED_UTC="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 STAMP="$(date -u +%Y%m%dT%H%M%SZ)"
 GIT_SHA="$(git rev-parse --short=12 HEAD 2>/dev/null || echo unknown)"
+REPORT_TITLE="# NineSQL local end-to-end report"
 if [ -n "$CHECK_REPORT" ]; then
+    CHECK_REPORT="${CHECK_REPORT%/}"
     [ -d "$CHECK_REPORT" ] && [ -O "$CHECK_REPORT" ] && [ ! -L "$CHECK_REPORT" ] ||
         die "--check-report: not a directory you own: $CHECK_REPORT"
+    # Only a report this script wrote: a summary.md (a regular file, not a symbolic link) whose
+    # first line is the report title. Any other directory you own (as root, /etc) is refused.
+    [ -f "$CHECK_REPORT/summary.md" ] && [ ! -L "$CHECK_REPORT/summary.md" ] &&
+        [ "$(head -n 1 "$CHECK_REPORT/summary.md" 2>/dev/null)" = "$REPORT_TITLE" ] ||
+        die "--check-report: not a report directory (no summary.md starting with \"$REPORT_TITLE\"): $CHECK_REPORT"
+    # The files this script writes into the report must be regular files or absent, never a
+    # symbolic link or anything else (a planted link would redirect the write).
+    for f in credential-uris.txt gitleaks.log report.tar.gz; do
+        if [ -L "$CHECK_REPORT/$f" ] || { [ -e "$CHECK_REPORT/$f" ] && [ ! -f "$CHECK_REPORT/$f" ]; }; then
+            die "--check-report: $f is not a regular file: $CHECK_REPORT/$f"
+        fi
+    done
+    if [ -L "$CHECK_REPORT/.notes" ] || { [ -e "$CHECK_REPORT/.notes" ] && [ ! -d "$CHECK_REPORT/.notes" ]; }; then
+        die "--check-report: .notes is not a directory: $CHECK_REPORT/.notes"
+    fi
     REPORT="$(cd "$CHECK_REPORT" && pwd -P)"
 else
     REPORT="$ROOT/target/e2e-reports/$STAMP-$GIT_SHA"
@@ -415,11 +434,9 @@ stage_env() {
     fi
     if [ "$SCREENSHOT" = 1 ]; then
         if [ -n "${DISPLAY:-}" ] && have import && { have xdotool || have wmctrl; }; then
-            kv "Screenshot" "requested (--screenshot): the NineSQL window (xdotool / wmctrl and import)"
-        elif have grim || have import || have gnome-screenshot || have spectacle || have scrot; then
-            warn "--screenshot: no window-only capture here (needs DISPLAY, ImageMagick import and xdotool or wmctrl): the screenshot will show the whole screen"
+            kv "Screenshot" "requested (--screenshot): the window of the launched process only (found by pid with xdotool / wmctrl, captured with import)"
         else
-            kv "Screenshot" "requested, but no tool found (xdotool / wmctrl with ImageMagick import, grim, spectacle, gnome-screenshot, scrot)"
+            warn "--screenshot: no window capture here (needs DISPLAY, ImageMagick import and xdotool or wmctrl): no screenshot will be taken, and no whole-screen capture instead"
         fi
     else
         kv "Screenshot" "not requested (--screenshot to take one)"
@@ -661,48 +678,53 @@ stage_engines() {
 
 APP_ID="io.github.yil00.NineSQL"
 
-# find_window: the X11 id of the NineSQL window (WM_CLASS), or nothing.
-find_window() {
-    local id=""
+# find_windows <pid>: the X11 ids of the visible windows of process <pid> (their _NET_WM_PID),
+# one per line, or nothing. The search is by pid, never by window class, so another NineSQL
+# window on the desktop (the maintainer's own) can never be picked.
+find_windows() {
+    local pid=$1 ids=""
     if have xdotool; then
-        id="$(timeout 5 xdotool search --onlyvisible --classname "$APP_ID" 2>/dev/null | head -n 1 || true)"
-        [ -n "$id" ] || id="$(timeout 5 xdotool search --onlyvisible --class "$APP_ID" 2>/dev/null | head -n 1 || true)"
+        ids="$(timeout 5 xdotool search --onlyvisible --pid "$pid" 2>/dev/null || true)"
     fi
-    if [ -z "$id" ] && have wmctrl; then
-        id="$(timeout 5 wmctrl -lx 2>/dev/null | awk -v c="$APP_ID" 'index($3, c) { print $1; exit }' || true)"
+    if [ -z "$ids" ] && have wmctrl; then
+        ids="$(timeout 5 wmctrl -lp 2>/dev/null | awk -v p="$pid" '$3 == p { print $1 }' || true)"
     fi
-    case "$id" in ''|*[!0-9a-fA-Fx]*) return 1 ;; esac
-    printf '%s\n' "$id"
+    grep -E '^(0x[0-9a-fA-F]+|[0-9]+)$' <<<"$ids" | sort -u || true
 }
 
-# screenshot_window <file>: the NineSQL window only (X11, or XWayland), raised first so no
-# other window covers it. Nothing is clicked or typed.
+# screenshot_window <file> <pid>: the window of the launched process only (X11, or XWayland),
+# raised first so no other window covers it. Nothing is clicked or typed. There is no
+# whole-screen fallback: when no single window of <pid> can be captured, nothing is taken and
+# SHOT_WHY says why.
+SHOT_WHY=""
 screenshot_window() {
-    local out=$1 id
-    if [ -z "${DISPLAY:-}" ] || ! have import; then return 1; fi
-    id="$(find_window)" || return 1
+    local out=$1 pid=$2 ids n id
+    if [ -z "${DISPLAY:-}" ]; then
+        SHOT_WHY="no X11 display (DISPLAY unset); a Wayland-native window cannot be captured alone"
+        return 1
+    fi
+    if ! have import; then SHOT_WHY="ImageMagick import is not installed"; return 1; fi
+    if ! have xdotool && ! have wmctrl; then SHOT_WHY="neither xdotool nor wmctrl is installed"; return 1; fi
+    ids="$(find_windows "$pid")"
+    n="$(grep -c . <<<"$ids" || true)"
+    if [ "$n" = 0 ]; then
+        SHOT_WHY="no visible X11 window of the launched process was found (searched by its pid, _NET_WM_PID; a Wayland-native window has none)"
+        return 1
+    fi
+    if [ "$n" != 1 ]; then
+        SHOT_WHY="$n visible windows belong to the launched process; none was picked"
+        return 1
+    fi
+    id="$ids"
     if have xdotool; then
         timeout 5 xdotool windowactivate --sync "$id" >/dev/null 2>&1 || true
-    elif have wmctrl; then
+    else
         timeout 5 wmctrl -i -a "$id" >/dev/null 2>&1 || true
     fi
     sleep 1
-    timeout 15 import -window "$id" "$out" 2>/dev/null && [ -s "$out" ]
-}
-
-# screenshot_screen <file>: the whole screen, when no window-only capture works.
-screenshot_screen() {
-    local out=$1
-    if [ "${XDG_SESSION_TYPE:-}" = wayland ] || [ -n "${WAYLAND_DISPLAY:-}" ]; then
-        have grim && timeout 15 grim "$out" 2>/dev/null && return 0
-        have spectacle && timeout 15 spectacle -b -n -f -o "$out" 2>/dev/null && [ -s "$out" ] && return 0
-        have gnome-screenshot && timeout 15 gnome-screenshot -f "$out" 2>/dev/null && [ -s "$out" ] && return 0
-    fi
-    if [ -n "${DISPLAY:-}" ]; then
-        have import && timeout 15 import -window root "$out" 2>/dev/null && return 0
-        have gnome-screenshot && timeout 15 gnome-screenshot -f "$out" 2>/dev/null && [ -s "$out" ] && return 0
-        have scrot && timeout 15 scrot -o "$out" 2>/dev/null && return 0
-    fi
+    if ! kill -0 "$pid" 2>/dev/null; then SHOT_WHY="the process exited before the capture"; return 1; fi
+    if timeout 15 import -window "$id" "$out" 2>/dev/null && [ -s "$out" ]; then return 0; fi
+    SHOT_WHY="ImageMagick import could not capture the window"
     return 1
 }
 
@@ -746,7 +768,7 @@ stage_gui_smoke() {
         say "    [dry-run] mkdir temp HOME / XDG_CONFIG_HOME / XDG_DATA_HOME / XDG_STATE_HOME / XDG_CACHE_HOME (0700)"
         say "    [dry-run] HOME=<temp> RUST_LOG=ninesql=debug,info $bin &   (alive check after ${GUI_WAIT} s)"
         if [ "$SCREENSHOT" = 1 ]; then
-            say "    [dry-run] screenshot of the NineSQL window (xdotool / wmctrl, import -window <id>); whole screen only as a fallback, with a warning"
+            say "    [dry-run] screenshot of the launched process's window, found by pid (xdotool search --pid / wmctrl -lp, import -window <id>); none when no single window matches, never the whole screen"
         else
             say "    [dry-run] no screenshot (--screenshot to take one)"
         fi
@@ -773,26 +795,20 @@ stage_gui_smoke() {
     if kill -0 "$pid" 2>/dev/null; then
         echo "alive after ${GUI_WAIT} s" >>"$log"
         if [ -n "${DISPLAY:-}" ] && have wmctrl; then
-            if wmctrl -lx 2>/dev/null | grep -q 'io.github.yil00.NineSQL'; then
-                note gui-smoke "A window with WM_CLASS io.github.yil00.NineSQL was found (wmctrl)."
+            if timeout 5 wmctrl -lpx 2>/dev/null | awk -v p="$pid" -v c="$APP_ID" '$3 == p && index($4, c) { f = 1 } END { exit !f }'; then
+                note gui-smoke "A window of the launched process with WM_CLASS $APP_ID was found (wmctrl)."
             else
-                note gui-smoke "No window with WM_CLASS io.github.yil00.NineSQL was listed by wmctrl (informational; normal on a Wayland-native window)."
+                note gui-smoke "No window of the launched process with WM_CLASS $APP_ID was listed by wmctrl (informational; normal on a Wayland-native window)."
             fi
         fi
         if [ "$SCREENSHOT" = 1 ]; then
             shot="$REPORT/gui-smoke-window.png"
-            if screenshot_window "$shot"; then
-                note gui-smoke "Screenshot (--screenshot): \`gui-smoke-window.png\`, the NineSQL window only (check it before sending)."
+            if screenshot_window "$shot" "$pid"; then
+                note gui-smoke "Screenshot (--screenshot): \`gui-smoke-window.png\`, the window of the launched process only (check it before sending)."
             else
                 rm -f "$shot"
-                shot="$REPORT/gui-smoke-screen.png"
-                say "    gui-smoke: WARNING: the NineSQL window could not be captured alone; taking a screenshot of the WHOLE screen"
-                if screenshot_screen "$shot"; then
-                    note gui-smoke "**Warning**: screenshot (--screenshot): \`gui-smoke-screen.png\` shows the **whole screen** (no window-only capture worked here: it needs X11 or XWayland, ImageMagick import and xdotool or wmctrl). Check it before sending."
-                else
-                    rm -f "$shot"
-                    note gui-smoke "Screenshot (--screenshot): not taken (no working tool for this session)."
-                fi
+                say "    gui-smoke: screenshot not taken: $SHOT_WHY"
+                note gui-smoke "Screenshot (--screenshot): not taken: $SHOT_WHY. No whole-screen capture is ever taken instead."
             fi
         else
             note gui-smoke "No screenshot (pass --screenshot to take one)."
@@ -929,6 +945,44 @@ trap - INT
 # Scrub, summary, secret scan, archive
 # ---------------------------------------------------------------------------------------------
 
+# Python helpers shared by the scrubber and the secret checks (prepended to their scripts).
+# report_files: the text files of the report, regular files only: a symbolic link (to a file
+# or a directory) or any other non-regular entry is never read nor written, and os.walk does
+# not descend into linked directories. replace_text: writes a new 0600 file next to the old
+# one and renames it over, so a hard link is broken, never written through.
+PY_REPORT_FILES='
+import os, stat, tempfile
+def report_files(report):
+    for dirpath, dirnames, files in os.walk(report):
+        dirnames.sort()
+        for f in sorted(files):
+            if f.endswith((".png", ".gz")):
+                continue
+            p = os.path.join(dirpath, f)
+            try:
+                st = os.lstat(p)
+            except OSError:
+                continue
+            if stat.S_ISREG(st.st_mode):
+                yield p
+def read_text(p, errors="surrogateescape"):
+    fd = os.open(p, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    if not stat.S_ISREG(os.fstat(fd).st_mode):
+        os.close(fd)
+        raise OSError("not a regular file")
+    with os.fdopen(fd, encoding="utf-8", errors=errors) as fh:
+        return fh.read()
+def replace_text(p, text):
+    fd, tmp = tempfile.mkstemp(dir=os.path.dirname(p), prefix=".scrub-")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8", errors="surrogateescape") as fh:
+            fh.write(text)
+        os.replace(tmp, p)
+    except BaseException:
+        os.unlink(tmp)
+        raise
+'
+
 # Replaces the repository path with <repo>, $HOME with ~, the user name with <user>, the host
 # name with <host>, IPv4 addresses (127.x and 0.x kept) and IPv6 global, unique local and
 # link-local addresses with <ip>, and MAC addresses with <mac>, in every text file of the
@@ -938,7 +992,7 @@ scrub() {
     user="$(id -un 2>/dev/null || echo "")"
     host="$(hostname 2>/dev/null || cat /proc/sys/kernel/hostname 2>/dev/null || echo "")"
     fqdn="$(hostname -f 2>/dev/null || echo "")"
-    python3 -I - "$REPORT" "$ROOT" "${HOME:-}" "$user" "$host" "$fqdn" <<'EOF'
+    { printf '%s\n' "$PY_REPORT_FILES"; cat; } <<'EOF' | python3 -I - "$REPORT" "$ROOT" "${HOME:-}" "$user" "$host" "$fqdn"
 import os, re, sys
 report, repo, home, user, host, fqdn = sys.argv[1:7]
 # Names that identify nobody; replacing them would garble the logs (root:root, mysql root…).
@@ -953,10 +1007,13 @@ for name, token in ((fqdn, "<host>"), (host, "<host>"), (user, "<user>")):
 import ipaddress
 octet = r"(?:25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)"
 ipv4 = re.compile(r"(?<![\w.])" + octet + r"(?:\." + octet + r"){3}(?!\w|\.\d)")
-version_label = re.compile(r"(?i)(?:version|\bver)\W{0,3}$")
+# Only the vulkaninfo fields the env stage keeps, exactly as it writes them ("apiVersion = ");
+# any other four-part number, "version: 10.1.2.3" included, becomes <ip>. A dotted number
+# with a component above 255 never matches ipv4, so it stays as it is.
+version_label = re.compile(r"\b(?:conformanceVersion|apiVersion|driverVersion) = $")
 def sub_ipv4(m):
     first = m.group(0).split(".")[0]
-    # Loopback and 0.x stay readable; so does a four-part version ("conformanceVersion = 1.4.0.0").
+    # Loopback and 0.x stay readable; so does a vulkaninfo version ("conformanceVersion = 1.4.0.0").
     if first in ("127", "0") or version_label.search(m.string, max(0, m.start() - 24), m.start()):
         return m.group(0)
     return "<ip>"
@@ -973,23 +1030,19 @@ def sub_ipv6(m):
         return text
     return "<ip>" if any(ip in n for n in nets) else text
 mac = re.compile(r"(?<![\w:-])[0-9A-Fa-f]{2}([:-])[0-9A-Fa-f]{2}(?:\1[0-9A-Fa-f]{2}){4}(?![\w:-])")
-for dirpath, _, files in os.walk(report):
-    for f in files:
-        p = os.path.join(dirpath, f)
-        if f.endswith((".png", ".gz")):
-            continue
-        try:
-            data = open(p, encoding="utf-8", errors="surrogateescape").read()
-        except OSError:
-            continue
-        new = data
-        for rx, token in pairs:
-            new = rx.sub(token, new)
-        new = mac.sub("<mac>", new)
-        new = ipv6.sub(sub_ipv6, new)
-        new = ipv4.sub(sub_ipv4, new)
-        if new != data:
-            open(p, "w", encoding="utf-8", errors="surrogateescape").write(new)
+for p in report_files(report):
+    try:
+        data = read_text(p)
+    except OSError:
+        continue
+    new = data
+    for rx, token in pairs:
+        new = rx.sub(token, new)
+    new = mac.sub("<mac>", new)
+    new = ipv6.sub(sub_ipv6, new)
+    new = ipv4.sub(sub_ipv4, new)
+    if new != data:
+        replace_text(p, new)
 EOF
 }
 
@@ -997,7 +1050,7 @@ EOF
 # fields and the "password: <value>" of its notes) with <dev-password> in the report's text
 # files; prints the number of files changed.
 redact_dev_passwords() {
-    python3 -I - "$REPORT" "$ROOT/dev/engines.json" <<'EOF'
+    { printf '%s\n' "$PY_REPORT_FILES"; cat; } <<'EOF' | python3 -I - "$REPORT" "$ROOT/dev/engines.json"
 import json, os, re, sys
 report, engines = sys.argv[1:3]
 found = set()
@@ -1019,35 +1072,30 @@ if not words:
     sys.exit("no password found in dev/engines.json")
 rx = re.compile("|".join(re.escape(w) for w in words))
 changed = 0
-for dirpath, _, files in os.walk(report):
-    for f in files:
-        if f.endswith((".png", ".gz")):
-            continue
-        p = os.path.join(dirpath, f)
-        data = open(p, encoding="utf-8", errors="surrogateescape").read()
-        new = rx.sub("<dev-password>", data)
-        if new != data:
-            open(p, "w", encoding="utf-8", errors="surrogateescape").write(new)
-            changed += 1
+for p in report_files(report):
+    data = read_text(p)
+    new = rx.sub("<dev-password>", data)
+    if new != data:
+        replace_text(p, new)
+        changed += 1
 print(changed)
 EOF
 }
 
 # credential_uris: prints "<file>:<line>" (never the match) for every URI with a user and a
-# password left in the report's text files; redacted dev passwords do not count.
+# password left in the report's text files; redacted dev passwords do not count. The scheme is
+# matched in any case (HTTP://), the user may be empty (redis://:password@host), and the
+# password runs to the next "@" on the same line, spaces included, but not across another
+# "://" (so "http://host:80/ then pg://…" is not read as one password).
 credential_uris() {
-    python3 -I - "$REPORT" <<'EOF'
+    { printf '%s\n' "$PY_REPORT_FILES"; cat; } <<'EOF' | python3 -I - "$REPORT"
 import os, re, sys
 report = sys.argv[1]
-rx = re.compile(r"[a-z][a-z0-9+.-]*://[^/:@\s]+:([^@\s]+)@")
-for dirpath, _, files in sorted(os.walk(report)):
-    for f in sorted(files):
-        if f.endswith((".png", ".gz")):
-            continue
-        p = os.path.join(dirpath, f)
-        for n, line in enumerate(open(p, encoding="utf-8", errors="replace"), 1):
-            if any(m.group(1) != "<dev-password>" for m in rx.finditer(line)):
-                print(f"{os.path.relpath(p, report)}:{n}")
+rx = re.compile(r"(?i)[a-z][a-z0-9+.-]*://[^/:@\s]*:((?:(?!://)[^@\r\n])+)@")
+for p in report_files(report):
+    for n, line in enumerate(read_text(p, errors="replace").split("\n"), 1):
+        if any(m.group(1) != "<dev-password>" for m in rx.finditer(line)):
+            print(f"{os.path.relpath(p, report)}:{n}")
 EOF
 }
 
@@ -1072,7 +1120,7 @@ write_summary() {
         case "${RESULT[$stage]}" in FAIL|INTERRUPTED) nfail=$((nfail + 1)) ;; esac
     done
     {
-        echo "# NineSQL local end-to-end report"
+        echo "$REPORT_TITLE"
         echo
         echo "- Result: **$([ "$nfail" = 0 ] && echo PASS || echo "FAIL ($nfail stage(s))")**$([ "$DRY_RUN" = 1 ] && echo " (dry run: nothing was executed)")"
         echo "- Commit: \`$(git rev-parse HEAD 2>/dev/null || echo unknown)\` on \`$branch\`, working tree $dirty"
@@ -1223,15 +1271,22 @@ fi
 } >>"$SUMMARY"
 
 if [ "$archive_ok" = 1 ]; then
-    tmp_archive="$(dirname "$REPORT")/.$(basename "$REPORT").tar.gz.tmp"
-    tar -czf "$tmp_archive" -C "$(dirname "$REPORT")" "$(basename "$REPORT")"
-    mv "$tmp_archive" "$ARCHIVE"
+    # A new file (mktemp, O_EXCL) next to the report, so a planted name cannot redirect tar.
+    tmp_archive="$(mktemp "$(dirname "$REPORT")/.$(basename "$REPORT").tar.gz.XXXXXX")"
+    tar -czf "$tmp_archive" --exclude="$(basename "$REPORT")/report.tar.gz" \
+        -C "$(dirname "$REPORT")" "$(basename "$REPORT")"
+    mv -fT "$tmp_archive" "$ARCHIVE"
 fi
 
 say ""
 say "Summary: $SUMMARY"
 [ "$archive_ok" = 1 ] && say "Archive: $ARCHIVE"
 [ -f "$REPORT/gui-smoke-window.png" ] && say "Note: the report holds a screenshot of the NineSQL window (gui-smoke-window.png); check it before sending."
-[ -f "$REPORT/gui-smoke-screen.png" ] && say "Note: the report holds a screenshot of your WHOLE screen (gui-smoke-screen.png); check it, or rerun without --screenshot."
-say "Next: send summary.md (or the archive) back to the session."
+# Only in a report written by an older version of this script, which could fall back to it.
+[ -f "$REPORT/gui-smoke-screen.png" ] && say "Note: the report holds a screenshot of your WHOLE screen (gui-smoke-screen.png); check it, or delete it."
+if [ "$archive_ok" = 1 ]; then
+    say "Next: send summary.md (or the archive) back to the session."
+else
+    say "Do not send anything before fixing the lines listed above."
+fi
 [ "$failures" = 0 ]
