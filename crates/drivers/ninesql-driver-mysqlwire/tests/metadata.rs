@@ -1224,6 +1224,114 @@ async fn navigator_reads_never_reapply_stale_one_shot_settings() {
     }
 }
 
+/// Security review L-A: with one-shot characteristics pending, the switch to auto-commit (the
+/// driver's own `SET SESSION autocommit = 1` or a user's assignment) commits, and MariaDB's
+/// `SET STATEMENT … FOR <write>` runs the write in a transaction of its own (auto-commit mode),
+/// which consumes them. The tracker kept them, so a navigator read re-issued stale settings
+/// (here a weaker isolation level); navigator reads are now refused until `COMMIT` /
+/// `ROLLBACK`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn autocommit_switches_and_set_statement_make_one_shot_settings_unknown() {
+    let _serial = SERIAL.lock().await;
+    for dev in devs() {
+        let e = &dev.engine;
+        let mut admin = txn_fixture(&dev).await;
+        let insert = "INSERT INTO ninesql_meta_txn VALUES (2, 20)";
+        let mut s = connect(&dev, false).await;
+
+        // The driver's switch to auto-commit, and a user's assignment (any scope or quoting).
+        for user_form in [
+            None,
+            Some("SET autocommit = 1"),
+            Some("SET @@session.`AutoCommit` = ON"),
+        ] {
+            s.set_auto_commit(false).await.unwrap();
+            exec(s.as_mut(), "SET TRANSACTION READ ONLY").await.unwrap();
+            match user_form {
+                None => s.set_auto_commit(true).await.unwrap(),
+                Some(sql) => exec(s.as_mut(), sql).await.unwrap(),
+            }
+            assert!(
+                navigator_refused(s.as_ref(), &dev).await,
+                "{e} {user_form:?}: navigator read not refused after the switch to auto-commit"
+            );
+            assert!(!s.in_transaction(), "{e}");
+            // As checked on MySQL 8.4 and MariaDB 11.8, the server kept the one-shot READ ONLY
+            // through the switch (no transaction was open): the driver does not rely on it,
+            // but it did not drop it either.
+            s.begin().await.unwrap();
+            assert!(
+                matches!(
+                    exec(s.as_mut(), insert).await,
+                    Err(DriverError::ReadOnly(_))
+                ),
+                "{e} {user_form:?}: the server dropped the one-shot READ ONLY"
+            );
+            s.rollback().await.unwrap();
+            browse_txn_table(s.as_ref(), &dev, false, "after the autocommit switch").await;
+        }
+
+        // MariaDB `SET STATEMENT … FOR <write>` in auto-commit mode: the write is a transaction
+        // of its own and consumes the pending READ UNCOMMITTED; a re-issue would let the next
+        // transaction read the admin's uncommitted change. On MySQL the statement is a syntax
+        // error: a failed access-mode statement makes the state unknown all the same.
+        s.set_auto_commit(true).await.unwrap();
+        exec(
+            s.as_mut(),
+            "SET SESSION transaction_isolation = 'REPEATABLE-READ'",
+        )
+        .await
+        .unwrap();
+        exec(
+            s.as_mut(),
+            "SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED",
+        )
+        .await
+        .unwrap();
+        let set_statement = exec(
+            s.as_mut(),
+            "SET STATEMENT max_statement_time = 10 FOR \
+             DELETE FROM ninesql_meta_txn WHERE id = 99",
+        )
+        .await;
+        let mariadb = *e == EngineId::MARIADB;
+        assert_eq!(set_statement.is_ok(), mariadb, "{e}: {set_statement:?}");
+        assert!(
+            navigator_refused(s.as_ref(), &dev).await,
+            "{e}: navigator read not refused after SET STATEMENT"
+        );
+        assert!(!s.in_transaction(), "{e}");
+        if mariadb {
+            admin.set_auto_commit(false).await.unwrap();
+            exec(
+                admin.as_mut(),
+                "UPDATE ninesql_meta_txn SET v = 99 WHERE id = 1",
+            )
+            .await
+            .unwrap();
+            s.begin().await.unwrap();
+            assert_eq!(
+                scalar(
+                    s.as_mut(),
+                    "SELECT CAST(v AS CHAR) FROM ninesql_meta_txn WHERE id = 1"
+                )
+                .await
+                .as_deref(),
+                Some("10"),
+                "{e}: SET STATEMENT did not consume the one-shot READ UNCOMMITTED"
+            );
+            admin.rollback().await.unwrap();
+            admin.set_auto_commit(true).await.unwrap();
+        }
+        s.rollback().await.unwrap();
+        browse_txn_table(s.as_ref(), &dev, false, "after SET STATEMENT").await;
+        s.close().await.unwrap();
+
+        exec_all(admin.as_mut(), e, &["DROP TABLE ninesql_meta_txn"]).await;
+        admin.close().await.unwrap();
+    }
+}
+
 /// Security re-review L2-b / L2-c: an error packet carries no status flags. A failed navigator
 /// read leaves no transaction (the rollback is sent whatever the stale flag says), and a user
 /// statement that fails but leaves work in the transaction (a procedure that inserts and then

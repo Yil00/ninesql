@@ -16,7 +16,13 @@
 //! user's settings lost).
 //!
 //! Engine behaviour this follows (checked on MySQL 8.4 and MariaDB 11.8): the pending
-//! characteristics survive `SET autocommit`, `SET @user_var`, `USE` and table-less `SELECT`s;
+//! characteristics survive `SET @user_var`, `USE`, table-less `SELECT`s and the switch of
+//! `autocommit` to 0 (the only `autocommit` change the tracker trusts: the driver's own `SET
+//! SESSION autocommit = 0`); the switch to 1 commits, and although both servers were seen to
+//! keep them through it when no transaction is open, an implicit commit resets them, so the
+//! tracker does not rely on it (below); `SET PASSWORD` (an implicit commit) and MariaDB `SET
+//! STATEMENT … FOR <statement>` (which runs that statement, in a transaction of its own in
+//! auto-commit mode) consume them;
 //! `COMMIT`, `ROLLBACK` (even with no transaction), `START TRANSACTION` and any statement that
 //! starts a transaction consume them; `SET SESSION TRANSACTION <x>` replaces only the pending
 //! characteristic `x`; two `SET TRANSACTION` statements accumulate; an assignment to
@@ -31,16 +37,26 @@
 //! ([`tx_var_assignment`]); any `Unknown` statement, succeeded or failed (`CALL`, `LOCK
 //! TABLES`, `ANALYZE` / `OPTIMIZE` / `CHECK TABLE`, `FLUSH`, `CACHE INDEX`, `LOAD INDEX`…,
 //! which commit implicitly or may start and end transactions), those words whatever the
-//! classifier says, a session statement with a `SELECT`, and a read or write that failed
-//! (it may have started its transaction first). With nothing pending, only a form that may
-//! leave characteristics pending makes it unknown (a scope-less `@@transaction_isolation`
-//! assignment, any assignment without its own `SESSION` / `LOCAL`); a plain read of such a
-//! variable (`SET @a = @@tx_isolation`) does not.
+//! classifier says, a session statement with a `SELECT`, a read or write that failed (it may
+//! have started its transaction first), any `ChangesAccessMode` statement that is not a parsed
+//! `SET TRANSACTION` (`SET STATEMENT … FOR`, `SET PASSWORD`…), succeeded or failed, any
+//! assignment to `autocommit` in any scope, case or quoting ([`assigns_autocommit`]),
+//! succeeded or failed, and the driver's own `SET SESSION autocommit = 1` (security review
+//! L-A). With nothing pending, only a form that may leave characteristics pending makes it
+//! unknown (a scope-less `@@transaction_isolation` assignment, any assignment without its own
+//! `SESSION` / `LOCAL`); a plain read of such a variable (`SET @a = @@tx_isolation`) does not.
 //!
-//! Residuals: a stored routine or prepared statement that runs `SET TRANSACTION` or assigns a
-//! transaction variable is not seen when nothing is pending (the `CALL` / `EXECUTE` text does
-//! not say so), and in auto-commit mode a table-less user `SELECT` is taken as consuming the
-//! pending characteristics (a later navigator read may then consume them).
+//! Residuals: a compound or indirect statement that runs `SET TRANSACTION` or assigns a
+//! transaction variable (MariaDB `BEGIN NOT ATOMIC … END`, `EXECUTE IMMEDIATE`, `EXECUTE` of a
+//! prepared statement, a stored routine through `CALL` or a function call) is not seen when
+//! nothing is pending: its text does not say so. The setting it left may then be consumed by
+//! a navigator read, so it is lost (the user's next transaction runs with the session's
+//! characteristics), never replaced by a stale re-issue. With characteristics pending, a
+//! `CALL` and those `Unknown` statements make the state unknown, but a stored function called
+//! from a statement classified as a read (`SELECT f()`, no table, manual-commit mode) is not
+//! seen even then (the classifier is lexical). In auto-commit mode a table-less user
+//! `SELECT` is taken as consuming the pending characteristics (a later navigator read may then
+//! consume them).
 
 use ninesql_driver_api::{CodeToken, CodeTokenKind, LexicalRules, StatementClass, code_tokens};
 
@@ -214,6 +230,18 @@ pub(crate) enum TxVarAssignment {
 /// variable of the same name (`SET @tx_isolation = 1`). A segment of the list with no `=` /
 /// `:=` is a target as a whole (fails closed).
 pub(crate) fn tx_var_assignment(text: &str) -> Option<TxVarAssignment> {
+    var_assignment(text, &TX_VARIABLES)
+}
+
+/// Scans a `SET` statement for an assignment to `autocommit`, in any scope, case or quoting
+/// (the same scan as [`tx_var_assignment`]).
+pub(crate) fn assigns_autocommit(text: &str) -> bool {
+    var_assignment(text, &["autocommit"]).is_some()
+}
+
+/// The scan behind [`tx_var_assignment`] and [`assigns_autocommit`], for the system variables
+/// `names` (lower case).
+fn var_assignment(text: &str, names: &[&str]) -> Option<TxVarAssignment> {
     let toks = code_tokens(text, LexicalRules::MYSQL);
     if !toks.first().is_some_and(|t| t.is_word(text, "SET")) {
         return None;
@@ -267,7 +295,7 @@ pub(crate) fn tx_var_assignment(text: &str) -> Option<TxVarAssignment> {
             match as_name(t.text(text)).as_str() {
                 "session" | "local" => session = true,
                 "global" | "persist" | "persist_only" | "statement" => other_scope = true,
-                n if TX_VARIABLES.contains(&n) => {
+                n if names.contains(&n) => {
                     // `@name` (a single `@`) is a user variable.
                     let user_variable = i >= 1 && at(i - 1) && !(i >= 2 && at(i - 2));
                     assigns |= !user_variable;
@@ -307,6 +335,9 @@ pub(crate) struct Effect {
     may_set_next: bool,
     /// Not parsed, and assigns a transaction variable in some scope ([`tx_var_assignment`]).
     assigns_tx_var: bool,
+    /// Assigns `autocommit` in some scope ([`assigns_autocommit`]): the switch to 1 commits,
+    /// and the value may come from an expression the driver cannot read.
+    assigns_autocommit: bool,
     /// Its first word is in [`IMPLICIT_COMMIT_WORDS`].
     implicit_commit: bool,
     /// Has a `SELECT`: a subquery (`SET @a = (SELECT … FROM t)`) may read a transactional
@@ -325,6 +356,7 @@ impl Effect {
                 && (assignment == Some(TxVarAssignment::Other)
                     || toks.iter().any(|t| t.is_word(text, "TRANSACTION"))),
             assigns_tx_var: assignment.is_some(),
+            assigns_autocommit: assigns_autocommit(text),
             implicit_commit: toks
                 .first()
                 .is_some_and(|t| IMPLICIT_COMMIT_WORDS.iter().any(|w| t.is_word(text, w))),
@@ -437,6 +469,17 @@ impl Pending {
             self.unknown = true;
             return;
         }
+        // With characteristics pending, a statement the classifier reads as changing the
+        // session's access (a `SET` of a setting outside its allowlist: MariaDB `SET STATEMENT
+        // … FOR <statement>`, which runs that statement and its transaction; `SET PASSWORD`,
+        // which commits implicitly) or one that assigns `autocommit` (the switch to 1 commits;
+        // any scope or quoting), succeeded or failed: the driver cannot tell whether the server
+        // still has them pending (security review L-A). A parsed `SET TRANSACTION … READ
+        // WRITE` returned above.
+        if pending && (class == StatementClass::ChangesAccessMode || effect.assigns_autocommit) {
+            self.unknown = true;
+            return;
+        }
         match class {
             // `COMMIT` / `ROLLBACK` / `START TRANSACTION` consume them, and DDL commits
             // implicitly before it runs (whether or not it then fails).
@@ -473,6 +516,18 @@ impl Pending {
 
     /// After a driver statement (transaction control from the core, session settings).
     pub(crate) fn after_driver_statement(&mut self, sql: &str, ok: bool) {
+        // Only the driver's own switch to manual commit is trusted to keep the pending
+        // characteristics. The switch to auto-commit commits: MySQL 8.4 and MariaDB 11.8 keep
+        // them through it when no transaction is open, but the driver does not rely on that
+        // (an implicit commit resets them); with some pending the state becomes unknown,
+        // succeeded or failed (security review L-A).
+        if sql != "SET SESSION autocommit = 0"
+            && assigns_autocommit(sql)
+            && self.chars != Chars::default()
+        {
+            self.unknown = true;
+            return;
+        }
         if !ok {
             return;
         }
@@ -893,7 +948,7 @@ mod tests {
         assert!(!p.blocks_navigator());
         // Still fine: harmless session statements keep the pending characteristics.
         let mut p = pending_read_uncommitted();
-        for text in ["SET @a = 1", "USE nine", "SET autocommit = 0"] {
+        for text in ["SET @a = 1", "USE nine", "SET @autocommit = 1"] {
             user(&mut p, text, StatementClass::Session, false, false);
         }
         assert!(!p.blocks_navigator() && p.reissue_sql(false).is_some());
@@ -906,6 +961,122 @@ mod tests {
             false,
         );
         assert!(!p.blocks_navigator() && p.reissue_sql(false).is_none());
+    }
+
+    #[test]
+    fn finds_autocommit_assignments() {
+        for text in [
+            "SET autocommit = 1",
+            "set AUTOCOMMIT=ON",
+            "SET SESSION autocommit = 0",
+            "SET LOCAL autocommit := 1",
+            "SET @@autocommit = 1",
+            "SET @@session.`AutoCommit` = 1",
+            "SET `autocommit` = @x",
+            "SET \"autocommit\" = 1",
+            "SET GLOBAL autocommit = 1",
+            "SET @a = 1, autocommit = 1",
+            "SET /*!40000 autocommit = 1 */",
+            "SET STATEMENT autocommit = 1 FOR SELECT 1",
+            "SET autocommit",
+        ] {
+            assert!(assigns_autocommit(text), "{text}");
+        }
+        for text in [
+            "SET @autocommit = 1",
+            "SET @`autocommit` = 1",
+            "SET @a = @@autocommit",
+            "SET @a = 'autocommit'",
+            "SET sql_mode = '' -- autocommit = 1",
+            "SELECT @@autocommit",
+            "SET TRANSACTION READ ONLY",
+        ] {
+            assert!(!assigns_autocommit(text), "{text}");
+        }
+    }
+
+    /// Security review L-A: with characteristics pending, statements that may consume or reset
+    /// them although the tracker would otherwise keep them.
+    #[test]
+    fn access_mode_statements_and_autocommit_make_pending_characteristics_unknown() {
+        for (text, class) in [
+            // MariaDB: runs the write (its own transaction in auto-commit mode).
+            (
+                "SET STATEMENT max_statement_time = 1 FOR DELETE FROM t",
+                StatementClass::ChangesAccessMode,
+            ),
+            (
+                "SET STATEMENT max_statement_time = 1 FOR INSERT INTO t VALUES (1)",
+                StatementClass::ChangesAccessMode,
+            ),
+            // An implicit commit.
+            ("SET PASSWORD = 'x'", StatementClass::ChangesAccessMode),
+            (
+                "SET PASSWORD FOR u = 'x'",
+                StatementClass::ChangesAccessMode,
+            ),
+            ("SET sql_log_bin = 0", StatementClass::ChangesAccessMode),
+            // Any `autocommit` assignment, whatever the class it is given.
+            ("SET autocommit = 1", StatementClass::ChangesAccessMode),
+            ("SET autocommit = 1", StatementClass::Session),
+            ("SET autocommit = 0", StatementClass::Session),
+            ("SET @@session.`autocommit` = ON", StatementClass::Session),
+            ("SET LOCAL AUTOCOMMIT = @x", StatementClass::Session),
+        ] {
+            for ok in [true, false] {
+                for ac in [true, false] {
+                    let mut p = pending_read_uncommitted();
+                    p.after_user_statement(Effect::of(text), class, ok, false, ac);
+                    assert!(p.blocks_navigator(), "{text} {class:?} {ok} {ac}");
+                }
+            }
+            // Nothing pending: nothing to lose.
+            let mut p = Pending::default();
+            p.after_user_statement(Effect::of(text), class, true, false, true);
+            assert!(!p.blocks_navigator(), "{text}");
+        }
+        // A parsed `SET TRANSACTION … READ WRITE` (`ChangesAccessMode`) is still tracked.
+        let mut p = pending_read_uncommitted();
+        user(
+            &mut p,
+            "SET TRANSACTION READ WRITE",
+            StatementClass::ChangesAccessMode,
+            false,
+            false,
+        );
+        assert!(!p.blocks_navigator());
+        assert_eq!(
+            p.reissue_sql(false).as_deref(),
+            Some("SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED, READ WRITE")
+        );
+        // A statement that left a transaction open took them: nothing pending, nothing unknown.
+        let mut p = pending_read_uncommitted();
+        user(
+            &mut p,
+            "SET STATEMENT max_statement_time = 1 FOR DELETE FROM t",
+            StatementClass::ChangesAccessMode,
+            true,
+            false,
+        );
+        assert!(!p.blocks_navigator() && p.reissue_sql(false).is_none());
+    }
+
+    #[test]
+    fn driver_autocommit_switch_to_one_makes_pending_characteristics_unknown() {
+        for ok in [true, false] {
+            let mut p = pending_read_uncommitted();
+            p.after_driver_statement("SET SESSION autocommit = 0", ok);
+            assert!(!p.blocks_navigator() && p.reissue_sql(false).is_some());
+            p.after_driver_statement("SET SESSION autocommit = 1", ok);
+            assert!(p.blocks_navigator(), "{ok}");
+            // Consumed by the transaction control that follows.
+            p.after_driver_statement("ROLLBACK", true);
+            assert!(!p.blocks_navigator() && p.reissue_sql(false).is_none());
+        }
+        // Nothing pending: nothing to lose.
+        let mut p = Pending::default();
+        p.after_driver_statement("SET SESSION autocommit = 1", true);
+        assert!(!p.blocks_navigator());
     }
 
     #[test]
