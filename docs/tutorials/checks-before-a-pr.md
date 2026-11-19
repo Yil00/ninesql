@@ -31,10 +31,25 @@ make test-engines
 ```
 This does what the `driver-integration` CI job does:
 1. pulls the images of the `core` profile and of the four wire-compatible engines, then starts PostgreSQL, MySQL and MariaDB (`dev/ready.py up core`) and TimescaleDB, YugabyteDB, QuestDB and TiDB (`dev/ready.py up sql --engines timescaledb,yugabytedb,questdb,tidb`; about 2.3 GB of memory together);
-2. runs `cargo test --locked` for `ninesql-driver-pgwire`, `ninesql-driver-mysqlwire`, `ninesql-driver-sqlite`, `ninesql-core` and `ninesql-ssh` with `NINESQL_REQUIRE_ENGINES=postgresql,mysql,mariadb,ssh,timescaledb,yugabytedb,questdb,tidb`, so an unreachable engine **fails** the run instead of skipping. The SSH tests start their own OpenSSH containers with `docker run`;
+2. runs `cargo test --locked` for `ninesql-driver-pgwire`, `ninesql-driver-mysqlwire`, `ninesql-driver-sqlite`, `ninesql-core`, `ninesql-ssh` and `ninesql-ui` with `NINESQL_REQUIRE_ENGINES=postgresql,mysql,mariadb,ssh,timescaledb,yugabytedb,questdb,tidb`, so an unreachable engine **fails** the run instead of skipping. The SSH tests start their own OpenSSH containers with `docker run`;
 3. stops the engines and deletes their volumes (`dev/ready.py down`), whether the tests passed or not.
 
-It needs Docker ([Start the dev databases](dev-databases.md#1-requirements)) and none of the GPUI system packages. If you already started the engines, run only the tests with `make test-engines-run` and stop the engines yourself with `make dev-down`. With only the `core` profile up (`make dev-up`), narrow the required list: `make test-engines-run REQUIRE_ENGINES=postgresql,mysql,mariadb,ssh` (the tests of the other engines then skip). Note that `make test-engines` stops them at the end too.
+It needs Docker ([Start the dev databases](dev-databases.md#1-requirements)) and, since `ninesql-ui` is in the list, the GPUI system packages ([build and run](build-and-run.md)). If you already started the engines, run only the tests with `make test-engines-run` and stop the engines yourself with `make dev-down`. With only the `core` profile up (`make dev-up`), narrow the required list: `make test-engines-run REQUIRE_ENGINES=postgresql,mysql,mariadb,ssh` (the tests of the other engines then skip). Note that `make test-engines` stops them at the end too.
+
+### The UI against the real engines
+`ninesql-ui` has `TestAppContext` tests that drive the application against the real `pgwire`, `mysqlwire` and `sqlite` drivers ([ADR-0029](../adr/0029-automated-ui-end-to-end-tests-and-application-logging.md) step 1, `crates/ninesql-ui/src/engine_tests/`). On the dev PostgreSQL, MySQL and MariaDB and on a SQLite file created per test, each one goes through the registered actions and the view models, with no display:
+- create a connection in the dialog, "Test connection", "Save", "Connect" from the navigator;
+- the navigator down to a table of the "nine" dataset, whose context menu starts with "Open table data";
+- "Open table data" on a scratch table larger than one page, edit a cell, "Cancel", then "Save changes", the value read back through a separate driver session;
+- "Export table…" to CSV and "Import CSV…" into a scratch table;
+- a read-only connection: a write statement refused by the engine, the error shown, no editing or import offered;
+- a production connection: `DELETE` without `WHERE` stops at "Run on production?", and declining runs nothing.
+
+Every test ends with a scan of its temporary XDG directories for the dev password (I1). They use the in-memory secret store and scratch tables named `ui_e2e_<what>_<uuid>`, dropped at the end, so they run in parallel with each other and with the driver tests. They skip themselves when an engine is unreachable, like the driver tests; the SQLite ones always run. To run only them against engines that are already up (`make dev-up`):
+```bash
+NINESQL_REQUIRE_ENGINES=postgresql,mysql,mariadb cargo test -p ninesql-ui --lib engine_tests
+```
+They take about 10 to 30 s once built. They prove the view models, actions, confirmations and the round trip through the core and the drivers, not the rendering: screenshots of the real window stay a local run ([local end-to-end check](local-e2e.md)).
 
 To run every test binary even after a failure, so you see all the failures at once, add `TEST_ARGS=--no-fail-fast` (`make test TEST_ARGS=--no-fail-fast`, also accepted by `make test-engines` and `make test-engines-run`).
 

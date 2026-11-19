@@ -21,6 +21,17 @@ pub mod import;
 #[cfg(test)]
 mod tests;
 
+#[cfg(test)]
+thread_local! {
+    /// The export dialog opened last on this thread, for tests that open it through its action
+    /// (the workspace keeps no handle; GPUI test contexts run on the test's thread).
+    pub(crate) static OPENED_EXPORT: std::cell::RefCell<Option<gpui_kit::Entity<export::ExportDialog>>> =
+        const { std::cell::RefCell::new(None) };
+    /// The import dialog opened last on this thread (see [`OPENED_EXPORT`]).
+    pub(crate) static OPENED_IMPORT: std::cell::RefCell<Option<gpui_kit::Entity<import::ImportCsvDialog>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
 use ninesql_core::driver_api::metadata::ObjectPath;
 use ninesql_core::{SessionHandle, TransferJobError};
 

@@ -959,6 +959,8 @@ pub fn open_import_dialog(
     window.open_dialog(cx, move |d, _, _| {
         d.title("Import CSV").w(px(720.)).child(view.clone())
     });
+    #[cfg(test)]
+    super::OPENED_IMPORT.with(|o| *o.borrow_mut() = Some(dialog.clone()));
     dialog
 }
 

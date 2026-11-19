@@ -36,8 +36,9 @@ WIRE_ENGINES ?= timescaledb,yugabytedb,questdb,tidb
 # The same list separated by spaces, for `docker compose pull` (no GNU functions, see above).
 WIRE_SERVICES ?= timescaledb yugabytedb questdb tidb
 # Crates whose integration tests run against the dev containers (driver-integration CI job).
+# ninesql-ui: the UI tests against the real drivers (src/engine_tests, ADR-0029 step 1).
 ENGINE_TEST_CRATES ?= -p ninesql-driver-pgwire -p ninesql-driver-mysqlwire \
-                      -p ninesql-driver-sqlite -p ninesql-core -p ninesql-ssh
+                      -p ninesql-driver-sqlite -p ninesql-core -p ninesql-ssh -p ninesql-ui
 
 # Extra arguments appended to `cargo test` in test and test-engines-run (empty by default, as
 # in CI), e.g. TEST_ARGS=--no-fail-fast to run every test binary even after a failure.
@@ -157,7 +158,7 @@ dev-ps: ## Show the state of the dev containers
 ##@ Integration tests (driver-integration CI job)
 # ---------------------------------------------------------------------------------------------
 
-test-engines: ## Start core and the wire engines, run driver/core/ssh tests, stop the engines
+test-engines: ## Start core and the wire engines, run driver/core/ssh/ui tests, stop the engines
 	@status=0; \
 	$(WITH_TIMEOUT) $(COMPOSE) $(COMPOSE_FILE_ARGS) --profile core pull --quiet \
 	&& $(WITH_TIMEOUT) $(COMPOSE) $(COMPOSE_FILE_ARGS) --profile sql pull --quiet $(WIRE_SERVICES) \

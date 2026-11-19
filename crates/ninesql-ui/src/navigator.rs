@@ -900,18 +900,7 @@ impl Navigator {
             }
             let mut menu = menu.action_context(focus.clone());
             if let Some((connection, path)) = &object {
-                let kind = path.kind();
-                let read_only = connection.is_some_and(|c| {
-                    hub.read(cx)
-                        .sessions(c)
-                        .first()
-                        .is_some_and(|s| s.info().read_only)
-                });
-                let ddl = match (connection, kind, hub.read(cx).metadata()) {
-                    (Some(c), Some(k), Some(m)) => m.supports_ddl(*c, k),
-                    _ => false,
-                };
-                for entry in object_menu_entries(kind, read_only, ddl) {
+                for entry in object_menu_for(hub.read(cx), *connection, path) {
                     menu = match entry {
                         Some((label, action)) => menu.menu(label, action),
                         None => menu.separator(),
@@ -971,6 +960,39 @@ impl Navigator {
 
 /// One entry of a context menu: its label and action, or `None` for a separator.
 pub(crate) type MenuEntry = Option<(String, Box<dyn Action>)>;
+
+/// The object part of the context menu of the object at `path` of `connection`, as the menu
+/// shows it now: read-only from the connection's first open session, "Show DDL" from the
+/// metadata service's declared DDL kinds (I8).
+pub(crate) fn object_menu_for(
+    hub: &ConnectionHub,
+    connection: Option<ConnectionId>,
+    path: &ObjectPath,
+) -> Vec<MenuEntry> {
+    let kind = path.kind();
+    let read_only =
+        connection.is_some_and(|c| hub.sessions(c).first().is_some_and(|s| s.info().read_only));
+    let ddl = match (connection, kind, hub.metadata()) {
+        (Some(c), Some(k), Some(m)) => m.supports_ddl(c, k),
+        _ => false,
+    };
+    object_menu_entries(kind, read_only, ddl)
+}
+
+impl Navigator {
+    /// The context menu's object entries of the selected row, for tests: what a right click on
+    /// it shows before the generic entries ("Refresh navigator node"…).
+    #[cfg(test)]
+    pub(crate) fn selected_object_menu(&self, cx: &App) -> Vec<MenuEntry> {
+        let Some(row) = self.selected_ix.and_then(|i| self.tree.rows().get(i)) else {
+            return Vec::new();
+        };
+        match self.tree.object(row) {
+            Some(o) => object_menu_for(self.hub.read(cx), MetaTree::connection_of(row), &o.path),
+            None => Vec::new(),
+        }
+    }
+}
 
 /// The object part of a navigator row's context menu, in order. Table and view rows start with
 /// "Open table data" (the action's own condition: a table-like object; it only reads, so a

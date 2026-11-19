@@ -99,6 +99,11 @@ ninesql-core = { workspace = true, features = ["mock"] }
 ninesql-secrets = { workspace = true, features = ["memory-store"] }
 proptest.workspace = true
 serde_json.workspace = true
+# The engine tests (src/engine_tests, ADR-0029 step 1): a separate driver session on the driver's
+# own runtime to set up scratch tables and read values back, and the SQLite "nine" seed. Both are
+# already in the graph (the drivers), with the same features.
+tokio = { workspace = true, features = ["rt", "net", "time"] }
+rusqlite.workspace = true
 # Regression test of the patched X11 IME decoder ([patch.crates-io] in the root Cargo.toml).
 xim-ctext = { version = "=0.3.0", default-features = false }
 
