@@ -34,6 +34,7 @@ use crate::conn::{
     STATUS_MORE_RESULTS, STATUS_NO_BACKSLASH_ESCAPES, local_infile_error,
 };
 use crate::dialect::Modes;
+use crate::oneshot::{Effect, Pending};
 use crate::types::{BatchBuilder, schema_for};
 
 /// `net_write_timeout` set for the session (only ever raised): how long the server keeps a
@@ -150,7 +151,7 @@ pub(crate) enum Command {
         value_limit: Option<u64>,
         verify: bool,
         /// A navigator read (`MyMetadata`): it must neither leave a transaction open that the
-        /// user did not start nor end one the user started ([`Actor::end_implicit_transaction`]).
+        /// user did not start nor end one the user started ([`Actor::end_navigator_read`]).
         navigator: bool,
         guard: ExecutionGuard,
         reply: oneshot::Sender<DriverResult<Rows>>,
@@ -193,6 +194,8 @@ struct Exec {
     cancel: Arc<ExecCancel>,
     demands: mpsc::Receiver<Demand>,
     class: StatementClass,
+    /// What the statement may do to the user's pending one-shot transaction characteristics.
+    effect: Effect,
     items: Vec<DriverResult<ResultItem>>,
     builder: Option<BatchBuilder>,
     error: Option<MyError>,
@@ -285,6 +288,9 @@ pub(crate) struct Actor {
     shared: Arc<Shared>,
     modes: Arc<Modes>,
     control: Arc<Control>,
+    /// The user's one-shot `SET TRANSACTION` characteristics still pending for the next
+    /// transaction ([`crate::oneshot`]), set again after a navigator read.
+    pending: Pending,
 }
 
 impl Actor {
@@ -299,6 +305,7 @@ impl Actor {
             shared,
             modes,
             control,
+            pending: Pending::default(),
         }
     }
 
@@ -315,24 +322,9 @@ impl Actor {
                     guard,
                     reply,
                 } => {
-                    // The server's own flag, from the last response: a transaction the user
-                    // opened (explicitly, or implicitly by a statement in manual-commit mode).
-                    let user_transaction = self.conn.status & STATUS_IN_TRANS != 0;
-                    let mut result = self.internal_limited(&sql, value_limit).await;
-                    if result.is_ok()
-                        && let Err(e) = self.verify_session(verify).await
-                    {
-                        result = Err(e);
-                    }
-                    if navigator
-                        && !user_transaction
-                        && let Err(e) = self.end_implicit_transaction().await
-                    {
-                        result = Err(e);
-                    }
-                    if let Err(e) = &result {
-                        self.note_fatal(e);
-                    }
+                    let result = self
+                        .run_internal(&sql, value_limit, verify, navigator)
+                        .await;
                     guard.complete();
                     let _ = reply.send(result);
                 }
@@ -363,6 +355,82 @@ impl Actor {
         }
         self.shutdown().await;
         tracing::debug!("mysqlwire connection task ended");
+    }
+
+    /// A driver statement from the session or its metadata (`Command::Internal`).
+    async fn run_internal(
+        &mut self,
+        sql: &str,
+        value_limit: Option<u64>,
+        verify: bool,
+        navigator: bool,
+    ) -> DriverResult<Rows> {
+        // The server's own flag, fresh: from the last OK / EOF packet, and refreshed after any
+        // statement that ended with an error ([`Self::refresh_status`]). A transaction the
+        // user opened, explicitly or implicitly by a statement in manual-commit mode.
+        let user_transaction = self.conn.status & STATUS_IN_TRANS != 0;
+        if navigator && !user_transaction && self.pending.blocks_navigator() {
+            // Nothing sent: the read would consume characteristics the driver cannot set again.
+            return Err(DriverError::Query {
+                code: None,
+                message: "a statement left transaction settings pending for the next \
+                          transaction in a form NineSQL cannot restore after its own reads, so \
+                          the navigator does not read now; start the transaction, or run \
+                          COMMIT or ROLLBACK to drop the pending settings, then refresh"
+                    .into(),
+                position: None,
+            });
+        }
+        let mut result = self.internal_limited(sql, value_limit).await;
+        if result.is_ok()
+            && let Err(e) = self.verify_session(verify).await
+        {
+            result = Err(e);
+        }
+        if let Err(e) = &result {
+            self.note_fatal(e);
+        }
+        if navigator && !user_transaction {
+            if let Err(e) = self.end_navigator_read(result.is_err()).await {
+                result = Err(e);
+            }
+        } else if !navigator {
+            self.pending.after_driver_statement(sql, result.is_ok());
+        }
+        if result.is_err()
+            && let Err(e) = self.refresh_status().await
+        {
+            result = Err(e);
+        }
+        result
+    }
+
+    /// Reads the server's status flags again after a statement that ended with an error
+    /// packet, which carries none: the flags of the last OK / EOF would be stale. `COM_PING`
+    /// runs no statement, so it neither starts nor ends a transaction nor consumes pending
+    /// transaction characteristics, and its OK packet carries the flags. A failure closes the
+    /// session: the driver cannot go on without knowing whether a transaction is open.
+    async fn refresh_status(&mut self) -> DriverResult<()> {
+        if self.shared.closed.load(Ordering::SeqCst) {
+            return Ok(());
+        }
+        match tokio::time::timeout(INTERNAL_TIMEOUT, self.conn.ping()).await {
+            Ok(Ok(Ok(()))) => {
+                self.sync_status();
+                Ok(())
+            }
+            other => {
+                if let Ok(Err(e)) = &other {
+                    tracing::warn!(error = ?std::mem::discriminant(e), "status refresh failed");
+                }
+                self.close_session("the transaction state could not be read after an error");
+                Err(DriverError::Closed(
+                    "the transaction state could not be read after an error; the session was \
+                     closed"
+                        .into(),
+                ))
+            }
+        }
     }
 
     async fn shutdown(&mut self) {
@@ -430,37 +498,80 @@ impl Actor {
         }
     }
 
-    /// Ends the transaction a navigator read started by itself. In manual-commit mode
-    /// (`autocommit = 0`) any statement that reads a transactional table, `information_schema`
-    /// included (MySQL 8 reads its data dictionary through InnoDB), implicitly starts a
-    /// transaction, which would hold a snapshot and data-dictionary metadata locks and show
-    /// as "in transaction" until the user commits. Called only when no transaction was open
-    /// before the read, so only the driver's own reads are rolled back (nothing was written:
-    /// navigator statements are reads). Explicit `AND NO CHAIN NO RELEASE`, so a session
-    /// `completion_type` neither chains a new transaction nor disconnects. A failed rollback
-    /// closes the session: the driver cannot leave a transaction the user did not start.
-    async fn end_implicit_transaction(&mut self) -> DriverResult<()> {
-        if self.shared.closed.load(Ordering::SeqCst) || self.conn.status & STATUS_IN_TRANS == 0 {
+    /// After a navigator read that ran outside any user transaction: ends the transaction the
+    /// read started by itself, then sets the user's pending one-shot characteristics again.
+    ///
+    /// In manual-commit mode (`autocommit = 0`) any statement that reads a transactional
+    /// table, `information_schema` included (MySQL 8 reads its data dictionary through
+    /// InnoDB), implicitly starts a transaction, which would hold a snapshot and
+    /// data-dictionary metadata locks and show as "in transaction" until the user commits.
+    /// Explicit `AND NO CHAIN NO RELEASE`, so a session `completion_type` neither chains a new
+    /// transaction nor disconnects. A failed rollback closes the session: the driver cannot
+    /// leave a transaction the user did not start.
+    ///
+    /// Why the rollback never discards user work: it runs only when the server's status flag
+    /// said no transaction was open before the read. That flag comes from the last OK / EOF
+    /// packet; an error packet carries none, so the flag is stale only after a statement that
+    /// failed, and every such statement is followed by a status refresh (`COM_PING`,
+    /// [`Self::refresh_status`]), user statements included. That matters for statements that
+    /// are not atomic as a whole: a `CALL` whose procedure inserts and then raises `SIGNAL`
+    /// keeps its insert in the open transaction (only the failing statement is rolled back),
+    /// so after it the flag must say "in transaction". (Such `Unknown` statements are also
+    /// followed by the session read-back, whose EOF carries the flags.) A plain statement that
+    /// fails is rolled back by the engine on its own and leaves no user work behind.
+    ///
+    /// When the read itself `failed`, its error packet left the flag stale, so in
+    /// manual-commit mode the rollback is sent anyway (no user transaction was open, so there
+    /// is nothing of the user's to lose) and its OK packet refreshes the flag, checked as
+    /// after a successful read (fails closed).
+    ///
+    /// Any transaction, the read's own included, consumes the characteristics a user's
+    /// `SET TRANSACTION` (no scope) left for the next transaction; they are set again from the
+    /// validated values the driver tracked ([`crate::oneshot`]), never from the user's text.
+    /// A failure closes the session: the user's next transaction would run without them.
+    async fn end_navigator_read(&mut self, failed: bool) -> DriverResult<()> {
+        if self.shared.closed.load(Ordering::SeqCst) {
             return Ok(());
         }
-        let sql = "ROLLBACK AND NO CHAIN NO RELEASE";
-        let mut r = self.internal(sql).await;
-        // A late `KILL QUERY` (the navigator call was abandoned) can interrupt the rollback.
-        if matches!(&r, Err(DriverError::Query { code: Some(c), .. }) if c == "1317") {
-            r = self.internal(sql).await;
+        let manual_commit = self.conn.status & STATUS_AUTOCOMMIT == 0;
+        if manual_commit && (failed || self.conn.status & STATUS_IN_TRANS != 0) {
+            let sql = "ROLLBACK AND NO CHAIN NO RELEASE";
+            let mut r = self.internal(sql).await;
+            // A late `KILL QUERY` (the navigator call was abandoned) can interrupt the rollback.
+            if matches!(&r, Err(DriverError::Query { code: Some(c), .. }) if c == "1317") {
+                r = self.internal(sql).await;
+            }
+            if r.is_err() || self.conn.status & STATUS_IN_TRANS != 0 {
+                if let Err(e) = &r {
+                    tracing::warn!(error = ?std::mem::discriminant(e), "navigator rollback failed");
+                }
+                self.close_session("the transaction of a navigator read could not be ended");
+                return Err(DriverError::Closed(
+                    "the transaction started by a navigator read could not be ended; the \
+                     session was closed"
+                        .into(),
+                ));
+            }
         }
-        if r.is_ok() && self.conn.status & STATUS_IN_TRANS == 0 {
-            return Ok(());
+        let read_only = self.shared.read_only.load(Ordering::SeqCst);
+        if self.conn.status & STATUS_IN_TRANS == 0
+            && let Some(sql) = self.pending.reissue_sql(read_only)
+        {
+            let mut r = self.internal(&sql).await;
+            if matches!(&r, Err(DriverError::Query { code: Some(c), .. }) if c == "1317") {
+                r = self.internal(&sql).await;
+            }
+            if let Err(e) = r {
+                tracing::warn!(error = ?std::mem::discriminant(&e), "one-shot re-issue failed");
+                self.close_session("pending transaction settings could not be restored");
+                return Err(DriverError::Closed(
+                    "the transaction settings pending for the next transaction could not be set \
+                     again after a navigator read; the session was closed"
+                        .into(),
+                ));
+            }
         }
-        if let Err(e) = &r {
-            tracing::warn!(error = ?std::mem::discriminant(e), "navigator rollback failed");
-        }
-        self.close_session("the transaction of a navigator read could not be ended");
-        Err(DriverError::Closed(
-            "the transaction started by a navigator read could not be ended; the session was \
-             closed"
-                .into(),
-        ))
+        Ok(())
     }
 
     /// Closes the session: the connection task stops after the current command.
@@ -548,6 +659,8 @@ impl Actor {
             if matches!(&r, Err(DriverError::Query { code: Some(c), .. }) if c == "1317") {
                 r = self.internal(sql).await;
             }
+            // It also replaces a pending one-shot access mode (never a pending isolation level).
+            self.pending.clear_access();
             if let Err(e) = r {
                 tracing::warn!(error = ?std::mem::discriminant(&e), "read-only re-assert failed");
                 self.close_session("read-only mode could not be re-asserted");
@@ -610,11 +723,13 @@ impl Actor {
             cancel,
             demands,
         } = req;
+        let effect = Effect::of(&text);
         let mut ex = Exec {
             guard: Some(guard),
             cancel,
             demands,
             class,
+            effect,
             items: Vec::new(),
             builder: None,
             error: None,
@@ -841,6 +956,28 @@ impl Actor {
             );
             if let Err(e) = self.verify_session(force).await {
                 terminal = Some(e);
+            }
+        }
+        // An error packet carries no status flags: read them again, so the navigator never
+        // takes a transaction the failed statement left open (a `CALL` whose procedure
+        // inserted before a `SIGNAL`) for one of its own ([`Self::end_navigator_read`]).
+        if ex.error.is_some()
+            && let Err(e) = self.refresh_status().await
+        {
+            terminal = Some(e);
+        }
+        if !self.shared.closed.load(Ordering::SeqCst) {
+            let status = self.conn.status;
+            self.pending.after_user_statement(
+                ex.effect,
+                ex.class,
+                ex.error.is_none(),
+                status & STATUS_IN_TRANS != 0,
+                status & STATUS_AUTOCOMMIT != 0,
+            );
+            if self.shared.read_only.load(Ordering::SeqCst) && !self.shared.tidb {
+                // The read-only re-assert after the statement replaced a pending access mode.
+                self.pending.clear_access();
             }
         }
         Self::finish(ex, reply, terminal);
