@@ -107,6 +107,7 @@ probe_keys! {
     NavigatorHasRow = "navigator.has_row", Bool, arg = true, record = true, "A visible navigator row has this label.";
     NavigatorLoading = "navigator.loading", Int, arg = false, record = true, "Navigator loads in flight.";
     DialogOpen = "dialog.open", Bool, arg = false, record = true, "A dialog is open in the window.";
+    FocusInput = "focus.input", Bool, arg = false, record = true, "The focused element is a text input.";
     TabsCount = "tabs.count", Int, arg = false, record = true, "Open tabs.";
     TabsActiveTitle = "tabs.active_title", Text, arg = false, record = true, "Title of the active tab.";
     EditorConnection = "editor.connection", Text, arg = false, record = true, "Name of the connection the active editor runs on.";
@@ -118,6 +119,8 @@ probe_keys! {
     GridResultTabs = "grid.result_tabs", Int, arg = false, record = true, "Result tabs of the active editor.";
     GridRows = "grid.rows", Int, arg = false, record = true, "Rows loaded in the first result table of the active editor.";
     GridState = "grid.state", Text, arg = false, record = true, "Fetch state of that table: fetching, idle, complete, truncated, budget, closed or none.";
+    GridFocusedRow = "grid.focused_row", Int, arg = false, record = true, "Row index (0-based, in the result) of the grid's focused cell.";
+    GridFocusedColumn = "grid.focused_column", Int, arg = false, record = true, "Column index (0-based, in the result) of the grid's focused cell.";
     GridUpdateCounts = "grid.update_counts", Int, arg = false, record = true, "Statements of the last run that reported an update count.";
     TableOpen = "table.open", Bool, arg = false, record = true, "The active tab shows a table's data (\"Open table data\").";
     TableEditable = "table.editable", Bool, arg = false, record = true, "The table's rows can be edited.";
@@ -168,6 +171,9 @@ pub fn read(
     use ProbeValue as V;
     if key == K::DialogOpen {
         return V::Bool(window.has_active_dialog(cx));
+    }
+    if key == K::FocusInput {
+        return V::Bool(window.has_focused_input(cx));
     }
     let cx: &App = cx;
     let hub = Hub::get(cx);
@@ -242,7 +248,7 @@ pub fn read(
                 .any(|(_, l)| Some(l.as_str()) == arg),
         ),
         K::NavigatorLoading => int(ws.navigator().read(cx).loads_in_flight()),
-        K::DialogOpen => V::Absent,
+        K::DialogOpen | K::FocusInput => V::Absent,
         K::TabsCount => int(ws.tab_titles(cx).len()),
         K::TabsActiveTitle => ws
             .active_title(cx)
@@ -272,6 +278,12 @@ pub fn read(
         }),
         K::GridRows => first_table(cx).map_or(V::Absent, |(rows, _)| int(rows)),
         K::GridState => V::Text(first_table(cx).map_or("none", |(_, s)| s).to_owned()),
+        K::GridFocusedRow => editor
+            .and_then(|e| e.results().read(cx).focused_cell(cx))
+            .map_or(V::Absent, |(_, r, _)| int(r)),
+        K::GridFocusedColumn => editor
+            .and_then(|e| e.results().read(cx).focused_cell(cx))
+            .map_or(V::Absent, |(_, _, c)| int(c)),
         K::GridUpdateCounts => editor.map_or(V::Absent, |e| {
             int(e.results().read(cx).results().update_counts().len())
         }),

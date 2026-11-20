@@ -68,12 +68,35 @@ fn probe_keys_are_unique_and_documented() {
     assert!(ProbeKey::parse("editor.password").is_none());
 }
 
-#[gpui::test]
-fn sqlite_editor_grid_runs_headless(cx: &mut gpui::TestAppContext) {
-    let Some((report, root)) = super::headless::run_scenario(cx, "sqlite-editor-grid") else {
+/// Runs a scenario headless and checks every step passed and the I1 scan of its directory.
+fn passes_headless(cx: &mut gpui::TestAppContext, name: &str) {
+    let Some((report, root)) = super::headless::run_scenario(cx, name) else {
         return;
     };
     super::headless::assert_passed(&report);
-    let (scanned, hits) = super::setup::scan_for_secrets(&root, &["nine_dev_only"], &[]);
-    assert!(scanned > 0 && hits.is_empty());
+    let engines = super::setup::DevEngines::load(
+        &PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../dev/engines.json"),
+    )
+    .unwrap_or_else(|e| panic!("{e}"));
+    let secrets: Vec<&str> = engines.passwords().iter().map(String::as_str).collect();
+    let (scanned, hits) = super::setup::scan_for_secrets(&root, &secrets, &[]);
+    assert!(scanned > 0, "the scan found the run's files");
+    assert!(hits.is_empty(), "I1: a dev password is in {hits:?}");
+}
+
+macro_rules! headless {
+    ($($test:ident => $name:literal;)*) => {
+        $(
+            #[gpui::test]
+            fn $test(cx: &mut gpui::TestAppContext) {
+                passes_headless(cx, $name);
+            }
+        )*
+    };
+}
+
+headless! {
+    sqlite_editor_grid_runs_headless => "sqlite-editor-grid";
+    sqlite_navigator_object_runs_headless => "sqlite-navigator-object";
+    sqlite_table_edit_runs_headless => "sqlite-table-edit";
 }

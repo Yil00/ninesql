@@ -375,10 +375,20 @@ fn keystroke(stroke: &str, config: &RunnerConfig, cx: &mut AsyncApp) -> Result<(
             let os = cx.platform_info().os;
             let ks = Keystroke::parse_with_os(stroke, os)
                 .map_err(|_| format!("`{stroke}` is not a keystroke"))?;
-            window.dispatch_keystroke(ks, cx);
+            press(ks, window, cx);
             Ok(())
         })
         .map_err(|_| "the window is closed".to_owned())?
+}
+
+/// A key press as the platform layer delivers it: key down (with the input handler for its
+/// character, `Window::dispatch_keystroke`), then key up (buttons click on it).
+fn press(ks: Keystroke, window: &mut gpui_kit::Window, cx: &mut App) {
+    window.dispatch_keystroke(ks.clone(), cx);
+    window.dispatch_event(
+        gpui_kit::PlatformInput::KeyUp(gpui_kit::KeyUpEvent { keystroke: ks }),
+        cx,
+    );
 }
 
 fn type_text(text: &str, config: &RunnerConfig, cx: &mut AsyncApp) -> Result<(), String> {
@@ -398,7 +408,7 @@ fn type_text(text: &str, config: &RunnerConfig, cx: &mut AsyncApp) -> Result<(),
                     }),
                 };
                 if let Some(ks) = ks {
-                    window.dispatch_keystroke(ks, cx);
+                    press(ks, window, cx);
                 }
             }
         })
