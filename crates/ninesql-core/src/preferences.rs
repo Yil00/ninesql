@@ -26,6 +26,9 @@
 //!
 //! [confirmations]
 //! close_with_open_transaction = true   # always asked for production (ADR-0007 §5)
+//!
+//! [logging]
+//! file_level = "off"                   # "off", "error", "warn", "info" or "debug" (ADR-0029 §3.3)
 //! ```
 //!
 //! # Rules
@@ -52,6 +55,11 @@
 //!   margin covers the release reaching the server. A value set directly in memory is still
 //!   clamped to [`PAUSED_RESULT_IDLE_SECS_RANGE`] when a run uses it
 //!   ([`crate::paused_result_idle_limit`]).
+//! - **The file log is off unless asked for.** `[logging] file_level` only says at which level
+//!   the application's subscriber (built in the `ninesql` binary, ADR-0029 §3) writes the
+//!   opt-in file log; the core reads and writes the key and installs nothing. There is no
+//!   `"trace"` value: statement text lives at `trace`, which only `NINESQL_LOG` reaches, and
+//!   release builds clamp every filter at `debug` (ADR-0029 §3.5).
 //! - No secret is ever stored here (I1); connection ids are not secrets.
 
 use std::collections::BTreeMap;
@@ -119,6 +127,69 @@ impl OnError {
             Self::Continue => "continue",
         }
     }
+}
+
+/// Level of the opt-in file log, `[logging] file_level` (ADR-0029 §3.3). Ordered from the
+/// quietest: a level writes its own events and every more severe one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
+#[non_exhaustive]
+pub enum LogFileLevel {
+    /// No file log (default).
+    #[default]
+    Off,
+    /// Errors only.
+    Error,
+    /// Warnings and errors.
+    Warn,
+    /// Informational events, warnings and errors.
+    Info,
+    /// Debug events and above. Never `trace` (statement text): see the module's rules.
+    Debug,
+}
+
+impl LogFileLevel {
+    /// Every level, quietest first.
+    pub const ALL: [Self; 5] = [Self::Off, Self::Error, Self::Warn, Self::Info, Self::Debug];
+
+    /// The value in `settings.toml`, also the `tracing` level-filter name.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Off => "off",
+            Self::Error => "error",
+            Self::Warn => "warn",
+            Self::Info => "info",
+            Self::Debug => "debug",
+        }
+    }
+
+    /// The level named `value` in `settings.toml` (exact, lower case); `None` otherwise.
+    #[must_use]
+    pub fn parse(value: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|l| l.as_str() == value)
+    }
+
+    /// Whether a file log is written at all.
+    #[must_use]
+    pub const fn is_on(self) -> bool {
+        !matches!(self, Self::Off)
+    }
+}
+
+impl std::fmt::Display for LogFileLevel {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// `[logging]` (ADR-0029 §3.3). Read by the binary when it builds its subscriber; changing it
+/// takes effect at the next start.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[non_exhaustive]
+pub struct LoggingPreferences {
+    /// Level of the file log under `$XDG_STATE_HOME/ninesql/logs/`; [`LogFileLevel::Off`] by
+    /// default.
+    pub file_level: LogFileLevel,
 }
 
 /// `[execution]`.
@@ -266,6 +337,8 @@ pub struct Preferences {
     pub history: HistoryPreferences,
     /// `[confirmations]`.
     pub confirmations: ConfirmationPreferences,
+    /// `[logging]`.
+    pub logging: LoggingPreferences,
 }
 
 /// An invalid entry found while reading `settings.toml`. The message names the key and the
@@ -358,6 +431,8 @@ pub enum PreferenceChange {
     HistoryMaxAgeDays(Option<u32>),
     /// `confirmations.close_with_open_transaction`.
     CloseWithOpenTransaction(bool),
+    /// `logging.file_level`.
+    LogFileLevel(LogFileLevel),
 }
 
 fn out_of_range<T: std::fmt::Display>(key: &'static str, lo: T, hi: T) -> PreferencesError {
@@ -408,6 +483,7 @@ impl PreferenceChange {
             Self::HistoryMaxEntries(_) => "history.max_entries_per_connection",
             Self::HistoryMaxAgeDays(_) => "history.max_age_days",
             Self::CloseWithOpenTransaction(_) => "confirmations.close_with_open_transaction",
+            Self::LogFileLevel(_) => "logging.file_level",
         }
     }
 
@@ -484,6 +560,7 @@ impl PreferenceChange {
             Self::CloseWithOpenTransaction(on) => {
                 prefs.confirmations.close_with_open_transaction = on;
             }
+            Self::LogFileLevel(level) => prefs.logging.file_level = level,
         }
         Ok(())
     }
@@ -514,6 +591,7 @@ impl PreferenceChange {
                 t.and_then(|d| int(d.as_secs())),
             ),
             Self::HistoryMaxAgeDays(d) => (section, key.into(), int(u64::from(d.unwrap_or(0)))),
+            Self::LogFileLevel(l) => (section, key.into(), Some(Value::from(l.as_str()))),
         }
     }
 }
@@ -696,6 +774,23 @@ impl Preferences {
                 prefs.confirmations.close_with_open_transaction = b;
             }
         }
+        if let Some(table) = section("logging", &mut issues) {
+            let mut r = Reader {
+                section: "logging",
+                table: &table,
+                issues: &mut issues,
+            };
+            if let Some(v) = table.get("file_level") {
+                // The value is never echoed (a hand-edited file may hold anything).
+                match v.as_str().and_then(LogFileLevel::parse) {
+                    Some(level) => prefs.logging.file_level = level,
+                    None => r.issue(
+                        "file_level",
+                        "\"off\", \"error\", \"warn\", \"info\" or \"debug\" is expected",
+                    ),
+                }
+            }
+        }
         (prefs, issues)
     }
 
@@ -838,6 +933,64 @@ pub fn save_changes(
 #[allow(clippy::unwrap_used, clippy::expect_used)] // Tests may panic (AGENTS.md).
 mod tests {
     use super::*;
+
+    #[test]
+    fn logging_file_level_is_off_by_default_and_read_leniently() {
+        assert_eq!(
+            Preferences::default().logging.file_level,
+            LogFileLevel::Off,
+            "ADR-0029 §3.3: no file log unless asked for"
+        );
+        assert!(!LogFileLevel::default().is_on());
+        for level in LogFileLevel::ALL {
+            let text = format!("[logging]\nfile_level = \"{level}\"\n");
+            let (p, issues) = Preferences::parse(&text);
+            assert_eq!(p.logging.file_level, level);
+            assert!(issues.is_empty(), "{issues:?}");
+        }
+        assert!(
+            LogFileLevel::Off < LogFileLevel::Error && LogFileLevel::Info < LogFileLevel::Debug
+        );
+        // `trace`, another case, a non-string: the default, one issue, the value never echoed.
+        for bad in [
+            "\"trace\"",
+            "\"DEBUG\"",
+            "\"secret_value_9e1\"",
+            "3",
+            "true",
+        ] {
+            let (p, issues) = Preferences::parse(&format!("[logging]\nfile_level = {bad}\n"));
+            assert_eq!(p.logging.file_level, LogFileLevel::Off, "{bad}");
+            assert_eq!(issues.len(), 1, "{bad}: {issues:?}");
+            assert!(issues[0].message().starts_with("[logging] file_level:"));
+            assert!(!issues[0].message().contains("secret_value_9e1"));
+        }
+        let (p, issues) = Preferences::parse("logging = 1\n");
+        assert_eq!(p.logging.file_level, LogFileLevel::Off);
+        assert_eq!(issues.len(), 1);
+    }
+
+    #[test]
+    fn logging_file_level_is_saved_in_its_section_keeping_the_rest() {
+        let text = "# mine\n[execution]\nfetch_size = 50 # rows\n";
+        let out =
+            apply_changes(text, &[PreferenceChange::LogFileLevel(LogFileLevel::Warn)]).unwrap();
+        assert!(
+            out.contains("# mine") && out.contains("fetch_size = 50 # rows"),
+            "{out}"
+        );
+        let (p, issues) = Preferences::parse(&out);
+        assert!(issues.is_empty(), "{issues:?}");
+        assert_eq!(p.logging.file_level, LogFileLevel::Warn);
+        assert_eq!(p.execution.fetch_size, 50);
+        let off =
+            apply_changes(&out, &[PreferenceChange::LogFileLevel(LogFileLevel::Off)]).unwrap();
+        assert!(off.contains("file_level = \"off\""), "{off}");
+        assert_eq!(
+            PreferenceChange::LogFileLevel(LogFileLevel::Debug).key(),
+            "logging.file_level"
+        );
+    }
 
     #[test]
     fn defaults_follow_adr_0004_and_0008() {

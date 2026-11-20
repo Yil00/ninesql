@@ -65,8 +65,8 @@ pub use metadata::{
     SearchHit, SearchRequest, SearchResults,
 };
 pub use preferences::{
-    ConfirmationPreferences, ExecutionPreferences, HistoryPreferences, OnError, PreferenceChange,
-    PreferenceIssue, Preferences, PreferencesError,
+    ConfirmationPreferences, ExecutionPreferences, HistoryPreferences, LogFileLevel,
+    LoggingPreferences, OnError, PreferenceChange, PreferenceIssue, Preferences, PreferencesError,
 };
 pub use registry::{DriverRegistry, EnableError};
 pub use runtime::DriverRuntime;
