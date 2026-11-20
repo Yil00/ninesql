@@ -1095,8 +1095,8 @@ fn register_keyring(stores: &mut SecretStores, keyring: &SecretServiceAvailabili
     if keyring.is_available() {
         match ninesql_secrets::SecretServiceStore::new(project) {
             Ok(store) => stores.register(Arc::new(store)),
-            // A fixed message (`InvalidProjectId`), no value.
-            Err(e) => tracing::warn!(error = %e, "keyring store not registered"),
+            // `InvalidProjectId`: a fixed kind, never the error's message (ADR-0029 §3.2).
+            Err(_) => tracing::warn!(error = "invalid-project-id", "keyring store not registered"),
         }
     } else {
         // The availability's detail is the D-Bus message: not logged (ADR-0029 §3.2).

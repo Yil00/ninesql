@@ -414,7 +414,9 @@ where
     let reply = conn
         .call_method(Some(LOGIND), LOGIND_PATH, Some(MANAGER), method, body)
         .await
-        .inspect_err(|e| tracing::debug!(method, error = %e, "logind lookup failed"))
+        .inspect_err(
+            |e| tracing::debug!(method, error = %bus_error_kind(e), "logind lookup failed"),
+        )
         .ok()?;
     let path: OwnedObjectPath = reply.body().deserialize().ok()?;
     (path.as_str() != "/").then(|| path.as_str().to_owned())
@@ -444,7 +446,9 @@ async fn own_session(conn: &Connection) -> Option<String> {
             &(USER, "Display"),
         )
         .await
-        .inspect_err(|e| tracing::debug!(error = %e, "no display session for the user"))
+        .inspect_err(
+            |e| tracing::debug!(error = %bus_error_kind(e), "no display session for the user"),
+        )
         .ok()?;
     let value: OwnedVariant = reply.body().deserialize().ok()?;
     let (_id, path): (String, OwnedObjectPath) = value.try_into().ok()?;
@@ -977,7 +981,7 @@ async fn supervise<D: Dialer>(
                 None => return,
                 Some(Some(Ok(l))) => break l,
                 Some(Some(Err(e))) => {
-                    tracing::debug!(error = %e, "system bus still unavailable");
+                    tracing::debug!(error = e.kind(), "system bus still unavailable");
                 }
                 Some(None) => tracing::debug!("the system bus did not answer in time"),
             }
@@ -1341,7 +1345,7 @@ impl BusLink {
                     }
                 }
                 Next::Message(Some(Err(e))) => {
-                    tracing::debug!(error = %e, "bad message on the system bus");
+                    tracing::debug!(error = %bus_error_kind(&e), "bad message on the system bus");
                 }
                 Next::Message(None) => return,
             }

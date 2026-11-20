@@ -1078,7 +1078,7 @@ async fn serve(
                         a
                     }
                     Err(e) => {
-                        tracing::debug!(error = %e, "tunnel accept failed");
+                        tracing::debug!(io_error = ?e.kind(), "tunnel accept failed");
                         tokio::time::sleep(accept_backoff).await;
                         accept_backoff = (accept_backoff * 2).min(ACCEPT_BACKOFF_MAX);
                         continue;
@@ -1138,7 +1138,7 @@ async fn forward(
     };
     let mut stream = channel.into_stream();
     if let Err(e) = tokio::io::copy_bidirectional(&mut socket, &mut stream).await {
-        tracing::debug!(error = %e, "tunnel connection ended with an error");
+        tracing::debug!(io_error = ?e.kind(), "tunnel connection ended with an error");
     }
 }
 

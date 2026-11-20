@@ -7,8 +7,8 @@
 # NINESQL-E2E-SCENARIOS-TEST-BUILD (a `#[used] static`, kept by the optimiser and the linker).
 # Such a binary must never be packaged, signed or shipped. Exit status: 1 when any file holds
 # the marker, 2 on a usage error or an unreadable file, 0 otherwise. Run by
-# packaging/deb/build.sh before cargo-deb packages the binary; release.yml checks the packaged
-# binary again, with `strings`, before signing.
+# packaging/deb/build.sh before cargo-deb packages the binary; release.yml runs it again on the
+# built binary and on the binary extracted from the .deb, before signing.
 set -euo pipefail
 
 MARKER=NINESQL-E2E-SCENARIOS-TEST-BUILD

@@ -104,30 +104,28 @@ jobs:
           export NINESQL_DEB_OUT="$RUNNER_TEMP/out"
           packaging/deb/build.sh
       # ADR-0029 §2.2, guard 2: an e2e-scenarios test build is never signed nor shipped. build.sh
-      # already refused the marker with grep; checked again here with strings, on the built
-      # binary and on the binary inside the .deb that the sign job signs.
+      # already refused the marker; checked again here through the same script, on the built
+      # binary and on the binary inside the .deb that the sign job signs. The script exits 1 on
+      # the marker and 2 on a missing or unreadable file, so a read error fails the step too.
       - name: No e2e-scenarios test build (marker check)
+        shell: bash
         run: |
-          marker=NINESQL-E2E-SCENARIOS-TEST-BUILD
+          set -euo pipefail
           extracted="$RUNNER_TEMP/deb-contents"
           rm -rf "$extracted"
+          shopt -s nullglob
           debs=("$RUNNER_TEMP"/out/*.deb)
+          shopt -u nullglob
           if [ "${#debs[@]}" -ne 1 ] || [ ! -f "${debs[0]}" ]; then
             echo "::error::expected exactly one .deb in $RUNNER_TEMP/out"
             exit 1
           fi
           dpkg-deb -x "${debs[0]}" "$extracted"
-          for bin in "$RUNNER_TEMP/target/deb-build/release/ninesql" "$extracted/usr/bin/ninesql"; do
-            if [ ! -f "$bin" ]; then
-              echo "::error::$bin not found"
-              exit 1
-            fi
-            if strings -a "$bin" | grep -q -F -- "$marker"; then
-              echo "::error::$bin is an e2e-scenarios test build (ADR-0029 §2.2)"
-              exit 1
-            fi
-            echo "ok: $bin holds no e2e-scenarios marker"
-          done
+          if ! bash packaging/check-no-e2e-marker.sh \
+            "$RUNNER_TEMP/target/deb-build/release/ninesql" "$extracted/usr/bin/ninesql"; then
+            echo "::error::e2e-scenarios marker check failed (marker found or binary unreadable, ADR-0029 §2.2)"
+            exit 1
+          fi
           rm -rf "$extracted"
       - name: SBOM (CycloneDX)
         if: matrix.replica == 'a'
