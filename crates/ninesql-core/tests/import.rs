@@ -152,7 +152,16 @@ fn tree(dir: &Path) -> BTreeMap<PathBuf, Node> {
     let mut out = BTreeMap::new();
     let mut stack = vec![dir.to_path_buf()];
     while let Some(path) = stack.pop() {
-        let meta = std::fs::symlink_metadata(&path).unwrap();
+        // An entry can vanish between its directory listing and this call: a writer finishing
+        // an atomic write (temporary file, then rename) on a blocking thread that outlived the
+        // runtime's bounded shutdown. Skip it: its name is still in the parent's `Dir` entries,
+        // so a snapshot comparison still sees any change, and a renamed file is scanned under
+        // its final name.
+        let meta = match std::fs::symlink_metadata(&path) {
+            Ok(meta) => meta,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound && path != dir => continue,
+            Err(e) => panic!("{}: {e}", path.display()),
+        };
         let mode = meta.mode() & 0o7777;
         let ft = meta.file_type();
         let node = if ft.is_dir() {
@@ -164,8 +173,13 @@ fn tree(dir: &Path) -> BTreeMap<PathBuf, Node> {
             stack.extend(entries.iter().map(|name| path.join(name)));
             Node::Dir { mode, entries }
         } else if ft.is_file() {
+            let bytes = match std::fs::read(&path) {
+                Ok(bytes) => bytes,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(e) => panic!("{}: {e}", path.display()),
+            };
             Node::File {
-                bytes: std::fs::read(&path).unwrap(),
+                bytes,
                 modified: meta.modified().unwrap(),
                 mode,
             }
