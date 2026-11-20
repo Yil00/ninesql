@@ -101,6 +101,19 @@ pub enum HistoryError {
     Closed,
 }
 
+impl HistoryError {
+    /// A short, stable name of the error kind, safe to log at any level: no path, no SQLite
+    /// message (ADR-0029 §3.2).
+    #[must_use]
+    pub fn kind(&self) -> &'static str {
+        match self {
+            Self::Storage(e) => e.kind(),
+            Self::Busy => "history-busy",
+            Self::Closed => "history-closed",
+        }
+    }
+}
+
 /// What became of a statement handed to [`History::record`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[non_exhaustive]
@@ -414,7 +427,7 @@ fn writer(mut db: HistoryDb, jobs: &mpsc::Receiver<Job>, shared: &WriterShared) 
             Ok(n)
         }
         Err(e) => {
-            tracing::warn!(error = %e, "history pruning failed");
+            tracing::warn!(kind = e.kind(), "history pruning failed");
             Err(HistoryError::from(e))
         }
     };
@@ -438,7 +451,7 @@ fn writer(mut db: HistoryDb, jobs: &mpsc::Receiver<Job>, shared: &WriterShared) 
             Job::Insert(entry) => {
                 if let Err(e) = db.insert(&entry) {
                     shared.dropped.fetch_add(1, Ordering::Relaxed);
-                    tracing::warn!(error = %e, "history entry not written");
+                    tracing::warn!(kind = e.kind(), "history entry not written");
                 }
                 since_prune += 1;
                 if since_prune >= PRUNE_EVERY {

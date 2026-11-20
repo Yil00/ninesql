@@ -18,6 +18,17 @@ pub const DEFAULT_READ_LIMIT: u64 = 64 * 1024 * 1024;
 /// Group and other permission bits.
 const GROUP_OTHER: u32 = 0o077;
 
+/// The last component of `path`, for log events: a full path names the user's home directory
+/// (their account name), so `warn` / `error` / `info` events carry only the file or directory
+/// name (ADR-0029 §3.2). Control characters are left for the subscriber to escape.
+#[must_use]
+pub fn log_name(path: &Path) -> String {
+    path.file_name().map_or_else(
+        || String::from("(no file name)"),
+        |n| n.to_string_lossy().into_owned(),
+    )
+}
+
 /// Creates `dir` and its missing parents with mode `0700`, then checks `dir` itself:
 ///
 /// - it must be a real directory: a symbolic link in place of `dir` is refused, never followed
@@ -60,7 +71,7 @@ pub fn ensure_private_dir(dir: &Path) -> Result<(), StorageError> {
     let mode = meta.permissions().mode();
     if mode & GROUP_OTHER != 0 {
         tracing::warn!(
-            path = %dir.display(),
+            dir = %log_name(dir),
             mode = format_args!("{:o}", mode & 0o7777),
             "tightening permissions of a NineSQL directory"
         );
@@ -119,7 +130,7 @@ fn not_regular(path: &Path) -> StorageError {
 fn restrict_mode(path: &Path, current: u32, wanted: u32) -> Result<(), StorageError> {
     if current & GROUP_OTHER != 0 {
         tracing::warn!(
-            path = %path.display(),
+            file = %log_name(path),
             mode = format_args!("{:o}", current & 0o7777),
             "tightening permissions of a NineSQL path"
         );
@@ -155,7 +166,7 @@ pub fn write_atomic(path: &Path, bytes: &[u8]) -> Result<(), StorageError> {
     // durability across a power loss; reporting it as an error would make callers roll back
     // state (for example stored secrets) that the new file already references.
     if let Err(e) = sync_dir(dir) {
-        tracing::warn!(dir = %dir.display(), error = %e, "directory fsync failed after an atomic write");
+        tracing::warn!(dir = %log_name(dir), io_error = ?e.kind(), "directory fsync failed after an atomic write");
     }
     Ok(())
 }
@@ -182,7 +193,7 @@ pub fn write_new_atomic(path: &Path, bytes: &[u8]) -> Result<(), StorageError> {
         return Err(StorageError::io(path, e));
     }
     if let Err(e) = sync_dir(dir) {
-        tracing::warn!(dir = %dir.display(), error = %e, "directory fsync failed after an atomic write");
+        tracing::warn!(dir = %log_name(dir), io_error = ?e.kind(), "directory fsync failed after an atomic write");
     }
     Ok(())
 }
@@ -289,7 +300,7 @@ pub fn read_private(path: &Path, limit: u64) -> Result<Option<Vec<u8>>, StorageE
         .mode();
     if mode & GROUP_OTHER != 0 {
         tracing::warn!(
-            path = %path.display(),
+            file = %log_name(path),
             mode = format_args!("{:o}", mode & 0o7777),
             "tightening permissions of a NineSQL file"
         );

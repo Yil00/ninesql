@@ -311,6 +311,20 @@ pub enum PreferencesError {
     Storage(#[from] StorageError),
 }
 
+impl PreferencesError {
+    /// A short, stable name of the error kind, safe to log at any level: no path, no value
+    /// (ADR-0029 §3.2).
+    #[must_use]
+    pub fn kind(&self) -> &'static str {
+        match self {
+            Self::Invalid { .. } => "preferences-invalid",
+            Self::Unreadable(_) => "preferences-unreadable",
+            Self::NewerVersion(_) => "preferences-newer-version",
+            Self::Storage(e) => e.kind(),
+        }
+    }
+}
+
 /// One preference changed (by the preferences page).
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]

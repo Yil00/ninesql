@@ -890,6 +890,23 @@ impl Drop for Tunnel {
     }
 }
 
+/// Why a `direct-tcpip` channel was refused, safe to log at any level: the standard reason code
+/// only, never the server's free-text reason (ADR-0029 §3.2).
+fn forward_error_kind(e: &russh::Error) -> &'static str {
+    use russh::ChannelOpenFailure as F;
+    match e {
+        russh::Error::ChannelOpenFailure(F::AdministrativelyProhibited) => {
+            "administratively-prohibited"
+        }
+        russh::Error::ChannelOpenFailure(F::ConnectFailed) => "connect-failed",
+        russh::Error::ChannelOpenFailure(F::UnknownChannelType) => "unknown-channel-type",
+        russh::Error::ChannelOpenFailure(F::ResourceShortage) => "resource-shortage",
+        russh::Error::ChannelOpenFailure(_) => "other-reason",
+        russh::Error::Disconnect | russh::Error::HUP => "disconnected",
+        _ => "ssh-error",
+    }
+}
+
 /// Connects, verifies and authenticates one hop, directly (first hop) or through `previous`.
 async fn open_hop(
     index: usize,
@@ -1089,7 +1106,10 @@ async fn forward(
     let channel = match tokio::time::timeout(connect_timeout, open).await {
         Ok(Ok(c)) => c,
         Ok(Err(e)) => {
-            tracing::warn!(error = %e, "the SSH server refused to forward to the database endpoint");
+            tracing::warn!(
+                reason = forward_error_kind(&e),
+                "the SSH server refused to forward to the database endpoint"
+            );
             return;
         }
         Err(_) => {

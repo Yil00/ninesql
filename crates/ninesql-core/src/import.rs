@@ -475,6 +475,27 @@ pub enum ImportError {
     Runtime(String),
 }
 
+impl ImportError {
+    /// A short, stable name of the error kind, safe to log at any level: no path, no source
+    /// detail (ADR-0029 §3.2).
+    #[must_use]
+    pub fn kind(&self) -> &'static str {
+        match self {
+            Self::Source(_) => "import-source",
+            Self::NothingFound => "import-nothing-found",
+            Self::SourceChanged => "import-source-changed",
+            Self::VaultLocked => "vault-locked",
+            Self::VaultNotCreated => "vault-not-created",
+            Self::NoStore(_) => "import-no-store",
+            Self::Secret(e) => e.kind(),
+            Self::Workspace(e) => e.kind(),
+            Self::ListingTruncated => "import-listing-truncated",
+            Self::Cancelled => "import-cancelled",
+            Self::Runtime(_) => "import-runtime",
+        }
+    }
+}
+
 /// Cancels a running import preview (P2-D M1). Cheap to clone; every clone shares one flag.
 ///
 /// The flag is an `Arc<AtomicBool>`, so the DBeaver reader's own cancel flag can share it
@@ -732,7 +753,7 @@ impl Importer {
             Err(e) => {
                 for reference in &stored {
                     if let Err(del) = self.stores.delete(reference) {
-                        tracing::warn!(reference = %reference, error = %del, "could not roll back an imported secret");
+                        tracing::warn!(reference = %reference, kind = del.kind(), "could not roll back an imported secret");
                     }
                 }
                 return Err(e);
@@ -750,7 +771,7 @@ impl Importer {
                 if !now.contains(&r)
                     && let Err(e) = self.stores.delete(r)
                 {
-                    tracing::warn!(reference = %r, error = %e, "could not delete a replaced secret");
+                    tracing::warn!(reference = %r, kind = e.kind(), "could not delete a replaced secret");
                 }
             }
         }
@@ -770,7 +791,7 @@ impl Importer {
             Err(e) => {
                 tracing::warn!(
                     project = %self.workspace.project(),
-                    error = %e,
+                    kind = e.kind(),
                     "the DBeaver import report could not be saved; the import is applied"
                 );
                 (None, Some(format!("report not saved: {e}")))

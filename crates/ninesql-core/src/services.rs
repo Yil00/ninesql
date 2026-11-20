@@ -367,7 +367,10 @@ impl CoreServices {
                 }
             }
             Err(e) => {
-                tracing::warn!(error = %e, "the vault cannot be opened; it is not available in this session");
+                tracing::warn!(
+                    kind = e.kind(),
+                    "the vault cannot be opened; it is not available in this session"
+                );
                 VaultSlot::Unavailable(e.to_string())
             }
         };
@@ -405,7 +408,10 @@ impl CoreServices {
                     (Some(w), None)
                 }
                 Err(e) => {
-                    tracing::warn!(error = %e, "sleep and screen lock are not watched; idle timers only");
+                    tracing::warn!(
+                        kind = e.kind(),
+                        "sleep and screen lock are not watched; idle timers only"
+                    );
                     (None, Some(e.to_string()))
                 }
             }
@@ -459,7 +465,10 @@ impl CoreServices {
                 issues.iter().map(|i| i.error.to_string()).collect(),
             ),
             Err(e) => {
-                tracing::warn!(error = %e, "navigator.json cannot be read; no navigator filter");
+                tracing::warn!(
+                    kind = e.kind(),
+                    "navigator.json cannot be read; no navigator filter"
+                );
                 (
                     MetadataService::new(manager.clone(), MetadataConfig::default()),
                     vec![e.to_string()],
@@ -1026,7 +1035,10 @@ fn load_preferences(paths: &Paths) -> (Preferences, Vec<PreferenceIssue>) {
     match Preferences::load(&settings_target(paths)) {
         Ok(loaded) => loaded,
         Err(e) => {
-            tracing::warn!(error = %e, "settings.toml cannot be read; default execution preferences");
+            tracing::warn!(
+                kind = e.kind(),
+                "settings.toml cannot be read; default execution preferences"
+            );
             (Preferences::default(), Vec::new())
         }
     }
@@ -1039,13 +1051,16 @@ fn open_history_db(
     prefs: &Preferences,
 ) -> (Option<History>, Option<String>) {
     let opened = ninesql_storage::HistoryDb::open(&paths.history_file())
-        .map_err(|e| e.to_string())
-        .and_then(|db| History::start(db, project, &prefs.history).map_err(|e| e.to_string()));
+        .map_err(crate::history::HistoryError::from)
+        .and_then(|db| History::start(db, project, &prefs.history));
     match opened {
         Ok(h) => (Some(h), None),
         Err(e) => {
-            tracing::warn!(error = %e, "the query history is not available in this session");
-            (None, Some(e))
+            tracing::warn!(
+                kind = e.kind(),
+                "the query history is not available in this session"
+            );
+            (None, Some(e.to_string()))
         }
     }
 }
@@ -1055,10 +1070,12 @@ fn register_keyring(stores: &mut SecretStores, keyring: &SecretServiceAvailabili
     if keyring.is_available() {
         match ninesql_secrets::SecretServiceStore::new(project) {
             Ok(store) => stores.register(Arc::new(store)),
+            // A fixed message (`InvalidProjectId`), no value.
             Err(e) => tracing::warn!(error = %e, "keyring store not registered"),
         }
     } else {
-        tracing::info!(availability = ?keyring, "no Secret Service: the keyring is not used");
+        // The availability's detail is the D-Bus message: not logged (ADR-0029 §3.2).
+        tracing::info!("no Secret Service: the keyring is not used");
     }
 }
 

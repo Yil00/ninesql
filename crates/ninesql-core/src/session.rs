@@ -1458,7 +1458,7 @@ async fn open_session(
         let marked = match marked {
             Ok(Ok(m)) => m,
             Ok(Err(e)) => {
-                tracing::warn!(connection = %connection.id, error = %e, "could not read the saved connection; init SQL counts as not confirmed");
+                tracing::warn!(connection = %connection.id, kind = e.kind(), "could not read the saved connection; init SQL counts as not confirmed");
                 true
             }
             Err(_) => true,
@@ -1769,7 +1769,7 @@ async fn record_imported_init_sql_confirmed(shared: &Arc<Shared>, connection: &C
                 Ok(Err(e)) => {
                     tracing::warn!(
                         connection = %id,
-                        error = %e,
+                        kind = e.kind(),
                         "could not record the confirmed init SQL; it will be asked again"
                     );
                     false
