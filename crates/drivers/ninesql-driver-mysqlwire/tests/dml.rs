@@ -311,7 +311,23 @@ struct Out {
     counts: Vec<Option<u64>>,
 }
 
+/// Runs `st`, retrying TiDB's transient error 8028 ("Information schema is changed … try again
+/// later"), which TiDB returns when DDL from another test session changes the schema while the
+/// statement runs; TiDB aborts the statement first, so running it again is safe.
 async fn exec(s: &mut dyn Session, st: Statement) -> Result<Out, DriverError> {
+    let mut attempt = 0;
+    loop {
+        match exec_once(s, st.clone()).await {
+            Err(e) if attempt < 5 && e.to_string().contains("Information schema is changed") => {
+                attempt += 1;
+                tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            }
+            other => return other,
+        }
+    }
+}
+
+async fn exec_once(s: &mut dyn Session, st: Statement) -> Result<Out, DriverError> {
     let mut stream = s.execute(st, ExecOptions::default()).await?;
     let mut o = Out::default();
     while let Some(item) = stream.next().await {
