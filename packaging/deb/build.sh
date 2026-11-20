@@ -11,8 +11,12 @@
 #      registry cache and index mounted read-only (the extracted crate sources are the
 #      container's own, under the build dir). Paths inside the container are fixed (/src, /cargo, /toolchain,
 #      /target) and remapped with --remap-path-prefix, so the binary does not depend on where
-#      the checkout or the cargo home lives on the host.
-#   4. Check that the binary needs no glibc symbol newer than 2.35 (Ubuntu 22.04).
+#      the checkout or the cargo home lives on the host. NINESQL_PACKAGE_BUILD=1 is set in the
+#      container, so a build with the `e2e-scenarios` test feature fails to compile
+#      (ADR-0029 §2.2, guard 1).
+#   4. Refuse a binary holding the e2e-scenarios test-build marker (check-no-e2e-marker.sh,
+#      ADR-0029 §2.2, guard 2), then check that it needs no glibc symbol newer than 2.35
+#      (Ubuntu 22.04).
 #   5. Generate the man page (gzip -n) and the third-party license file (cargo-about, offline,
 #      from the crates' own license files) next to the binary, and check that it holds the
 #      FreeType and Lucide notices (check-notices.sh).
@@ -131,6 +135,7 @@ docker run --rm --network none \
     -e CARGO_TERM_COLOR=never \
     -e CARGO_INCREMENTAL=0 \
     -e SOURCE_DATE_EPOCH \
+    -e NINESQL_PACKAGE_BUILD=1 \
     -e RUSTFLAGS="$remap" \
     "$IMAGE" \
     timeout "$TIMEOUT" cargo build --release --locked --offline -p ninesql-ui --bin ninesql
@@ -138,7 +143,9 @@ docker run --rm --network none \
 BIN=$BUILD_DIR/release/ninesql
 [ -x "$BIN" ] || die "the build did not produce $BIN"
 
-log "4/6 glibc check (<= $MAX_GLIBC)"
+log "4/6 no e2e-scenarios test build, glibc check (<= $MAX_GLIBC)"
+# ADR-0029 §2.2: a test build of the end-to-end scenario runner is never packaged.
+packaging/check-no-e2e-marker.sh "$BIN"
 needed=$(docker run --rm --network none -v "$BIN:/ninesql:ro" "$IMAGE" \
     sh -c "objdump -T /ninesql | grep -o 'GLIBC_[0-9][0-9.]*' | sed 's/GLIBC_//' | sort -uV | tail -n 1")
 log "highest glibc symbol version needed: $needed"

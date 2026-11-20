@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # Test of the report scrubber and secret checks of scripts/e2e-local.sh, on fake report
-# directories (scripts/e2e-local.sh --check-report). Needs no display, Docker or cargo.
+# directories (scripts/e2e-local.sh --check-report), and of its scenarios stage with a fake
+# scenario runner. Needs no display, Docker or cargo.
 # Usage: scripts/e2e-local-report-test.sh
 set -euo pipefail
 umask 077
@@ -183,6 +184,191 @@ for case in "0 0 yes" "42 1 no" "3 1 no"; do
     else
         check "gitleaks exit $glrc: no archive" [ ! -e "$d/report.tar.gz" ]
     fi
+done
+
+# 5. The scenarios stage, with a fake runner instead of the test build (E2E_TEST_SCENARIO_BIN)
+# and fake xdotool / import, so its logic runs with no build, display or Docker.
+mkdir "$WORK/bin-shot" "$WORK/scen"
+cat >"$WORK/bin-shot/xdotool" <<'EOF'
+#!/bin/sh
+case "$1" in search) echo 4242 ;; esac
+exit 0
+EOF
+cat >"$WORK/bin-shot/import" <<'EOF'
+#!/bin/sh
+for a in "$@"; do out=$a; done
+printf 'fake png\n' >"$out"
+EOF
+cat >"$WORK/fake-ninesql" <<'EOF'
+#!/usr/bin/env bash
+# Fake scenario runner: the CLI and exit statuses of `ninesql --e2e-run` (e2e/README.md).
+set -u
+if [ "${1:-}" = --version ]; then echo "${FAKE_VERSION:-ninesql 0.0.0 (e2e-scenarios test build, not for distribution)}"; exit 0; fi
+[ "${1:-}" = --e2e-run ] && [ "${3:-}" = --e2e-out ] && [ $# = 4 ] || exit 2
+name="$(basename "$2" .toml)"
+out=$4
+run="$(dirname "$out")"
+[ -z "${WAYLAND_DISPLAY:-}" ] || { echo "WAYLAND_DISPLAY must be unset" >&2; exit 2; }
+for v in HOME XDG_CONFIG_HOME XDG_DATA_HOME XDG_STATE_HOME XDG_CACHE_HOME; do
+    case "${!v}" in "$run"/*) ;; *) echo "$v is outside the run directory" >&2; exit 2 ;; esac
+done
+[ "$(stat -c %a "$run")" = 700 ] || { echo "run directory mode" >&2; exit 2; }
+[ -d "$out" ] || { echo "no out directory" >&2; exit 2; }
+mkdir -p "$XDG_STATE_HOME/ninesql/logs"
+results() { # <outcome> <exit> <checkpoints json> <steps json>
+    printf '{"schema_version":1,"scenario":"%s","outcome":"%s","exit_code":%s,"message":null,"checkpoints":%s,"planned_checkpoints":["start","done"],"steps":%s}\n' \
+        "$name" "$1" "$2" "$3" "$4" >"$out/results.json"
+}
+checkpoint() { echo "ninesql-e2e checkpoint $1 $2"; sleep 1; }
+pass_steps='[{"index":1,"name":"a","kind":"wait","outcome":"pass"},{"index":2,"name":"b","kind":"checkpoint","outcome":"pass"}]'
+case "$name" in
+    fake-pass)
+        checkpoint 1 start
+        checkpoint 2 done
+        echo "connected with nine_dev_only" >"$XDG_STATE_HOME/ninesql/logs/ninesql.log"
+        results pass 0 '["start","done"]' "$pass_steps"; exit 0 ;;
+    fake-fail)
+        checkpoint 1 start
+        results fail 1 '["start"]' '[{"index":1,"name":"a","kind":"wait","outcome":"pass"},{"index":2,"name":"rows","kind":"expect","outcome":"fail","message":"grid.rows: expected 5 | got `0`"}]'
+        exit 1 ;;
+    fake-refused) echo "ninesql: scenario run stopped: the run directory must be owned by the current user with mode 0700" >&2; exit 2 ;;
+    fake-secret)
+        echo "MasterSecretXYZ" >"$XDG_STATE_HOME/ninesql/logs/ninesql.log"
+        echo "found MasterSecretXYZ in state/x" >&2
+        results secret-found 3 '[]' "$pass_steps"; exit 3 ;;
+    fake-setup) results setup-error 4 '[]' '[]'; exit 4 ;;
+    fake-skip) results skipped 5 '[]' '[]'; exit 5 ;;
+    fake-hang) echo "ninesql-e2e checkpoint 1 start"; exec sleep 60 ;;
+    fake-panic) echo "thread 'main' panicked at src/x.rs:1:1" >&2; results pass 0 '[]' "$pass_steps"; exit 0 ;;
+esac
+exit 2
+EOF
+chmod 0700 "$WORK/bin-shot/xdotool" "$WORK/bin-shot/import" "$WORK/fake-ninesql"
+for s in fake-pass fake-fail fake-refused fake-secret fake-setup fake-skip fake-hang fake-panic; do
+    printf 'schema_version = 1\nname = "%s"\n' "$s" >"$WORK/scen/$s.toml"
+done
+printf '[[connection]]\nname = "PG"\nengine = "postgresql"\n' >>"$WORK/scen/fake-skip.toml"
+
+# scenarios <n> [options...]: runs only the scenarios stage into $WORK/sN; sets REP and RC.
+scenarios() {
+    local n=$1
+    shift
+    RC=0
+    E2E_TEST_SCENARIO_BIN="${FAKE_BIN:-$WORK/fake-ninesql}" E2E_TEST_SCENARIO_DIR="$WORK/scen" \
+        E2E_TEST_OUTPUT_DIR="$WORK/s$n" DISPLAY="${FAKE_DISPLAY-:99}" WAYLAND_DISPLAY=wayland-test \
+        PATH="$WORK/bin-shot:$NOGL_PATH" timeout 300 "$E2E" --skip env --only scenarios \
+        --engines-running --no-secret-scan "$@" >"$WORK/scen-out$n.txt" 2>&1 || RC=$?
+    REP="$(find "$WORK/s$n/e2e-reports" -mindepth 1 -maxdepth 1 -type d 2>/dev/null | head -n 1 || true)"
+}
+
+# 5a. Every exit status at once.
+scenarios 1 --scenario-timeout 4
+S="$REP/summary.md"
+check "scenarios: script exit 1 (got $RC)" [ "$RC" = 1 ]
+expect_in "$S" "| scenarios | FAIL |" "scenarios: stage FAIL"
+expect_in "$S" "| fake-pass | PASS | 0 | 2 | 0 | 2 / 2 | 2 |" "scenarios: pass row"
+expect_in "$S" "| fake-fail | FAIL | 1 | 1 | 1 | 1 / 2 | 1 |" "scenarios: fail row"
+expect_in "$S" "| fake-refused | FAIL (refused) | 2 |" "scenarios: refused row"
+expect_in "$S" "| fake-secret | FAIL (SECRET FOUND) | 3 |" "scenarios: secret row"
+expect_in "$S" "| fake-setup | FAIL (setup error) | 4 |" "scenarios: setup-error row"
+expect_in "$S" "| fake-skip | SKIP | 5 |" "scenarios: skipped row"
+expect_in "$S" "| fake-hang | FAIL (time limit 4 s) |" "scenarios: time limit row"
+expect_in "$S" "| fake-panic | FAIL (panic on stderr) | 0 |" "scenarios: panic row"
+expect_in "$S" 'grid.rows: expected 5   got  0 ' "scenarios: failed step message, Markdown-safe"
+expect_in "$S" "the run directory must be owned" "scenarios: refusal message from stderr"
+expect_in "$S" "Dev engines \`postgresql\`: --engines-running" "scenarios: engines read from the scenario files"
+check "scenarios: checkpoint 1 screenshot taken" [ -s "$REP/scenarios/fake-pass/checkpoint-01-start.png" ]
+check "scenarios: checkpoint 2 screenshot taken" [ -s "$REP/scenarios/fake-pass/checkpoint-02-done.png" ]
+check "scenarios: results.json collected" [ -s "$REP/scenarios/fake-fail/results.json" ]
+expect_in "$REP/scenarios/fake-pass/stdout.log" "ninesql-e2e checkpoint 2 done" "scenarios: stdout collected"
+expect_in "$REP/scenarios/fake-pass/ninesql.log" "<dev-password>" "scenarios: file log collected, dev password redacted"
+check "scenarios: secret run's file log not collected" [ ! -e "$REP/scenarios/fake-secret/ninesql.log" ]
+check "scenarios: secret found: no archive, even with --no-secret-scan" [ ! -e "$REP/report.tar.gz" ]
+expect_in "$WORK/scen-out1.txt" "!!! scenarios: fake-secret" "scenarios: secret found: loud warning"
+expect_in "$S" "this report is never archived, whatever the other checks say" "scenarios: secret found: noted in the secret checks"
+check "scenarios: run directories removed" [ -z "$(ls -A "$WORK/s1/e2e-runs" 2>/dev/null)" ]
+expect_not_in "$S" "WAYLAND_DISPLAY must be unset" "scenarios: WAYLAND_DISPLAY unset for the run"
+# M1: a secret run's standard error never reaches the report; a marker stops any archive.
+expect_in "$REP/scenarios/fake-secret/stderr.log" "stderr withheld" "scenarios: secret run's stderr.log is the placeholder"
+check "scenarios: secret run's stderr.log is the placeholder only" [ "$(grep -c . "$REP/scenarios/fake-secret/stderr.log")" = 1 ]
+secret_absent() { ! grep -rqF MasterSecretXYZ "$REP"; }
+check "scenarios: the secret is nowhere in the report" secret_absent
+check "scenarios: SECRET-FOUND marker written" [ -f "$REP/scenarios/SECRET-FOUND" ]
+expect_in "$REP/scenarios/fake-panic/stderr.log" "panicked at" "scenarios: other runs' stderr still collected"
+# L2: the report is for this user only.
+check "scenarios: report directory is 0700" mode_is "$REP" 700
+check "scenarios: scenarios directory is 0700" mode_is "$REP/scenarios" 700
+check "scenarios: scenario directory is 0700" mode_is "$REP/scenarios/fake-pass" 700
+for f in stderr.log stdout.log results.json ninesql.log; do
+    check "scenarios: fake-pass/$f is 0600" mode_is "$REP/scenarios/fake-pass/$f" 600
+done
+check "scenarios: secret run's stderr.log is 0600" mode_is "$REP/scenarios/fake-secret/stderr.log" 600
+check "scenarios: summary.md is 0600" mode_is "$S" 600
+# M1: a later --check-report, even with --no-secret-scan, refuses to archive the report.
+rc=0
+PATH="$NOGL_PATH" "$E2E" --check-report "$REP" --no-secret-scan >"$WORK/out-secret-check.txt" 2>&1 || rc=$?
+check "check-report of a secret report: exit 1 (got $rc)" [ "$rc" = 1 ]
+check "check-report of a secret report: no archive" [ ! -e "$REP/report.tar.gz" ]
+expect_in "$WORK/out-secret-check.txt" "this report is never archived" "check-report of a secret report: clear message"
+# Without the marker, the "FAIL (SECRET FOUND)" row of summary.md still stops the archive.
+rm -f "$REP/scenarios/SECRET-FOUND"
+rc=0
+PATH="$NOGL_PATH" "$E2E" --check-report "$REP" --no-secret-scan >"$WORK/out-secret-check2.txt" 2>&1 || rc=$?
+check "check-report, marker removed: exit 1 (got $rc)" [ "$rc" = 1 ]
+check "check-report, marker removed: no archive" [ ! -e "$REP/report.tar.gz" ]
+# A marker alone (a planted one, or a report whose summary was rewritten) is enough.
+d="$(new_report marker-only)"
+mkdir "$d/scenarios"
+printf 'x\n' >"$d/scenarios/SECRET-FOUND"
+rc=0
+PATH="$NOGL_PATH" "$E2E" --check-report "$d" --no-secret-scan >"$WORK/out-marker.txt" 2>&1 || rc=$?
+check "check-report, marker only: exit 1 (got $rc)" [ "$rc" = 1 ]
+check "check-report, marker only: no archive" [ ! -e "$d/report.tar.gz" ]
+
+# 5b. Pass and skip: stage PASS, archive with the screenshots.
+scenarios 2 --scenario fake-pass,fake-skip
+check "scenarios pass: script exit 0 (got $RC)" [ "$RC" = 0 ]
+expect_in "$REP/summary.md" "| scenarios | PASS |" "scenarios pass: stage PASS"
+check "scenarios pass: archive written" [ -s "$REP/report.tar.gz" ]
+archive_has() { tar -tzf "$1" 2>/dev/null | grep -q -- "$2"; }
+check "scenarios pass: screenshots in the archive" archive_has "$REP/report.tar.gz" "scenarios/fake-pass/checkpoint-01-start.png"
+expect_in "$WORK/scen-out2.txt" "checkpoint screenshots of the test windows" "scenarios pass: screenshot note"
+
+# 5c. Only skipped scenarios: stage SKIP. No display: stage SKIP, nothing run.
+scenarios 3 --scenario fake-skip
+check "scenarios all skipped: script exit 0 (got $RC)" [ "$RC" = 0 ]
+expect_in "$REP/summary.md" "| scenarios | SKIP |" "scenarios all skipped: stage SKIP"
+FAKE_DISPLAY="" scenarios 4 --scenario fake-pass
+check "scenarios no display: script exit 0 (got $RC)" [ "$RC" = 0 ]
+expect_in "$REP/summary.md" "| scenarios | SKIP |" "scenarios no display: stage SKIP"
+check "scenarios no display: nothing run" [ ! -e "$REP/scenarios" ]
+
+# 5d. --no-screenshot; a binary that is not a test build; --dry-run; an unknown scenario.
+scenarios 5 --scenario fake-pass --no-screenshot
+check "scenarios --no-screenshot: exit 0 (got $RC)" [ "$RC" = 0 ]
+check "scenarios --no-screenshot: no screenshot" [ -z "$(find "$REP" -name '*.png')" ]
+expect_in "$REP/summary.md" "none: off (--no-screenshot)" "scenarios --no-screenshot: noted"
+cat >"$WORK/not-test-build" <<'EOF'
+#!/bin/sh
+echo "ninesql 0.0.0"
+EOF
+chmod 0700 "$WORK/not-test-build"
+FAKE_BIN="$WORK/not-test-build" scenarios 6 --scenario fake-pass
+check "scenarios release binary: exit 1 (got $RC)" [ "$RC" = 1 ]
+expect_in "$REP/summary.md" "does not say it is a test build" "scenarios release binary: refused"
+scenarios 7 --dry-run
+check "scenarios --dry-run: exit 0 (got $RC)" [ "$RC" = 0 ]
+expect_in "$WORK/scen-out7.txt" "--e2e-run $WORK/scen/fake-pass.toml" "scenarios --dry-run: run command printed"
+check "scenarios --dry-run: nothing run" [ ! -e "$REP/scenarios" ]
+scenarios 8 --scenario no-such-scenario
+check "scenarios unknown name: exit 2 (got $RC)" [ "$RC" = 2 ]
+# L1: names outside [a-z0-9-] are refused before any file is looked up.
+printf 'schema_version = 1\n' >"$WORK/foo.toml"
+for bad in ../foo 'fake-pass,../foo' 'fake-pass,,fake-skip' 'Fake-pass' 'fake pass'; do
+    scenarios 9 --scenario "$bad"
+    check "scenarios name '$bad': exit 2 (got $RC)" [ "$RC" = 2 ]
+    check "scenarios name '$bad': nothing written" [ ! -e "$WORK/s9" ]
+    expect_in "$WORK/scen-out9.txt" "--scenario takes scenario names" "scenarios name '$bad': refusal message"
 done
 
 if [ "$FAILS" = 0 ]; then echo "All report checks passed."; else echo "$FAILS check(s) failed."; exit 1; fi

@@ -1,0 +1,84 @@
+# Phase 1 and 3 exit scenarios on SQLite: the saved connection in the navigator, "Connect",
+# a statement run from the SQL editor, the rows in the results grid, a second statement that
+# reports an update count. Runs without any container (the "nine" file is created in the run's
+# HOME from dev/seed/sqlite/nine.sql).
+schema_version = 1
+name = "sqlite-editor-grid"
+description = "SQLite: connect from the navigator, run a SELECT in the SQL editor, read the grid."
+
+[[connection]]
+name = "Nine SQLite"
+engine = "sqlite"
+file = "nine.db"
+
+[[step]]
+wait = "core.ready"
+equals = true
+timeout_secs = 60
+
+[[step]]
+wait = "connections.count"
+equals = 1
+
+[[step]]
+checkpoint = "start"
+
+[[step]]
+action = "ninesql::FocusNavigator"
+
+[[step]]
+keys = "home"
+
+[[step]]
+wait = "navigator.selected"
+equals = "Nine SQLite"
+
+[[step]]
+checkpoint = "navigator-connection"
+
+[[step]]
+action = "ninesql::ConnectConnection"
+
+[[step]]
+wait = "session.open"
+arg = "Nine SQLite"
+equals = true
+timeout_secs = 30
+
+[[step]]
+wait = "editor.connection"
+equals = "Nine SQLite"
+
+[[step]]
+expect = "session.read_only"
+arg = "Nine SQLite"
+equals = false
+
+[[step]]
+checkpoint = "connected"
+
+# Focus the active editor (the pane cycle focuses it), type and run.
+[[step]]
+action = "ninesql::FocusNextPane"
+
+[[step]]
+text = "SELECT id, name, email FROM customers ORDER BY id LIMIT 5"
+
+[[step]]
+action = "ninesql_editor::ExecuteStatement"
+
+[[step]]
+wait = "grid.state"
+equals = "complete"
+timeout_secs = 30
+
+[[step]]
+expect = "grid.rows"
+equals = 5
+
+[[step]]
+expect = "editor.error"
+equals = false
+
+[[step]]
+checkpoint = "select-results"

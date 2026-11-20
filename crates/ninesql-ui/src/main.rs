@@ -10,6 +10,12 @@
 //! a statement, a secret), and the default hook prints it to stderr, where a terminal log, a
 //! journal or a bug report keeps it (I1). Release builds print only a fixed message and the
 //! panic's source location; the message is kept only in debug builds.
+//!
+//! With the test-only feature `e2e-scenarios` (ADR-0029 §2), and only then, the binary also
+//! takes `--e2e-run <scenario-file> --e2e-out <directory>` (the scenario runner of
+//! `ninesql_ui::e2e`), and carries three build guards: a compile-time refusal when
+//! `NINESQL_PACKAGE_BUILD` is set (package builds), a fixed marker string kept in the binary
+//! that the packaging checks refuse, and a `--version` line that names the test build.
 #![forbid(unsafe_code)]
 
 use std::io::Write;
@@ -17,6 +23,45 @@ use std::process::ExitCode;
 use std::sync::Arc;
 
 use ninesql_core::DriverRegistry;
+
+mod logging;
+
+// ADR-0029 §2.2, guard 1: a package build (`packaging/deb/build.sh`, the Flatpak manifest)
+// sets `NINESQL_PACKAGE_BUILD`, so a package built with the runner does not compile.
+#[cfg(feature = "e2e-scenarios")]
+const _: () = assert!(
+    option_env!("NINESQL_PACKAGE_BUILD").is_none(),
+    "e2e-scenarios must not be built for a package"
+);
+
+/// ADR-0029 §2.2, guard 2: the marker the packaging checks look for (`grep -a`, `strings`),
+/// kept by the optimiser and the linker even though nothing reads it.
+#[cfg(feature = "e2e-scenarios")]
+#[used]
+static E2E_TEST_BUILD_MARKER: [u8; 32] = *b"NINESQL-E2E-SCENARIOS-TEST-BUILD";
+
+/// The `--version` line.
+fn version_line() -> String {
+    #[cfg(feature = "e2e-scenarios")]
+    {
+        format!(
+            "ninesql {} (e2e-scenarios test build, not for distribution)",
+            env!("CARGO_PKG_VERSION")
+        )
+    }
+    #[cfg(not(feature = "e2e-scenarios"))]
+    {
+        format!("ninesql {}", env!("CARGO_PKG_VERSION"))
+    }
+}
+
+#[cfg(feature = "e2e-scenarios")]
+const E2E_USAGE: &str = concat!(
+    "  --e2e-run FILE --e2e-out DIR\n",
+    "                   (test build only) Run the scenario FILE in a window and write\n",
+    "                   its results to DIR; HOME and the XDG directories must lie in a\n",
+    "                   fresh private run directory (ADR-0029)\n",
+);
 
 const USAGE: &str = "\
 Usage: ninesql [OPTION]
@@ -36,9 +81,29 @@ enum Command {
     Help,
     /// An argument NineSQL does not take; it is not echoed back (it could be anything).
     Invalid,
+    /// A scenario run (test build only).
+    #[cfg(feature = "e2e-scenarios")]
+    E2eRun {
+        scenario: std::path::PathBuf,
+        out: std::path::PathBuf,
+    },
 }
 
 fn parse<I: IntoIterator<Item = std::ffi::OsString>>(args: I) -> Command {
+    #[cfg(feature = "e2e-scenarios")]
+    let args: Vec<std::ffi::OsString> = args.into_iter().collect();
+    #[cfg(feature = "e2e-scenarios")]
+    if let [run, file, out, dir] = args.as_slice()
+        && run == "--e2e-run"
+        && out == "--e2e-out"
+        && !file.is_empty()
+        && !dir.is_empty()
+    {
+        return Command::E2eRun {
+            scenario: file.into(),
+            out: dir.into(),
+        };
+    }
     let mut args = args.into_iter();
     let Some(first) = args.next() else {
         return Command::Run;
@@ -124,6 +189,9 @@ fn format_panic_report(
 /// installed before any thread is spawned; nothing else in the workspace sets a hook. It never
 /// panics itself and ignores a closed stderr.
 fn install_panic_hook() {
+    /// How long a panic waits for the queued log lines.
+    const PANIC_LOG_FLUSH: std::time::Duration = std::time::Duration::from_millis(250);
+
     std::panic::set_hook(Box::new(|info| {
         let mode = PanicReport::for_this_build();
         #[allow(unused_mut)]
@@ -135,6 +203,9 @@ fn install_panic_hook() {
                 report.push_str(&format!("backtrace:\n{backtrace}\n"));
             }
         }
+        // The log lines queued before the panic first, within a short bound: the subscriber's
+        // writer threads may be stuck on an undrained stderr.
+        logging::flush_before_exit(PANIC_LOG_FLUSH);
         let _ = std::io::stderr().lock().write_all(report.as_bytes());
     }));
 }
@@ -144,15 +215,13 @@ fn main() -> ExitCode {
     match parse(std::env::args_os().skip(1)) {
         Command::Version => {
             // A closed stdout is not worth an error for `--version`.
-            let _ = writeln!(
-                std::io::stdout().lock(),
-                "ninesql {}",
-                env!("CARGO_PKG_VERSION")
-            );
+            let _ = writeln!(std::io::stdout().lock(), "{}", version_line());
             return ExitCode::SUCCESS;
         }
         Command::Help => {
             let _ = write!(std::io::stdout().lock(), "{USAGE}");
+            #[cfg(feature = "e2e-scenarios")]
+            let _ = write!(std::io::stdout().lock(), "{E2E_USAGE}");
             return ExitCode::SUCCESS;
         }
         Command::Invalid => {
@@ -162,15 +231,46 @@ fn main() -> ExitCode {
             );
             return ExitCode::from(2);
         }
+        #[cfg(feature = "e2e-scenarios")]
+        Command::E2eRun { scenario, out } => return run_scenario(&scenario, &out),
         Command::Run => {}
     }
 
+    // The subscriber (ADR-0029 §3): before GPUI starts, after the panic hook. Its guard flushes
+    // the file log when `main` returns.
+    let _log = logging::install(ninesql_core::storage::Paths::from_env().ok().as_ref());
+    ninesql_ui::app::run(registry());
+    ExitCode::SUCCESS
+}
+
+/// The drivers NineSQL ships (L5).
+fn registry() -> DriverRegistry {
     let mut registry = DriverRegistry::new();
     registry.register(Arc::new(ninesql_driver_pgwire::PgWireDriver::new()));
     registry.register(Arc::new(ninesql_driver_mysqlwire::MySqlWireDriver::new()));
     registry.register(Arc::new(ninesql_driver_sqlite::SqliteDriver::new()));
-    ninesql_ui::app::run(registry);
-    ExitCode::SUCCESS
+    registry
+}
+
+/// `--e2e-run` (test build): the isolation and scenario checks before anything is read or
+/// written (status 2 with a fixed message otherwise), then the subscriber (the run's settings
+/// and log file), then the run in a window. Exit statuses: `ninesql_ui::e2e::ExitStatus`.
+#[cfg(feature = "e2e-scenarios")]
+fn run_scenario(scenario: &std::path::Path, out: &std::path::Path) -> ExitCode {
+    let prepared = match ninesql_ui::e2e::prepare(scenario, out) {
+        Ok(p) => p,
+        Err(stop) => {
+            let _ = writeln!(
+                std::io::stderr().lock(),
+                "ninesql: scenario run stopped: {}",
+                logging::escape(&stop.message)
+            );
+            return ExitCode::from(stop.status.code());
+        }
+    };
+    let _log = logging::install(ninesql_core::storage::Paths::from_env().ok().as_ref());
+    let status = prepared.run(registry());
+    ExitCode::from(status.code())
 }
 
 #[cfg(test)]
@@ -242,5 +342,47 @@ mod tests {
         assert_eq!(parse(args(&["--verbose"])), Command::Invalid);
         assert_eq!(parse(args(&["file.sql"])), Command::Invalid);
         assert_eq!(parse(args(&["--version", "--help"])), Command::Invalid);
+    }
+
+    /// The scenario runner's arguments: refused in a normal build (status 2), accepted in the
+    /// test build only and only in their exact form (ADR-0029 §2.3).
+    #[test]
+    fn e2e_arguments_only_in_the_test_build() {
+        let run = args(&["--e2e-run", "s.toml", "--e2e-out", "/tmp/out"]);
+        #[cfg(not(feature = "e2e-scenarios"))]
+        assert_eq!(parse(run), Command::Invalid);
+        #[cfg(feature = "e2e-scenarios")]
+        assert_eq!(
+            parse(run),
+            Command::E2eRun {
+                scenario: "s.toml".into(),
+                out: "/tmp/out".into()
+            }
+        );
+        for wrong in [
+            &["--e2e-run", "s.toml"][..],
+            &["--e2e-out", "/tmp/out", "--e2e-run", "s.toml"],
+            &["--e2e-run", "", "--e2e-out", "/tmp/out"],
+            &["--e2e-run", "s.toml", "--e2e-out", "/tmp/out", "x"],
+        ] {
+            assert_eq!(parse(args(wrong)), Command::Invalid, "{wrong:?}");
+        }
+    }
+
+    #[test]
+    fn version_line_names_the_test_build_only_with_the_feature() {
+        let line = super::version_line();
+        assert!(line.starts_with("ninesql "));
+        assert_eq!(
+            line.contains("e2e"),
+            cfg!(feature = "e2e-scenarios"),
+            "{line}"
+        );
+        #[cfg(feature = "e2e-scenarios")]
+        {
+            assert!(line.ends_with(" (e2e-scenarios test build, not for distribution)"));
+            assert_eq!(super::E2E_TEST_BUILD_MARKER.len(), 32);
+            assert_eq!(ninesql_ui::app::TITLE_SUFFIX, " [E2E TEST BUILD]");
+        }
     }
 }

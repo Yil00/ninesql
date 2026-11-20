@@ -82,6 +82,41 @@ impl DriverError {
     }
 }
 
+/// The variant name of `e`, for a log field (`driver_error_kind`): never its message, which can
+/// quote an engine's values (a duplicate key, a failing cast), statement text, a host or a path
+/// (ADR-0029 §3.2).
+pub(crate) fn log_kind(e: &DriverError) -> &'static str {
+    match e {
+        DriverError::InvalidParams(_) => "InvalidParams",
+        DriverError::Connect(_) => "Connect",
+        DriverError::Auth(_) => "Auth",
+        DriverError::Tls(_) => "Tls",
+        DriverError::ReadOnly(_) => "ReadOnly",
+        DriverError::Query { .. } => "Query",
+        DriverError::Timeout(_) => "Timeout",
+        DriverError::Cancelled => "Cancelled",
+        DriverError::Unsupported(_) => "Unsupported",
+        DriverError::MultipleStatements(_) => "MultipleStatements",
+        DriverError::Busy => "Busy",
+        DriverError::Closed(_) => "Closed",
+        DriverError::Protocol(_) => "Protocol",
+        DriverError::Io(_) => "Io",
+    }
+}
+
+/// The engine error code of a query error (SQLSTATE, MySQL error number), for a log field; only
+/// a short ASCII alphanumeric code, so a server cannot smuggle text through it.
+pub(crate) fn log_code(e: &DriverError) -> Option<&str> {
+    match e {
+        DriverError::Query { code: Some(c), .. }
+            if !c.is_empty() && c.len() <= 8 && c.bytes().all(|b| b.is_ascii_alphanumeric()) =>
+        {
+            Some(c)
+        }
+        _ => None,
+    }
+}
+
 /// Replaces every occurrence of `secret` in `message` with `***`.
 ///
 /// Use it on client-library error text that may echo the password it was given.

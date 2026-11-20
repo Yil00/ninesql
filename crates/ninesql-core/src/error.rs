@@ -70,6 +70,27 @@ pub enum ConnectionError {
     NotFound(ConnectionId),
 }
 
+impl ConnectionError {
+    /// A short, stable name of the error kind, safe to log at any level: no property key, no
+    /// connection id (ADR-0029 §3.2).
+    #[must_use]
+    pub fn kind(&self) -> &'static str {
+        match self {
+            Self::InvalidEngineId => "invalid-engine-id",
+            Self::InvalidConnectionTypeId => "invalid-connection-type-id",
+            Self::InvalidColor => "invalid-color",
+            Self::InvalidField { .. } => "invalid-field",
+            Self::SecretInProperties { .. } => "secret-in-properties",
+            Self::ReservedProperty { .. } => "reserved-property",
+            Self::SecretInPropertyValue { .. } => "secret-in-property-value",
+            Self::SecretInInitSql { .. } => "secret-in-init-sql",
+            Self::NoSuchSecretSlot(_) => "no-such-secret-slot",
+            Self::DuplicateId(_) => "duplicate-id",
+            Self::NotFound(_) => "connection-not-found",
+        }
+    }
+}
+
 /// Error of a workspace operation.
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
@@ -102,6 +123,20 @@ pub enum WorkspaceError {
         #[source]
         source: Box<CoreError>,
     },
+}
+
+impl WorkspaceError {
+    /// A short, stable name of the error kind, safe to log at any level: no path, no
+    /// connection name, no store detail (ADR-0029 §3.2).
+    #[must_use]
+    pub fn kind(&self) -> &'static str {
+        match self {
+            Self::Storage(e) => e.kind(),
+            Self::InvalidConnection { source, .. } | Self::Model(source) => source.kind(),
+            Self::Secrets(e) => e.kind(),
+            Self::Core { source, .. } => source.kind(),
+        }
+    }
 }
 
 /// Error of the driver runtime, the connect flow and sessions (P1-D). User-presentable: no
@@ -179,6 +214,11 @@ pub enum CoreError {
     /// No vault is open in this session (it could not be opened at startup).
     #[error("no vault is available in this session: {0}")]
     NoVault(String),
+    /// A test-build guard refused (feature `e2e-scenarios`, ADR-0029 §2.5): an endpoint that is
+    /// not loopback, a file outside the run directory, or guards not installed.
+    #[cfg(feature = "e2e-scenarios")]
+    #[error(transparent)]
+    TestBuild(#[from] crate::e2e::GuardError),
 }
 
 impl CoreError {
@@ -207,6 +247,8 @@ impl CoreError {
             Self::Runtime(_) => "runtime",
             Self::Vault(e) => vault_error_kind(e),
             Self::NoVault(_) => "no-vault",
+            #[cfg(feature = "e2e-scenarios")]
+            Self::TestBuild(e) => e.kind(),
         }
     }
 
@@ -223,18 +265,7 @@ impl CoreError {
 
 /// A short, stable name of a vault error kind, safe to log at any level (no path).
 fn vault_error_kind(e: &ninesql_secrets::VaultError) -> &'static str {
-    use ninesql_secrets::VaultError as E;
-    match e {
-        E::NotCreated => "vault-not-created",
-        E::AlreadyExists(_) => "vault-already-exists",
-        E::Locked => "vault-locked",
-        E::WrongPassword => "vault-wrong-password",
-        E::TooManyAttempts { .. } => "vault-too-many-attempts",
-        E::EmptyPassword => "vault-empty-password",
-        E::PasswordTooShort { .. } => "vault-password-too-short",
-        E::Corrupted { .. } | E::NewerVersion { .. } => "vault-file",
-        _ => "vault-other",
-    }
+    e.kind()
 }
 
 /// A short, stable name of a driver error kind, safe to log at any level.

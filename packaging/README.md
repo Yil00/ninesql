@@ -13,6 +13,7 @@ How NineSQL is packaged for Debian / Ubuntu and Flatpak (P6-A, [ADR-0010](../doc
 | `deb/about.toml`, `deb/third-party-licenses.hbs`, `deb/check-notices.sh` | The third-party license file (cargo-about) and its check for the FreeType and Lucide notices |
 | `deb/install-test.sh` | Install test on Debian 12 / 13 and Ubuntu 22.04 / 24.04 |
 | `deb/check-reproducible.sh` | Builds twice and compares the hashes |
+| `check-no-e2e-marker.sh`, `check-no-e2e-marker-test.sh` | Refuses a binary built with the `e2e-scenarios` test feature (marker check), and its test |
 | `sbom.py` | CycloneDX SBOM of the binary |
 | `flatpak/io.github.yil00.NineSQL.yml` | Flatpak manifest |
 | `flatpak/lint-manifest.py`, `flatpak/prepare-sources.sh`, `flatpak/verify-sources.py` | Manifest checks; the generated Flatpak sources and their check against `Cargo.lock` |
@@ -34,6 +35,13 @@ Needs Docker, rustup with the repository's toolchain, and on the host exactly ca
 **Base image.** `builder.Dockerfile` pins `ubuntu:22.04` by digest. `NINESQL_BUILDER_BASE` may pull that same digest from a mirror (`mirror.gcr.io/library/ubuntu@sha256:<digest>`); `build.sh` refuses any value that does not end with the pinned digest. Another base image means editing the Dockerfile, and such a build is not the release build.
 
 **Why cargo-deb.** ADR-0010 §1 names it; it builds the package from `[package.metadata.deb]` in `crates/ninesql-ui/Cargo.toml` (the manifest of the package that owns the binary, which is where cargo-deb reads it), clamps every file's time stamp to `SOURCE_DATE_EPOCH`, writes `root:root` owners and compresses the archive itself (no `dpkg-deb`), and generates `/usr/share/doc/ninesql/copyright` from `LICENSE`. It is a build tool (MIT), never linked into NineSQL, so I7 is unaffected. `--no-build` uses the binary from the builder; `--no-strip` keeps the release profile's symbol table (`strip = "debuginfo"`) and avoids a host `strip`.
+
+**Never a test build** ([ADR-0029](../docs/adr/0029-automated-ui-end-to-end-tests-and-application-logging.md) §2.2). The `e2e-scenarios` feature of `ninesql-ui` builds the end-to-end scenario runner, a test build that is never packaged. Three independent guards keep it out:
+1. *Compile time.* `build.sh` sets `NINESQL_PACKAGE_BUILD=1` in the builder (the Flatpak manifest sets it too, and `make flatpak-lint` requires it and refuses `e2e-scenarios` on a cargo line); with the feature on, the binary crate then fails to compile.
+2. *Marker.* A test build embeds `NINESQL-E2E-SCENARIOS-TEST-BUILD` and prints `(e2e-scenarios test build, not for distribution)` in `ninesql --version`. `build.sh` refuses a binary holding the marker before cargo-deb runs (`check-no-e2e-marker.sh`, `grep -a -c`); `release.yml` checks the built binary and the binary inside the `.deb` again with `strings` before signing; the install test refuses a `--version` line containing `e2e`.
+3. *Manifest.* `make e2e-feature-guard` (`scripts/e2e-feature-guard.py`, run by `make check` and the CI `deny` job) reads `cargo metadata --no-deps` and fails when `e2e-scenarios` is reachable from the `default` feature of `ninesql-ui` or `ninesql-core`, or when a workspace crate turns it on for either in a normal or build dependency or a feature (only the UI's own `e2e-scenarios` feature may enable the core's). It also runs the tests of the guard and of the marker check.
+
+The only place a test build is made on purpose is the `scenarios` stage of `make e2e-local` ([tutorial](../docs/tutorials/local-e2e.md)), which builds it in its own target directory, `target/e2e-build/`, and never replaces `target/release/ninesql`. `make deb` does not take a binary from the host: `build.sh` compiles its own in the builder, with `NINESQL_PACKAGE_BUILD=1` and no `--features`.
 
 **Contents.**
 | File | |
@@ -57,7 +65,7 @@ Needs Docker, rustup with the repository's toolchain, and on the host exactly ca
 ```bash
 make deb-install-test    # = packaging/deb/install-test.sh target/debian/ninesql_*_amd64.deb
 ```
-For each of Debian 12, Debian 13, Ubuntu 22.04 and Ubuntu 24.04, in a fresh container: apt installs the `.deb` and resolves its dependencies, no maintainer script exists, `ninesql --version` / `--help` run and an unknown argument exits with status 2, `desktop-file-validate` and `appstreamcli validate --no-net` pass, the man page renders with no `groff` warning, the icons and license files are there, and `apt-get purge` leaves no file behind. A distribution whose archive cannot be reached is reported `BLOCKED`, not passed. `NINESQL_TEST_REGISTRY=mirror.gcr.io/library` pulls the images from a mirror when Docker Hub rate-limits.
+For each of Debian 12, Debian 13, Ubuntu 22.04 and Ubuntu 24.04, in a fresh container: apt installs the `.deb` and resolves its dependencies, no maintainer script exists, `ninesql --version` / `--help` run, the version line has no `e2e` in it (not a test build) and an unknown argument exits with status 2, `desktop-file-validate` and `appstreamcli validate --no-net` pass, the man page renders with no `groff` warning, the icons and license files are there, and `apt-get purge` leaves no file behind. A distribution whose archive cannot be reached is reported `BLOCKED`, not passed. `NINESQL_TEST_REGISTRY=mirror.gcr.io/library` pulls the images from a mirror when Docker Hub rate-limits.
 
 ## Reproducibility
 ```bash
@@ -77,7 +85,7 @@ CycloneDX 1.5 JSON from `cargo cyclonedx` 0.5.10, limited to the crates linked i
 
 ## Release workflow
 [`release.yml`](../.github/workflows/release.yml) runs on the push of a tag `vX.Y.Z` or `vX.Y.Z-…` only; never on pull requests or branches. The maintainer pushes the tag (a tag created with `GITHUB_TOKEN` does not start workflows). Jobs:
-1. **build** (two replicas, two checkout paths, `contents: read`): checks that the tag matches the workspace version and is on `main`, installs the pinned toolchain (`RUSTUP_TOOLCHAIN`, bumped in its own PR), runs the supply-chain gate before building (`cargo deny --locked check advisories bans licenses sources` with the CI's cargo-deny version, installed `--locked`, and `scripts/verify-patches.sh`; P6-E review L2), installs the packaging tools from crates.io (`--locked`), runs `packaging/deb/build.sh`, and writes the SBOM;
+1. **build** (two replicas, two checkout paths, `contents: read`): checks that the tag matches the workspace version and is on `main`, installs the pinned toolchain (`RUSTUP_TOOLCHAIN`, bumped in its own PR), runs the supply-chain gate before building (`cargo deny --locked check advisories bans licenses sources` with the CI's cargo-deny version, installed `--locked`, and `scripts/verify-patches.sh`; P6-E review L2), installs the packaging tools from crates.io (`--locked`), runs `packaging/deb/build.sh` (which refuses an `e2e-scenarios` test build), checks the built binary and the binary inside the `.deb` again for the test-build marker with `strings` (ADR-0029 §2.2), and writes the SBOM;
 2. **reproducible** (no permission): the two `.deb` files must be byte-identical;
 3. **install-test**: `packaging/deb/install-test.sh` on the four distributions;
 4. **sign** (`id-token: write` only, environment `release`, after the three others): `SHA256SUMS` and cosign keyless signatures (`cosign sign-blob --bundle`, Sigstore with the workflow's OIDC identity) of the `.deb`, the SBOM and `SHA256SUMS`; it has no write access to the repository;

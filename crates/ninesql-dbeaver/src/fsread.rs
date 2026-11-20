@@ -276,7 +276,9 @@ pub(crate) fn list_dir(
         });
     }
     if truncated {
-        tracing::warn!(dir = %crate::report::shown_path(dir), "directory listing truncated");
+        // Only the folder's own name: its full path names the user's home (ADR-0029 §3.2).
+        let name = std::path::Path::new(dir.file_name().unwrap_or_default());
+        tracing::warn!(dir = %crate::report::shown_path(name), "directory listing truncated");
     }
     Ok(Listing { entries, truncated })
 }

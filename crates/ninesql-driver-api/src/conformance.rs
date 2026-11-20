@@ -17,6 +17,9 @@
 //!     conformance::assert_stale_cancel_ignored(&driver, dev_params(..), Q1, Q2).await;
 //!     conformance::assert_batches_within_budget(&driver, dev_params(..), WIDE_SQL, budget).await;
 //!     conformance::assert_credential_statements_not_logged(&driver, dev_params(..)).await;
+//!     conformance::assert_engine_messages_not_logged(&driver, dev_params(..), SETUP, FAILING)
+//!         .await;
+//!     conformance::assert_failed_connect_not_logged(&driver, &|| dev_params(..)).await;
 //!     conformance::assert_identifier_quoting(
 //!         &driver, dev_params(..), conformance::ALIAS_TEMPLATE, conformance::IDENTIFIER_SAMPLES,
 //!     ).await;
@@ -721,11 +724,11 @@ pub const CREDENTIAL_STATEMENT_SAMPLES: &[&str] = &[
 /// The value every [`CREDENTIAL_STATEMENT_SAMPLES`] statement holds.
 pub const LOG_HYGIENE_SECRET: &str = "hunter2-log-probe";
 
-/// Records the fields of every event it receives while `active` is set (a process-wide
-/// capture stays installed after a check, so it records only during one).
+/// Records the level and fields of every event it receives while `active` is set (a
+/// process-wide capture stays installed after a check, so it records only during one).
 #[derive(Clone, Default)]
 struct LogCapture {
-    lines: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+    lines: std::sync::Arc<std::sync::Mutex<Vec<(tracing::Level, String)>>>,
     active: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
@@ -755,34 +758,55 @@ impl tracing::Subscriber for LogCapture {
         self.lines
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .push(line);
+            .push((*event.metadata().level(), line));
     }
     fn enter(&self, _: &tracing::span::Id) {}
     fn exit(&self, _: &tracing::span::Id) {}
 }
 
-/// Connects with statement logging allowed and every event captured (`trace` included), runs
-/// [`CREDENTIAL_STATEMENT_SAMPLES`] as init SQL and as statements, then a harmless statement
-/// as both, and asserts that the log shows the harmless ones (so logging was on) but neither
-/// the credential statements nor [`LOG_HYGIENE_SECRET`] (I1, `text_may_hold_credentials`).
+/// One check's view of the log capture: recording from [`start_capture`] until
+/// [`CaptureRun::finish`]. Checks run one at a time (a process-wide lock), so two checks of one
+/// test binary never clear or stop each other's capture.
+struct CaptureRun {
+    capture: LogCapture,
+    _guard: Option<tracing::subscriber::DefaultGuard>,
+    _serial: tokio::sync::MutexGuard<'static, ()>,
+}
+
+impl CaptureRun {
+    /// Stops recording and returns the captured events.
+    fn finish(self) -> Vec<(tracing::Level, String)> {
+        self.capture
+            .active
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+        std::mem::take(
+            &mut *self
+                .capture
+                .lines
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+        )
+    }
+}
+
+/// Starts recording every event (`trace` included).
 ///
 /// Events are captured by a process-wide subscriber installed on first use, so events from
 /// every thread are seen (a thread-local subscriber missed events whose callsite interest
 /// another test thread had cached). If another global subscriber is already installed, the
-/// capture falls back to the calling thread: call it from a current-thread runtime
+/// capture falls back to the calling thread: call the checks from a current-thread runtime
 /// (`#[tokio::test(flavor = "current_thread")]`) so every task the driver spawns runs there.
-///
-/// # Panics
-/// When a credential statement is logged, or when no statement is (logging was not on).
-pub async fn assert_credential_statements_not_logged(driver: &dyn Driver, params: ConnectParams) {
+async fn start_capture() -> CaptureRun {
+    static SERIAL: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
     static GLOBAL: std::sync::OnceLock<Option<LogCapture>> = std::sync::OnceLock::new();
+    let serial = SERIAL.lock().await;
     let global = GLOBAL.get_or_init(|| {
         let capture = LogCapture::default();
         tracing::subscriber::set_global_default(capture.clone())
             .ok()
             .map(|()| capture)
     });
-    let (capture, _guard) = match global {
+    let (capture, guard) = match global {
         Some(capture) => {
             capture
                 .lines
@@ -803,6 +827,39 @@ pub async fn assert_credential_statements_not_logged(driver: &dyn Driver, params
     capture
         .active
         .store(true, std::sync::atomic::Ordering::SeqCst);
+    CaptureRun {
+        capture,
+        _guard: guard,
+        _serial: serial,
+    }
+}
+
+/// The captured events at `debug` and above (what a release build can write: ADR-0029 §3.5),
+/// one per line.
+fn debug_and_above(lines: &[(tracing::Level, String)]) -> String {
+    lines
+        .iter()
+        .filter(|(level, _)| *level <= tracing::Level::DEBUG)
+        .map(|(_, line)| line.as_str())
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// Connects with statement logging allowed and every event captured (`trace` included), runs
+/// [`CREDENTIAL_STATEMENT_SAMPLES`] as init SQL and as statements, then a harmless statement
+/// as both, and asserts that the log shows the harmless ones (so logging was on) but neither
+/// the credential statements nor [`LOG_HYGIENE_SECRET`] (I1, `text_may_hold_credentials`).
+///
+/// Events are captured by a process-wide subscriber installed on first use, so events from
+/// every thread are seen (a thread-local subscriber missed events whose callsite interest
+/// another test thread had cached). If another global subscriber is already installed, the
+/// capture falls back to the calling thread: call it from a current-thread runtime
+/// (`#[tokio::test(flavor = "current_thread")]`) so every task the driver spawns runs there.
+///
+/// # Panics
+/// When a credential statement is logged, or when no statement is (logging was not on).
+pub async fn assert_credential_statements_not_logged(driver: &dyn Driver, params: ConnectParams) {
+    let run_capture = start_capture().await;
     let mut p = params;
     p.log_statements = true;
     p.production = false;
@@ -825,13 +882,11 @@ pub async fn assert_credential_statements_not_logged(driver: &dyn Driver, params
         panic!("harmless statement failed: {e}");
     }
     let _ = session.close().await;
-    capture
-        .active
-        .store(false, std::sync::atomic::Ordering::SeqCst);
-    let all = capture
-        .lines
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
+    let all = run_capture
+        .finish()
+        .into_iter()
+        .map(|(_, line)| line)
+        .collect::<Vec<_>>()
         .join("\n");
     assert!(
         all.contains("SELECT 7 AS init_log_probe") && all.contains("SELECT 42 AS log_probe"),
@@ -840,6 +895,124 @@ pub async fn assert_credential_statements_not_logged(driver: &dyn Driver, params
     assert!(
         !all.contains(LOG_HYGIENE_SECRET),
         "a statement holding a credential was logged"
+    );
+}
+
+/// A value that the statements of [`assert_engine_messages_not_logged`] put into an engine's
+/// error message (a duplicate key's `DETAIL`, a failing cast, a missing table's name).
+pub const ENGINE_MESSAGE_PROBE: &str = "dup-log-probe-5821";
+
+/// Connects with every event captured (`trace` included), runs the `setup` statements, then
+/// each `failing` statement, which must fail; at least one of them must fail with
+/// [`ENGINE_MESSAGE_PROBE`] in the error's message (so the engine did quote it and the check
+/// proves something). Asserts that no event at `debug` and above holds the probe: an engine's
+/// message stays in the error for the UI, logs carry only its kind and code (ADR-0029 §3.2).
+/// `trace` is not checked, since statement text (which holds the probe) is logged there under
+/// the hygiene rule.
+///
+/// See [`assert_credential_statements_not_logged`] for the runtime to call it from.
+///
+/// # Panics
+/// When a `setup` statement fails, a `failing` statement succeeds, no error message holds the
+/// probe, or an event at `debug` and above does.
+pub async fn assert_engine_messages_not_logged(
+    driver: &dyn Driver,
+    params: ConnectParams,
+    setup: &[&str],
+    failing: &[&str],
+) {
+    let run_capture = start_capture().await;
+    let mut p = params;
+    p.log_statements = true;
+    p.production = false;
+    p.read_only = false;
+    let mut session = match driver.connect(p).await {
+        Ok(s) => s,
+        Err(e) => panic!("connect failed: {e}"),
+    };
+    for sql in setup {
+        if let Err(e) = run(session.as_mut(), sql).await {
+            panic!("setup `{sql}` failed: {e}");
+        }
+    }
+    let mut quoted = false;
+    for sql in failing {
+        match run(session.as_mut(), sql).await {
+            Ok(()) => panic!("`{sql}` did not fail"),
+            Err(e) => quoted |= e.to_string().contains(ENGINE_MESSAGE_PROBE),
+        }
+    }
+    let _ = session.close().await;
+    let logged = debug_and_above(&run_capture.finish());
+    assert!(
+        quoted,
+        "no engine error message quoted the probe: the check proves nothing"
+    );
+    assert!(
+        !logged.contains(ENGINE_MESSAGE_PROBE),
+        "an engine error message reached the log at debug or above:\n{logged}"
+    );
+}
+
+/// Two failed connects with every event captured (`trace` included): the server's own endpoint
+/// with [`LOG_HYGIENE_SECRET`] as the password (refused by the server), then a host field
+/// holding a connection URL with that password in it (`postgresql://user:…@nonexistent.invalid`,
+/// as a user may paste it) and the same password. Asserts that neither the returned errors
+/// (shown in the UI) nor any event at `debug` and above holds the password.
+///
+/// `make_params` builds parameters that connect to a network engine with a user name and a
+/// password. See [`assert_credential_statements_not_logged`] for the runtime to call it from.
+///
+/// # Panics
+/// When a connect succeeds, or when the password reaches an error or the log.
+pub async fn assert_failed_connect_not_logged(
+    driver: &dyn Driver,
+    make_params: &(dyn Fn() -> ConnectParams + Sync),
+) {
+    let run_capture = start_capture().await;
+    let with_probe = |mut p: ConnectParams| {
+        let user = match &p.auth {
+            Auth::Password { user, .. } => user.clone(),
+            _ => panic!("the check needs password authentication"),
+        };
+        p.auth = Auth::password(
+            user.clone(),
+            Some(Secret::new(LOG_HYGIENE_SECRET.to_owned())),
+        );
+        p.log_statements = true;
+        p.production = false;
+        p.connect_timeout = std::time::Duration::from_secs(10);
+        (p, user)
+    };
+    let mut errors = Vec::new();
+    let (p, _) = with_probe(make_params());
+    match driver.connect(p).await {
+        Ok(_) => panic!("a connect with a wrong password succeeded"),
+        Err(e) => errors.push(e.to_string()),
+    }
+    let (mut p, user) = with_probe(make_params());
+    let port = match &p.endpoint {
+        crate::params::Endpoint::Tcp { port, .. } => *port,
+        _ => panic!("the check needs a network engine"),
+    };
+    p.endpoint = crate::params::Endpoint::tcp(
+        format!("postgresql://{user}:{LOG_HYGIENE_SECRET}@nonexistent.invalid"),
+        port,
+    );
+    match driver.connect(p).await {
+        Ok(_) => panic!("a connect to a host holding a URL succeeded"),
+        Err(e) => errors.push(e.to_string()),
+    }
+    let logged = debug_and_above(&run_capture.finish());
+    for e in &errors {
+        assert!(
+            !e.contains(LOG_HYGIENE_SECRET),
+            "a connect error echoes the password: {e}"
+        );
+    }
+    assert!(
+        !logged.contains(LOG_HYGIENE_SECRET),
+        "the password of a failed connect reached the log at debug or above:\n{logged}"
     );
 }
 

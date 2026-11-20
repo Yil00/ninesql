@@ -138,6 +138,38 @@ pub enum StorageError {
 }
 
 impl StorageError {
+    /// A short, stable name of the error kind, safe to log at any level: no path, no parser
+    /// or SQLite message (ADR-0029 §3.2). The message itself is for the UI.
+    #[must_use]
+    pub fn kind(&self) -> &'static str {
+        match self {
+            Self::NoHome => "storage-no-home",
+            Self::InvalidProjectName => "storage-invalid-project-name",
+            Self::Io { .. } => "storage-io",
+            Self::WrongFileType { .. } => "storage-wrong-file-type",
+            Self::NotOwned { .. } => "storage-not-owned",
+            Self::Locked { .. } => "storage-locked",
+            Self::LockUnsupported { .. } => "storage-lock-unsupported",
+            Self::TooLarge { .. } => "storage-too-large",
+            Self::Parse { .. } => "storage-parse",
+            Self::MissingSchemaVersion { .. } => "storage-missing-schema-version",
+            Self::NewerVersion { .. } => "storage-newer-version",
+            Self::MissingMigration { .. } => "storage-missing-migration",
+            Self::Migration { .. } => "storage-migration",
+            Self::History { .. } => "storage-history",
+            Self::Serialize { .. } => "storage-serialize",
+        }
+    }
+
+    /// The I/O error kind of an [`StorageError::Io`], safe to log (no path, no OS message).
+    #[must_use]
+    pub fn io_kind(&self) -> Option<io::ErrorKind> {
+        match self {
+            Self::Io { source, .. } => Some(source.kind()),
+            _ => None,
+        }
+    }
+
     pub(crate) fn io(path: impl Into<PathBuf>, source: io::Error) -> Self {
         Self::Io {
             path: path.into(),

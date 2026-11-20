@@ -1,0 +1,225 @@
+# Phase 5 exit scenario on SQLite: "Open table data", a cell edited through the cell editor,
+# a row marked for deletion, "Preview changes…" (the DML preview), then "Save changes" of the
+# edit only (the deletion is reverted first), read back in the grid.
+schema_version = 1
+name = "sqlite-table-edit"
+description = "SQLite: Open table data, edit a cell, mark a row deleted, preview the DML, save."
+
+[[connection]]
+name = "Nine SQLite"
+engine = "sqlite"
+file = "nine.db"
+
+[[step]]
+wait = "core.ready"
+equals = true
+timeout_secs = 60
+
+[[step]]
+action = "ninesql::FocusNavigator"
+
+[[step]]
+keys = "home"
+
+[[step]]
+action = "ninesql::ConnectConnection"
+
+[[step]]
+wait = "session.open"
+arg = "Nine SQLite"
+equals = true
+timeout_secs = 30
+
+# Load the schema's tables in the navigator, so "Find object" can find them.
+[[step]]
+action = "ninesql::FocusNavigator"
+
+[[step]]
+keys = "home left right"
+
+[[step]]
+wait = "navigator.has_row"
+arg = "main"
+equals = true
+timeout_secs = 30
+
+[[step]]
+keys = "right right right"
+
+[[step]]
+wait = "navigator.has_row"
+arg = "Tables"
+equals = true
+timeout_secs = 30
+
+[[step]]
+keys = "right right"
+
+[[step]]
+wait = "navigator.has_row"
+arg = "products"
+equals = true
+timeout_secs = 30
+
+[[step]]
+action = "ninesql::FindObject"
+
+[[step]]
+wait = "dialog.open"
+equals = true
+
+[[step]]
+text = "products"
+
+[[step]]
+keys = "enter"
+
+[[step]]
+wait = "navigator.selected"
+equals = "products"
+timeout_secs = 30
+
+# "Open table data": a new tab with the table's rows, editable (the key is read first).
+[[step]]
+action = "ninesql::OpenTableData"
+
+[[step]]
+wait = "table.open"
+equals = true
+timeout_secs = 30
+
+[[step]]
+wait = "table.editable"
+equals = true
+timeout_secs = 30
+
+[[step]]
+wait = "grid.rows"
+at_least = 10
+timeout_secs = 30
+
+[[step]]
+checkpoint = "table-data"
+
+# The grid's keyboard: the first row, then the third column (`name`).
+[[step]]
+action = "ninesql_grid::ShowGridView"
+
+[[step]]
+keys = "down right right"
+
+[[step]]
+wait = "grid.focused_column"
+equals = 2
+
+[[step]]
+action = "ninesql::EditCell"
+
+[[step]]
+wait = "dialog.open"
+equals = true
+
+# The dialog takes the focus; Tab reaches its input.
+[[step]]
+keys = "tab"
+
+[[step]]
+expect = "focus.input"
+equals = true
+
+[[step]]
+keys = "ctrl-a"
+
+[[step]]
+text = "Edited by the e2e scenario"
+
+[[step]]
+checkpoint = "cell-editor"
+
+[[step]]
+expect = "dialog.open"
+equals = true
+
+# The cell editor's input, then Cancel, Set NULL, Apply: Tab three times reaches "Apply",
+# Space presses it.
+[[step]]
+keys = "tab tab tab"
+
+[[step]]
+expect = "focus.input"
+equals = false
+
+[[step]]
+keys = "space"
+
+[[step]]
+wait = "dialog.open"
+equals = false
+
+[[step]]
+expect = "editor.error"
+equals = false
+
+[[step]]
+wait = "table.pending_changes"
+equals = 1
+
+[[step]]
+checkpoint = "pending-edit"
+
+# A row marked for deletion (the focused row of the grid).
+[[step]]
+action = "ninesql_grid::ShowGridView"
+
+[[step]]
+keys = "down"
+
+[[step]]
+action = "ninesql::DeleteRows"
+
+[[step]]
+wait = "table.pending_changes"
+equals = 2
+
+[[step]]
+action = "ninesql::PreviewChanges"
+
+[[step]]
+wait = "dialog.open"
+equals = true
+
+[[step]]
+checkpoint = "preview-changes"
+
+[[step]]
+keys = "escape"
+
+[[step]]
+wait = "dialog.open"
+equals = false
+
+# Revert the deletion, save the edit (a dev connection: no confirmation).
+[[step]]
+action = "ninesql_grid::ShowGridView"
+
+[[step]]
+action = "ninesql::RevertRowChanges"
+
+[[step]]
+wait = "table.pending_changes"
+equals = 1
+
+[[step]]
+action = "ninesql::SaveChanges"
+
+[[step]]
+wait = "table.pending_changes"
+equals = 0
+timeout_secs = 30
+
+[[step]]
+expect = "editor.error"
+equals = false
+
+[[step]]
+checkpoint = "saved"

@@ -444,6 +444,8 @@ pub(super) struct App {
     pub nav: Entity<Navigator>,
     pub vcx: VisualTestContext,
     pub root: PathBuf,
+    /// "Load more" rows [`Self::reveal`] activated so far.
+    pub load_more_clicks: usize,
 }
 
 fn xdg(base: &Path) -> XdgDirs {
@@ -484,6 +486,16 @@ pub(super) fn wait(
 impl App {
     /// Starts the application for `target`, its storage under `root`.
     pub(super) fn start(cx: &mut TestAppContext, target: Target, root: &Path) -> Self {
+        Self::start_with(cx, target, root, ninesql_core::MetadataConfig::default())
+    }
+
+    /// [`Self::start`] with the metadata service's limits of the caller's (smaller pages).
+    pub(super) fn start_with(
+        cx: &mut TestAppContext,
+        target: Target,
+        root: &Path,
+        metadata: ninesql_core::MetadataConfig,
+    ) -> Self {
         let paths = Paths::new(&xdg(root));
         let store = Arc::new(MemoryStore::new(StoreKind::Vault));
         let mut stores = SecretStores::new();
@@ -508,6 +520,7 @@ impl App {
         config.manager = Some(manager);
         config.workspace = Some(workspace);
         config.stores = stores;
+        config.metadata = metadata;
         let (settings, diagnostics) = settings::parse("");
         let hub = cx.update(|cx| {
             crate::app::init(
@@ -535,6 +548,7 @@ impl App {
             nav,
             vcx,
             root: root.to_path_buf(),
+            load_more_clicks: 0,
         }
     }
 
@@ -727,9 +741,12 @@ impl App {
     }
 
     /// Expands the navigator along `labels` (each looked for below the previous one; a row
-    /// already expanded is left so) and selects the last one. Returns its index.
+    /// already expanded is left so) and selects the last one. Returns its index. A label that is
+    /// not among the loaded children of its parent is looked for behind that parent's "Load
+    /// more" row, which is activated as a user would ([`Self::load_more_clicks`] counts them).
     pub(super) fn reveal(&mut self, labels: &[&str]) -> usize {
         let mut after = 0;
+        let mut parent_depth: Option<usize> = None;
         let mut found = 0;
         for (i, label) in labels.iter().enumerate() {
             let nav = self.nav.clone();
@@ -737,16 +754,35 @@ impl App {
             let started = Instant::now();
             let at = loop {
                 self.vcx.run_until_parked();
-                let ix = nav.read_with(&self.vcx, |n, cx| {
-                    n.rows(cx)
+                // The rows below the parent (its subtree), from `after` on.
+                let (hit, load_more) = nav.read_with(&self.vcx, |n, cx| {
+                    let rows = n.rows(cx);
+                    let below = rows
                         .iter()
                         .enumerate()
                         .skip(after)
-                        .find(|(_, (_, l))| *l == label)
-                        .map(|(i, _)| i)
+                        .take_while(|(_, (d, _))| parent_depth.is_none_or(|p| *d > p));
+                    let mut hit = None;
+                    let mut load_more = None;
+                    for (ix, (d, l)) in below {
+                        if *l == label && hit.is_none() {
+                            hit = Some(ix);
+                        }
+                        if l == "Load more"
+                            && load_more.is_none()
+                            && parent_depth.is_none_or(|p| *d <= p + 2)
+                        {
+                            load_more = Some(ix);
+                        }
+                    }
+                    (hit, load_more)
                 });
-                if let Some(ix) = ix {
+                if let Some(ix) = hit {
                     break ix;
+                }
+                if let Some(ix) = load_more {
+                    nav.update(&mut self.vcx, |n, cx| n.activate(ix, cx));
+                    self.load_more_clicks += 1;
                 }
                 assert!(
                     started.elapsed() < STEP_TIMEOUT,
@@ -757,6 +793,8 @@ impl App {
             };
             found = at;
             after = at + 1;
+            parent_depth =
+                Some(nav.read_with(&self.vcx, |n, cx| n.rows(cx).get(at).map_or(0, |(d, _)| *d)));
             if i + 1 < labels.len() {
                 let expand = nav.read_with(&self.vcx, |n, _| {
                     n.tree().can_expand(at) && !n.tree().is_expanded(at)

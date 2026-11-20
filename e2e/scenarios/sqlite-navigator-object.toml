@@ -1,0 +1,153 @@
+# Phase 4 exit scenario on SQLite: the navigator expanded from the keyboard, "Find object",
+# the object editor of `orders` and "Show DDL".
+schema_version = 1
+name = "sqlite-navigator-object"
+description = "SQLite: expand the navigator, Find object, the object editor and Show DDL."
+
+[[connection]]
+name = "Nine SQLite"
+engine = "sqlite"
+file = "nine.db"
+
+[[step]]
+wait = "core.ready"
+equals = true
+timeout_secs = 60
+
+[[step]]
+action = "ninesql::FocusNavigator"
+
+[[step]]
+keys = "home"
+
+[[step]]
+action = "ninesql::ConnectConnection"
+
+[[step]]
+wait = "session.open"
+arg = "Nine SQLite"
+equals = true
+timeout_secs = 30
+
+# Expand the connection, then its schema and its tables, from the keyboard: Home, Left
+# (collapses the connection if the connect expanded it), then Right expands a row or, on an
+# expanded row, selects its first child.
+[[step]]
+action = "ninesql::FocusNavigator"
+
+[[step]]
+keys = "home left right"
+
+[[step]]
+wait = "navigator.has_row"
+arg = "main"
+equals = true
+timeout_secs = 30
+
+[[step]]
+keys = "right"
+
+[[step]]
+wait = "navigator.selected"
+equals = "Schemas"
+
+[[step]]
+keys = "right"
+
+[[step]]
+wait = "navigator.selected"
+equals = "main"
+
+[[step]]
+keys = "right"
+
+[[step]]
+wait = "navigator.has_row"
+arg = "Tables"
+equals = true
+timeout_secs = 30
+
+[[step]]
+keys = "right"
+
+[[step]]
+wait = "navigator.selected"
+equals = "Tables"
+
+[[step]]
+keys = "right"
+
+[[step]]
+wait = "navigator.has_row"
+arg = "orders"
+equals = true
+timeout_secs = 30
+
+[[step]]
+wait = "navigator.loading"
+equals = 0
+timeout_secs = 30
+
+[[step]]
+checkpoint = "navigator-tables"
+
+# "Find object": type, Enter reveals and selects the object.
+[[step]]
+action = "ninesql::FindObject"
+
+[[step]]
+wait = "dialog.open"
+equals = true
+
+[[step]]
+text = "customers"
+
+[[step]]
+checkpoint = "find-object"
+
+[[step]]
+keys = "enter"
+
+[[step]]
+wait = "navigator.selected"
+equals = "customers"
+timeout_secs = 30
+
+[[step]]
+expect = "dialog.open"
+equals = false
+
+# The object editor of the selected table.
+[[step]]
+action = "ninesql::OpenObjectEditor"
+
+[[step]]
+wait = "object_editor.open"
+equals = true
+timeout_secs = 30
+
+[[step]]
+expect = "tabs.active_title"
+contains = "customers"
+
+[[step]]
+checkpoint = "object-editor"
+
+# "Show DDL" opens the DDL of the navigator's selected object in a new SQL editor.
+[[step]]
+action = "ninesql::FocusNavigator"
+
+[[step]]
+action = "ninesql::ShowObjectDdl"
+
+[[step]]
+wait = "tabs.count"
+at_least = 3
+timeout_secs = 30
+
+[[step]]
+expect = "object_editor.open"
+equals = false
+
+[[step]]
+checkpoint = "show-ddl"

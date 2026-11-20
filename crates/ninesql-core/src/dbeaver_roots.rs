@@ -682,6 +682,25 @@ fn portal_host_path_uncached(id: &str) -> Option<PathBuf> {
 #[cfg(feature = "document-portal")]
 const MAX_PORTAL_PENDING: usize = 4;
 
+/// What failed in a Documents portal call, safe to log at any level (ADR-0029 §3.2): the D-Bus
+/// error name of a method error (a dotted name whose syntax zbus validates), the I/O error kind of
+/// a transport failure, or a fixed label; never the error's free-text description, which can hold
+/// a path.
+#[cfg(feature = "document-portal")]
+fn portal_error_kind(e: &zbus::Error) -> String {
+    match e {
+        zbus::Error::MethodError(name, _, _) => name.to_string(),
+        zbus::Error::FDO(fdo) => zbus::DBusError::name(&**fdo).to_string(),
+        zbus::Error::InputOutput(io) | zbus::Error::Connection(io, _) => {
+            format!("io-{:?}", io.kind())
+        }
+        zbus::Error::Handshake(_) => "handshake".to_owned(),
+        zbus::Error::Address(_) => "address".to_owned(),
+        zbus::Error::InvalidReply => "invalid-reply".to_owned(),
+        _ => "dbus-other".to_owned(),
+    }
+}
+
 #[cfg(feature = "document-portal")]
 async fn get_host_path(id: &str) -> Option<PathBuf> {
     use std::collections::HashMap;
@@ -689,7 +708,7 @@ async fn get_host_path(id: &str) -> Option<PathBuf> {
         .method_timeout(PORTAL_TIMEOUT)
         .build()
         .await
-        .map_err(|e| tracing::debug!(error = %e, "no session bus for the document portal"))
+        .map_err(|e| tracing::debug!(error = %portal_error_kind(&e), "no session bus for the document portal"))
         .ok()?;
     let reply = conn
         .call_method(
@@ -700,7 +719,7 @@ async fn get_host_path(id: &str) -> Option<PathBuf> {
             &(vec![id],),
         )
         .await
-        .map_err(|e| tracing::debug!(error = %e, "document portal GetHostPaths failed"))
+        .map_err(|e| tracing::debug!(error = %portal_error_kind(&e), "document portal GetHostPaths failed"))
         .ok()?;
     let paths: HashMap<String, Vec<u8>> = reply.body().deserialize().ok()?;
     host_path_from_bytes(paths.get(id)?)

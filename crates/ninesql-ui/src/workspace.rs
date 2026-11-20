@@ -37,7 +37,9 @@ use crate::actions::{
 use crate::actions::{ConnectScriptConnection, NewScript, OpenScript, SaveScript, SaveScriptAs};
 use crate::actions::{ExportResults, ExportTable, FormatSql, ImportCsv, InsertSnippet};
 use crate::appearance;
-use crate::browse::generate::{KeySource, Template, TemplateInput, names_survive_editor, template};
+use crate::browse::generate::{
+    KeySource, Template, TemplateAllowance, TemplateInput, names_survive_editor, template,
+};
 use crate::browse::object_editor::{ObjectEditor, ObjectEditorEvent};
 use crate::browse::search::{FindChoice, SearchScope, open_find_object};
 use crate::browse::{is_table_like, kind_singular};
@@ -1161,10 +1163,10 @@ impl Workspace {
 
     fn after_change(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.focus_active(window, cx);
-        let title = match self.active_title(cx) {
+        let title = crate::app::window_title(&match self.active_title(cx) {
             Some(tab) => format!("{tab} - NineSQL"),
             None => "NineSQL".to_owned(),
-        };
+        });
         window.set_window_title(&title);
         cx.notify();
     }
@@ -1756,6 +1758,23 @@ impl Workspace {
 /// Refusal of a write template on a read-only session (I8).
 pub const READ_ONLY_TEMPLATES: &str =
     "This session is read-only: only the SELECT template is offered.";
+/// Refusal of a write template on a driver that does not declare the row edit (review L2).
+pub const UNDECLARED_TEMPLATE: &str = "This engine does not support this kind of row change: only the templates it declares are offered.";
+
+/// Why `session` refuses the template `which`, if it does.
+fn template_refusal_for(
+    session: &ninesql_core::SessionHandle,
+    which: Template,
+) -> Option<&'static str> {
+    if !which.writes() {
+        return None;
+    }
+    if session.info().read_only {
+        return Some(READ_ONLY_TEMPLATES);
+    }
+    (!TemplateAllowance::of_session(session).allows(which)).then_some(UNDECLARED_TEMPLATE)
+}
+
 /// Refusal of a template whose names the SQL editor would change (P4-B review M2).
 pub const UNSAFE_NAMES: &str = "This object or one of its columns has a name with control or line-separator characters that the SQL editor would change, so a template could target another object. No template was opened.";
 /// Show DDL with text the SQL editor would change (P4-B review M2).
@@ -2063,8 +2082,8 @@ impl Workspace {
                 cx,
             );
         };
-        if which.writes() && self.session_is_read_only(connection, cx) {
-            return Self::notify(READ_ONLY_TEMPLATES, window, cx);
+        if let Some(why) = self.template_refusal(connection, which, cx) {
+            return Self::notify(why, window, cx);
         }
         if !names_survive_editor(&path, &TemplateInput::none()) {
             return Self::notify(UNSAFE_NAMES, window, cx);
@@ -2116,13 +2135,17 @@ impl Workspace {
         .detach();
     }
 
-    /// Whether the open session of `connection` is read-only.
-    fn session_is_read_only(&self, connection: ConnectionId, cx: &App) -> bool {
-        self.hub
-            .read(cx)
-            .sessions(connection)
-            .first()
-            .is_some_and(|s| s.info().read_only)
+    /// Why the open session of `connection` refuses the template `which`, if it does: a write
+    /// template on a read-only session, or on a driver that does not declare the row edit
+    /// (I8, review L2).
+    fn template_refusal(
+        &self,
+        connection: ConnectionId,
+        which: Template,
+        cx: &App,
+    ) -> Option<&'static str> {
+        let session = self.hub.read(cx).sessions(connection).first().cloned()?;
+        template_refusal_for(&session, which)
     }
 
     fn open_template(
@@ -2137,8 +2160,8 @@ impl Workspace {
         let Some(session) = self.hub.read(cx).sessions(connection).first().cloned() else {
             return Self::notify("The connection is not open any more.", window, cx);
         };
-        if which.writes() && session.info().read_only {
-            return Self::notify(READ_ONLY_TEMPLATES, window, cx);
+        if let Some(why) = template_refusal_for(&session, which) {
+            return Self::notify(why, window, cx);
         }
         // The editor strips or rewrites control characters and line separators: a template
         // with such a name would target another object than the one shown (M2).

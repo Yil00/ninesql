@@ -32,3 +32,6 @@ credentials-config.json
 
 # Dev environment state
 dev/.state/
+
+# Python bytecode caches (scripts/*.py tests)
+__pycache__/

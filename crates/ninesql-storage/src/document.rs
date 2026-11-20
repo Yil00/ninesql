@@ -119,10 +119,10 @@ pub fn load<D: Document>(path: &Path) -> Result<Option<Loaded<D>>, StorageError>
         fs::write_atomic(&bak, &backup_bytes::<D>(path, &bytes, from)?)?;
         save(path, &loaded.document)?;
         tracing::info!(
-            path = %path.display(),
+            file = %fs::log_name(path),
             from,
             to = D::SCHEMA_VERSION,
-            backup = %bak.display(),
+            backup = %fs::log_name(&bak),
             "migrated workspace file"
         );
     } else {
@@ -138,7 +138,7 @@ pub fn load<D: Document>(path: &Path) -> Result<Option<Loaded<D>>, StorageError>
         if removable || duplicate {
             save(path, &loaded.document)?;
             tracing::warn!(
-                path = %path.display(),
+                file = %fs::log_name(path),
                 keys = ?loaded.secret_like_keys,
                 duplicate_keys = duplicate,
                 "rewrote a workspace file without data that may hold a secret"
@@ -147,7 +147,7 @@ pub fn load<D: Document>(path: &Path) -> Result<Option<Loaded<D>>, StorageError>
     }
     if !loaded.secret_like_keys.is_empty() {
         tracing::warn!(
-            path = %path.display(),
+            file = %fs::log_name(path),
             keys = ?loaded.secret_like_keys,
             "keys that look like secrets were found in a workspace file"
         );
@@ -251,7 +251,7 @@ pub fn scrub_file<D: Document>(path: &Path) -> Result<bool, StorageError> {
             detail,
         })?;
         fs::write_atomic(path, &out)?;
-        tracing::warn!(path = %path.display(), "removed secret-looking data from a workspace file that failed to load");
+        tracing::warn!(file = %fs::log_name(path), "removed secret-looking data from a workspace file that failed to load");
         Ok(true)
     } else {
         Ok(false)

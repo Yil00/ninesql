@@ -126,8 +126,12 @@ fn server_name(name: &str) -> DriverResult<ServerName<'static>> {
     if let Ok(ip) = name.parse::<IpAddr>() {
         return Ok(ServerName::IpAddress(ip.into()));
     }
-    ServerName::try_from(name.to_owned())
-        .map_err(|_| DriverError::InvalidParams(format!("invalid TLS server name `{name}`")))
+    ServerName::try_from(name.to_owned()).map_err(|_| {
+        DriverError::InvalidParams(format!(
+            "invalid TLS server name `{}`",
+            ninesql_driver_api::redact_connection_string(name)
+        ))
+    })
 }
 
 /// Trust anchors: the connection's CA file only when set, the platform trust store otherwise.

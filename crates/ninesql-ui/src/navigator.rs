@@ -39,17 +39,18 @@ use ninesql_core::{
 };
 
 use crate::actions::{
-    ConfigureNavigatorFilters, CopyObjectDdl, FindObject, GenerateDeleteSql, GenerateInsertSql,
-    GenerateSelectSql, GenerateUpdateSql, LoadMoreObjects, OpenObjectEditor, OpenTableData,
-    RefreshNavigatorNode, ShowObjectDdl,
+    ConfigureNavigatorFilters, ConnectConnection, CopyObjectDdl, FindObject, GenerateDeleteSql,
+    GenerateInsertSql, GenerateSelectSql, GenerateUpdateSql, ImportFromDbeaver, LoadMoreObjects,
+    NewConnection, OpenObjectEditor, OpenTableData, RefreshNavigatorNode, ShowObjectDdl,
 };
-use crate::browse::generate::Template;
+use crate::browse::generate::{Template, TemplateAllowance};
 use crate::browse::tree::{Effect, Group, MetaTree, RevealStep, Row, RowKey, RowKind, TreeEnv};
 use crate::browse::{is_table_like, kind_plural};
 use crate::connections::hub::{ConnectionHub, MetadataUpdate, hub_or_install_empty};
 use crate::connections::visuals::{ConnectionBadges, badges};
 use crate::import::enable::disabled_text;
 use crate::import::model::disabled_kind_label;
+use crate::keymap::EffectiveKeymap;
 
 /// Key context of the navigator (its keyboard navigation bindings).
 pub const NAVIGATOR_CONTEXT: &str = "Navigator";
@@ -773,7 +774,7 @@ impl Navigator {
                 .child(self.render_connection(*id, cx))
                 .into_any_element(),
             RowKind::NotConnected(_) => {
-                note("Not connected (\"Connect\": Ctrl+K Ctrl+O)".to_owned()).into_any_element()
+                note(not_connected_text(cx.try_global::<EffectiveKeymap>())).into_any_element()
             }
             RowKind::NoKinds(_) => {
                 note("No objects are listed for this engine".to_owned()).into_any_element()
@@ -958,25 +959,55 @@ impl Navigator {
     }
 }
 
+/// How the hints of the navigator name `action`: its label with its first binding in effect
+/// (`"New connection" (Ctrl+Alt+N)`), overrides of `[keybindings]` included, or the label alone
+/// when the action is unbound (review L8: never a hard-coded binding).
+fn action_hint(label: &str, action: &dyn Action, keymap: Option<&EffectiveKeymap>) -> String {
+    match keymap.and_then(|k| k.display_for(action.name())) {
+        Some(keys) => format!("\"{label}\" ({keys})"),
+        None => format!("\"{label}\""),
+    }
+}
+
+/// The note under a connection that is not open: the binding of "Connect" in effect, or the
+/// context menu when it is unbound (review L8).
+pub(crate) fn not_connected_text(keymap: Option<&EffectiveKeymap>) -> String {
+    match keymap.and_then(|k| k.display_for(ConnectConnection.name())) {
+        Some(keys) => format!("Not connected (\"Connect\": {keys})"),
+        None => "Not connected (\"Connect\" in the context menu)".to_owned(),
+    }
+}
+
+/// The text of the empty navigator.
+pub(crate) fn no_connections_text(keymap: Option<&EffectiveKeymap>) -> String {
+    format!(
+        "No connections yet. Use {} or {}.",
+        action_hint("New connection", &NewConnection, keymap),
+        action_hint("Import from DBeaver", &ImportFromDbeaver, keymap)
+    )
+}
+
 /// One entry of a context menu: its label and action, or `None` for a separator.
 pub(crate) type MenuEntry = Option<(String, Box<dyn Action>)>;
 
 /// The object part of the context menu of the object at `path` of `connection`, as the menu
-/// shows it now: read-only from the connection's first open session, "Show DDL" from the
-/// metadata service's declared DDL kinds (I8).
+/// shows it now: the "Generate SQL" templates from the connection's first open session
+/// (read-only, declared row edits), "Show DDL" from the metadata service's declared DDL kinds
+/// (I8).
 pub(crate) fn object_menu_for(
     hub: &ConnectionHub,
     connection: Option<ConnectionId>,
     path: &ObjectPath,
 ) -> Vec<MenuEntry> {
     let kind = path.kind();
-    let read_only =
-        connection.is_some_and(|c| hub.sessions(c).first().is_some_and(|s| s.info().read_only));
+    let allows = connection
+        .and_then(|c| hub.sessions(c).first().map(TemplateAllowance::of_session))
+        .unwrap_or_default();
     let ddl = match (connection, kind, hub.metadata()) {
         (Some(c), Some(k), Some(m)) => m.supports_ddl(c, k),
         _ => false,
     };
-    object_menu_entries(kind, read_only, ddl)
+    object_menu_entries(kind, allows, ddl)
 }
 
 impl Navigator {
@@ -997,11 +1028,11 @@ impl Navigator {
 /// The object part of a navigator row's context menu, in order. Table and view rows start with
 /// "Open table data" (the action's own condition: a table-like object; it only reads, so a
 /// read-only session offers it too), then "Open object editor" and the "Generate SQL" templates
-/// the kind and the session allow (I8); "Show DDL" / "Copy DDL" only when the driver declares
+/// the kind and the session `allows` (I8, review L2); "Show DDL" / "Copy DDL" only when the driver declares
 /// DDL for the kind.
 pub(crate) fn object_menu_entries(
     kind: Option<ninesql_core::driver_api::ObjectKind>,
-    read_only: bool,
+    allows: TemplateAllowance,
     ddl: bool,
 ) -> Vec<MenuEntry> {
     let mut entries: Vec<MenuEntry> = Vec::new();
@@ -1024,7 +1055,7 @@ pub(crate) fn object_menu_entries(
             (Template::Update, Box::new(GenerateUpdateSql)),
             (Template::Delete, Box::new(GenerateDeleteSql)),
         ] {
-            if kind.is_some_and(|k| t.offered(k, read_only)) {
+            if kind.is_some_and(|k| t.offered(k, allows)) {
                 entries.push(Some((format!("Generate SQL: {}", t.label()), action)));
             }
         }
@@ -1081,7 +1112,7 @@ impl Render for Navigator {
                     .py_2()
                     .text_sm()
                     .text_color(theme.muted_foreground)
-                    .child("No connections yet. Use \"New connection\" (Ctrl+Alt+N) or \"Import from DBeaver\" (Ctrl+K Ctrl+I).")
+                    .child(no_connections_text(cx.try_global::<EffectiveKeymap>()))
                     .into_any_element()
             } else {
                 uniform_list(

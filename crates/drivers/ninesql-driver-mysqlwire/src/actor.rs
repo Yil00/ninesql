@@ -426,8 +426,15 @@ impl Actor {
                 Ok(())
             }
             other => {
-                if let Ok(Err(e)) = &other {
-                    tracing::warn!(error = ?std::mem::discriminant(e), "status refresh failed");
+                match &other {
+                    Ok(Err(e)) => tracing::warn!(
+                        driver_error_kind = crate::logkind::error_kind(e),
+                        code = crate::logkind::error_code(e),
+                        "status refresh failed"
+                    ),
+                    Ok(Ok(Err(e))) => tracing::warn!(code = e.code, "status refresh refused"),
+                    Err(_) => tracing::warn!("status refresh timed out"),
+                    Ok(Ok(Ok(()))) => {}
                 }
                 self.close_session("the transaction state could not be read after an error");
                 Err(DriverError::Closed(
@@ -549,7 +556,11 @@ impl Actor {
             }
             if r.is_err() || self.conn.status & STATUS_IN_TRANS != 0 {
                 if let Err(e) = &r {
-                    tracing::warn!(error = ?std::mem::discriminant(e), "navigator rollback failed");
+                    tracing::warn!(
+                        driver_error_kind = crate::logkind::error_kind(e),
+                        code = crate::logkind::error_code(e),
+                        "navigator rollback failed"
+                    );
                 }
                 self.close_session("the transaction of a navigator read could not be ended");
                 return Err(DriverError::Closed(
@@ -568,7 +579,11 @@ impl Actor {
                 r = self.internal(&sql).await;
             }
             if let Err(e) = r {
-                tracing::warn!(error = ?std::mem::discriminant(&e), "one-shot re-issue failed");
+                tracing::warn!(
+                    driver_error_kind = crate::logkind::error_kind(&e),
+                    code = crate::logkind::error_code(&e),
+                    "one-shot re-issue failed"
+                );
                 self.close_session("pending transaction settings could not be restored");
                 return Err(DriverError::Closed(
                     "the transaction settings pending for the next transaction could not be set \
@@ -581,7 +596,7 @@ impl Actor {
     }
 
     /// Closes the session: the connection task stops after the current command.
-    fn close_session(&self, reason: &str) {
+    fn close_session(&self, reason: &'static str) {
         tracing::warn!(reason, "mysqlwire session closed by the driver");
         self.shared.mark_closed(reason);
     }
@@ -611,7 +626,11 @@ impl Actor {
         let row = match rows {
             Ok(r) => r.into_iter().next().unwrap_or_default(),
             Err(e) => {
-                tracing::warn!(error = ?std::mem::discriminant(&e), "session read-back failed");
+                tracing::warn!(
+                    driver_error_kind = crate::logkind::error_kind(&e),
+                    code = crate::logkind::error_code(&e),
+                    "session read-back failed"
+                );
                 self.close_session("session state could not be verified");
                 return Err(DriverError::Closed(
                     "the session state could not be verified after the statement; the session \
@@ -668,7 +687,11 @@ impl Actor {
             // It also replaces a pending one-shot access mode (never a pending isolation level).
             self.pending.clear_access();
             if let Err(e) = r {
-                tracing::warn!(error = ?std::mem::discriminant(&e), "read-only re-assert failed");
+                tracing::warn!(
+                    driver_error_kind = crate::logkind::error_kind(&e),
+                    code = crate::logkind::error_code(&e),
+                    "read-only re-assert failed"
+                );
                 self.close_session("read-only mode could not be re-asserted");
                 return Err(DriverError::Closed(
                     "the read-only mode could not be re-asserted after the statement; the \
@@ -759,7 +782,11 @@ impl Actor {
             Ok(()) => self.end(&mut ex, reply).await,
             Err(e) => {
                 // Every error here comes from the connection: it is out of sync or gone.
-                tracing::debug!(error = ?std::mem::discriminant(&e), "mysqlwire connection unusable");
+                tracing::debug!(
+                    driver_error_kind = crate::logkind::error_kind(&e),
+                    code = crate::logkind::error_code(&e),
+                    "mysqlwire connection unusable"
+                );
                 self.close_session("connection lost or unresponsive");
                 let e = if matches!(e, DriverError::Closed(_)) {
                     e
@@ -1010,7 +1037,11 @@ impl Actor {
                 }
             }
             Err(e) => {
-                tracing::debug!(error = ?std::mem::discriminant(&e), "SHOW WARNINGS failed");
+                tracing::debug!(
+                    driver_error_kind = crate::logkind::error_kind(&e),
+                    code = crate::logkind::error_code(&e),
+                    "SHOW WARNINGS failed"
+                );
             }
         }
     }

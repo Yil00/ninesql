@@ -1,0 +1,289 @@
+# Phase 1, 3 and 5 exit scenarios on the dev MariaDB (`dev/engines.json`, loopback only):
+# the saved connection connected from the navigator, a statement run in the SQL editor and its
+# rows in the grid, a paged result of the "nine" `big_events` table stopped with the cancel
+# action (its label follows the driver's cancel capability), then the production `DELETE`
+# confirmation declined and a write refused on a read-only session (I3).
+schema_version = 1
+name = "mariadb-editor-safety"
+description = "MariaDB: connect, run SQL, page and cancel big_events, production DELETE declined, read-only write refused."
+engines = "../../dev/engines.json"
+
+[[connection]]
+name = "Dev MariaDB"
+engine = "mariadb"
+
+[[connection]]
+name = "MariaDB production"
+engine = "mariadb"
+type = "prod"
+
+[[connection]]
+name = "MariaDB read-only"
+engine = "mariadb"
+read_only = true
+
+[[step]]
+wait = "core.ready"
+equals = true
+timeout_secs = 60
+
+[[step]]
+wait = "connections.count"
+equals = 3
+
+[[step]]
+checkpoint = "connections"
+
+# Connections are listed by name: "Dev …" first.
+[[step]]
+action = "ninesql::FocusNavigator"
+
+[[step]]
+keys = "home"
+
+[[step]]
+wait = "navigator.selected"
+equals = "Dev MariaDB"
+
+[[step]]
+action = "ninesql::ConnectConnection"
+
+[[step]]
+wait = "session.open"
+arg = "Dev MariaDB"
+equals = true
+timeout_secs = 60
+
+[[step]]
+wait = "editor.connection"
+equals = "Dev MariaDB"
+timeout_secs = 30
+
+[[step]]
+expect = "session.read_only"
+arg = "Dev MariaDB"
+equals = false
+
+[[step]]
+checkpoint = "connected"
+
+[[step]]
+action = "ninesql::FocusNextPane"
+
+[[step]]
+text = "SELECT id, name, country FROM customers ORDER BY id LIMIT 5"
+
+[[step]]
+action = "ninesql_editor::ExecuteStatement"
+
+[[step]]
+wait = "grid.state"
+equals = "complete"
+timeout_secs = 60
+
+[[step]]
+expect = "grid.rows"
+equals = 5
+
+[[step]]
+expect = "editor.error"
+equals = false
+
+[[step]]
+checkpoint = "select-results"
+
+# A paged result: the first page, then the cancel action ends it.
+[[step]]
+keys = "ctrl-a"
+
+[[step]]
+text = "SELECT * FROM big_events ORDER BY id"
+
+[[step]]
+action = "ninesql_editor::ExecuteStatement"
+
+[[step]]
+wait = "grid.state"
+equals = "idle"
+timeout_secs = 60
+
+[[step]]
+expect = "grid.rows"
+at_least = 1
+
+[[step]]
+expect = "editor.cancel_label"
+equals = "Cancel"
+
+[[step]]
+checkpoint = "paged-result"
+
+[[step]]
+action = "ninesql_editor::CancelExecution"
+
+[[step]]
+wait = "grid.state"
+equals = "stopped"
+timeout_secs = 30
+
+[[step]]
+expect = "editor.running"
+equals = false
+
+[[step]]
+checkpoint = "paged-result-cancelled"
+
+# Production: "Run on production?" declined with Escape; nothing deleted.
+[[step]]
+action = "ninesql::FocusNavigator"
+
+[[step]]
+keys = "home down"
+
+[[step]]
+wait = "navigator.selected"
+equals = "MariaDB production"
+
+[[step]]
+action = "ninesql::ConnectConnection"
+
+[[step]]
+wait = "session.open"
+arg = "MariaDB production"
+equals = true
+timeout_secs = 60
+
+[[step]]
+expect = "session.production"
+arg = "MariaDB production"
+equals = true
+
+# "Choose editor connection": one button per open session, in the order they opened.
+[[step]]
+action = "ninesql::ChooseEditorConnection"
+
+[[step]]
+wait = "dialog.open"
+equals = true
+
+[[step]]
+keys = "tab tab space"
+
+[[step]]
+wait = "editor.connection"
+equals = "MariaDB production"
+
+[[step]]
+checkpoint = "production-frame"
+
+[[step]]
+action = "ninesql::FocusNextPane"
+
+[[step]]
+keys = "ctrl-a"
+
+[[step]]
+text = "DELETE FROM orders"
+
+[[step]]
+action = "ninesql_editor::ExecuteStatement"
+
+[[step]]
+wait = "editor.awaiting_confirmation"
+equals = true
+timeout_secs = 30
+
+[[step]]
+checkpoint = "run-on-production"
+
+[[step]]
+keys = "escape"
+
+[[step]]
+wait = "editor.awaiting_confirmation"
+equals = false
+
+[[step]]
+expect = "grid.update_counts"
+equals = 0
+
+[[step]]
+keys = "ctrl-a"
+
+[[step]]
+text = "SELECT id FROM orders ORDER BY id LIMIT 10"
+
+[[step]]
+action = "ninesql_editor::ExecuteStatement"
+
+[[step]]
+wait = "grid.state"
+equals = "complete"
+timeout_secs = 60
+
+[[step]]
+expect = "grid.rows"
+equals = 10
+
+# Read-only: the driver refuses the write (engine-side), the editor shows the error.
+[[step]]
+action = "ninesql::FocusNavigator"
+
+[[step]]
+keys = "end"
+
+[[step]]
+wait = "navigator.selected"
+equals = "MariaDB read-only"
+
+[[step]]
+action = "ninesql::ConnectConnection"
+
+[[step]]
+wait = "session.open"
+arg = "MariaDB read-only"
+equals = true
+timeout_secs = 60
+
+[[step]]
+expect = "session.read_only"
+arg = "MariaDB read-only"
+equals = true
+
+[[step]]
+action = "ninesql::ChooseEditorConnection"
+
+[[step]]
+wait = "dialog.open"
+equals = true
+
+[[step]]
+keys = "tab tab tab space"
+
+[[step]]
+wait = "editor.connection"
+equals = "MariaDB read-only"
+
+[[step]]
+action = "ninesql::FocusNextPane"
+
+[[step]]
+keys = "ctrl-a"
+
+[[step]]
+text = "UPDATE customers SET name = 'changed by e2e' WHERE id = 1"
+
+[[step]]
+action = "ninesql_editor::ExecuteStatement"
+
+[[step]]
+wait = "editor.error"
+equals = true
+timeout_secs = 60
+
+[[step]]
+expect = "editor.running"
+equals = false
+
+[[step]]
+checkpoint = "read-only-refused"

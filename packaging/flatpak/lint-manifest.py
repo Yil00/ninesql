@@ -154,6 +154,9 @@ def check(manifest_path: Path) -> list[str]:
     for line in cargo_lines:
         if "--offline" not in line or "--locked" not in line:
             errors.append(f"cargo must run --offline --locked: {line.strip()}")
+        if "e2e-scenarios" in line:
+            # ADR-0029 §2.2: the end-to-end scenario runner is a test build, never packaged.
+            errors.append(f"cargo must not enable e2e-scenarios: {line.strip()}")
     for module in data["modules"]:
         if not isinstance(module, dict):
             continue
@@ -166,6 +169,9 @@ def check(manifest_path: Path) -> list[str]:
                     errors.append(f"source {source.get('url')}: no sha256 or commit")
     if data.get("build-options", {}).get("env", {}).get("CARGO_NET_OFFLINE") != "true":
         errors.append("build-options.env.CARGO_NET_OFFLINE must be 'true'")
+    if data.get("build-options", {}).get("env", {}).get("NINESQL_PACKAGE_BUILD") != "1":
+        # ADR-0029 §2.2: a package build refuses the e2e-scenarios test feature at compile time.
+        errors.append("build-options.env.NINESQL_PACKAGE_BUILD must be '1' (ADR-0029 §2.2)")
     return errors
 
 

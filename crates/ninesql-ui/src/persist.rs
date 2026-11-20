@@ -33,7 +33,7 @@ use toml_edit::{DocumentMut, Item, TableLike, Value};
 use crate::actions;
 use crate::settings::{
     Diagnostic, SETTINGS_SCHEMA_VERSION, Settings, SettingsState, ThemePreference,
-    max_settings_bytes, resolve_settings_file,
+    max_settings_bytes, resolve_settings_file, storage_reason,
 };
 
 /// Quiet time after the last change before the file is written.
@@ -192,7 +192,7 @@ pub fn flush_on_quit(cx: &mut App) -> impl std::future::Future<Output = ()> + us
         if let Some(task) = task
             && let Err(problem) = task.await
         {
-            tracing::warn!(problem = %problem, "settings not saved at quit");
+            tracing::warn!(problem = %problem.log_text(), "settings not saved at quit");
         }
     }
 }
@@ -204,7 +204,7 @@ fn report(result: Result<(), Diagnostic>, cx: &mut App) {
         state.diagnostics.retain(|d| d != previous);
     }
     if let Err(problem) = result {
-        tracing::warn!(problem = %problem, "settings not saved");
+        tracing::warn!(problem = %problem.log_text(), "settings not saved");
         state.diagnostics.push(problem.clone());
         cx.default_global::<Writer>().last_error = Some(problem);
     }
@@ -234,17 +234,28 @@ pub fn save_blocking(configured: &Path, changes: &[SettingsChange]) -> Result<()
             Diagnostic::new("settings not saved: settings.toml is not valid UTF-8 any more")
         })?,
         Err(e) => {
-            return Err(Diagnostic::new(format!(
-                "settings not saved: settings.toml cannot be read ({e})"
-            )));
+            return Err(Diagnostic::with_log_text(
+                format!("settings not saved: settings.toml cannot be read ({e})"),
+                format!(
+                    "settings not saved: settings.toml cannot be read ({})",
+                    storage_reason(&e)
+                ),
+            ));
         }
     };
     let updated = apply_changes(&text, changes)?;
     if updated == text {
         return Ok(());
     }
-    write_atomic(&file, updated.as_bytes())
-        .map_err(|e| Diagnostic::new(format!("settings not saved: {e}")))?;
+    write_atomic(&file, updated.as_bytes()).map_err(|e| {
+        Diagnostic::with_log_text(
+            format!("settings not saved: {e}"),
+            format!(
+                "settings not saved: settings.toml cannot be written ({})",
+                storage_reason(&e)
+            ),
+        )
+    })?;
     tracing::debug!(changes = changes.len(), "settings.toml saved");
     Ok(())
 }
@@ -260,7 +271,15 @@ fn prepare_dir(dir: &Path) -> Result<(), Diagnostic> {
     if is_link {
         return Ok(());
     }
-    ensure_private_dir(dir).map_err(|e| Diagnostic::new(format!("settings not saved: {e}")))
+    ensure_private_dir(dir).map_err(|e| {
+        Diagnostic::with_log_text(
+            format!("settings not saved: {e}"),
+            format!(
+                "settings not saved: the configuration directory cannot be used ({})",
+                storage_reason(&e)
+            ),
+        )
+    })
 }
 
 /// Applies `changes` to the settings text `text` (empty for a new file) and returns the new

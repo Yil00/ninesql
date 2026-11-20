@@ -211,6 +211,15 @@ fn load_key(
     }
 }
 
+/// What failed in an agent signature, safe to log at any level (ADR-0029 §3.2): a fixed label,
+/// never the error's description.
+fn agent_error_kind(e: &russh::AgentAuthError) -> &'static str {
+    match e {
+        russh::AgentAuthError::Send(_) => "agent-send-failed",
+        russh::AgentAuthError::Key(_) => "agent-signature-failed",
+    }
+}
+
 async fn authenticate_agent<H: Handler>(
     handle: &mut Handle<H>,
     hop: &HopRef<'_>,
@@ -276,7 +285,11 @@ async fn authenticate_agent<H: Handler>(
             ) => return hop.result(r, "agent"),
             Ok(AuthResult::Failure { .. }) => {}
             Err(e) => {
-                tracing::debug!(hop = hop.index, error = %e, "agent signature failed; trying the next key");
+                tracing::debug!(
+                    hop = hop.index,
+                    error = agent_error_kind(&e),
+                    "agent signature failed; trying the next key"
+                );
             }
         }
     }

@@ -351,6 +351,27 @@ async fn statements_with_credentials_are_never_logged() {
     conformance::assert_credential_statements_not_logged(&PgWireDriver::new(), params(&dev)).await;
 }
 
+/// ADR-0029 §3.2: an engine's error message (a duplicate key's `DETAIL`, a failing cast quoting
+/// its input) never reaches an event at `debug` and above; neither does the password of a
+/// failed connect, also when the host field holds a URL with it.
+#[tokio::test(flavor = "current_thread")]
+async fn engine_messages_and_connect_passwords_are_never_logged() {
+    let Some(dev) = dev() else { return };
+    let probe = conformance::ENGINE_MESSAGE_PROBE;
+    let insert = format!("INSERT INTO ninesql_log_probe VALUES ('{probe}')");
+    conformance::assert_engine_messages_not_logged(
+        &PgWireDriver::new(),
+        params(&dev),
+        &[
+            "CREATE TEMPORARY TABLE ninesql_log_probe (k text PRIMARY KEY)",
+            &insert,
+        ],
+        &[&insert, &format!("SELECT '{probe}'::int")],
+    )
+    .await;
+    conformance::assert_failed_connect_not_logged(&PgWireDriver::new(), &|| params(&dev)).await;
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn read_only_refuses_writes_engine_side() {
     let Some(dev) = dev() else { return };

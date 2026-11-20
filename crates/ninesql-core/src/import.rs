@@ -473,6 +473,33 @@ pub enum ImportError {
     /// The blocking task failed.
     #[error("import task: {0}")]
     Runtime(String),
+    /// A test-build guard refused the source (feature `e2e-scenarios`, ADR-0029 §2.5).
+    #[cfg(feature = "e2e-scenarios")]
+    #[error(transparent)]
+    TestBuild(#[from] crate::e2e::GuardError),
+}
+
+impl ImportError {
+    /// A short, stable name of the error kind, safe to log at any level: no path, no source
+    /// detail (ADR-0029 §3.2).
+    #[must_use]
+    pub fn kind(&self) -> &'static str {
+        match self {
+            Self::Source(_) => "import-source",
+            Self::NothingFound => "import-nothing-found",
+            Self::SourceChanged => "import-source-changed",
+            Self::VaultLocked => "vault-locked",
+            Self::VaultNotCreated => "vault-not-created",
+            Self::NoStore(_) => "import-no-store",
+            Self::Secret(e) => e.kind(),
+            Self::Workspace(e) => e.kind(),
+            Self::ListingTruncated => "import-listing-truncated",
+            Self::Cancelled => "import-cancelled",
+            Self::Runtime(_) => "import-runtime",
+            #[cfg(feature = "e2e-scenarios")]
+            Self::TestBuild(e) => e.kind(),
+        }
+    }
 }
 
 /// Cancels a running import preview (P2-D M1). Cheap to clone; every clone shares one flag.
@@ -732,7 +759,7 @@ impl Importer {
             Err(e) => {
                 for reference in &stored {
                     if let Err(del) = self.stores.delete(reference) {
-                        tracing::warn!(reference = %reference, error = %del, "could not roll back an imported secret");
+                        tracing::warn!(reference = %reference, kind = del.kind(), "could not roll back an imported secret");
                     }
                 }
                 return Err(e);
@@ -750,7 +777,7 @@ impl Importer {
                 if !now.contains(&r)
                     && let Err(e) = self.stores.delete(r)
                 {
-                    tracing::warn!(reference = %r, error = %e, "could not delete a replaced secret");
+                    tracing::warn!(reference = %r, kind = e.kind(), "could not delete a replaced secret");
                 }
             }
         }
@@ -770,7 +797,7 @@ impl Importer {
             Err(e) => {
                 tracing::warn!(
                     project = %self.workspace.project(),
-                    error = %e,
+                    kind = e.kind(),
                     "the DBeaver import report could not be saved; the import is applied"
                 );
                 (None, Some(format!("report not saved: {e}")))
@@ -866,6 +893,20 @@ impl Importer {
         cancel: &ImportCancel,
     ) -> Result<(ImportPreview, SecretPayload, Connections), ImportError> {
         cancel.check()?;
+        // Test build (ADR-0029 §2.5): DBeaver sources only inside the run directory (copies of
+        // the synthetic fixtures), never the user's own workspaces.
+        #[cfg(feature = "e2e-scenarios")]
+        {
+            let guards = crate::e2e::installed()?;
+            match source {
+                ImportSource::Detect(roots) => {
+                    guards.check_existing(&roots.home, "DBeaver search root")?;
+                }
+                ImportSource::Folder(path) => {
+                    guards.check_existing(path, "DBeaver import folder")?
+                }
+            }
+        }
         // One flag for the whole read: detection, folder listing and project reads stop when
         // the preview is cancelled (P2-D M1).
         let flag = ninesql_dbeaver::CancelFlag::from_shared(cancel.shared());

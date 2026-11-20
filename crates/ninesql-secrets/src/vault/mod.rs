@@ -204,6 +204,30 @@ pub enum VaultError {
     Storage(#[from] StorageError),
 }
 
+impl VaultError {
+    /// A short, stable name of the error kind, safe to log at any level: no path (ADR-0029
+    /// §3.2). The message itself is for the UI.
+    #[must_use]
+    pub fn kind(&self) -> &'static str {
+        match self {
+            Self::NotCreated => "vault-not-created",
+            Self::AlreadyExists(_) => "vault-already-exists",
+            Self::Locked => "vault-locked",
+            Self::WrongPassword => "vault-wrong-password",
+            Self::TooManyAttempts { .. } => "vault-too-many-attempts",
+            Self::EmptyPassword => "vault-empty-password",
+            Self::PasswordTooShort { .. } => "vault-password-too-short",
+            Self::Corrupted { .. } | Self::NewerVersion { .. } => "vault-file",
+            Self::InvalidKdfParams(_) => "vault-invalid-kdf-params",
+            Self::Limit(_) => "vault-limit",
+            Self::OutOfMemory(_) => "vault-out-of-memory",
+            Self::Random => "vault-random",
+            Self::Crypto => "vault-crypto",
+            Self::Storage(e) => e.kind(),
+        }
+    }
+}
+
 /// State of the vault.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum VaultStatus {
@@ -477,7 +501,7 @@ impl Vault {
         }
         let unlocked = Unlocked::fresh(master, params, BTreeMap::new(), self.clock.now())?;
         unlocked.persist(&self.path)?;
-        tracing::info!(path = %self.path.display(), m_cost_kib = params.m_cost_kib, t_cost = params.t_cost, p_cost = params.p_cost, "vault created");
+        tracing::info!(file = %ninesql_storage::fs::log_name(&self.path), m_cost_kib = params.m_cost_kib, t_cost = params.t_cost, p_cost = params.p_cost, "vault created");
         st.unlocked = Some(unlocked);
         st.throttle.record_success();
         Ok(())
@@ -497,10 +521,10 @@ impl Vault {
         let file = self.read_file()?;
         match self.open_with(&file, master) {
             Ok(unlocked) => {
-                tracing::info!(path = %self.path.display(), entries = unlocked.entries.len(), "vault unlocked");
+                tracing::info!(file = %ninesql_storage::fs::log_name(&self.path), entries = unlocked.entries.len(), "vault unlocked");
                 if !unlocked.kdf.meets_minimum() {
                     tracing::warn!(
-                        path = %self.path.display(),
+                        file = %ninesql_storage::fs::log_name(&self.path),
                         m_cost_kib = unlocked.kdf.m_cost_kib,
                         t_cost = unlocked.kdf.t_cost,
                         p_cost = unlocked.kdf.p_cost,
@@ -513,11 +537,11 @@ impl Vault {
             }
             Err(VaultError::WrongPassword) => {
                 st.throttle.record_failure(self.clock.now());
-                tracing::warn!(path = %self.path.display(), "vault unlock failed: wrong master password or damaged header");
+                tracing::warn!(file = %ninesql_storage::fs::log_name(&self.path), "vault unlock failed: wrong master password or damaged header");
                 Err(VaultError::WrongPassword)
             }
             Err(e) => {
-                tracing::warn!(path = %self.path.display(), error = %e, "vault unlock failed");
+                tracing::warn!(file = %ninesql_storage::fs::log_name(&self.path), kind = e.kind(), "vault unlock failed");
                 Err(e)
             }
         }
@@ -580,7 +604,7 @@ impl Vault {
             Ok(old) => old,
             Err(VaultError::WrongPassword) => {
                 st.throttle.record_failure(self.clock.now());
-                tracing::warn!(path = %self.path.display(), "vault password change refused: wrong master password");
+                tracing::warn!(file = %ninesql_storage::fs::log_name(&self.path), "vault password change refused: wrong master password");
                 return Err(VaultError::WrongPassword);
             }
             Err(e) => return Err(e),
@@ -594,7 +618,7 @@ impl Vault {
         let Unlocked { entries, .. } = old;
         let fresh = Unlocked::fresh(new, kdf, entries, self.clock.now())?;
         fresh.persist(&self.path)?;
-        tracing::info!(path = %self.path.display(), m_cost_kib = kdf.m_cost_kib, t_cost = kdf.t_cost, p_cost = kdf.p_cost, "vault master password changed");
+        tracing::info!(file = %ninesql_storage::fs::log_name(&self.path), m_cost_kib = kdf.m_cost_kib, t_cost = kdf.t_cost, p_cost = kdf.p_cost, "vault master password changed");
         st.unlocked = Some(fresh);
         Ok(())
     }

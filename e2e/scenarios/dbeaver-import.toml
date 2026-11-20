@@ -1,0 +1,43 @@
+# Phase 2 exit scenario: a synthetic DBeaver 25.3 workspace (a copy of
+# crates/ninesql-dbeaver/tests/fixtures/dbeaver-25.3.5, never a real one) at the run's
+# ~/.local/share/DBeaverData/workspace6, found by the first-run offer, previewed by
+# "Import from DBeaver" and imported. The DBeaver files are read only (I4); the imported
+# connections are not connected (their hosts are not dev engines).
+schema_version = 1
+name = "dbeaver-import"
+description = "DBeaver import: the first-run offer, the preview of a synthetic workspace, the import."
+
+[[dbeaver]]
+fixture = "dbeaver-25.3.5"
+
+[[step]]
+wait = "core.ready"
+equals = true
+timeout_secs = 60
+
+[[step]]
+wait = "import.first_run_offer"
+equals = true
+timeout_secs = 30
+
+[[step]]
+checkpoint = "first-run-offer"
+
+[[step]]
+action = "ninesql::ImportFromDbeaver"
+
+[[step]]
+wait = "import.stage"
+equals = "preview"
+timeout_secs = 60
+
+[[step]]
+expect = "import.preview_connections"
+at_least = 1
+
+[[step]]
+expect = "dialog.open"
+equals = true
+
+[[step]]
+checkpoint = "import-preview"

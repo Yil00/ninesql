@@ -257,7 +257,7 @@ where
             let _ = tx.send(probe());
         });
     if let Err(e) = spawned {
-        tracing::warn!(error = %e, "could not start the Secret Service probe");
+        tracing::warn!(io_error = ?e.kind(), "could not start the Secret Service probe");
         return unavailable("could not start the Secret Service probe");
     }
     match rx.recv_timeout(timeout) {
@@ -284,7 +284,10 @@ fn probe_on_this_thread() -> crate::backend::SecretServiceAvailability {
     match result {
         Ok(()) => A::Available,
         Err(e) => {
-            tracing::info!(error = %e, "no usable Secret Service; the encrypted vault is the secret store");
+            tracing::info!(
+                kind = e.kind(),
+                "no usable Secret Service; the encrypted vault is the secret store"
+            );
             A::Unavailable {
                 detail: e.to_string(),
             }
@@ -395,7 +398,7 @@ impl SecretStore for SecretServiceStore {
         }) {
             Ok(paths) => paths,
             Err(e) => {
-                tracing::warn!(id = %id, error = %map_error(e), "cannot look up the default secret collection; deleting every item under the id");
+                tracing::warn!(id = %id, kind = map_error(e).kind(), "cannot look up the default secret collection; deleting every item under the id");
                 Vec::new()
             }
         };
@@ -424,7 +427,7 @@ fn delete_matches<P>(
         match delete(item) {
             Ok(()) => deleted_any = true,
             Err(e) => {
-                tracing::warn!(id = %id, in_default_collection = in_default, error = %e, "could not delete a secret item");
+                tracing::warn!(id = %id, in_default_collection = in_default, kind = e.kind(), "could not delete a secret item");
                 if *in_default && default_failure.is_none() {
                     default_failure = Some(e);
                 } else if first_failure.is_none() {
@@ -468,12 +471,12 @@ fn write_then_prune<O: ItemOps>(ops: &mut O, id: &SecretId) -> Result<(), Secret
         Ok(paths) => {
             for stale in paths.iter().filter(|p| **p != created) {
                 if let Err(e) = ops.delete(stale) {
-                    tracing::warn!(id = %id, item = ?stale, error = %e, "could not delete a stale duplicate secret item");
+                    tracing::warn!(id = %id, item = ?stale, kind = e.kind(), "could not delete a stale duplicate secret item");
                 }
             }
         }
         Err(e) => {
-            tracing::warn!(id = %id, error = %e, "could not look for stale duplicate secret items");
+            tracing::warn!(id = %id, kind = e.kind(), "could not look for stale duplicate secret items");
         }
     }
     Ok(())

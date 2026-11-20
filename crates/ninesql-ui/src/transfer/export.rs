@@ -121,6 +121,9 @@ pub struct ExportDialog {
     stage: ExportStage,
     /// The job's tasks: dropping them drops the job, which cancels it in the core.
     tasks: Vec<Task<()>>,
+    /// The "Close" button's focus: the button that started the run is gone once it ends, so
+    /// the focus moves here and the dialog stays usable from the keyboard.
+    close_focus: FocusHandle,
 }
 
 impl ExportDialog {
@@ -144,6 +147,7 @@ impl ExportDialog {
             path,
             stage: ExportStage::Editing,
             tasks: Vec::new(),
+            close_focus: cx.focus_handle(),
         }
     }
 
@@ -422,7 +426,11 @@ impl ExportDialog {
 }
 
 impl Render for ExportDialog {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        // The run ended and its button went with the stage: keep the keyboard in the dialog.
+        if matches!(self.stage, ExportStage::Done(_)) && window.focused(cx).is_none() {
+            self.close_focus.focus(window, cx);
+        }
         let theme = cx.theme().clone();
         let busy = self.is_busy();
         let editing = matches!(
@@ -554,6 +562,7 @@ impl Render for ExportDialog {
             _ => footer
                 .child(
                     Button::new("export-close")
+                        .track_focus(&self.close_focus)
                         .label("Close")
                         .on_click(|_, window, cx| window.close_dialog(cx)),
                 )
@@ -587,7 +596,7 @@ pub fn open_export_dialog(
     window.open_dialog(cx, move |d, _, _| {
         d.title(title).w(px(620.)).child(view.clone())
     });
-    #[cfg(test)]
+    #[cfg(any(test, feature = "e2e-scenarios"))]
     super::OPENED_EXPORT.with(|o| *o.borrow_mut() = Some(dialog.clone()));
     dialog
 }

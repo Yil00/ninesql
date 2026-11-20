@@ -10,13 +10,16 @@
 # smoke test and the report. Every stage has its own log, exit status and duration; a failing
 # stage does not stop the next ones unless --fail-fast is given.
 #
-# Stages (default: env static unit engines gui-smoke; deb is opt-in with --with-deb):
+# Stages (default: env static unit engines gui-smoke scenarios; deb is opt-in with --with-deb):
 #   env        prerequisites and versions (no hostname, user name or IP address)
 #   static     make fmt-check clippy deny verify-patches forbidden-apis md-links dev-check
 #   unit       make test (cargo test --workspace), NINESQL_REQUIRE_DBUS=1 when dbus-daemon exists
 #   engines    the driver-integration CI job: dev engines up, make test-engines-run, logs, down
 #   gui-smoke  release binary, --version / --help, a window kept open ~15 s, SIGTERM, I1 check
 #              (temporary HOME and XDG directories; screenshot only with --screenshot)
+#   scenarios  the e2e-scenarios test build (its own target directory), then each scenario of
+#              e2e/scenarios/ in a real window with a fresh 0700 run directory, a window-only
+#              screenshot at each checkpoint (X11 / XWayland), results.json and logs (ADR-0029 §2)
 #   deb        make deb, then make deb-install-test
 #
 # Usage: scripts/e2e-local.sh [options]     (or: make e2e-local E2E_ARGS="...")
@@ -28,8 +31,8 @@ umask 077
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
 
-ALL_STAGES=(env static unit engines gui-smoke deb)
-DEFAULT_STAGES=(env static unit engines gui-smoke)
+ALL_STAGES=(env static unit engines gui-smoke scenarios deb)
+DEFAULT_STAGES=(env static unit engines gui-smoke scenarios)
 # Same list as the driver-integration CI job and `make test-engines`.
 DEFAULT_ENGINES="postgresql,mysql,mariadb,ssh,timescaledb,yugabytedb,questdb,tidb"
 STATIC_STEPS=(fmt-check clippy deny verify-patches forbidden-apis md-links dev-check)
@@ -49,6 +52,11 @@ CARGO_TIMEOUT=2700
 DEV_TIMEOUT=900
 GUI_WAIT=15
 SCREENSHOT=0
+# Checkpoint screenshots of the scenarios stage: on by default (isolated test windows that show
+# only dev data), off with --no-screenshot.
+SCENARIO_SHOTS=1
+SCENARIOS=""
+SCENARIO_TIMEOUT=1200
 KEEP_TEMP=0
 NO_SECRET_SCAN=0
 CHECK_REPORT=""
@@ -65,8 +73,8 @@ Usage: scripts/e2e-local.sh [options]
 Runs the NineSQL checks on this machine and writes a report to
 target/e2e-reports/<UTC time>-<short sha>/ (summary.md, one log per stage, report.tar.gz).
 
-Stages: env static unit engines gui-smoke deb
-Default: env static unit engines gui-smoke. env always runs unless --skip env.
+Stages: env static unit engines gui-smoke scenarios deb
+Default: env static unit engines gui-smoke scenarios. env always runs unless --skip env.
 
 Options:
   --only LIST          Run only these stages (comma-separated), e.g. --only unit,engines
@@ -91,17 +99,26 @@ Options:
                        launched process only, found by its pid on X11 / XWayland (xdotool or
                        wmctrl, and ImageMagick import); when no single window matches, none is
                        taken (never the whole screen) and the summary says why
-  --no-screenshot      Accepted for compatibility; no screenshot is the default
+  --no-screenshot      No screenshot at all: none in gui-smoke, and none at the checkpoints of
+                       the scenarios stage (taken by default there, the test window only)
+  --scenario LIST      Scenarios to run in the scenarios stage (comma-separated names of
+                       e2e/scenarios/<name>.toml; default: all of them)
+  --scenario-timeout SECS
+                       Time limit of each scenario run (default 1200); the run is then stopped
   --no-secret-scan     Write the archive without a gitleaks scan (by default the archive is
-                       written only when gitleaks scanned the report clean)
-  --keep-temp          Keep gui-smoke's temporary HOME and XDG directories
+                       written only when gitleaks scanned the report clean); a report in
+                       which a scenario run found a secret (scenarios/SECRET-FOUND) is never
+                       archived, with this option or with --check-report
+  --keep-temp          Keep gui-smoke's temporary HOME and XDG directories, and the run
+                       directories of the scenarios stage (target/e2e-runs/)
   --check-report DIR   Run no stage: scrub and secret-check an existing report directory (one
                        you own, with the summary.md this script writes), then archive it;
                        symbolic links and other non-regular files are skipped
   -h, --help           Show this help
 
-Environment: CARGO_TARGET_DIR is respected; E2E_COMPOSE_PROJECT names the compose project of
-the engines stage, like --compose-project.
+Environment: CARGO_TARGET_DIR is respected (the scenarios stage builds its test binary in
+target/e2e-build/ whatever it says); E2E_COMPOSE_PROJECT names the compose project of the
+engines and scenarios stages, like --compose-project.
 EOF
 }
 
@@ -129,7 +146,10 @@ while [ $# -gt 0 ]; do
         --dev-timeout) [ $# -ge 2 ] || die "--dev-timeout needs a value"; DEV_TIMEOUT="$2"; shift 2 ;;
         --gui-wait) [ $# -ge 2 ] || die "--gui-wait needs a value"; GUI_WAIT="$2"; shift 2 ;;
         --screenshot) SCREENSHOT=1; shift ;;
-        --no-screenshot) shift ;; # the default; kept so older command lines still work
+        --no-screenshot) SCREENSHOT=0; SCENARIO_SHOTS=0; shift ;;
+        --scenario) [ $# -ge 2 ] || die "--scenario needs a value"; SCENARIOS="$2"; shift 2 ;;
+        --scenario=*) SCENARIOS="${1#*=}"; shift ;;
+        --scenario-timeout) [ $# -ge 2 ] || die "--scenario-timeout needs a value"; SCENARIO_TIMEOUT="$2"; shift 2 ;;
         --no-secret-scan) NO_SECRET_SCAN=1; shift ;;
         --keep-temp) KEEP_TEMP=1; shift ;;
         --check-report) [ $# -ge 2 ] || die "--check-report needs a directory"; CHECK_REPORT="$2"; shift 2 ;;
@@ -138,7 +158,7 @@ while [ $# -gt 0 ]; do
     esac
 done
 
-for n in "$LOG_LINES" "$CARGO_TIMEOUT" "$DEV_TIMEOUT" "$GUI_WAIT"; do
+for n in "$LOG_LINES" "$CARGO_TIMEOUT" "$DEV_TIMEOUT" "$GUI_WAIT" "$SCENARIO_TIMEOUT"; do
     case "$n" in ''|*[!0-9]*) die "not a whole number: $n" ;; esac
 done
 case "$ENGINES" in ''|*[!a-z0-9,]*) die "--engines takes ids like postgresql,mysql" ;; esac
@@ -165,6 +185,31 @@ for s in "${ALL_STAGES[@]}"; do
 done
 [ -n "$CHECK_REPORT" ] && STAGES=()
 [ -n "$CHECK_REPORT" ] || [ "${#STAGES[@]}" -gt 0 ] || die "no stage left to run"
+
+# Test hooks of scripts/e2e-local-report-test.sh only (never needed for a real run):
+# E2E_TEST_SCENARIO_DIR replaces e2e/scenarios, E2E_TEST_SCENARIO_BIN replaces the test build
+# (no cargo build; its --version must still say it is a test build), E2E_TEST_OUTPUT_DIR
+# replaces target/ as the parent of e2e-reports/ and e2e-runs/.
+SCENARIO_DIR="${E2E_TEST_SCENARIO_DIR:-$ROOT/e2e/scenarios}"
+OUT_BASE="${E2E_TEST_OUTPUT_DIR:-$ROOT/target}"
+# The scenarios to run: --scenario, else every e2e/scenarios/*.toml, in name order.
+SCENARIO_LIST=()
+if [ -n "$SCENARIOS" ]; then
+    IFS=, read -ra SCENARIO_ARGS <<<"$SCENARIOS"
+    for sc in "${SCENARIO_ARGS[@]}"; do
+        case "$sc" in
+            ''|*[!a-z0-9-]*) die "--scenario takes scenario names (lower-case letters, digits and -) like sqlite-editor-grid,postgresql-editor-safety: ${sc:-<empty>}" ;;
+        esac
+        [ -f "$SCENARIO_DIR/$sc.toml" ] || die "unknown scenario: $sc (no e2e/scenarios/$sc.toml)"
+        in_list "$sc" "$(IFS=,; echo "${SCENARIO_LIST[*]}")" || SCENARIO_LIST+=("$sc")
+    done
+elif [ -d "$SCENARIO_DIR" ]; then
+    while IFS= read -r f; do
+        sc="$(basename "$f" .toml)"
+        case "$sc" in ''|*[!a-z0-9-]*) continue ;; esac
+        SCENARIO_LIST+=("$sc")
+    done < <(find "$SCENARIO_DIR" -maxdepth 1 -type f -name '*.toml' | LC_ALL=C sort)
+fi
 
 # ---------------------------------------------------------------------------------------------
 # Report directory and helpers
@@ -196,11 +241,14 @@ if [ -n "$CHECK_REPORT" ]; then
     fi
     REPORT="$(cd "$CHECK_REPORT" && pwd -P)"
 else
-    REPORT="$ROOT/target/e2e-reports/$STAMP-$GIT_SHA"
+    mkdir -p "$OUT_BASE/e2e-reports"
+    REPORT="$OUT_BASE/e2e-reports/$STAMP-$GIT_SHA"
     suffix=1
-    while [ -e "$REPORT" ]; do
+    # A new directory, for this user only (mkdir fails when the name exists).
+    until mkdir -m 0700 "$REPORT" 2>/dev/null; do
         suffix=$((suffix + 1))
-        REPORT="$ROOT/target/e2e-reports/$STAMP-$GIT_SHA-$suffix"
+        [ "$suffix" -le 100 ] || die "cannot create a report directory under $OUT_BASE/e2e-reports"
+        REPORT="$OUT_BASE/e2e-reports/$STAMP-$GIT_SHA-$suffix"
     done
 fi
 NOTES="$REPORT/.notes"
@@ -208,6 +256,12 @@ mkdir -p "$NOTES"
 TARGET_DIR="${CARGO_TARGET_DIR:-$ROOT/target}"
 SUMMARY="$REPORT/summary.md"
 ARCHIVE="$REPORT/report.tar.gz"
+# Written into the report when a scenario run found a secret (runner exit 3). Its presence,
+# or a "FAIL (SECRET FOUND)" row in summary.md, stops any archive of this report, later
+# --check-report runs and --no-secret-scan included.
+SECRET_MARKER="$REPORT/scenarios/SECRET-FOUND"
+# What stderr.log of such a run holds instead of the runner's standard error.
+STDERR_WITHHELD="stderr withheld: the runner found a secret in a file it wrote (exit 3); its standard error is not copied into the report."
 
 say() { printf '%s\n' "$*"; }
 
@@ -440,6 +494,15 @@ stage_env() {
         fi
     else
         kv "Screenshot" "not requested (--screenshot to take one)"
+    fi
+    if [ "$SCENARIO_SHOTS" = 1 ]; then
+        if [ -n "${DISPLAY:-}" ] && have import && { have xdotool || have wmctrl; }; then
+            kv "Scenario screenshots" "at each checkpoint, the test window only (XWayland or X11: WAYLAND_DISPLAY unset for the run)"
+        else
+            warn "scenario checkpoint screenshots need DISPLAY (X11 or XWayland), ImageMagick import and xdotool or wmctrl: the scenarios will run without screenshots"
+        fi
+    else
+        kv "Scenario screenshots" "off (--no-screenshot)"
     fi
 
     cat "$md" >>"$log"
@@ -692,13 +755,13 @@ find_windows() {
     grep -E '^(0x[0-9a-fA-F]+|[0-9]+)$' <<<"$ids" | sort -u || true
 }
 
-# screenshot_window <file> <pid>: the window of the launched process only (X11, or XWayland),
-# raised first so no other window covers it. Nothing is clicked or typed. There is no
-# whole-screen fallback: when no single window of <pid> can be captured, nothing is taken and
-# SHOT_WHY says why.
+# screenshot_window <file> <pid> [settle]: the window of the launched process only (X11, or
+# XWayland), raised first so no other window covers it, then [settle] seconds (default 1) for
+# the raise to be drawn. Nothing is clicked or typed. There is no whole-screen fallback: when
+# no single window of <pid> can be captured, nothing is taken and SHOT_WHY says why.
 SHOT_WHY=""
 screenshot_window() {
-    local out=$1 pid=$2 ids n id
+    local out=$1 pid=$2 settle=${3:-1} ids n id
     if [ -z "${DISPLAY:-}" ]; then
         SHOT_WHY="no X11 display (DISPLAY unset); a Wayland-native window cannot be captured alone"
         return 1
@@ -721,7 +784,7 @@ screenshot_window() {
     else
         timeout 5 wmctrl -i -a "$id" >/dev/null 2>&1 || true
     fi
-    sleep 1
+    sleep "$settle"
     if ! kill -0 "$pid" 2>/dev/null; then SHOT_WHY="the process exited before the capture"; return 1; fi
     if timeout 15 import -window "$id" "$out" 2>/dev/null && [ -s "$out" ]; then return 0; fi
     SHOT_WHY="ImageMagick import could not capture the window"
@@ -766,7 +829,7 @@ stage_gui_smoke() {
 
     if [ "$DRY_RUN" = 1 ]; then
         say "    [dry-run] mkdir temp HOME / XDG_CONFIG_HOME / XDG_DATA_HOME / XDG_STATE_HOME / XDG_CACHE_HOME (0700)"
-        say "    [dry-run] HOME=<temp> RUST_LOG=ninesql=debug,info $bin &   (alive check after ${GUI_WAIT} s)"
+        say "    [dry-run] HOME=<temp> NINESQL_LOG=ninesql=debug,info $bin &   (alive check after ${GUI_WAIT} s)"
         if [ "$SCREENSHOT" = 1 ]; then
             say "    [dry-run] screenshot of the launched process's window, found by pid (xdotool search --pid / wmctrl -lp, import -window <id>); none when no single window matches, never the whole screen"
         else
@@ -783,9 +846,10 @@ stage_gui_smoke() {
     say "    gui-smoke: starting ninesql for ${GUI_WAIT} s (a window opens; leave it alone)"
     # A temporary HOME too: the first-run DBeaver detection reads known locations under $HOME,
     # so the user's real DBeaver connection names never reach the window (or a screenshot).
-    # RUST_LOG never at trace: trace may carry query text (AGENTS.md).
+    # NINESQL_LOG (ADR-0029 §3.4; RUST_LOG is ignored), never at trace: trace may carry query
+    # text (AGENTS.md). It also turns the file log on, under $tmp/state/ninesql/logs/.
     env HOME="$tmp/home" XDG_CONFIG_HOME="$tmp/config" XDG_DATA_HOME="$tmp/data" \
-        XDG_STATE_HOME="$tmp/state" XDG_CACHE_HOME="$tmp/cache" RUST_LOG="ninesql=debug,info" \
+        XDG_STATE_HOME="$tmp/state" XDG_CACHE_HOME="$tmp/cache" NINESQL_LOG="ninesql=debug,info" \
         "$bin" </dev/null >"$out" 2>"$err" &
     pid=$!
     for ((i = 0; i < GUI_WAIT; i++)); do
@@ -833,15 +897,15 @@ stage_gui_smoke() {
     if grep -qE 'internal error \(panic\)|panicked at' "$err" 2>/dev/null; then
         fails+=("a panic was reported on stderr")
     fi
-    note gui-smoke "stderr: \`gui-smoke-stderr.log\` ($(wc -l <"$err") lines), stdout: \`gui-smoke-stdout.log\`. The binary installs no log subscriber yet, so RUST_LOG adds nothing today."
+    note gui-smoke "stderr: \`gui-smoke-stderr.log\` ($(wc -l <"$err") lines), stdout: \`gui-smoke-stdout.log\`. The file log (NINESQL_LOG) is saved as \`gui-smoke-ninesql.log\` when written."
 
     # What the run wrote (names and sizes, relative to the temp directory), and its log file.
     {
         echo "Files written under the temporary HOME and XDG directories:"
         (cd "$tmp" && find . -type f -printf '  %p (%s bytes, mode %m)\n' | sort)
     } >>"$log"
-    if [ -f "$tmp/state/ninesql/ninesql.log" ]; then
-        cp "$tmp/state/ninesql/ninesql.log" "$REPORT/gui-smoke-ninesql.log"
+    if [ -f "$tmp/state/ninesql/logs/ninesql.log" ]; then
+        cp "$tmp/state/ninesql/logs/ninesql.log" "$REPORT/gui-smoke-ninesql.log"
     fi
 
     # I1 (modest): the run makes no connection, so nothing secret should be on disk. Look for
@@ -864,6 +928,384 @@ stage_gui_smoke() {
         rc=1
     fi
     return "$rc"
+}
+
+# ---------------------------------------------------------------------------------------------
+# Stage: scenarios
+# ---------------------------------------------------------------------------------------------
+
+E2E_TARGET_DIR="$ROOT/target/e2e-build"
+
+# scenario_engines <scenario...>: the dev engine ids the scenarios' [[connection]] tables name
+# (sqlite excepted), comma-separated, or nothing.
+scenario_engines() {
+    local sc
+    for sc in "$@"; do
+        sed -n 's/^[[:space:]]*engine[[:space:]]*=[[:space:]]*"\([a-z0-9]*\)".*/\1/p' "$SCENARIO_DIR/$sc.toml"
+    done | { grep -vx sqlite || true; } | LC_ALL=C sort -u | paste -sd, -
+}
+
+# scenario_results <results.json>: "<outcome> <steps passed> <steps failed> <checkpoints
+# reached> <checkpoints planned>" from the runner's results.json, then one line per step that
+# did not pass ("- step <n> `<name>` (<kind>): <outcome>: <message>"), Markdown-safe.
+scenario_results() {
+    python3 -I - "$1" <<'EOF'
+import json, re, sys
+def clean(v, n=200):
+    v = re.sub(r"[\x00-\x1f\x7f|`]", " ", str(v if v is not None else ""))
+    return v[:n]
+try:
+    with open(sys.argv[1], encoding="utf-8") as fh:
+        doc = json.load(fh)
+    if not isinstance(doc, dict):
+        raise ValueError("not an object")
+except (OSError, ValueError):
+    print("unreadable 0 0 0 0")
+    sys.exit(0)
+steps = [s for s in (doc.get("steps") or []) if isinstance(s, dict)]
+passed = sum(1 for s in steps if s.get("outcome") == "pass")
+failed = sum(1 for s in steps if s.get("outcome") in ("fail", "timeout"))
+reached = len(doc.get("checkpoints") or [])
+planned = len(doc.get("planned_checkpoints") or [])
+print(clean(doc.get("outcome") or "unknown", 20).replace(" ", "-"), passed, failed, reached, planned)
+for s in steps:
+    if s.get("outcome") in ("fail", "timeout"):
+        print(f"- step {clean(s.get('index'), 8)} `{clean(s.get('name'), 80)}` ({clean(s.get('kind'), 20)}): "
+              f"{clean(s.get('outcome'), 20)}: {clean(s.get('message'))}")
+if doc.get("message"):
+    print(f"- message: {clean(doc.get('message'))}")
+EOF
+}
+
+# proc_start <pid>: the start time of process <pid> (field 22 of /proc/<pid>/stat), or nothing.
+proc_start() {
+    local s f
+    s="$(cat "/proc/$1/stat" 2>/dev/null)" || return 0
+    s="${s##*) }"
+    read -ra f <<<"$s"
+    printf '%s' "${f[19]:-}"
+}
+
+# child_alive <pid> <start>: the process is still the one started (same start time), so a
+# signal never reaches another process that reused the pid. With no start time, kill -0 only.
+child_alive() {
+    kill -0 "$1" 2>/dev/null || return 1
+    [ -z "$2" ] && return 0
+    [ "$(proc_start "$1")" = "$2" ]
+}
+
+stage_scenarios() {
+    local log=$1 bin="$E2E_TARGET_DIR/release/ninesql" rc=0 v sc fails=() skipped=0 ran=0
+    local engines plan kind a b rest busy=() owners started=0 shots_why="" runs_root fifo t0
+    local run pid="" code line fd deadline left timed_out n name shot taken r_out r_line extra
+    local dest outcome passed failed reached planned result errf start="" partial
+    export COMPOSE_PROJECT_NAME="$COMPOSE_PROJECT"
+
+    if [ "${#SCENARIO_LIST[@]}" -eq 0 ]; then
+        reason scenarios "no scenario file in e2e/scenarios"
+        return 1
+    fi
+    # The test window runs on X11 or XWayland only (ADR-0029 §2.7): WAYLAND_DISPLAY is unset for
+    # the run, so an X server (DISPLAY) is needed.
+    if [ -z "${DISPLAY:-}" ]; then
+        echo "No X11 display: DISPLAY is unset (the scenario windows run on X11 or XWayland)." >>"$log"
+        reason scenarios "no X11 display (DISPLAY unset; the scenarios run on X11 or XWayland only)"
+        if [ "$DRY_RUN" = 1 ]; then
+            say "    scenarios: no X11 display; with one it would run:"
+        else
+            return 77
+        fi
+    fi
+
+    # Checkpoint screenshots: the test window only, by default, when the tools are there.
+    if [ "$SCENARIO_SHOTS" = 0 ]; then
+        shots_why="off (--no-screenshot)"
+    elif ! have import; then
+        shots_why="ImageMagick import is not installed"
+    elif ! have xdotool && ! have wmctrl; then
+        shots_why="neither xdotool nor wmctrl is installed"
+    fi
+
+    note scenarios "Scenarios: ${SCENARIO_LIST[*]}."
+    cleanup_scenarios() {
+        if [ -n "$pid" ] && child_alive "$pid" "$start"; then kill -KILL "$pid" 2>/dev/null || true; fi
+        if [ "$started" = 1 ] && [ "$KEEP_ENGINES" = 0 ]; then
+            started=0
+            say "    scenarios: stopping the containers"
+            run "$log" compose --profile all down || true
+        fi
+    }
+    trap 'cleanup_scenarios; exit 130' INT TERM
+
+    # 1. The test build, in its own target directory: target/release/ninesql is never replaced.
+    if [ -n "${E2E_TEST_SCENARIO_BIN:-}" ]; then
+        bin="$E2E_TEST_SCENARIO_BIN"
+        echo "Test hook: E2E_TEST_SCENARIO_BIN, no build" >>"$log"
+    else
+        say "    scenarios: building the e2e-scenarios test binary (target/e2e-build)"
+        run "$log" env CARGO_TARGET_DIR="$E2E_TARGET_DIR" timeout "$CARGO_TIMEOUT" \
+            cargo build --release --locked -p ninesql-ui --bin ninesql --features e2e-scenarios || {
+            reason scenarios "the e2e-scenarios test build failed"
+            cleanup_scenarios
+            return 1
+        }
+    fi
+    if [ "$DRY_RUN" = 0 ]; then
+        v="$("$bin" --version 2>&1 </dev/null | head -n 1 || true)"
+        echo "test build --version: $v" >>"$log"
+        case "$v" in
+            *"e2e-scenarios test build"*) note scenarios "Test build: \`$v\`." ;;
+            *) reason scenarios "the binary built with --features e2e-scenarios does not say it is a test build"
+               cleanup_scenarios
+               return 1 ;;
+        esac
+    else
+        say "    [dry-run] $bin --version   (must say: e2e-scenarios test build, not for distribution)"
+    fi
+
+    # 2. The dev engines the scenarios name (sqlite needs none).
+    engines="$(scenario_engines "${SCENARIO_LIST[@]}")"
+    if [ -z "$engines" ]; then
+        note scenarios "No dev engine needed."
+    elif [ "$ENGINES_RUNNING" = 1 ]; then
+        note scenarios "Dev engines \`$engines\`: --engines-running, nothing started (a scenario whose engine does not answer is skipped)."
+    elif [ "$DRY_RUN" = 0 ] && { ! have docker || ! timeout 20 docker info >/dev/null 2>&1; }; then
+        note scenarios "Docker is not available: the scenarios that need \`$engines\` are skipped."
+    else
+        plan="$(engine_plan "$engines")" || plan=""
+        printf 'Engine plan:\n%s\n' "$plan" >>"$log"
+        if [ "$DRY_RUN" = 0 ]; then
+            while read -r kind a; do
+                [ "$kind" = PORT ] && port_busy "$a" </dev/null && busy+=("$a")
+            done <<<"$plan"
+        fi
+        if [ "${#busy[@]}" -gt 0 ]; then
+            owners="$(running_compose_projects "$plan")"
+            if [ "$owners" = "$COMPOSE_PROJECT_NAME" ]; then
+                # Left up by the engines stage (--keep-engines) or an earlier run of this script.
+                note scenarios "Dev engines \`$engines\`: already up in compose project \`$COMPOSE_PROJECT_NAME\`, reused."
+            else
+                reason scenarios "host ports already in use (${busy[*]}) by another compose project: stop it (make dev-down) or rerun with --engines-running"
+                cleanup_scenarios
+                return 1
+            fi
+        else
+            started=1
+            while read -r kind a b rest; do
+                [ "$kind" = UP ] || continue
+                say "    scenarios: starting $b"
+                # shellcheck disable=SC2086 # $rest is a list of service names
+                run "$log" timeout "$DEV_TIMEOUT" docker compose -f dev/compose.yaml --profile "$a" pull --quiet $rest || rc=$?
+                [ "$rc" = 0 ] || break
+                run "$log" python3 dev/ready.py up "$a" --engines "$b" --timeout "$DEV_TIMEOUT" || rc=$?
+                [ "$rc" = 0 ] || break
+            done <<<"$plan"
+            if [ "$rc" != 0 ]; then
+                fails+=("the dev engines did not start (exit $rc), so their scenarios were skipped")
+                rc=0
+            fi
+            note scenarios "Dev engines \`$engines\`: started in compose project \`$COMPOSE_PROJECT_NAME\` for this stage."
+        fi
+    fi
+
+    # 3. Each scenario in a fresh 0700 run directory, target/e2e-runs/<time>/<scenario>, with
+    # HOME and the four XDG directories inside it (the runner refuses anything else).
+    runs_root="$OUT_BASE/e2e-runs/$STAMP"
+    note scenarios ""
+    note scenarios "| Scenario | Result | Exit | Steps passed | Steps failed | Checkpoints reached / planned | Screenshots | Duration |"
+    note scenarios "|---|---|---|---|---|---|---|---|"
+    for sc in "${SCENARIO_LIST[@]}"; do
+        dest="$REPORT/scenarios/$sc"
+        run="$runs_root/$sc"
+        if [ "$DRY_RUN" = 1 ]; then
+            say "    [dry-run] mkdir -m 0700 $run/{home,config,data,state,cache,out}"
+            say "    [dry-run] env -u WAYLAND_DISPLAY HOME=$run/home XDG_CONFIG_HOME=… XDG_DATA_HOME=… XDG_STATE_HOME=… XDG_CACHE_HOME=… NINESQL_LOG=ninesql=debug,info $bin --e2e-run $SCENARIO_DIR/$sc.toml --e2e-out $run/out   (limit ${SCENARIO_TIMEOUT} s)"
+            if [ -z "$shots_why" ]; then
+                say "    [dry-run]   at each 'ninesql-e2e checkpoint <n> <name>' line: import -window <window of the launched pid> $dest/checkpoint-<n>-<name>.png"
+            else
+                say "    [dry-run]   no checkpoint screenshots: $shots_why"
+            fi
+            continue
+        fi
+        say "    scenarios: $sc (a window opens; leave it alone)"
+        mkdir -p "$runs_root" "$dest"
+        chmod 0700 "$OUT_BASE/e2e-runs" "$runs_root"
+        rm -rf "$run"
+        mkdir -m 0700 "$run"
+        mkdir -m 0700 "$run/home" "$run/config" "$run/data" "$run/state" "$run/cache" "$run/out"
+        # The pipe of the runner's standard output and the file of its standard error lie outside
+        # the run directory, which the runner's I1 scan reads whole. The standard error reaches
+        # the report only after the run, and only when the runner found no secret (exit 3).
+        fifo="$runs_root/.$sc.stdout"
+        errf="$runs_root/.$sc.stderr"
+        rm -f "$fifo" "$errf"
+        mkfifo -m 0600 "$fifo"
+        t0=$SECONDS
+        timed_out=0
+        taken=0
+        # WAYLAND_DISPLAY unset: GPUI uses its X11 backend (XWayland on a Wayland desktop), so the
+        # window can be captured alone (ADR-0029 §2.7). NINESQL_LOG, never trace (AGENTS.md).
+        # env execs the binary, so $! is the pid of ninesql itself (the screenshot looks it up).
+        env -u WAYLAND_DISPLAY HOME="$run/home" XDG_CONFIG_HOME="$run/config" XDG_DATA_HOME="$run/data" \
+            XDG_STATE_HOME="$run/state" XDG_CACHE_HOME="$run/cache" NINESQL_LOG="ninesql=debug,info" \
+            NINESQL_E2E_COMMIT="$(git rev-parse HEAD 2>/dev/null || echo unknown)" \
+            "$bin" --e2e-run "$SCENARIO_DIR/$sc.toml" --e2e-out "$run/out" \
+            </dev/null >"$fifo" 2>"$errf" &
+        pid=$!
+        start="$(proc_start "$pid")"
+        # Opened read-write, so this open never blocks, even when the runner dies before it
+        # opens its end; the end of its output is therefore its exit, not an end of file.
+        exec {fd}<>"$fifo"
+        : >"$dest/stdout.log"
+        deadline=$((SECONDS + SCENARIO_TIMEOUT))
+        partial=""
+        while :; do
+            left=$((deadline - SECONDS))
+            if [ "$left" -le 0 ]; then timed_out=1; break; fi
+            line=""
+            r_line=0
+            IFS= read -r -t 1 -u "$fd" line || r_line=$?
+            if [ "$r_line" != 0 ]; then
+                # A timeout keeps any partial line; once the runner has exited, a timeout means
+                # the pipe is drained. Any other status is a read error.
+                partial+="$line"
+                if [ "$r_line" -gt 128 ] && child_alive "$pid" "$start"; then continue; fi
+                break
+            fi
+            line="$partial$line"
+            partial=""
+            printf '%s\n' "$line" >>"$dest/stdout.log"
+            # A checkpoint: the runner holds the UI still for checkpoint_hold_ms (1 500 ms by
+            # default) after this line; capture the launched process's window within it.
+            if [[ "$line" =~ ^ninesql-e2e\ checkpoint\ ([0-9]{1,4})\ ([a-z0-9-]{1,64})$ ]]; then
+                n="${BASH_REMATCH[1]}"
+                name="${BASH_REMATCH[2]}"
+                [ -z "$shots_why" ] || continue
+                shot="$dest/checkpoint-$(printf '%02d' "$((10#$n))")-$name.png"
+                if screenshot_window "$shot" "$pid" 0.2; then
+                    taken=$((taken + 1))
+                else
+                    rm -f "$shot"
+                    printf 'checkpoint %s %s: no screenshot: %s\n' "$n" "$name" "$SHOT_WHY" >>"$log"
+                fi
+            fi
+        done
+        exec {fd}<&-
+        if [ -n "$partial" ]; then printf '%s\n' "$partial" >>"$dest/stdout.log"; fi
+        # The process should be ending; it still gets only the time left.
+        while [ "$timed_out" = 0 ] && child_alive "$pid" "$start"; do
+            [ "$SECONDS" -lt "$deadline" ] || timed_out=1
+            [ "$timed_out" = 1 ] || sleep 0.2
+        done
+        if [ "$timed_out" = 1 ]; then
+            if child_alive "$pid" "$start"; then kill -TERM "$pid" 2>/dev/null || true; fi
+            for ((n = 0; n < 10; n++)); do
+                child_alive "$pid" "$start" || break
+                sleep 1
+            done
+            if child_alive "$pid" "$start"; then kill -KILL "$pid" 2>/dev/null || true; fi
+        fi
+        wait "$pid" 2>/dev/null && code=0 || code=$?
+        pid=""
+        rm -f "$fifo"
+        ran=$((ran + 1))
+
+        # Results and the run's file log.
+        if [ -f "$run/out/results.json" ] && [ ! -L "$run/out/results.json" ]; then
+            cp "$run/out/results.json" "$dest/results.json"
+        fi
+        if [ "$code" = 3 ]; then
+            # The runner's I1 scan found a password: neither its standard error nor the run's
+            # file log reaches the report, and the marker stops any archive of the report, now
+            # and in any later --check-report run (checked at the end of this script).
+            printf '%s\n' "$STDERR_WITHHELD" >"$dest/stderr.log"
+            printf '%s\n' "A scenario run ($sc) found a dev password or its master password in a file it wrote (runner exit 3). scripts/e2e-local.sh never archives this report, with --check-report and --no-secret-scan too." >"$SECRET_MARKER"
+        else
+            if [ -f "$errf" ] && [ ! -L "$errf" ]; then cat "$errf" >"$dest/stderr.log"; else : >"$dest/stderr.log"; fi
+            if [ -f "$run/state/ninesql/logs/ninesql.log" ] && [ ! -L "$run/state/ninesql/logs/ninesql.log" ]; then
+                cp "$run/state/ninesql/logs/ninesql.log" "$dest/ninesql.log"
+            fi
+        fi
+        if [ "$KEEP_TEMP" = 0 ]; then rm -f "$errf"; fi
+        if [ -f "$dest/results.json" ]; then
+            r_out="$(scenario_results "$dest/results.json")"
+        else
+            r_out="none 0 0 0 0"
+        fi
+        read -r outcome passed failed reached planned <<<"$(head -n 1 <<<"$r_out")"
+        extra="$(tail -n +2 <<<"$r_out")"
+        case "$code" in
+            0) result=PASS ;;
+            1) result=FAIL ;;
+            2) result="FAIL (refused)" ;;
+            3) result="FAIL (SECRET FOUND)" ;;
+            4) result="FAIL (setup error)" ;;
+            5) result=SKIP ;;
+            *) result="FAIL (exit $code)" ;;
+        esac
+        [ "$timed_out" = 1 ] && result="FAIL (time limit ${SCENARIO_TIMEOUT} s)"
+        if grep -qE 'internal error \(panic\)|panicked at' "$dest/stderr.log" 2>/dev/null && [ "$result" = PASS ]; then
+            result="FAIL (panic on stderr)"
+        fi
+        case "$result" in
+            FAIL*) fails+=("$sc: $result") ;;
+            SKIP) skipped=$((skipped + 1)) ;;
+        esac
+        if [ "$code" = 3 ]; then
+            say ""
+            say "    !!! scenarios: $sc: the runner found a dev password or the run's master password in a file it wrote (I1)."
+            say "    !!! Its standard error and the run's file log are NOT copied into the report, and no archive"
+            say "    !!! of this report will be written, now or by a later --check-report (scenarios/SECRET-FOUND)."
+            say "    !!! The file names (never the values) are under i1_scan in $dest/results.json."
+            say ""
+            note scenarios "**$sc: SECRET FOUND** (exit 3): a dev password or the run's master password appeared in a file of the run directory (I1). The file names are under \`i1_scan\` in \`scenarios/$sc/results.json\`; the runner's standard error and the file log were not copied, and this report is never archived (\`scenarios/SECRET-FOUND\`, also with \`--check-report\` and \`--no-secret-scan\`). Report it as a bug."
+        fi
+        [ -n "$shots_why" ] && taken="none: $shots_why"
+        note scenarios "| $sc | $result | $code | $passed | $failed | $reached / $planned | $taken | $(fmt_dur $((SECONDS - t0))) |"
+        printf 'scenario %s: %s (exit %s; steps passed %s, failed %s; checkpoints %s / %s; screenshots %s)\n' \
+            "$sc" "$result" "$code" "$passed" "$failed" "$reached" "$planned" "$taken" >>"$log"
+        if [ -n "$extra" ] && [ "$result" != PASS ]; then
+            {
+                printf -- '- **%s** (%s):\n' "$sc" "$outcome"
+                while IFS= read -r line; do printf '  %s\n' "$line"; done <<<"$extra"
+            } >>"$NOTES/scenarios.failures"
+        fi
+        if [ -s "$dest/stderr.log" ] && [ ! -f "$dest/results.json" ]; then
+            printf -- '- **%s**: stderr: %s\n' "$sc" "$(head -c 300 "$dest/stderr.log" | tr -d '\000-\037|`')" >>"$NOTES/scenarios.failures"
+        fi
+        if [ "$KEEP_TEMP" = 0 ]; then rm -rf "$run"; fi
+    done
+    if [ "$DRY_RUN" = 0 ]; then
+        if [ -f "$NOTES/scenarios.failures" ]; then
+            note scenarios ""
+            note scenarios "Steps that did not pass, and runner messages:"
+            note scenarios ""
+            cat "$NOTES/scenarios.failures" >>"$NOTES/scenarios.md"
+            rm -f "$NOTES/scenarios.failures"
+        fi
+        note scenarios ""
+        note scenarios "Per scenario, in \`scenarios/<name>/\`: \`results.json\` (the runner's results), \`stdout.log\` (the checkpoint lines), \`stderr.log\`, \`ninesql.log\` (the file log, \`NINESQL_LOG=ninesql=debug,info\`) and \`checkpoint-<n>-<name>.png\` (the test window only, taken during the runner's 1 500 ms hold; a slow capture can show the state just after the checkpoint). Runner exit statuses: 0 pass, 1 a step failed, 2 refused, 3 secret found, 4 setup error, 5 skipped (a dev engine did not answer)."
+        if [ "$KEEP_TEMP" = 1 ]; then
+            note scenarios "Run directories kept (--keep-temp): \`target/e2e-runs/$STAMP/\`."
+        else
+            rmdir "$runs_root" 2>/dev/null || true
+        fi
+    fi
+    cleanup_scenarios
+    trap - INT TERM
+    if [ "$DRY_RUN" = 1 ]; then
+        [ -n "${DISPLAY:-}" ] || return 77
+        return 0
+    fi
+    if [ "${#fails[@]}" -gt 0 ]; then
+        reason scenarios "$(printf '%s; ' "${fails[@]}")"
+        return 1
+    fi
+    if [ "$ran" -gt 0 ] && [ "$skipped" = "$ran" ]; then
+        reason scenarios "every scenario was skipped (a dev engine did not answer)"
+        return 77
+    fi
+    return 0
 }
 
 # ---------------------------------------------------------------------------------------------
@@ -1186,7 +1628,7 @@ write_summary() {
         if [ -f "$NOTES/env.md" ]; then cat "$NOTES/env.md"; else echo "Not collected (env stage skipped)."; fi
         echo
         echo "---"
-        echo "Generated by scripts/e2e-local.sh. Paths are shown relative to <repo> or ~; the user name, host name, IP addresses (loopback kept) and MAC addresses are replaced."
+        echo "Generated by scripts/e2e-local.sh. Paths are shown relative to <repo> or ~; the user name, host name, IP addresses (loopback kept) and MAC addresses are replaced in text files. Screenshots (gui-smoke-window.png with --screenshot, scenarios/*/checkpoint-*.png) are part of the archive and are not scrubbed: they show the NineSQL test window only, with dev data, but a popup over the window can appear in them."
     } >"$SUMMARY"
     return "$nfail"
 }
@@ -1201,12 +1643,25 @@ else
     failures=0
 fi
 scrub
+SCENARIO_SECRET_FOUND=0
+if [ -e "$SECRET_MARKER" ] || [ -L "$SECRET_MARKER" ] || grep -qF 'FAIL (SECRET FOUND)' "$SUMMARY" 2>/dev/null; then
+    SCENARIO_SECRET_FOUND=1
+fi
 rm -rf "$NOTES"
 
 # Secret checks of the report, then the archive. The archive is written only when every check
 # passed and gitleaks scanned the report clean, or with --no-secret-scan (fail closed).
 archive_ok=1
 scan_notes=()
+if [ "$SCENARIO_SECRET_FOUND" = 1 ]; then
+    archive_ok=0
+    failures=$((failures + 1))
+    scan_notes+=("a scenario run found a dev password or its master password in a file it wrote (runner exit 3, \`scenarios/SECRET-FOUND\`): this report is never archived, whatever the other checks say and with \`--no-secret-scan\` too")
+    say ""
+    say "FAIL: a scenario run found a password in a file it wrote (scenarios/SECRET-FOUND, and the scenarios"
+    say "      section of summary.md): this report is never archived, --check-report and --no-secret-scan included."
+    say "      Report it as a bug; do not send this report."
+fi
 if ! redacted="$(redact_dev_passwords)"; then
     redacted=0
     archive_ok=0
@@ -1282,6 +1737,9 @@ say ""
 say "Summary: $SUMMARY"
 [ "$archive_ok" = 1 ] && say "Archive: $ARCHIVE"
 [ -f "$REPORT/gui-smoke-window.png" ] && say "Note: the report holds a screenshot of the NineSQL window (gui-smoke-window.png); check it before sending."
+if [ -d "$REPORT/scenarios" ] && [ -n "$(find "$REPORT/scenarios" -name '*.png' -print -quit 2>/dev/null)" ]; then
+    say "Note: the report holds checkpoint screenshots of the test windows (scenarios/*/*.png): dev data only, but not scrubbed; a popup over the window can show in them."
+fi
 # Only in a report written by an older version of this script, which could fall back to it.
 [ -f "$REPORT/gui-smoke-screen.png" ] && say "Note: the report holds a screenshot of your WHOLE screen (gui-smoke-screen.png); check it, or delete it."
 if [ "$archive_ok" = 1 ]; then

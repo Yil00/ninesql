@@ -59,6 +59,9 @@ build-options:
     CARGO_HOME: /run/build/ninesql/cargo
     CARGO_NET_OFFLINE: 'true'
     CARGO_INCREMENTAL: '0'
+    # A package build: with the `e2e-scenarios` test feature, ninesql-ui fails to compile
+    # (ADR-0029 §2.2, guard 1).
+    NINESQL_PACKAGE_BUILD: '1'
 
 modules:
   - name: ninesql

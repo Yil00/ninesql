@@ -191,7 +191,11 @@ impl CancelHandle for MyCancel {
     async fn cancel(&self) -> DriverResult<()> {
         self.exec.request();
         if let Err(e) = self.control.kill().await {
-            tracing::warn!(error = ?std::mem::discriminant(&e), "KILL QUERY failed");
+            tracing::warn!(
+                driver_error_kind = crate::logkind::error_kind(&e),
+                code = crate::logkind::error_code(&e),
+                "KILL QUERY failed"
+            );
         }
         Ok(())
     }

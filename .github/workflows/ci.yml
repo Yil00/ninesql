@@ -139,6 +139,10 @@ jobs:
       # and every changed file marked "Modified for NineSQL".
       - name: Patched crates
         run: scripts/verify-patches.sh
+      # ADR-0029 §2.2: the e2e-scenarios test feature is in no default feature and enabled by no
+      # workspace crate (cargo metadata), with the tests of that guard and of the marker check.
+      - name: e2e-scenarios feature guard
+        run: make e2e-feature-guard
       # ADR-0013 (security review of P0-A): GPUI must never get an HTTP client (I2), and
       # GPUI's credential API must not be used: secrets go through ninesql-secrets (I1).
       - name: Forbidden GPUI APIs under crates/

@@ -317,7 +317,11 @@ impl MySession {
             .internal_limited("SHOW GRANTS", false, Some(64 * 1024), None)
             .await
             .map_err(|e| {
-                tracing::warn!(error = ?std::mem::discriminant(&e), "SHOW GRANTS failed");
+                tracing::warn!(
+                    driver_error_kind = crate::logkind::error_kind(&e),
+                    code = crate::logkind::error_code(&e),
+                    "SHOW GRANTS failed"
+                );
                 DriverError::ReadOnly(
                     "the account's privileges could not be read (SHOW GRANTS); read-only mode \
                      refused"

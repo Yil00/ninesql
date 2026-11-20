@@ -1,0 +1,198 @@
+# Phase 5 exit scenario on SQLite: "Export table…" of `products` to a new CSV file in the run's
+# HOME, then "Import CSV…" of a small file into `nine_meta`, both through their dialogs from
+# the keyboard. In a test build, export and import files must lie inside the run directory
+# (ADR-0029 §2.5).
+schema_version = 1
+name = "sqlite-transfer"
+description = "SQLite: export a table to CSV and import a CSV file, through the dialogs."
+
+[[connection]]
+name = "Nine SQLite"
+engine = "sqlite"
+file = "nine.db"
+
+[[file]]
+name = "meta.csv"
+content = "key,value\ne2e_one,first\ne2e_two,second\ne2e_three,third\n"
+
+[[step]]
+wait = "core.ready"
+equals = true
+timeout_secs = 60
+
+[[step]]
+action = "ninesql::FocusNavigator"
+
+[[step]]
+keys = "home"
+
+[[step]]
+action = "ninesql::ConnectConnection"
+
+[[step]]
+wait = "session.open"
+arg = "Nine SQLite"
+equals = true
+timeout_secs = 30
+
+[[step]]
+action = "ninesql::FocusNavigator"
+
+[[step]]
+keys = "home left right"
+
+[[step]]
+wait = "navigator.has_row"
+arg = "main"
+equals = true
+timeout_secs = 30
+
+[[step]]
+keys = "right right right"
+
+[[step]]
+wait = "navigator.has_row"
+arg = "Tables"
+equals = true
+timeout_secs = 30
+
+[[step]]
+keys = "right right"
+
+[[step]]
+wait = "navigator.has_row"
+arg = "products"
+equals = true
+timeout_secs = 30
+
+[[step]]
+action = "ninesql::FindObject"
+
+[[step]]
+wait = "dialog.open"
+equals = true
+
+[[step]]
+text = "products"
+
+[[step]]
+keys = "enter"
+
+[[step]]
+wait = "navigator.selected"
+equals = "products"
+timeout_secs = 30
+
+# "Export table…": seven formats, "Header row", "Formula guard", then the file input.
+[[step]]
+action = "ninesql::ExportTable"
+
+[[step]]
+wait = "export.stage"
+equals = "editing"
+
+[[step]]
+checkpoint = "export-dialog"
+
+[[step]]
+keys = "tab tab tab tab tab tab tab tab tab tab"
+
+[[step]]
+expect = "focus.input"
+equals = true
+
+[[step]]
+text = "{home}/products.csv"
+
+# "Choose…", "Cancel", then "Export".
+[[step]]
+keys = "tab tab tab space"
+
+[[step]]
+wait = "export.stage"
+equals = "done"
+timeout_secs = 60
+
+[[step]]
+checkpoint = "export-done"
+
+[[step]]
+expect = "focus.any"
+equals = true
+
+# The pressed button is gone with its stage; the focus is on "Close", Space presses it.
+[[step]]
+keys = "space"
+
+[[step]]
+wait = "dialog.open"
+equals = false
+
+# "Import CSV…" into `nine_meta`.
+[[step]]
+action = "ninesql::FindObject"
+
+[[step]]
+wait = "dialog.open"
+equals = true
+
+[[step]]
+text = "nine_meta"
+
+[[step]]
+keys = "enter"
+
+[[step]]
+wait = "navigator.selected"
+equals = "nine_meta"
+timeout_secs = 30
+
+[[step]]
+action = "ninesql::ImportCsv"
+
+[[step]]
+wait = "csv_import.stage"
+equals = "choose-file"
+timeout_secs = 30
+
+[[step]]
+keys = "tab"
+
+[[step]]
+expect = "focus.input"
+equals = true
+
+[[step]]
+text = "{home}/meta.csv"
+
+# "Choose…", then "Preview".
+[[step]]
+keys = "tab tab space"
+
+[[step]]
+wait = "csv_import.stage"
+equals = "preview"
+timeout_secs = 30
+
+[[step]]
+checkpoint = "import-preview"
+
+# From "Preview": "Header row", the two column mappings, the commit mode, "Skip invalid rows",
+# "Close", then "Import".
+[[step]]
+keys = "tab tab tab tab tab tab tab space"
+
+[[step]]
+wait = "csv_import.stage"
+equals = "done"
+timeout_secs = 60
+
+[[step]]
+checkpoint = "import-done"
+
+[[step]]
+keys = "space"
+
+[[step]]
+wait = "dialog.open"
+equals = false
