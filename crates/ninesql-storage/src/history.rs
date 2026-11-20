@@ -493,7 +493,7 @@ impl HistoryDb {
                     detail: e.to_string(),
                 })?;
             if version > 0 {
-                tracing::info!(path = %path.display(), from = version, "migrated the history database");
+                tracing::info!(file = %crate::fs::log_name(&path), from = version, "migrated the history database");
             }
             version += 1;
         }

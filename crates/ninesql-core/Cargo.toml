@@ -25,6 +25,11 @@ secret-service = ["ninesql-secrets/secret-service", "desktop-lock"]
 # to 2 s), so the DBeaver workspace check (I4) runs on the real location. Without it, or when
 # the call fails, every document-portal path counts as inside a DBeaver workspace (fail closed).
 document-portal = ["dep:zbus"]
+# Test-build guards of the end-to-end scenario runner (ADR-0029 §2.5): `ninesql_core::e2e`, the
+# loopback-only endpoint filter in the connect flow and the driver registry, file targets
+# confined to the run directory, the vault forced. Off by default, never in `default`; only the
+# `ninesql-ui` feature of the same name turns it on, and package builds refuse that binary.
+e2e-scenarios = ["tokio/net", "dep:async-trait"]
 # Registers nothing by itself: exposes `ninesql_driver_api::mock` (the in-memory mock driver) to
 # UI and core tests. Never enabled in release builds.
 mock = ["ninesql-driver-api/mock"]
@@ -51,6 +56,8 @@ zeroize.workspace = true
 tokio = { workspace = true, features = ["rt", "rt-multi-thread", "sync", "time", "macros"] }
 # The Documents portal client (feature `document-portal`): the same zbus 6 as ninesql-secrets.
 zbus = { workspace = true, optional = true }
+# The guarded driver wrapper of the test build (feature `e2e-scenarios`).
+async-trait = { workspace = true, optional = true }
 
 [dev-dependencies]
 ninesql-driver-api = { workspace = true, features = ["mock"] }

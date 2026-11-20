@@ -79,6 +79,36 @@ pub enum LockWatchError {
     Timeout,
 }
 
+impl LockWatchError {
+    /// A short, stable name of the error kind, safe to log at any level: no D-Bus message
+    /// (ADR-0029 §3.2). The message itself is for the UI.
+    #[must_use]
+    pub fn kind(&self) -> &'static str {
+        match self {
+            Self::Bus(_) => "lock-watch-bus",
+            Self::Timeout => "lock-watch-timeout",
+        }
+    }
+}
+
+/// What failed in a D-Bus call, safe to log at any level (ADR-0029 §3.2): the D-Bus error name
+/// of a method error (a dotted name such as `org.freedesktop.DBus.Error.AccessDenied`, whose
+/// syntax zbus validates), the I/O error kind of a transport failure, or a fixed label; never
+/// the error's free-text description.
+fn bus_error_kind(e: &zbus::Error) -> String {
+    match e {
+        zbus::Error::MethodError(name, _, _) => name.to_string(),
+        zbus::Error::FDO(fdo) => zbus::DBusError::name(&**fdo).to_string(),
+        zbus::Error::InputOutput(io) | zbus::Error::Connection(io, _) => {
+            format!("io-{:?}", io.kind())
+        }
+        zbus::Error::Handshake(_) => "handshake".to_owned(),
+        zbus::Error::Address(_) => "address".to_owned(),
+        zbus::Error::InvalidReply => "invalid-reply".to_owned(),
+        _ => "dbus-other".to_owned(),
+    }
+}
+
 /// Which session's lock to watch.
 #[derive(Debug, Clone)]
 enum SessionChoice {
@@ -434,7 +464,7 @@ async fn take_sleep_delay(conn: &Connection) -> Option<OwnedFd> {
             &("sleep", "NineSQL", "Lock secrets before sleep", "delay"),
         )
         .await
-        .inspect_err(|e| tracing::info!(error = %e, "no sleep delay inhibitor"))
+        .inspect_err(|e| tracing::info!(error = %bus_error_kind(e), "no sleep delay inhibitor"))
         .ok()?;
     reply.body().deserialize::<OwnedFd>().ok()
 }
@@ -455,7 +485,7 @@ async fn session_locked_or_unknown(conn: &Connection, path: &str) -> bool {
     {
         Ok(r) => r,
         Err(e) => {
-            tracing::info!(error = %e, "cannot read the session's LockedHint: taken as locked");
+            tracing::info!(error = %bus_error_kind(&e), "cannot read the session's LockedHint: taken as locked");
             return true;
         }
     };
@@ -529,7 +559,7 @@ async fn logind_owner(conn: &Connection) -> Option<String> {
             &(LOGIND,),
         )
         .await
-        .inspect_err(|e| tracing::info!(error = %e, "logind is not on the bus"))
+        .inspect_err(|e| tracing::info!(error = %bus_error_kind(e), "logind is not on the bus"))
         .ok()?;
     reply.body().deserialize::<String>().ok()
 }
@@ -745,7 +775,10 @@ fn relookup_request(conn: &Connection, wait: Option<BoxFuture<'static, ()>>) -> 
         match session_streams(&c, &path).await {
             Ok(streams) => Some((path, streams)),
             Err(e) => {
-                tracing::info!(error = %e, "cannot subscribe to the session's lock signals");
+                tracing::info!(
+                    kind = e.kind(),
+                    "cannot subscribe to the session's lock signals"
+                );
                 None
             }
         }

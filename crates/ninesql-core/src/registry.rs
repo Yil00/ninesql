@@ -53,7 +53,13 @@ impl DriverRegistry {
 
     /// Registers a driver for every engine it serves, replacing any driver previously
     /// registered for one of them.
+    ///
+    /// In a test build (feature `e2e-scenarios`), the driver is wrapped so that its `connect`
+    /// refuses a non-loopback TCP endpoint and a file outside the run directory, whoever calls
+    /// it ([`crate::e2e`]).
     pub fn register(&mut self, driver: Arc<dyn Driver>) {
+        #[cfg(feature = "e2e-scenarios")]
+        let driver: Arc<dyn Driver> = Arc::new(crate::e2e::GuardedDriver(driver));
         for engine in driver.engines() {
             if self
                 .drivers

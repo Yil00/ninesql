@@ -279,7 +279,9 @@ impl OutputFile {
             match fs::remove_file(&self.temp) {
                 Ok(()) => {}
                 Err(e) if e.kind() == io::ErrorKind::NotFound => {}
-                Err(e) => tracing::warn!(error = %e, "could not remove a partial export file"),
+                Err(e) => {
+                    tracing::warn!(io_error = ?e.kind(), "could not remove a partial export file")
+                }
             }
         }
     }

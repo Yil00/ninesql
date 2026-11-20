@@ -12,6 +12,8 @@ pub mod connection;
 pub mod connection_type;
 pub mod dbeaver_export;
 pub mod dbeaver_roots;
+#[cfg(feature = "e2e-scenarios")]
+pub mod e2e;
 pub mod edit;
 mod error;
 pub mod execution;
@@ -65,8 +67,8 @@ pub use metadata::{
     SearchHit, SearchRequest, SearchResults,
 };
 pub use preferences::{
-    ConfirmationPreferences, ExecutionPreferences, HistoryPreferences, OnError, PreferenceChange,
-    PreferenceIssue, Preferences, PreferencesError,
+    ConfirmationPreferences, ExecutionPreferences, HistoryPreferences, LogFileLevel,
+    LoggingPreferences, OnError, PreferenceChange, PreferenceIssue, Preferences, PreferencesError,
 };
 pub use registry::{DriverRegistry, EnableError};
 pub use runtime::DriverRuntime;

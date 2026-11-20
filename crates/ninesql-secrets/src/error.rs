@@ -41,3 +41,20 @@ pub enum SecretError {
         detail: String,
     },
 }
+
+impl SecretError {
+    /// A short, stable name of the error kind, safe to log at any level: no identifier, no
+    /// transport detail (ADR-0029 §3.2). The message itself is for the UI.
+    #[must_use]
+    pub fn kind(&self) -> &'static str {
+        match self {
+            Self::NotFound(_) => "secret-not-found",
+            Self::StoreNotConfigured(_) => "secret-store-not-configured",
+            Self::Locked(_) => "secret-store-locked",
+            Self::Unavailable { .. } => "secret-store-unavailable",
+            Self::BadEncoding(_) => "secret-bad-encoding",
+            Self::Ambiguous(_) => "secret-ambiguous",
+            Self::Backend { .. } => "secret-store-failed",
+        }
+    }
+}

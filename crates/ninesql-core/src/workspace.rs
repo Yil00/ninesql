@@ -651,7 +651,7 @@ impl Workspace {
         let mut items = loaded.document.connections;
         for c in &mut items {
             for problem in c.sanitize() {
-                tracing::warn!(connection = %c.id, problem = %problem, "removed unsafe connection data on load");
+                tracing::warn!(connection = %c.id, problem = problem.kind(), "removed unsafe connection data on load");
                 issues.push(LoadIssue {
                     connection: c.id,
                     name: c.name.clone(),
@@ -701,7 +701,7 @@ impl Workspace {
             Ok(false) => {}
             Err(e) => tracing::warn!(
                 project = %self.project,
-                error = %e,
+                kind = e.kind(),
                 "could not remove secret-looking data from connections.json"
             ),
         }
@@ -1066,7 +1066,7 @@ impl Workspace {
             Err(e) => {
                 for reference in &stored {
                     if let Err(del) = stores.delete(reference) {
-                        tracing::warn!(reference = %reference, error = %del, "could not roll back a stored secret");
+                        tracing::warn!(reference = %reference, kind = del.kind(), "could not roll back a stored secret");
                     }
                 }
                 Err(e)
@@ -1091,7 +1091,7 @@ impl Workspace {
         *connections = next;
         for (_, _, reference) in removed.secret_refs() {
             if let Err(e) = stores.delete(reference) {
-                tracing::warn!(reference = %reference, error = %e, "could not delete a secret of a removed connection");
+                tracing::warn!(reference = %reference, kind = e.kind(), "could not delete a secret of a removed connection");
             }
         }
         tracing::info!(project = %self.project, connection = %id, "connection removed");

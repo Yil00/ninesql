@@ -20,7 +20,7 @@
 
 use std::borrow::Cow;
 use std::fmt;
-use std::net::{Ipv4Addr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -60,6 +60,13 @@ pub struct HopSpec {
     pub auth: HopAuth,
     /// Host key policy of this hop; default strict.
     pub host_key_policy: HostKeyPolicy,
+    /// The address to reach instead of resolving [`Self::host`] (`None`, the default: the name
+    /// is resolved). The first hop connects to it over TCP; a later hop asks the previous one
+    /// to forward to it. [`Self::host`] still names the hop for its `known_hosts` entry and in
+    /// messages. Set by a caller that resolved and checked the name itself, so the address
+    /// connected to is the one it checked (the test-build endpoint filter of `ninesql-core`,
+    /// ADR-0029 §2.5).
+    pub dial_address: Option<IpAddr>,
 }
 
 impl HopSpec {
@@ -72,7 +79,15 @@ impl HopSpec {
             username: username.into(),
             auth,
             host_key_policy: HostKeyPolicy::Strict,
+            dial_address: None,
         }
+    }
+
+    /// Connects to `address` instead of resolving the host name ([`Self::dial_address`]).
+    #[must_use]
+    pub fn with_dial_address(mut self, address: IpAddr) -> Self {
+        self.dial_address = Some(address);
+        self
     }
 
     /// Sets the port.
@@ -890,6 +905,23 @@ impl Drop for Tunnel {
     }
 }
 
+/// Why a `direct-tcpip` channel was refused, safe to log at any level: the standard reason code
+/// only, never the server's free-text reason (ADR-0029 §3.2).
+fn forward_error_kind(e: &russh::Error) -> &'static str {
+    use russh::ChannelOpenFailure as F;
+    match e {
+        russh::Error::ChannelOpenFailure(F::AdministrativelyProhibited) => {
+            "administratively-prohibited"
+        }
+        russh::Error::ChannelOpenFailure(F::ConnectFailed) => "connect-failed",
+        russh::Error::ChannelOpenFailure(F::UnknownChannelType) => "unknown-channel-type",
+        russh::Error::ChannelOpenFailure(F::ResourceShortage) => "resource-shortage",
+        russh::Error::ChannelOpenFailure(_) => "other-reason",
+        russh::Error::Disconnect | russh::Error::HUP => "disconnected",
+        _ => "ssh-error",
+    }
+}
+
 /// Connects, verifies and authenticates one hop, directly (first hop) or through `previous`.
 async fn open_hop(
     index: usize,
@@ -904,6 +936,7 @@ async fn open_hop(
         username,
         auth,
         host_key_policy,
+        dial_address,
     } = hop;
     let timeout_err = || SshError::Timeout {
         hop: index,
@@ -930,15 +963,18 @@ async fn open_hop(
         };
         let result = match previous {
             None => {
-                let tcp = TcpStream::connect((host.as_str(), port))
-                    .await
-                    .map_err(|e| connect_err(e.to_string()))?;
+                let tcp = match dial_address {
+                    Some(ip) => TcpStream::connect(SocketAddr::new(ip, port)).await,
+                    None => TcpStream::connect((host.as_str(), port)).await,
+                }
+                .map_err(|e| connect_err(e.to_string()))?;
                 let _ = tcp.set_nodelay(true);
                 handshake(config, tcp, handler).await
             }
             Some(prev) => {
+                let dial = dial_address.map_or_else(|| host.clone(), |ip| ip.to_string());
                 let channel = prev
-                    .channel_open_direct_tcpip(host.as_str(), u32::from(port), "127.0.0.1", 0)
+                    .channel_open_direct_tcpip(dial, u32::from(port), "127.0.0.1", 0)
                     .await
                     .map_err(|e| {
                         connect_err(format!("the previous hop refused to forward ({e})"))
@@ -1089,7 +1125,10 @@ async fn forward(
     let channel = match tokio::time::timeout(connect_timeout, open).await {
         Ok(Ok(c)) => c,
         Ok(Err(e)) => {
-            tracing::warn!(error = %e, "the SSH server refused to forward to the database endpoint");
+            tracing::warn!(
+                reason = forward_error_kind(&e),
+                "the SSH server refused to forward to the database endpoint"
+            );
             return;
         }
         Err(_) => {
@@ -1111,6 +1150,33 @@ mod tests {
 
     fn hop(host: &str) -> HopSpec {
         HopSpec::new(host, "u", HopAuth::Password(SecretString::from("x")))
+    }
+
+    #[tokio::test]
+    async fn the_first_hop_dials_its_dial_address_not_its_name() {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        // Accepted, then closed at once: the handshake fails, but the hop was reached.
+        let accepted = tokio::spawn(async move { listener.accept().await.map(|_| ()) });
+        let dir = tempfile::tempdir().unwrap();
+        let store = KnownHostsStore::load(dir.path().join("known_hosts"), None)
+            .await
+            .unwrap();
+        let options = TunnelOptions {
+            connect_timeout: Duration::from_secs(5),
+            ..TunnelOptions::default()
+        };
+        // `.invalid` never resolves (RFC 6761): only the dial address can be reached.
+        let server = hop("bastion.invalid")
+            .with_port(port)
+            .with_dial_address(IpAddr::V4(Ipv4Addr::LOCALHOST));
+        let spec = TunnelSpec::new(server, "db.invalid", 5432).with_options(options);
+        assert!(Tunnel::open(spec, store).await.is_err());
+        tokio::time::timeout(Duration::from_secs(5), accepted)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
     }
 
     #[test]
