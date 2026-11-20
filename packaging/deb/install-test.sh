@@ -8,8 +8,9 @@
 # For each one, in a fresh container:
 #   1. apt installs the package and resolves its dependencies from the distribution's archive;
 #   2. the package has no maintainer script (ADR-0010 §1: nothing runs at install or removal);
-#   3. `ninesql --version` and `ninesql --help` run (no display needed) and an unknown argument
-#      exits with status 2;
+#   3. `ninesql --version` and `ninesql --help` run (no display needed), the version line is not
+#      that of an e2e-scenarios test build (no `e2e` in it, ADR-0029 §2.2) and an unknown
+#      argument exits with status 2;
 #   4. the desktop file passes `desktop-file-validate` and the AppStream file
 #      `appstreamcli validate --no-net`; the man page renders without warnings;
 #   5. `apt-get purge` removes the package and leaves none of its files behind.
@@ -72,6 +73,9 @@ echo "ok: no maintainer script"
 version=$(ninesql --version)
 echo "ok: ninesql --version: $version"
 case "$version" in "ninesql "*) ;; *) echo "FAIL: unexpected --version output"; exit 1;; esac
+# ADR-0029 §2.2: a test build prints "(e2e-scenarios test build, not for distribution)".
+case "$version" in *e2e*) echo "FAIL: an e2e-scenarios test build was packaged"; exit 1;; esac
+echo "ok: not an e2e-scenarios test build"
 ninesql --help >/dev/null
 echo "ok: ninesql --help"
 set +e

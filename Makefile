@@ -63,7 +63,8 @@ FORBIDDEN_GPUI_APIS = set_http_client|with_http_client|read_credentials|write_cr
 
 .PHONY: help \
 	build run release \
-	fmt fmt-check clippy test deny md-links verify-patches verify-gpui-snapshot forbidden-apis check \
+	fmt fmt-check clippy test deny md-links verify-patches verify-gpui-snapshot forbidden-apis \
+	e2e-feature-guard check \
 	dev-up dev-up-all dev-down dev-check dev-ps \
 	test-engines test-engines-run e2e-local \
 	deb deb-install-test deb-reproducible sbom flatpak-lint \
@@ -132,7 +133,12 @@ forbidden-apis: ## Refuse GPUI HTTP and credential APIs under crates/ (ADR-0013)
 		echo "Forbidden GPUI API used under crates/ (ADR-0013)"; exit 1; \
 	else echo "No forbidden GPUI API under crates/"; fi
 
-check: fmt-check clippy test deny verify-patches forbidden-apis md-links dev-check ## Everything CI runs that needs no engine
+e2e-feature-guard: ## Refuse e2e-scenarios in a default feature or enabled by a crate (ADR-0029 §2.2)
+	$(PYTHON) scripts/e2e-feature-guard-test.py
+	packaging/check-no-e2e-marker-test.sh
+	$(PYTHON) scripts/e2e-feature-guard.py
+
+check: fmt-check clippy test deny verify-patches forbidden-apis e2e-feature-guard md-links dev-check ## Everything CI runs that needs no engine
 	@echo "check: all passed"
 
 # ---------------------------------------------------------------------------------------------

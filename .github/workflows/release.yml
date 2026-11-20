@@ -103,6 +103,32 @@ jobs:
           export CARGO_TARGET_DIR="$RUNNER_TEMP/target"
           export NINESQL_DEB_OUT="$RUNNER_TEMP/out"
           packaging/deb/build.sh
+      # ADR-0029 §2.2, guard 2: an e2e-scenarios test build is never signed nor shipped. build.sh
+      # already refused the marker with grep; checked again here with strings, on the built
+      # binary and on the binary inside the .deb that the sign job signs.
+      - name: No e2e-scenarios test build (marker check)
+        run: |
+          marker=NINESQL-E2E-SCENARIOS-TEST-BUILD
+          extracted="$RUNNER_TEMP/deb-contents"
+          rm -rf "$extracted"
+          debs=("$RUNNER_TEMP"/out/*.deb)
+          if [ "${#debs[@]}" -ne 1 ] || [ ! -f "${debs[0]}" ]; then
+            echo "::error::expected exactly one .deb in $RUNNER_TEMP/out"
+            exit 1
+          fi
+          dpkg-deb -x "${debs[0]}" "$extracted"
+          for bin in "$RUNNER_TEMP/target/deb-build/release/ninesql" "$extracted/usr/bin/ninesql"; do
+            if [ ! -f "$bin" ]; then
+              echo "::error::$bin not found"
+              exit 1
+            fi
+            if strings -a "$bin" | grep -q -F -- "$marker"; then
+              echo "::error::$bin is an e2e-scenarios test build (ADR-0029 §2.2)"
+              exit 1
+            fi
+            echo "ok: $bin holds no e2e-scenarios marker"
+          done
+          rm -rf "$extracted"
       - name: SBOM (CycloneDX)
         if: matrix.replica == 'a'
         run: |

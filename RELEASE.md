@@ -20,7 +20,7 @@ Inspired by [Portabase](https://github.com/Portabase/portabase) and DataBastion:
 
 ## 3. Artifacts (from v0.1.0)
 Built only by the tag-push workflow [`release.yml`](.github/workflows/release.yml) ([ADR-0010](docs/adr/0010-packaging-and-distribution.md) and its [P6-A amendment](docs/adr/0010-packaging-and-distribution.md#amendment-p6-a-packaging-2026-11-19)), started when the maintainer pushes a `vX.Y.Z` tag:
-- the `.deb` (amd64), built twice from two checkouts and required to be byte-identical (reproducible within one run), then install-tested on Debian 12 / 13 and Ubuntu 22.04 / 24.04;
+- the `.deb` (amd64), built twice from two checkouts and required to be byte-identical (reproducible within one run), then install-tested on Debian 12 / 13 and Ubuntu 22.04 / 24.04; a binary built with the `e2e-scenarios` test feature is refused at compile time, by its marker before packaging and again before signing, and by the install test ([ADR-0029](docs/adr/0029-automated-ui-end-to-end-tests-and-application-logging.md) §2.2, [packaging/README.md](packaging/README.md#the-deb));
 - a CycloneDX SBOM of the linked crates;
 - `SHA256SUMS` of the `.deb` and the SBOM;
 - a cosign keyless signature bundle (`<file>.sigstore.json`) for each of these files;
