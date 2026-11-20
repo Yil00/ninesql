@@ -26,8 +26,9 @@ No version has been released yet. This section summarizes, for users, everything
 - **Packaging** (no package published yet): a `.deb` for Debian 12 / 13 and Ubuntu 22.04 / 24.04 (amd64), built with `make deb`, with a desktop entry, icons, AppStream metadata, a man page (`man ninesql`) and the licenses of the bundled crates, no install or removal script; a Flatpak manifest with minimal permissions (not built yet); a release workflow that builds the `.deb` twice and compares it, writes an SBOM and signs the files with cosign ([packaging/README.md](packaging/README.md)).
 - **`ninesql --version` and `ninesql --help`** (also `-V` / `-h`), answered without opening a window; any other argument exits with status 2.
 - **Application id `io.github.yil00.NineSQL`** for the window (Wayland app id, X11 `WM_CLASS`), the desktop entry, the icons, AppStream and the Flatpak, so the desktop shows NineSQL's name and icon.
+- **Logging**: warnings and errors go to standard error (one line each, no colours); a log file, off by default, is turned on with `[logging] file_level` in `settings.toml` (`error`, `warn`, `info` or `debug`) and written to `~/.local/state/ninesql/logs/ninesql.log` (private, at most three files of 8 MiB); `NINESQL_LOG` sets the filter for one run (`RUST_LOG` is ignored). Logs never hold passwords, parameter or result values, or a database's error message; release builds never log statement text ([troubleshooting](docs/user-guide/troubleshooting.md)).
 - **Documentation**: a [user guide](docs/user-guide/README.md) and step-by-step [tutorials](docs/tutorials/README.md).
-- **For contributors**: a dev environment with the 20 planned engines in containers and a sample dataset ("nine"), a root `Makefile`, CI with driver integration tests against eight engines and a macOS build job; UI tests that drive the application against the dev PostgreSQL, MySQL, MariaDB and SQLite; `make e2e-local`, which runs the checks, the tests against the dev engines and a short start of the application on a Linux desktop and writes one scrubbed report.
+- **For contributors**: a dev environment with the 20 planned engines in containers and a sample dataset ("nine"), a root `Makefile`, CI with driver integration tests against eight engines and a macOS build job; UI tests that drive the application against the dev PostgreSQL, MySQL, MariaDB and SQLite; `make e2e-local`, which runs the checks, the tests against the dev engines, a short start of the application and the end-to-end scenarios of `e2e/scenarios/` on a Linux desktop (a test build, never packaged, that drives a real window and takes a screenshot of it at each checkpoint) and writes one scrubbed report.
 
 ### Changed
 - `connections.json` moved from schema 1 to schema 5 during development (SSH host-key policies, the password exchange, the imported init SQL marker, default schema and catalog, auto-commit override, disabled reason, DBeaver source workspace). Each migration keeps the previous file as `connections.json.bak`; an older NineSQL refuses a newer file.
@@ -38,12 +39,15 @@ No version has been released yet. This section summarizes, for users, everything
 - The key bindings of the data editing, export, import, "Format SQL", snippet and DBeaver export actions work from the SQL editor (they were reachable from the command palette only).
 - A symbolically linked `settings.toml` is followed when it resolves to a regular file you own.
 - Building from source needs Rust 1.89 or newer.
+- "Generate SQL" offers `INSERT`, `UPDATE` and `DELETE` templates only on tables, on a session that is not read-only, and only where the engine declares that row edit (none on QuestDB); views get `SELECT` only.
+- The navigator's "Not connected" hint and its empty-state text name the key bindings in effect, your `[keybindings]` overrides included, instead of fixed shortcuts.
 
 ### Fixed
 - Edits made in "Open table data" could be lost after "Cancel": the tab stayed read-only when the table's key was read while the rows were loading. The key is now read first, and the rows already loaded stay editable after "Cancel" or "Stop fetching".
 - Navigator loads, the editor's schema warm-up and statements on the same connection no longer fail with "session busy": metadata loads run one at a time, and a statement sent during a load waits for it ("Waiting for the navigator to finish loading on this connection… (Cancel stops waiting)").
 - MySQL, MariaDB, TiDB: browsing a connection in manual-commit mode no longer leaves a transaction open (and no longer asks to commit or roll back when closing); a pending one-shot `SET TRANSACTION …` still applies to the next transaction after browsing.
 - The "Test connection" result stayed out of sight at large display scales.
+- The export and CSV import dialogs lost the keyboard focus when a run ended, so they could not be closed from the keyboard; the focus now moves to their "Close" button.
 - X11: a crash on the first input-method preedit with a non-ASCII character.
 - A paused result lost its whole session after 300 s on PostgreSQL and MySQL; it is now closed by NineSQL before that, keeping the session and the loaded rows.
 - Results of a script with many result sets were not bounded; each result set now counts against the memory budget, and one run keeps at most 1 000 result tabs.

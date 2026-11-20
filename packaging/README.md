@@ -41,6 +41,8 @@ Needs Docker, rustup with the repository's toolchain, and on the host exactly ca
 2. *Marker.* A test build embeds `NINESQL-E2E-SCENARIOS-TEST-BUILD` and prints `(e2e-scenarios test build, not for distribution)` in `ninesql --version`. `build.sh` refuses a binary holding the marker before cargo-deb runs (`check-no-e2e-marker.sh`, `grep -a -c`); `release.yml` checks the built binary and the binary inside the `.deb` again with `strings` before signing; the install test refuses a `--version` line containing `e2e`.
 3. *Manifest.* `make e2e-feature-guard` (`scripts/e2e-feature-guard.py`, run by `make check` and the CI `deny` job) reads `cargo metadata --no-deps` and fails when `e2e-scenarios` is reachable from the `default` feature of `ninesql-ui` or `ninesql-core`, or when a workspace crate turns it on for either in a normal or build dependency or a feature (only the UI's own `e2e-scenarios` feature may enable the core's). It also runs the tests of the guard and of the marker check.
 
+The only place a test build is made on purpose is the `scenarios` stage of `make e2e-local` ([tutorial](../docs/tutorials/local-e2e.md)), which builds it in its own target directory, `target/e2e-build/`, and never replaces `target/release/ninesql`. `make deb` does not take a binary from the host: `build.sh` compiles its own in the builder, with `NINESQL_PACKAGE_BUILD=1` and no `--features`.
+
 **Contents.**
 | File | |
 |---|---|

@@ -11,7 +11,16 @@ The test build is never packaged: `make e2e-feature-guard`, a compile-time refus
 `NINESQL_PACKAGE_BUILD` is set, a marker string the package checks refuse, and a `--version`
 line that says `(e2e-scenarios test build, not for distribution)` keep it out.
 
-## Running one scenario
+## Running the scenarios
+
+`make e2e-local` runs them all in its `scenarios` stage: it builds the test binary in
+`target/e2e-build/`, creates the run directories, takes a screenshot of the test window at each
+checkpoint and puts the results in its report (`make e2e-local E2E_ARGS="--only scenarios"`, or
+`--scenario NAME[,NAME]` for some of them). See the
+[local end-to-end tutorial](../docs/tutorials/local-e2e.md) for the options and how to read the
+results.
+
+## Running one scenario by hand
 
 ```sh
 cargo build -p ninesql-ui --bin ninesql --features e2e-scenarios --target-dir target/e2e

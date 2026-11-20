@@ -14,10 +14,10 @@ What NineSQL does not do yet, or does only partly, as of phase 6. The list is bu
 | In the Flatpak (once built), a SQLite file chosen through the file chooser opens read-only unless it lies directly in your home folder or its folder is granted with `flatpak override` | Later |
 | The `.deb` has no `md5sums`, so `dpkg --verify` and `debsums` cannot check the installed files (the package itself is covered by `SHA256SUMS` and its signature) | Later |
 | "Open with NineSQL" is not offered for `.sql` files: `ninesql` does not open a file given on its command line yet | Later |
-| The interface was written and tested without a display: its visual check on real Linux desktops (Wayland and X11), with screenshots and a manual run of the main scenarios, has not been done | v0.1.0 (P6) |
+| The interface was written and tested without a display. Automated scenarios now drive a real window and take screenshots of it, but they have not yet run on a real desktop, and their screenshots have not been reviewed; input methods, HiDPI and fractional scaling on real monitors, the dialogs at 200 % scale and drag gestures stay manual checks | v0.1.0 (P6) |
 | Start time, idle memory, time to the first rows on screen and scrolling smoothness have **not been measured** on real hardware; no figure is published for them. The only published numbers are core-level test timings (time to the first rows of a 1 M-row query, export and import speeds), each with its method and commit | v0.1.0 (P6) |
 | Accessibility with the Orca screen reader has not been tested | v0.1.0 (P6) |
-| The end-of-MVP security review (2026-11-19) found no critical or high issue; its verdict is "ready for v0.1.0 with conditions", and the conditions (missing license notices, crash output that could print internal values, release-workflow checks, among others) are being fixed before the release | v0.1.0 (P6) |
+| The end-of-MVP security review (2026-11-19) found no critical or high issue; its verdict is "ready for v0.1.0 with conditions", and its code and documentation conditions (missing license notices, crash output that could print internal values, release-workflow checks, among others) are fixed; the remaining conditions are the maintainer's release settings and the checks on real hardware listed on this page | v0.1.0 (P6) |
 | The `.deb` carries its own copy of the FreeType font library, which does not receive Debian or Ubuntu security updates: a FreeType fix reaches you only with a new NineSQL release | Later |
 | Opening a window on Ubuntu 22.04 and Debian 12 is not checked yet (GPUI may need newer graphics libraries); the `.deb` installs and runs `--version` on Ubuntu 22.04 | v0.1.0 (P6) |
 | macOS is a development platform only (no locking on sleep or screen lock, no keyring, macOS-only dependencies not license-checked); Windows is not supported; arm64 is not built | Later |
@@ -74,7 +74,6 @@ What NineSQL does not do yet, or does only partly, as of phase 6. The list is bu
 | With very large catalogs, completion is rebuilt on the interface thread after every metadata change (up to 250 000 objects), and one metadata load can hold about 320 MiB briefly | Later |
 | Filters of a deleted connection stay in `navigator.json` (harmless); load limits are not configurable | Later |
 | MySQL, MariaDB, TiDB: a one-shot `SET TRANSACTION …` (next transaction only) is set again after the navigator reads, except when a stored routine ran it, or, in auto-commit mode, when a `SELECT` without a table ran between it and the navigator read; the next transaction may then run without those settings | Later |
-| The navigator's "Not connected" hint always reads "Ctrl+K Ctrl+O", even when "Connect" is rebound | Later |
 | No create / alter / drop forms, dependencies, users and roles, schema compare or ER diagrams | Later (phase 10) |
 
 ## Results, editing and transfer
@@ -99,6 +98,19 @@ What NineSQL does not do yet, or does only partly, as of phase 6. The list is bu
 | No screen to relax a built-in connection type that an import made stricter | Later |
 | A read blocked on a stalled network or FUSE file cannot be cancelled until the file answers | Later |
 | Hard links to DBeaver files, and DBeaver workspaces in custom places never picked for an import, are not recognised as DBeaver files | Later |
+
+## Automated interface tests
+These limits concern the project's own tests, not what you can do in NineSQL: they say which parts of the interface are checked by hand rather than automatically. The interface is tested headless against the dev engines (PostgreSQL, MySQL, MariaDB, SQLite) and by the end-to-end scenarios of [`e2e/scenarios/`](../../e2e/README.md), which run in a real window on the maintainer's desktop ([local end-to-end check](../tutorials/local-e2e.md)).
+
+| Limitation | When |
+|---|---|
+| The scenarios run on X11 or XWayland only; a Wayland-native window is not captured | Later |
+| A scenario reaches a dialog's fields and buttons by pressing Tab a fixed number of times, so a change in a dialog's field or button order breaks the scenario until its file is updated | Later |
+| The cell editor's input and buttons are reached the same way, from the focus the dialog takes when it opens; a change in where that focus lands breaks the scenario | Later |
+| The DBeaver import scenario stops at the preview: it does not apply the import | Later |
+| The save and CSV import confirmations on production and the "Insert row" form are covered by the headless tests, not by the window scenarios | Later |
+| Script files and session restore (a restart) are not in the scenarios | Later |
+| The dialogs at 200 % scale are checked by hand | Later |
 
 ## Engines
 Only the eight MVP engines are supported: PostgreSQL, MySQL, MariaDB, SQLite, TimescaleDB, YugabyteDB, QuestDB and TiDB. DuckDB, ClickHouse, Trino, Firebird and InfluxDB 3 are planned for v0.2; MongoDB, Redis and Valkey for v0.3; Elasticsearch, OpenSearch, Cassandra and Neo4j for v0.4 ([ROADMAP](../ROADMAP.md)). Per-engine limits are in the [capability matrix](../08-engine-capabilities.md).
