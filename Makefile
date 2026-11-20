@@ -182,7 +182,7 @@ test-engines-run: ## Run the same tests against engines that are already up
 ##@ Local end-to-end run (docs/tutorials/local-e2e.md; a Linux desktop with Docker)
 # ---------------------------------------------------------------------------------------------
 
-e2e-local: ## Checks, engine tests and a GUI smoke test, with a report to send back (E2E_ARGS=...)
+e2e-local: ## Checks, engine tests, a GUI smoke test and the UI scenarios, with a report to send back (E2E_ARGS=...)
 	scripts/e2e-local.sh $(E2E_ARGS)
 
 # ---------------------------------------------------------------------------------------------
