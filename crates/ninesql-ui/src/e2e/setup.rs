@@ -149,13 +149,42 @@ fn passwords_in(doc: &serde_json::Value) -> Vec<String> {
     out
 }
 
-/// Whether the dev engine answers on TCP (2 s). **Blocking.**
-#[must_use]
-pub fn reachable(engine: &DevEngine) -> bool {
-    format!("{}:{}", engine.host, engine.port)
-        .parse::<std::net::SocketAddr>()
+/// The dev engine's host is not a loopback IP address: the run is refused, never skipped
+/// (ADR-0029 §2.5, I2).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NotLoopback {
+    /// The engine id.
+    pub engine: String,
+}
+
+impl std::fmt::Display for NotLoopback {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "the dev engine {} is not at a loopback IP address in engines.json; a scenario run connects to loopback only",
+            self.engine
+        )
+    }
+}
+
+/// Whether the dev engine answers on TCP (2 s). **Blocking.** The address is checked to be a
+/// loopback IP address before any socket is opened (the probe runs before the core's endpoint
+/// filter sees a connection).
+///
+/// # Errors
+/// [`NotLoopback`]: the host is not a loopback IP address (a name included); nothing was
+/// opened.
+pub fn reachable(engine: &DevEngine) -> Result<bool, NotLoopback> {
+    let ip = engine
+        .host
+        .parse::<std::net::IpAddr>()
         .ok()
-        .is_some_and(|a| std::net::TcpStream::connect_timeout(&a, Duration::from_secs(2)).is_ok())
+        .filter(|ip| ninesql_core::e2e::is_loopback(*ip))
+        .ok_or_else(|| NotLoopback {
+            engine: engine.id.clone(),
+        })?;
+    let addr = std::net::SocketAddr::new(ip, engine.port);
+    Ok(std::net::TcpStream::connect_timeout(&addr, Duration::from_secs(2)).is_ok())
 }
 
 /// A random master password for the run's vault, never written anywhere (ADR-0029 §2.5).
@@ -321,6 +350,51 @@ pub fn scan_for_secrets(
 #[allow(clippy::unwrap_used, clippy::expect_used)] // Tests may panic (AGENTS.md).
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_reachability_probe_refuses_a_non_loopback_host_before_any_socket() {
+        let doc = serde_json::json!({
+            "engines": [
+                { "id": "remote", "host": "192.0.2.10", "port": 5432 },
+                { "id": "named", "host": "localhost", "port": 5432 },
+                { "id": "mapped", "host": "::ffff:10.0.0.1", "port": 5432 },
+                { "id": "empty", "port": 5432 }
+            ]
+        });
+        let e = DevEngines::from_json(&doc);
+        for id in ["remote", "named", "mapped", "empty"] {
+            let started = std::time::Instant::now();
+            let refused = reachable(e.get(id).unwrap()).unwrap_err();
+            assert_eq!(refused.engine, id);
+            assert!(refused.to_string().contains("loopback"), "{refused}");
+            // No connect: a TEST-NET address would take the 2 s timeout.
+            assert!(started.elapsed() < Duration::from_secs(1), "{id}");
+        }
+
+        // Loopback (IPv4, IPv6, IPv4-mapped) is probed: a closed port answers "down".
+        let free = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = free.local_addr().unwrap().port();
+        drop(free);
+        let doc = serde_json::json!({
+            "engines": [
+                { "id": "v4", "host": "127.0.0.1", "port": port },
+                { "id": "mapped", "host": "::ffff:127.0.0.1", "port": port }
+            ]
+        });
+        let e = DevEngines::from_json(&doc);
+        assert_eq!(reachable(e.get("v4").unwrap()), Ok(false));
+        assert!(reachable(e.get("mapped").unwrap()).is_ok());
+        let open = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let doc = serde_json::json!({
+            "engines": [
+                { "id": "up", "host": "127.0.0.1", "port": open.local_addr().unwrap().port() }
+            ]
+        });
+        assert_eq!(
+            reachable(DevEngines::from_json(&doc).get("up").unwrap()),
+            Ok(true)
+        );
+    }
 
     #[test]
     fn passwords_of_fields_and_notes() {

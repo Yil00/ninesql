@@ -189,6 +189,9 @@ fn format_panic_report(
 /// installed before any thread is spawned; nothing else in the workspace sets a hook. It never
 /// panics itself and ignores a closed stderr.
 fn install_panic_hook() {
+    /// How long a panic waits for the queued log lines.
+    const PANIC_LOG_FLUSH: std::time::Duration = std::time::Duration::from_millis(250);
+
     std::panic::set_hook(Box::new(|info| {
         let mode = PanicReport::for_this_build();
         #[allow(unused_mut)]
@@ -200,6 +203,9 @@ fn install_panic_hook() {
                 report.push_str(&format!("backtrace:\n{backtrace}\n"));
             }
         }
+        // The log lines queued before the panic first, within a short bound: the subscriber's
+        // writer threads may be stuck on an undrained stderr.
+        logging::flush_before_exit(PANIC_LOG_FLUSH);
         let _ = std::io::stderr().lock().write_all(report.as_bytes());
     }));
 }

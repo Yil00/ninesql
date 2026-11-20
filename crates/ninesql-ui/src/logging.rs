@@ -4,6 +4,9 @@
 //!
 //! - **Stderr, at `warn` by default.** One line per event, no ANSI colours. `info` and `debug`
 //!   are opt-in, so a desktop session's journal receives only warnings and errors (§3.2).
+//!   Like the file log, stderr is written by its own thread fed through a bounded channel
+//!   (dropped and counted when full), so an undrained stderr pipe never blocks a thread that
+//!   logs (I6); the panic hook and [`LogGuard`] give it a bounded time to drain at exit.
 //! - **A file log, off by default.** `[logging] file_level` in `settings.toml` (or
 //!   `NINESQL_LOG`, below) turns on `$XDG_STATE_HOME/ninesql/logs/ninesql.log`: the directory
 //!   `0700`, the file `0600`, opened with `O_NOFOLLOW` and refused unless it is a regular file
@@ -28,9 +31,10 @@ use std::io::{self, Write};
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, SyncSender, TrySendError};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use ninesql_core::preferences::LogFileLevel;
 use ninesql_core::storage::Paths;
@@ -38,6 +42,7 @@ use tracing::field::{Field, Visit};
 use tracing_subscriber::field::RecordFields;
 use tracing_subscriber::filter::{EnvFilter, LevelFilter};
 use tracing_subscriber::fmt::format::Writer;
+use tracing_subscriber::fmt::writer::BoxMakeWriter;
 use tracing_subscriber::fmt::{FormatFields, MakeWriter};
 use tracing_subscriber::layer::SubscriberExt as _;
 use tracing_subscriber::{Layer as _, Registry};
@@ -201,22 +206,36 @@ impl<'writer> FormatFields<'writer> for EscapedFields {
 }
 
 // ---------------------------------------------------------------------------------------------
-// The file sink (§3.3).
+// The sinks (§3.3): the file log and stderr, each behind its own writer thread.
 
 enum Msg {
     Line(Vec<u8>),
     Flush(SyncSender<()>),
 }
 
-/// The file log's writer side: formatted events go into a bounded channel, never to the disk
-/// on the caller's thread. Cheap to clone.
+/// Where a writer thread puts its lines.
+trait Target: Send + 'static {
+    /// Writes one formatted event; a failure loses the line, never blocks a caller.
+    fn write_line(&mut self, bytes: &[u8]);
+    /// Pushes buffered bytes out.
+    fn flush(&mut self);
+    /// The line reporting `lost` dropped events.
+    fn dropped_line(&self, lost: u64) -> String;
+}
+
+/// One sink's writer side: formatted events go into a bounded channel, never to the disk or
+/// to stderr on the caller's thread. When the channel is full the event is dropped and
+/// counted; the writer thread reports the count at `warn` once it catches up. Cheap to clone.
 #[derive(Clone)]
-pub struct FileSink {
+pub struct ChannelSink {
     tx: SyncSender<Msg>,
     dropped: Arc<AtomicU64>,
 }
 
-impl FileSink {
+/// The file log's sink.
+pub type FileSink = ChannelSink;
+
+impl ChannelSink {
     /// A sink whose receiving end is returned instead of given to a writer thread (tests).
     fn detached(capacity: usize) -> (Self, Receiver<Msg>) {
         let (tx, rx) = mpsc::sync_channel(capacity);
@@ -229,6 +248,16 @@ impl FileSink {
         )
     }
 
+    /// A sink feeding `target` from a new thread named `name`.
+    fn spawn<T: Target>(target: T, capacity: usize, name: &str) -> io::Result<Self> {
+        let (sink, rx) = Self::detached(capacity);
+        let dropped = Arc::clone(&sink.dropped);
+        std::thread::Builder::new()
+            .name(name.into())
+            .spawn(move || writer_loop(target, &rx, &dropped))?;
+        Ok(sink)
+    }
+
     /// Opens the log in `dir` (`…/ninesql/logs`) and starts its writer thread. **Blocking**
     /// (a few file system calls): `main` setup only.
     ///
@@ -237,12 +266,16 @@ impl FileSink {
     /// by the user (a symbolic link included), or the thread cannot start.
     pub fn open(dir: &Path, capacity: usize) -> io::Result<Self> {
         let log = LogFile::open(dir.to_path_buf())?;
-        let (sink, rx) = Self::detached(capacity);
-        let dropped = Arc::clone(&sink.dropped);
-        std::thread::Builder::new()
-            .name("ninesql-log-writer".into())
-            .spawn(move || writer_loop(log, &rx, &dropped))?;
-        Ok(sink)
+        Self::spawn(log, capacity, "ninesql-log-writer")
+    }
+
+    /// A sink writing to `out` (the process's stderr in production) from its own thread, so
+    /// an undrained stderr pipe never blocks a thread that logs (the UI thread included, I6).
+    ///
+    /// # Errors
+    /// The thread cannot start.
+    pub fn stream<W: Write + Send + 'static>(out: W, capacity: usize) -> io::Result<Self> {
+        Self::spawn(StreamTarget(out), capacity, "ninesql-log-stderr")
     }
 
     /// Events dropped and not reported yet.
@@ -252,17 +285,32 @@ impl FileSink {
         self.dropped.load(Ordering::Relaxed)
     }
 
-    /// Waits (at most `wait`) until the writer has written everything queued before this call.
+    /// Waits (at most `wait`, the enqueueing included) until the writer has written
+    /// everything queued before this call. Never blocks longer, even when the writer is stuck
+    /// and the channel full.
     pub fn flush(&self, wait: Duration) {
+        let deadline = Instant::now() + wait;
         let (tx, rx) = mpsc::sync_channel(1);
-        if self.tx.send(Msg::Flush(tx)).is_ok() {
-            let _ = rx.recv_timeout(wait);
+        let mut msg = Msg::Flush(tx);
+        loop {
+            match self.tx.try_send(msg) {
+                Ok(()) => break,
+                Err(TrySendError::Disconnected(_)) => return,
+                Err(TrySendError::Full(back)) => {
+                    if Instant::now() >= deadline {
+                        return;
+                    }
+                    msg = back;
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+            }
         }
+        let _ = rx.recv_timeout(deadline.saturating_duration_since(Instant::now()));
     }
 }
 
-/// One event's bytes for [`FileSink`].
-pub struct SinkWriter(FileSink);
+/// One event's bytes for a [`ChannelSink`].
+pub struct SinkWriter(ChannelSink);
 
 impl Write for SinkWriter {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
@@ -281,11 +329,30 @@ impl Write for SinkWriter {
     }
 }
 
-impl<'a> MakeWriter<'a> for FileSink {
+impl<'a> MakeWriter<'a> for ChannelSink {
     type Writer = SinkWriter;
 
     fn make_writer(&'a self) -> Self::Writer {
         SinkWriter(self.clone())
+    }
+}
+
+/// A byte stream (stderr) as a writer thread's target.
+struct StreamTarget<W>(W);
+
+impl<W: Write + Send + 'static> Target for StreamTarget<W> {
+    fn write_line(&mut self, bytes: &[u8]) {
+        let _ = self.0.write_all(bytes);
+    }
+
+    fn flush(&mut self) {
+        let _ = self.0.flush();
+    }
+
+    fn dropped_line(&self, lost: u64) -> String {
+        format!(
+            "WARN ninesql::logging: {lost} log events were dropped (stderr was not being read)\n"
+        )
     }
 }
 
@@ -373,7 +440,7 @@ impl LogFile {
         Ok(())
     }
 
-    fn write_line(&mut self, bytes: &[u8]) {
+    fn append(&mut self, bytes: &[u8]) {
         if self.size > 0
             && self.size + bytes.len() as u64 > MAX_FILE_BYTES
             && self.rotate().is_err()
@@ -387,21 +454,35 @@ impl LogFile {
     }
 }
 
-fn writer_loop(mut log: LogFile, rx: &Receiver<Msg>, dropped: &AtomicU64) {
+impl Target for LogFile {
+    fn write_line(&mut self, bytes: &[u8]) {
+        self.append(bytes);
+    }
+
+    fn flush(&mut self) {
+        let _ = self.file.flush();
+    }
+
+    fn dropped_line(&self, lost: u64) -> String {
+        format!(
+            "WARN ninesql::logging: {lost} log events were dropped (the log writer was behind)\n"
+        )
+    }
+}
+
+fn writer_loop<T: Target>(mut target: T, rx: &Receiver<Msg>, dropped: &AtomicU64) {
     while let Ok(msg) = rx.recv() {
         match msg {
             Msg::Line(bytes) => {
-                log.write_line(&bytes);
+                target.write_line(&bytes);
                 let lost = dropped.swap(0, Ordering::Relaxed);
                 if lost > 0 {
-                    let line = format!(
-                        "WARN ninesql::logging: {lost} log events were dropped (the log writer was behind)\n"
-                    );
-                    log.write_line(line.as_bytes());
+                    let line = target.dropped_line(lost);
+                    target.write_line(line.as_bytes());
                 }
             }
             Msg::Flush(done) => {
-                let _ = log.file.flush();
+                target.flush();
                 let _ = done.send(());
             }
         }
@@ -411,16 +492,44 @@ fn writer_loop(mut log: LogFile, rx: &Receiver<Msg>, dropped: &AtomicU64) {
 // ---------------------------------------------------------------------------------------------
 // Assembly.
 
-/// What [`install`] leaves running: the file sink, flushed when this is dropped.
-pub struct LogGuard {
+/// The installed sinks, for [`flush_before_exit`] (set once by [`install`]).
+static INSTALLED: OnceLock<Sinks> = OnceLock::new();
+
+/// The writer-thread sinks of the process's subscriber.
+#[derive(Clone, Default)]
+struct Sinks {
+    stderr: Option<ChannelSink>,
     file: Option<FileSink>,
+}
+
+impl Sinks {
+    /// Flushes both sinks within `wait` in all.
+    fn flush(&self, wait: Duration) {
+        let deadline = Instant::now() + wait;
+        for sink in [&self.stderr, &self.file].into_iter().flatten() {
+            sink.flush(deadline.saturating_duration_since(Instant::now()));
+        }
+    }
+}
+
+/// Best effort, at most `wait`: lets the writer threads write the events queued so far (the
+/// panic hook calls it before it prints its report, so the last lines come first). Does
+/// nothing before [`install`].
+pub fn flush_before_exit(wait: Duration) {
+    if let Some(sinks) = INSTALLED.get() {
+        sinks.flush(wait);
+    }
+}
+
+/// What [`install`] leaves running: the stderr and file sinks, flushed (within
+/// [`FLUSH_WAIT`] in all) when this is dropped.
+pub struct LogGuard {
+    sinks: Sinks,
 }
 
 impl Drop for LogGuard {
     fn drop(&mut self) {
-        if let Some(file) = &self.file {
-            file.flush(FLUSH_WAIT);
-        }
+        self.sinks.flush(FLUSH_WAIT);
     }
 }
 
@@ -491,7 +600,13 @@ pub fn install(paths: Option<&Paths>) -> LogGuard {
         (Some(_), Some(p)) => match FileSink::open(&log_dir(p), CHANNEL_CAPACITY) {
             Ok(sink) => Some(sink),
             Err(e) => {
-                problems.push(format!("the file log cannot be written: {e}"));
+                // The kind and the directory's last component only: the error's text can
+                // carry the full path, which names the user's home (§3.2).
+                problems.push(format!(
+                    "the file log cannot be written in {}: {}",
+                    ninesql_core::storage::fs::log_name(&log_dir(p)),
+                    e.kind()
+                ));
                 None
             }
         },
@@ -501,14 +616,24 @@ pub fn install(paths: Option<&Paths>) -> LogGuard {
         }
         _ => None,
     };
-    let (subscriber, mut more) = build(&plan, io::stderr, file.clone());
+    // Stderr goes through its own writer thread: an undrained stderr pipe (a stopped pager, a
+    // journal that is behind) never blocks a thread that logs, the UI thread included (I6).
+    // Without that thread, stderr gets no events rather than blocking ones.
+    let stderr = ChannelSink::stream(io::stderr(), CHANNEL_CAPACITY).ok();
+    let stderr_writer = match &stderr {
+        Some(sink) => BoxMakeWriter::new(sink.clone()),
+        None => BoxMakeWriter::new(io::sink),
+    };
+    let (subscriber, mut more) = build(&plan, stderr_writer, file.clone());
     problems.append(&mut more);
+    let sinks = Sinks { stderr, file };
     if tracing::subscriber::set_global_default(subscriber).is_ok() {
+        let _ = INSTALLED.set(sinks.clone());
         for p in &problems {
             tracing::warn!(problem = %p, "logging");
         }
     }
-    LogGuard { file }
+    LogGuard { sinks }
 }
 
 /// `$XDG_STATE_HOME/ninesql/logs`.
@@ -731,7 +856,7 @@ mod tests {
         assert!(dir.join("ninesql.log.1").exists());
         let line = vec![b'x'; 1024 * 1024];
         for _ in 0..40 {
-            log.write_line(&line);
+            log.append(&line);
         }
         let mut names: Vec<String> = std::fs::read_dir(&dir)
             .unwrap()
@@ -781,6 +906,78 @@ mod tests {
         t.join().unwrap();
         let text = read_log(&dir);
         assert!(text.contains("3 log events were dropped"), "{text}");
+    }
+
+    /// A stderr stand-in whose first write waits until the test opens the gate: an undrained
+    /// pipe.
+    struct Stuck {
+        gate: Arc<std::sync::Barrier>,
+        opened: bool,
+        out: Buffer,
+    }
+
+    impl Write for Stuck {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            if !self.opened {
+                self.gate.wait();
+                self.opened = true;
+            }
+            self.out.write(buf)
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn a_stuck_stderr_never_blocks_warn_callers() {
+        let gate = Arc::new(std::sync::Barrier::new(2));
+        let out = Buffer::default();
+        let stuck = Stuck {
+            gate: Arc::clone(&gate),
+            opened: false,
+            out: out.clone(),
+        };
+        let sink = ChannelSink::stream(stuck, 4).unwrap();
+        let (subscriber, _) = build(
+            &Plan::new(None, LogFileLevel::Off, false),
+            sink.clone(),
+            None,
+        );
+        let started = Instant::now();
+        tracing::subscriber::with_default(subscriber, || {
+            for i in 0..200 {
+                tracing::warn!(i, "stuck-probe");
+            }
+        });
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "warn! waited on stderr: {:?}",
+            started.elapsed()
+        );
+        // A flush while the writer is stuck and the channel full returns within its bound.
+        let started = Instant::now();
+        sink.flush(Duration::from_millis(100));
+        assert!(started.elapsed() < Duration::from_secs(2));
+        assert!(sink.dropped() > 0, "a full channel drops");
+
+        // Once stderr drains, the queued lines and the drop count come out.
+        gate.wait();
+        sink.flush(Duration::from_secs(5));
+        let text = out.text();
+        assert!(text.contains("stuck-probe"), "{text}");
+        assert!(
+            text.contains("log events were dropped (stderr was not being read)"),
+            "{text}"
+        );
+        assert!(text.lines().all(|l| !l.is_empty()));
+    }
+
+    #[test]
+    fn flush_before_exit_without_install_returns_at_once() {
+        let started = Instant::now();
+        flush_before_exit(Duration::from_secs(5));
+        assert!(started.elapsed() < Duration::from_secs(1));
     }
 
     /// I1 (ADR-0029 §3.7): a connect with a password, a statement with a credential word and a
