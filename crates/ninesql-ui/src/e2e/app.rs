@@ -68,11 +68,11 @@ pub fn prepare(scenario_file: &Path, out_dir: &Path) -> Result<Prepared, Stopped
         home: isolated.home,
     };
     for id in prepared.scenario.dev_engines() {
-        let up = prepared
-            .engines
-            .as_ref()
-            .and_then(|e| e.get(id))
-            .is_some_and(setup::reachable);
+        let up = match prepared.engines.as_ref().and_then(|e| e.get(id)) {
+            // A non-loopback entry is a refusal, not a skip: nothing is opened (I2).
+            Some(engine) => setup::reachable(engine).map_err(|e| refused(e.to_string()))?,
+            None => false,
+        };
         if !up {
             let message = format!(
                 "the dev engine {id} does not answer (python3 dev/ready.py up core); the scenario is skipped"
@@ -148,7 +148,7 @@ impl Prepared {
         if let Err(e) =
             ninesql_core::storage::fs::write_atomic(&self.out_dir.join("results.json"), &text)
         {
-            tracing::error!(error = %e, "results.json was not written");
+            tracing::error!(kind = e.kind(), "results.json was not written");
         }
     }
 

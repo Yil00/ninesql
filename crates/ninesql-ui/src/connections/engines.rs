@@ -169,7 +169,11 @@ pub fn offers(registry: &DriverRegistry) -> Vec<EngineOffer> {
             match registry.capabilities(&id) {
                 Ok(caps) => Some(EngineOffer::from_capabilities(engine, caps)),
                 Err(e) => {
-                    tracing::warn!(engine, error = %e, "engine left out of the connection dialog");
+                    tracing::warn!(
+                        engine,
+                        kind = e.kind(),
+                        "engine left out of the connection dialog"
+                    );
                     None
                 }
             }

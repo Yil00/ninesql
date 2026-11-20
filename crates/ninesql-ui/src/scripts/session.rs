@@ -255,7 +255,7 @@ fn read_tab(
 /// changed before the next start is skipped. **Blocking.**
 ///
 /// # Errors
-/// A user-presentable reason; the previous file is left as it was.
+/// A reason with no path (it is logged at quit); the previous file is left as it was.
 pub fn write(
     path: &Path,
     store: Option<&ScriptStore>,
@@ -267,13 +267,23 @@ pub fn write(
         }
     }
     if let Some(dir) = path.parent() {
-        ensure_private_dir(dir).map_err(|e| e.to_string())?;
+        ensure_private_dir(dir).map_err(|e| {
+            format!(
+                "the session directory cannot be used ({})",
+                crate::settings::storage_reason(&e)
+            )
+        })?;
     }
     // A file written by a newer NineSQL is never overwritten (ADR-0008 §2).
     if let Err(StorageError::NewerVersion { .. }) = document::load::<SessionFile>(path) {
         return Err("the session file was written by a newer NineSQL: kept as it is".to_owned());
     }
-    document::save(path, &file).map_err(|e| e.to_string())
+    document::save(path, &file).map_err(|e| {
+        format!(
+            "the session file cannot be written ({})",
+            crate::settings::storage_reason(&e)
+        )
+    })
 }
 
 #[cfg(test)]

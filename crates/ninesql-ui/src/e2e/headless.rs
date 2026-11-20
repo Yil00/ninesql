@@ -70,7 +70,7 @@ pub(super) fn run_scenario(cx: &mut TestAppContext, name: &str) -> Option<(RunRe
         let up = engines
             .as_ref()
             .and_then(|e| e.get(id))
-            .is_some_and(setup::reachable);
+            .is_some_and(|e| setup::reachable(e).unwrap_or_else(|refused| panic!("{refused}")));
         if !up {
             assert!(!required(id), "{id} is required but unreachable");
             #[allow(clippy::print_stderr)] // Test output: why the test did nothing.

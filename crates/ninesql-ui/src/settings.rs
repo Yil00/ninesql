@@ -67,25 +67,57 @@ pub const ZOOM_RANGE: std::ops::RangeInclusive<f32> = -8.0..=16.0;
 
 /// One problem found in settings.toml.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Diagnostic(String);
+pub struct Diagnostic {
+    message: String,
+    /// What a log event carries instead of the message, when the message holds a storage
+    /// error's text (a full path names the user's home, ADR-0029 §3.2).
+    log: Option<String>,
+}
 
 impl Diagnostic {
-    /// A problem with this message.
+    /// A problem with this message, safe to log as it is.
     #[must_use]
     pub fn new(message: impl Into<String>) -> Self {
-        Self(message.into())
+        Self {
+            message: message.into(),
+            log: None,
+        }
+    }
+
+    /// A problem whose message is for the UI only; log events carry `log` instead.
+    #[must_use]
+    pub fn with_log_text(message: impl Into<String>, log: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+            log: Some(log.into()),
+        }
     }
 
     /// The message.
     #[must_use]
     pub fn message(&self) -> &str {
-        &self.0
+        &self.message
+    }
+
+    /// The text for log events: no path, no storage detail.
+    #[must_use]
+    pub fn log_text(&self) -> &str {
+        self.log.as_deref().unwrap_or(&self.message)
     }
 }
 
 impl std::fmt::Display for Diagnostic {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(&self.0)
+        f.write_str(&self.message)
+    }
+}
+
+/// A storage error's kind (and I/O kind), safe to log: never its text, which holds a path.
+#[must_use]
+pub(crate) fn storage_reason(e: &ninesql_core::storage::StorageError) -> String {
+    match e.io_kind() {
+        Some(io) => format!("{}: {io}", e.kind()),
+        None => e.kind().to_owned(),
     }
 }
 
@@ -453,15 +485,19 @@ pub fn load(path: &Path) -> SettingsState {
                 }
             },
             Err(err) => {
-                state.diagnostics.push(Diagnostic::new(format!(
-                    "settings.toml cannot be read ({err}): defaults are used"
-                )));
+                state.diagnostics.push(Diagnostic::with_log_text(
+                    format!("settings.toml cannot be read ({err}): defaults are used"),
+                    format!(
+                        "settings.toml cannot be read ({}): defaults are used",
+                        storage_reason(&err)
+                    ),
+                ));
                 state.save_blocked = Some(not_saved("settings.toml was not read"));
             }
         },
     }
     for d in &state.diagnostics {
-        tracing::warn!(problem = %d, "settings.toml");
+        tracing::warn!(problem = %d.log_text(), "settings.toml");
     }
     state
 }

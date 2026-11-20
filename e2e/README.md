@@ -23,13 +23,13 @@ results.
 ## Running one scenario by hand
 
 ```sh
-cargo build -p ninesql-ui --bin ninesql --features e2e-scenarios --target-dir target/e2e
+CARGO_TARGET_DIR=target/e2e-build cargo build --release -p ninesql-ui --bin ninesql --features e2e-scenarios
 run="$(mktemp -d -t ninesql-e2e-XXXXXX)"            # mode 0700, under the temporary directory
 mkdir -m 0700 "$run"/{home,config,data,state,cache,out}
 env HOME="$run/home" XDG_CONFIG_HOME="$run/config" XDG_DATA_HOME="$run/data" \
     XDG_STATE_HOME="$run/state" XDG_CACHE_HOME="$run/cache" \
     NINESQL_LOG=info NINESQL_E2E_COMMIT="$(git rev-parse HEAD)" \
-    target/e2e/debug/ninesql --e2e-run e2e/scenarios/sqlite-editor-grid.toml --e2e-out "$run/out"
+    target/e2e-build/release/ninesql --e2e-run e2e/scenarios/sqlite-editor-grid.toml --e2e-out "$run/out"
 ```
 
 The dev engines must be up for the scenarios that name them (`python3 dev/ready.py up core`).
@@ -43,7 +43,29 @@ directory (from the password database) nor a default XDG directory under it, and
 NineSQL directories in it are empty. It then installs the core's guards: connections to
 loopback addresses only (after DNS resolution, SSH hops included), export and import files and
 database files inside the run directory, the encrypted vault in the run directory (created with
-a random master password that is never written anywhere), never the keyring.
+a random master password that is never written anywhere), never the keyring. A dev engine of
+`dev/engines.json` must be at a loopback IP address before its reachability probe opens a
+socket: any other entry, a host name included, is a refusal (status 2), not a skip.
+
+### Limits of the run-directory confinement
+
+The guards cover what NineSQL itself opens: connections, export and import files, database
+files and its own storage. They do not make the run a sandbox:
+
+- **File I/O done by an engine through SQL.** A statement can read or write files the core never
+  sees as paths: SQLite `ATTACH DATABASE` or `VACUUM INTO` on a SQLite connection, and the
+  server-side file functions of the dev engines (which run in their containers).
+- **Files read as they are.** Read-only inputs such as a CA file or an SSH key named by a
+  connection are read where they are, outside the run directory.
+- **Inherited environment.** `SSH_AUTH_SOCK` and the agent's keys stay reachable when it is set;
+  the harness of `make e2e-local` runs with what the desktop session gives it.
+- **Same-user races and hard links.** The checks of paths are done by the user who runs the
+  scenario; another process of that user can swap a path between the check and the open, and a
+  hard link inside the run directory can point at a file outside it.
+
+This is acceptable because scenario files are code, reviewed like the rest of the repository:
+the confinement guards against mistakes in a scenario and in the runner, not against a hostile
+scenario or a hostile process of the same user.
 
 ## Exit status
 

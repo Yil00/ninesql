@@ -733,7 +733,7 @@ impl ConnectionHub {
                             continue;
                         }
                         if let Err(e) = stores.delete(r) {
-                            tracing::warn!(reference = %r, error = %e, "could not delete an unused secret");
+                            tracing::warn!(reference = %r, kind = e.kind(), "could not delete an unused secret");
                         }
                     }
                     Ok((next, id))
@@ -742,7 +742,7 @@ impl ConnectionHub {
                     // Fresh ids: nothing on disk points at them.
                     for r in &stored {
                         if let Err(del) = stores.delete(r) {
-                            tracing::warn!(reference = %r, error = %del, "could not roll back a stored secret");
+                            tracing::warn!(reference = %r, kind = del.kind(), "could not roll back a stored secret");
                         }
                     }
                     Err(e)
