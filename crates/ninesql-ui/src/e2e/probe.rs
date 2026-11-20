@@ -107,6 +107,7 @@ probe_keys! {
     NavigatorHasRow = "navigator.has_row", Bool, arg = true, record = true, "A visible navigator row has this label.";
     NavigatorLoading = "navigator.loading", Int, arg = false, record = true, "Navigator loads in flight.";
     DialogOpen = "dialog.open", Bool, arg = false, record = true, "A dialog is open in the window.";
+    FocusAny = "focus.any", Bool, arg = false, record = true, "Some element of the window has the keyboard focus.";
     FocusInput = "focus.input", Bool, arg = false, record = true, "The focused element is a text input.";
     TabsCount = "tabs.count", Int, arg = false, record = true, "Open tabs.";
     TabsActiveTitle = "tabs.active_title", Text, arg = false, record = true, "Title of the active tab.";
@@ -114,11 +115,11 @@ probe_keys! {
     EditorRunning = "editor.running", Bool, arg = false, record = true, "The active editor is running a statement.";
     EditorAwaitingConfirmation = "editor.awaiting_confirmation", Bool, arg = false, record = true, "The active editor waits for a statement confirmation (\"Run on production?\").";
     EditorMessage = "editor.message", Text, arg = false, record = false, "The active editor's message (compared, never recorded: it can quote an engine message).";
-    EditorError = "editor.error", Bool, arg = false, record = true, "The active editor's message is an error.";
+    EditorError = "editor.error", Bool, arg = false, record = true, "The active editor shows an error: its message is an error, or the SQL editor marks a statement's error (F8).";
     EditorCancelLabel = "editor.cancel_label", Text, arg = false, record = true, "\"Cancel\" or \"Stop fetching\" (the driver's cancel capability).";
     GridResultTabs = "grid.result_tabs", Int, arg = false, record = true, "Result tabs of the active editor.";
     GridRows = "grid.rows", Int, arg = false, record = true, "Rows loaded in the first result table of the active editor.";
-    GridState = "grid.state", Text, arg = false, record = true, "Fetch state of that table: fetching, idle, complete, truncated, budget, closed or none.";
+    GridState = "grid.state", Text, arg = false, record = true, "Fetch state of that table: fetching, idle, complete, truncated, budget, closed, closed-idle, stopped or none.";
     GridFocusedRow = "grid.focused_row", Int, arg = false, record = true, "Row index (0-based, in the result) of the grid's focused cell.";
     GridFocusedColumn = "grid.focused_column", Int, arg = false, record = true, "Column index (0-based, in the result) of the grid's focused cell.";
     GridUpdateCounts = "grid.update_counts", Int, arg = false, record = true, "Statements of the last run that reported an update count.";
@@ -132,6 +133,8 @@ probe_keys! {
     ImportStage = "import.stage", Text, arg = false, record = true, "DBeaver import: idle, choose-folder, previewing, preview, applying, vault or done.";
     ImportPreviewConnections = "import.preview_connections", Int, arg = false, record = true, "DBeaver import: connections in the preview.";
     FirstRunOffer = "import.first_run_offer", Bool, arg = false, record = true, "The first-run DBeaver import offer is shown.";
+    ExportStage = "export.stage", Text, arg = false, record = true, "The export dialog opened last: none, editing, checking, confirm-overwrite, running, done, failed or cancelled.";
+    CsvImportStage = "csv_import.stage", Text, arg = false, record = true, "The CSV import dialog opened last: none, choose-file, previewing, preview, confirm, running, done or failed.";
 }
 
 impl ProbeKey {
@@ -154,8 +157,8 @@ fn fetch_state_name(state: &FetchState) -> &'static str {
         FetchState::Truncated(_) => "truncated",
         FetchState::GridBudgetReached => "budget",
         FetchState::Closed => "closed",
-        #[allow(unreachable_patterns)]
-        _ => "other",
+        FetchState::ClosedIdle { .. } => "closed-idle",
+        FetchState::Stopped => "stopped",
     }
 }
 
@@ -171,6 +174,9 @@ pub fn read(
     use ProbeValue as V;
     if key == K::DialogOpen {
         return V::Bool(window.has_active_dialog(cx));
+    }
+    if key == K::FocusAny {
+        return V::Bool(window.focused(cx).is_some());
     }
     if key == K::FocusInput {
         return V::Bool(window.has_focused_input(cx));
@@ -248,7 +254,7 @@ pub fn read(
                 .any(|(_, l)| Some(l.as_str()) == arg),
         ),
         K::NavigatorLoading => int(ws.navigator().read(cx).loads_in_flight()),
-        K::DialogOpen | K::FocusInput => V::Absent,
+        K::DialogOpen | K::FocusAny | K::FocusInput => V::Absent,
         K::TabsCount => int(ws.tab_titles(cx).len()),
         K::TabsActiveTitle => ws
             .active_title(cx)
@@ -269,9 +275,9 @@ pub fn read(
         K::EditorMessage => editor
             .and_then(|e| e.message())
             .map_or(V::Absent, |m| V::Text(m.text.to_string())),
-        K::EditorError => {
-            editor.map_or(V::Absent, |e| V::Bool(e.message().is_some_and(|m| m.error)))
-        }
+        K::EditorError => editor.map_or(V::Absent, |e| {
+            V::Bool(e.message().is_some_and(|m| m.error) || e.editor().read(cx).error().is_some())
+        }),
         K::EditorCancelLabel => editor.map_or(V::Absent, |e| V::Text(e.cancel_label().to_owned())),
         K::GridResultTabs => editor.map_or(V::Absent, |e| {
             int(e.results().read(cx).results().tabs().len())
@@ -322,6 +328,36 @@ pub fn read(
             .and_then(|f| f.read(cx).preview().map(|p| p.connections().count()))
             .map_or(V::Absent, int),
         K::FirstRunOffer => V::Bool(ws.first_run_offer(cx).is_some()),
+        K::ExportStage => {
+            use crate::transfer::export::ExportStage as S;
+            let stage = crate::transfer::OPENED_EXPORT.with(|o| {
+                o.borrow().as_ref().map(|d| match d.read(cx).stage() {
+                    S::Editing => "editing",
+                    S::Checking => "checking",
+                    S::ConfirmOverwrite(_) => "confirm-overwrite",
+                    S::Running { .. } => "running",
+                    S::Done(_) => "done",
+                    S::Failed(_) => "failed",
+                    S::Cancelled => "cancelled",
+                })
+            });
+            V::Text(stage.unwrap_or("none").to_owned())
+        }
+        K::CsvImportStage => {
+            use crate::transfer::import::ImportStage as S;
+            let stage = crate::transfer::OPENED_IMPORT.with(|o| {
+                o.borrow().as_ref().map(|d| match d.read(cx).stage() {
+                    S::ChooseFile => "choose-file",
+                    S::Previewing => "previewing",
+                    S::Preview => "preview",
+                    S::Confirm(_) => "confirm",
+                    S::Running { .. } => "running",
+                    S::Done(_) => "done",
+                    S::Failed(_) => "failed",
+                })
+            });
+            V::Text(stage.unwrap_or("none").to_owned())
+        }
     }
 }
 

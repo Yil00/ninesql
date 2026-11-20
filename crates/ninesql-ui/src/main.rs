@@ -56,12 +56,12 @@ fn version_line() -> String {
 }
 
 #[cfg(feature = "e2e-scenarios")]
-const E2E_USAGE: &str = "\
-  --e2e-run FILE --e2e-out DIR
-                   (test build only) Run the scenario FILE in a window and write
-                   its results to DIR; HOME and the XDG directories must lie in a
-                   fresh private run directory (ADR-0029)
-";
+const E2E_USAGE: &str = concat!(
+    "  --e2e-run FILE --e2e-out DIR\n",
+    "                   (test build only) Run the scenario FILE in a window and write\n",
+    "                   its results to DIR; HOME and the XDG directories must lie in a\n",
+    "                   fresh private run directory (ADR-0029)\n",
+);
 
 const USAGE: &str = "\
 Usage: ninesql [OPTION]
@@ -336,5 +336,47 @@ mod tests {
         assert_eq!(parse(args(&["--verbose"])), Command::Invalid);
         assert_eq!(parse(args(&["file.sql"])), Command::Invalid);
         assert_eq!(parse(args(&["--version", "--help"])), Command::Invalid);
+    }
+
+    /// The scenario runner's arguments: refused in a normal build (status 2), accepted in the
+    /// test build only and only in their exact form (ADR-0029 §2.3).
+    #[test]
+    fn e2e_arguments_only_in_the_test_build() {
+        let run = args(&["--e2e-run", "s.toml", "--e2e-out", "/tmp/out"]);
+        #[cfg(not(feature = "e2e-scenarios"))]
+        assert_eq!(parse(run), Command::Invalid);
+        #[cfg(feature = "e2e-scenarios")]
+        assert_eq!(
+            parse(run),
+            Command::E2eRun {
+                scenario: "s.toml".into(),
+                out: "/tmp/out".into()
+            }
+        );
+        for wrong in [
+            &["--e2e-run", "s.toml"][..],
+            &["--e2e-out", "/tmp/out", "--e2e-run", "s.toml"],
+            &["--e2e-run", "", "--e2e-out", "/tmp/out"],
+            &["--e2e-run", "s.toml", "--e2e-out", "/tmp/out", "x"],
+        ] {
+            assert_eq!(parse(args(wrong)), Command::Invalid, "{wrong:?}");
+        }
+    }
+
+    #[test]
+    fn version_line_names_the_test_build_only_with_the_feature() {
+        let line = super::version_line();
+        assert!(line.starts_with("ninesql "));
+        assert_eq!(
+            line.contains("e2e"),
+            cfg!(feature = "e2e-scenarios"),
+            "{line}"
+        );
+        #[cfg(feature = "e2e-scenarios")]
+        {
+            assert!(line.ends_with(" (e2e-scenarios test build, not for distribution)"));
+            assert_eq!(super::E2E_TEST_BUILD_MARKER.len(), 32);
+            assert_eq!(ninesql_ui::app::TITLE_SUFFIX, " [E2E TEST BUILD]");
+        }
     }
 }

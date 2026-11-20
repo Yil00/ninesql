@@ -1,0 +1,190 @@
+# Production safety (I3, ADR-0007) on SQLite: a `DELETE` on a connection typed production stops
+# at "Run on production?" and is declined with Escape (nothing deleted), and a write on a
+# read-only connection is refused by the driver, the error shown in the editor.
+schema_version = 1
+name = "sqlite-safety"
+description = "SQLite: the production DELETE confirmation declined, a write refused on a read-only session."
+
+[[connection]]
+name = "Nine production"
+engine = "sqlite"
+file = "nine-prod.db"
+type = "prod"
+
+[[connection]]
+name = "Nine read-only"
+engine = "sqlite"
+file = "nine-ro.db"
+read_only = true
+
+[[step]]
+wait = "core.ready"
+equals = true
+timeout_secs = 60
+
+[[step]]
+wait = "connections.count"
+equals = 2
+
+# The production connection (connections are listed by name: "Nine production" first).
+[[step]]
+action = "ninesql::FocusNavigator"
+
+[[step]]
+keys = "home"
+
+[[step]]
+wait = "navigator.selected"
+equals = "Nine production"
+
+[[step]]
+action = "ninesql::ConnectConnection"
+
+[[step]]
+wait = "session.open"
+arg = "Nine production"
+equals = true
+timeout_secs = 30
+
+[[step]]
+wait = "editor.connection"
+equals = "Nine production"
+
+[[step]]
+expect = "session.production"
+arg = "Nine production"
+equals = true
+
+[[step]]
+checkpoint = "production-frame"
+
+[[step]]
+action = "ninesql::FocusNextPane"
+
+[[step]]
+text = "DELETE FROM orders"
+
+[[step]]
+action = "ninesql_editor::ExecuteStatement"
+
+[[step]]
+wait = "editor.awaiting_confirmation"
+equals = true
+timeout_secs = 30
+
+[[step]]
+expect = "dialog.open"
+equals = true
+
+[[step]]
+checkpoint = "run-on-production"
+
+[[step]]
+keys = "escape"
+
+[[step]]
+wait = "editor.awaiting_confirmation"
+equals = false
+
+[[step]]
+expect = "dialog.open"
+equals = false
+
+[[step]]
+expect = "grid.update_counts"
+equals = 0
+
+[[step]]
+checkpoint = "production-declined"
+
+# Nothing was deleted: the rows are still there.
+[[step]]
+keys = "ctrl-a"
+
+[[step]]
+text = "SELECT id FROM orders ORDER BY id LIMIT 10"
+
+[[step]]
+action = "ninesql_editor::ExecuteStatement"
+
+[[step]]
+wait = "grid.state"
+equals = "complete"
+timeout_secs = 30
+
+[[step]]
+expect = "grid.rows"
+equals = 10
+
+# The read-only connection: connected, then chosen for the editor with "Choose editor
+# connection" (one button per open session, in the order they opened). A write is refused by
+# the driver (engine-side, I3).
+[[step]]
+action = "ninesql::FocusNavigator"
+
+[[step]]
+keys = "end"
+
+[[step]]
+wait = "navigator.selected"
+equals = "Nine read-only"
+
+[[step]]
+action = "ninesql::ConnectConnection"
+
+[[step]]
+wait = "session.open"
+arg = "Nine read-only"
+equals = true
+timeout_secs = 30
+
+[[step]]
+expect = "session.read_only"
+arg = "Nine read-only"
+equals = true
+
+[[step]]
+action = "ninesql::ChooseEditorConnection"
+
+[[step]]
+wait = "dialog.open"
+equals = true
+
+[[step]]
+checkpoint = "choose-editor-connection"
+
+[[step]]
+keys = "tab tab space"
+
+[[step]]
+wait = "editor.connection"
+equals = "Nine read-only"
+timeout_secs = 30
+
+[[step]]
+expect = "dialog.open"
+equals = false
+
+[[step]]
+action = "ninesql::FocusNextPane"
+
+[[step]]
+keys = "ctrl-a"
+
+[[step]]
+text = "UPDATE customers SET name = 'changed' WHERE id = 1"
+
+[[step]]
+action = "ninesql_editor::ExecuteStatement"
+
+[[step]]
+wait = "editor.error"
+equals = true
+timeout_secs = 30
+
+[[step]]
+expect = "editor.running"
+equals = false
+
+[[step]]
+checkpoint = "read-only-refused"

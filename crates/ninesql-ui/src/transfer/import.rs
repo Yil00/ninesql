@@ -81,6 +81,9 @@ pub struct ImportCsvDialog {
     /// The statement of the confirmation, laid out once ([`ScriptRows`]).
     confirm_script: Option<Rc<ScriptRows>>,
     tasks: Vec<Task<()>>,
+    /// The "Close" button's focus: the button that started the run is gone while it runs, so
+    /// the focus moves here once it ends and the dialog stays usable from the keyboard.
+    close_focus: FocusHandle,
 }
 
 impl ImportCsvDialog {
@@ -122,6 +125,7 @@ impl ImportCsvDialog {
             stage: ImportStage::ChooseFile,
             confirm_script: None,
             tasks: vec![read_target],
+            close_focus: cx.focus_handle(),
         }
     }
 
@@ -677,7 +681,11 @@ impl SummaryFacts {
 }
 
 impl Render for ImportCsvDialog {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        // The run ended and its button went with the stage: keep the keyboard in the dialog.
+        if matches!(self.stage, ImportStage::Done(_)) && window.focused(cx).is_none() {
+            self.close_focus.focus(window, cx);
+        }
         let theme = cx.theme().clone();
         let running = matches!(
             self.stage,
@@ -919,6 +927,7 @@ impl Render for ImportCsvDialog {
                 .justify_end()
                 .child(
                     Button::new("import-close")
+                        .track_focus(&self.close_focus)
                         .label("Close")
                         .on_click(|_, window, cx| window.close_dialog(cx)),
                 )
@@ -959,7 +968,7 @@ pub fn open_import_dialog(
     window.open_dialog(cx, move |d, _, _| {
         d.title("Import CSV").w(px(720.)).child(view.clone())
     });
-    #[cfg(test)]
+    #[cfg(any(test, feature = "e2e-scenarios"))]
     super::OPENED_IMPORT.with(|o| *o.borrow_mut() = Some(dialog.clone()));
     dialog
 }

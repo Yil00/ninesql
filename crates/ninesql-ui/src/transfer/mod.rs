@@ -21,7 +21,7 @@ pub mod import;
 #[cfg(test)]
 mod tests;
 
-#[cfg(test)]
+#[cfg(any(test, feature = "e2e-scenarios"))]
 thread_local! {
     /// The export dialog opened last on this thread, for tests that open it through its action
     /// (the workspace keeps no handle; GPUI test contexts run on the test's thread).
