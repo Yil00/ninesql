@@ -378,6 +378,14 @@ impl Render for FindObjectDialog {
     }
 }
 
+#[cfg(test)]
+thread_local! {
+    /// The "Find object" dialog opened last on this thread, for tests that open it through its
+    /// action (the workspace keeps no handle; GPUI test contexts run on the test's thread).
+    pub(crate) static OPENED_FIND: std::cell::RefCell<Option<Entity<FindObjectDialog>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
 /// Opens "Find object" over `window`.
 pub fn open_find_object(
     service: MetadataService,
@@ -387,6 +395,8 @@ pub fn open_find_object(
     cx: &mut App,
 ) -> Entity<FindObjectDialog> {
     let view = cx.new(|cx| FindObjectDialog::new(service, scopes, on_choose, window, cx));
+    #[cfg(test)]
+    OPENED_FIND.with(|o| *o.borrow_mut() = Some(view.clone()));
     let shown = view.clone();
     let first = std::cell::Cell::new(true);
     window.open_dialog(cx, move |dialog, window, cx| {

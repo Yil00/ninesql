@@ -9,7 +9,7 @@ use ninesql_core::driver_api::ObjectKind;
 use ninesql_core::driver_api::metadata::ObjectPath;
 use ninesql_core::{Auth, ConnectionId, ConnectionTypeId, MetadataConfig, NodeKey};
 
-use super::generate::Template;
+use super::generate::{Template, TemplateAllowance};
 use super::object_editor::ObjectTab;
 use super::search::SearchScope;
 use crate::connections::connect_flow::Purpose;
@@ -749,8 +749,15 @@ fn read_only_sessions_offer_select_only(cx: &mut TestAppContext) {
 #[test]
 fn the_context_menu_of_tables_and_views_starts_with_open_table_data() {
     use crate::navigator::object_menu_entries;
+    let allowance = |read_only: bool| {
+        if read_only {
+            TemplateAllowance::select_only()
+        } else {
+            TemplateAllowance::all()
+        }
+    };
     let labels = |kind: Option<ObjectKind>, read_only: bool, ddl: bool| -> Vec<String> {
-        object_menu_entries(kind, read_only, ddl)
+        object_menu_entries(kind, allowance(read_only), ddl)
             .into_iter()
             .map(|e| e.map_or_else(|| "-".to_owned(), |(label, _)| label))
             .collect()
@@ -776,8 +783,14 @@ fn the_context_menu_of_tables_and_views_starts_with_open_table_data() {
             !read_only.iter().any(|l| l == "Generate SQL: DELETE"),
             "{read_only:?}"
         );
+        // Review L2: row writes only on tables.
+        assert_eq!(
+            entries.iter().any(|l| l == "Generate SQL: DELETE"),
+            kind == ObjectKind::Table,
+            "{kind:?}: {entries:?}"
+        );
     }
-    let entries = object_menu_entries(Some(ObjectKind::Table), false, false);
+    let entries = object_menu_entries(Some(ObjectKind::Table), TemplateAllowance::all(), false);
     let first = entries
         .first()
         .and_then(|e| e.as_ref())
@@ -797,7 +810,11 @@ fn open_table_data_from_the_context_menu_opens_the_table(cx: &mut TestAppContext
     let ix = index_of(&f, "t000");
     f.nav
         .update(&mut f.vcx, |n, cx| n.select_index(Some(ix), cx));
-    let entries = crate::navigator::object_menu_entries(Some(ObjectKind::Table), false, false);
+    let entries = crate::navigator::object_menu_entries(
+        Some(ObjectKind::Table),
+        TemplateAllowance::all(),
+        false,
+    );
     let Some(Some((_, action))) = entries.into_iter().next() else {
         panic!("a first entry");
     };
@@ -817,4 +834,182 @@ fn open_table_data_from_the_context_menu_opens_the_table(cx: &mut TestAppContext
                 && t.editor().read(cx).running().is_none()
         })
     });
+}
+
+/// Review L2: "Generate SQL" follows the driver's declared `Capabilities::editing`. A driver
+/// that declares no row editing (QuestDB) gets the SELECT template only: in the context menu, in
+/// the object editor's toolbar and through the actions (palette, key bindings).
+#[gpui::test]
+fn generate_sql_follows_the_declared_editing_capabilities(cx: &mut TestAppContext) {
+    use ninesql_core::driver_api::capabilities::EditingCapabilities;
+    use ninesql_core::driver_api::mock::{MockDriver, full_capabilities};
+    let tmp = tempfile::tempdir().unwrap_or_else(|e| panic!("{e}"));
+    let mut caps = full_capabilities();
+    caps.editing = EditingCapabilities::default();
+    let c = mock_connection("NoEdit", ConnectionTypeId::dev(), Auth::None);
+    let id = c.id;
+    let hub = crate::connections::tests::mock_hub_with_transfer_driver(
+        cx,
+        tmp.path(),
+        vec![c],
+        MockDriver::new().with_capabilities(caps),
+    );
+    let (ws, mut vcx) = open_live(cx);
+    ws.update_in(&mut vcx, |ws, window, cx| {
+        ws.connect(id, Purpose::Open, window, cx);
+    });
+    wait_until(&mut vcx, |vcx| hub.read_with(vcx, |h, _| h.is_open(id)));
+    let nav = ws.read_with(&vcx, |ws, _| ws.navigator().clone());
+    let mut f = Fixture {
+        ws,
+        hub,
+        nav,
+        id,
+        vcx,
+        _tmp: tmp,
+    };
+    expand(&mut f, "NoEdit");
+    wait_for(&mut f, "nine");
+    expand(&mut f, "nine");
+    wait_for(&mut f, "public");
+    expand(&mut f, "public");
+    wait_for(&mut f, "t000");
+    let ix = index_of(&f, "t000");
+    f.nav
+        .update(&mut f.vcx, |n, cx| n.select_index(Some(ix), cx));
+    let labels: Vec<String> = f
+        .nav
+        .read_with(&f.vcx, |n, cx| n.selected_object_menu(cx))
+        .into_iter()
+        .flatten()
+        .map(|(l, _)| l)
+        .collect();
+    assert!(
+        labels.contains(&"Generate SQL: SELECT".to_owned()),
+        "{labels:?}"
+    );
+    for write in ["INSERT", "UPDATE", "DELETE"] {
+        assert!(
+            !labels.contains(&format!("Generate SQL: {write}")),
+            "{write}: {labels:?}"
+        );
+    }
+    // The actions refuse too.
+    let before = tab_count(&f);
+    for action in [
+        Box::new(crate::actions::GenerateInsertSql) as Box<dyn gpui::Action>,
+        Box::new(crate::actions::GenerateUpdateSql),
+        Box::new(crate::actions::GenerateDeleteSql),
+    ] {
+        f.ws.update_in(&mut f.vcx, |ws, window, cx| {
+            ws.perform(action.as_ref(), window, cx);
+        });
+        f.vcx.run_until_parked();
+        assert_eq!(tab_count(&f), before, "{}", action.name());
+    }
+    // The object editor's toolbar offers SELECT only.
+    f.ws.update_in(&mut f.vcx, |ws, window, cx| {
+        ws.open_object_editor(id, path_of("t000"), None, window, cx);
+    });
+    let editor =
+        f.ws.read_with(&f.vcx, |ws, _| ws.active_object_editor().cloned());
+    let Some(editor) = editor else {
+        panic!("an object editor");
+    };
+    assert_eq!(
+        editor.read_with(&f.vcx, |e, cx| e.offered_templates(cx)),
+        vec![Template::Select]
+    );
+}
+
+/// Review L2: on a driver that declares row editing, the object editor of a table offers every
+/// template, and a view gets no write template.
+#[gpui::test]
+fn write_templates_are_offered_on_tables_only(cx: &mut TestAppContext) {
+    let mut f = connected(cx, MetadataConfig::default());
+    let id = f.id;
+    f.ws.update_in(&mut f.vcx, |ws, window, cx| {
+        ws.open_object_editor(id, path_of("t000"), None, window, cx);
+    });
+    let editor =
+        f.ws.read_with(&f.vcx, |ws, _| ws.active_object_editor().cloned());
+    let Some(editor) = editor else {
+        panic!("an object editor");
+    };
+    assert_eq!(
+        editor.read_with(&f.vcx, |e, cx| e.offered_templates(cx)),
+        Template::ALL.to_vec()
+    );
+    let view = ObjectPath::root()
+        .child(ObjectKind::Catalog, "nine")
+        .child(ObjectKind::Schema, "public")
+        .child(ObjectKind::View, "v000");
+    let before = tab_count(&f);
+    f.ws.update_in(&mut f.vcx, |ws, window, cx| {
+        ws.generate(id, view, Template::Delete, window, cx);
+    });
+    f.vcx.run_until_parked();
+    assert_eq!(tab_count(&f), before, "no DELETE template on a view");
+}
+
+/// Review L8: the navigator's hints name the bindings in effect, not hard-coded ones.
+#[test]
+fn navigator_hints_follow_the_effective_key_bindings() {
+    use crate::keymap::{BindingOverrides, EffectiveKeymap};
+    use crate::navigator::{no_connections_text, not_connected_text};
+    let defaults = EffectiveKeymap::resolve(&BindingOverrides::default());
+    assert_eq!(
+        not_connected_text(Some(&defaults)),
+        "Not connected (\"Connect\": Ctrl+K Ctrl+O)"
+    );
+    assert_eq!(
+        no_connections_text(Some(&defaults)),
+        "No connections yet. Use \"New connection\" (Ctrl+Alt+N) or \"Import from DBeaver\" (Ctrl+K Ctrl+I)."
+    );
+    let mut overrides = BindingOverrides::default();
+    overrides.set("ninesql::ConnectConnection", vec!["alt-shift-c".into()]);
+    overrides.set("ninesql::NewConnection", vec![]);
+    let changed = EffectiveKeymap::resolve(&overrides);
+    assert_eq!(
+        not_connected_text(Some(&changed)),
+        "Not connected (\"Connect\": Alt+Shift+C)"
+    );
+    assert_eq!(
+        no_connections_text(Some(&changed)),
+        "No connections yet. Use \"New connection\" or \"Import from DBeaver\" (Ctrl+K Ctrl+I)."
+    );
+    overrides.set("ninesql::ConnectConnection", vec![]);
+    let unbound = EffectiveKeymap::resolve(&overrides);
+    assert_eq!(
+        not_connected_text(Some(&unbound)),
+        "Not connected (\"Connect\" in the context menu)"
+    );
+    assert_eq!(
+        not_connected_text(None),
+        "Not connected (\"Connect\" in the context menu)"
+    );
+}
+
+/// Review L8: an override from `settings.toml` reaches the hint through the installed keymap,
+/// which is what the navigator reads when it draws a row.
+#[gpui::test]
+fn the_installed_keymap_drives_the_navigator_hint(cx: &mut TestAppContext) {
+    use crate::keymap::EffectiveKeymap;
+    use crate::navigator::not_connected_text;
+    let (settings, diagnostics) =
+        crate::settings::parse("[keybindings]\nConnectConnection = \"alt-shift-c\"\n");
+    assert!(diagnostics.is_empty(), "{diagnostics:?}");
+    cx.update(|cx| {
+        crate::app::init(
+            crate::settings::SettingsState {
+                path: None,
+                settings,
+                diagnostics,
+                save_blocked: None,
+            },
+            cx,
+        );
+    });
+    let text = cx.update(|cx| not_connected_text(cx.try_global::<EffectiveKeymap>()));
+    assert_eq!(text, "Not connected (\"Connect\": Alt+Shift+C)");
 }
