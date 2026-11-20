@@ -28,7 +28,7 @@ use ninesql_core::{
     NodeChildren, NodeKey, ObjectDdl,
 };
 
-use super::generate::Template;
+use super::generate::{Template, TemplateAllowance};
 use super::{display_name, display_path, kind_plural, kind_singular};
 use crate::connections::hub::{ConnectionHub, MetadataUpdate};
 
@@ -209,6 +209,28 @@ impl ObjectEditor {
             .sessions(self.connection)
             .first()
             .is_some_and(|s| s.info().read_only)
+    }
+
+    /// The templates the open session allows (read-only, declared row edits; review L2).
+    #[must_use]
+    pub fn template_allowance(&self, cx: &App) -> TemplateAllowance {
+        self.hub
+            .read(cx)
+            .sessions(self.connection)
+            .first()
+            .map(TemplateAllowance::of_session)
+            .unwrap_or_default()
+    }
+
+    /// The "Generate SQL" buttons of the toolbar, in order.
+    #[must_use]
+    pub fn offered_templates(&self, cx: &App) -> Vec<Template> {
+        let kind = self.path.kind();
+        let allows = self.template_allowance(cx);
+        Template::ALL
+            .into_iter()
+            .filter(|t| kind.is_some_and(|k| t.offered(k, allows)))
+            .collect()
     }
 
     /// Bidirectional controls in the loaded DDL (flagged like in the SQL editor).
@@ -927,11 +949,7 @@ impl Render for ObjectEditor {
                 }
             }));
         let kind = self.path.kind();
-        let read_only = self.read_only(cx);
-        let templates: Vec<Template> = Template::ALL
-            .into_iter()
-            .filter(|t| kind.is_some_and(|k| t.offered(k, read_only)))
-            .collect();
+        let templates = self.offered_templates(cx);
         let toolbar = h_flex()
             .px_3()
             .py_1()

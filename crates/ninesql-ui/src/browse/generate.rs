@@ -21,6 +21,7 @@
 
 use ninesql_core::NodeChildren;
 use ninesql_core::driver_api::ObjectKind;
+use ninesql_core::driver_api::capabilities::EditingCapabilities;
 use ninesql_core::driver_api::metadata::{ConstraintKind, ObjectDetails, ObjectInfo, ObjectPath};
 use ninesql_editor::hygiene::needs_sanitizing;
 
@@ -68,19 +69,84 @@ impl Template {
     }
 
     /// Whether the template applies to objects of `kind`: `SELECT` to every table-like
-    /// object, the DML templates to tables and views (a materialized view cannot be written).
+    /// object, the DML templates to tables only (a view or a materialized view is not offered
+    /// row writes; review L2).
     #[must_use]
     pub fn applies_to(self, kind: ObjectKind) -> bool {
         match self {
             Self::Select => super::is_table_like(kind),
-            _ => matches!(kind, ObjectKind::Table | ObjectKind::View),
+            _ => matches!(kind, ObjectKind::Table),
         }
     }
 
-    /// Whether the template is offered for `kind` on a session that is `read_only` or not.
+    /// Whether the template is offered for `kind` with what the session `allows`.
     #[must_use]
-    pub fn offered(self, kind: ObjectKind, read_only: bool) -> bool {
-        self.applies_to(kind) && !(read_only && self.writes())
+    pub fn offered(self, kind: ObjectKind, allows: TemplateAllowance) -> bool {
+        self.applies_to(kind) && allows.allows(self)
+    }
+}
+
+/// Which templates a session allows (I8, review L2): `SELECT` always; `INSERT`, `UPDATE` and
+/// `DELETE` only on a session that is not read-only and whose driver declares the matching row
+/// edit in `Capabilities::editing` (QuestDB declares none). With no open session only `SELECT`
+/// is offered: the capabilities are not known yet.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct TemplateAllowance {
+    /// `INSERT` is offered.
+    pub insert: bool,
+    /// `UPDATE` is offered.
+    pub update: bool,
+    /// `DELETE` is offered.
+    pub delete: bool,
+}
+
+impl TemplateAllowance {
+    /// `SELECT` only (no session, or a read-only one).
+    #[must_use]
+    pub fn select_only() -> Self {
+        Self::default()
+    }
+
+    /// Every template.
+    #[must_use]
+    pub fn all() -> Self {
+        Self {
+            insert: true,
+            update: true,
+            delete: true,
+        }
+    }
+
+    /// What a session that is `read_only` or not, with these declared editing capabilities,
+    /// allows.
+    #[must_use]
+    pub fn of(read_only: bool, editing: &EditingCapabilities) -> Self {
+        if read_only {
+            return Self::select_only();
+        }
+        Self {
+            insert: editing.insert,
+            update: editing.update,
+            delete: editing.delete,
+        }
+    }
+
+    /// What `session` allows.
+    #[must_use]
+    pub fn of_session(session: &ninesql_core::SessionHandle) -> Self {
+        let info = session.info();
+        Self::of(info.read_only, &info.capabilities.editing)
+    }
+
+    /// Whether `template` is allowed.
+    #[must_use]
+    pub fn allows(self, template: Template) -> bool {
+        match template {
+            Template::Select => true,
+            Template::Insert => self.insert,
+            Template::Update => self.update,
+            Template::Delete => self.delete,
+        }
     }
 }
 
@@ -603,14 +669,56 @@ mod tests {
 
     #[test]
     fn templates_are_offered_by_kind_and_session() {
+        let all = TemplateAllowance::all();
         assert!(Template::Select.applies_to(ObjectKind::MaterializedView));
         assert!(!Template::Delete.applies_to(ObjectKind::MaterializedView));
-        assert!(Template::Delete.applies_to(ObjectKind::View));
         assert!(!Template::Select.applies_to(ObjectKind::Column));
-        assert!(Template::Select.offered(ObjectKind::Table, true));
+        let read_only = TemplateAllowance::of(true, &full_editing());
+        assert!(Template::Select.offered(ObjectKind::Table, read_only));
         for t in [Template::Insert, Template::Update, Template::Delete] {
-            assert!(!t.offered(ObjectKind::Table, true), "{t:?} on read-only");
-            assert!(t.offered(ObjectKind::Table, false));
+            assert!(
+                !t.offered(ObjectKind::Table, read_only),
+                "{t:?} on read-only"
+            );
+            assert!(t.offered(ObjectKind::Table, all));
+            // Review L2: no row write on a view, whatever the session allows.
+            assert!(!t.applies_to(ObjectKind::View), "{t:?} on a view");
+            assert!(!t.offered(ObjectKind::View, all), "{t:?} on a view");
         }
+        assert!(Template::Select.offered(ObjectKind::View, all));
+    }
+
+    fn full_editing() -> EditingCapabilities {
+        let mut e = EditingCapabilities::default();
+        e.insert = true;
+        e.update = true;
+        e.delete = true;
+        e
+    }
+
+    /// Review L2: the write templates follow the driver's declared `Capabilities::editing`.
+    #[test]
+    fn write_templates_follow_the_declared_editing_capabilities() {
+        // QuestDB declares no row editing: SELECT only.
+        let none = TemplateAllowance::of(false, &EditingCapabilities::default());
+        assert_eq!(none, TemplateAllowance::select_only());
+        for t in Template::ALL {
+            assert_eq!(
+                t.offered(ObjectKind::Table, none),
+                t == Template::Select,
+                "{t:?}"
+            );
+        }
+        // Each write template on its own capability.
+        let mut insert_only = EditingCapabilities::default();
+        insert_only.insert = true;
+        let a = TemplateAllowance::of(false, &insert_only);
+        assert!(Template::Insert.offered(ObjectKind::Table, a));
+        assert!(!Template::Update.offered(ObjectKind::Table, a));
+        assert!(!Template::Delete.offered(ObjectKind::Table, a));
+        assert_eq!(
+            TemplateAllowance::of(false, &full_editing()),
+            TemplateAllowance::all()
+        );
     }
 }
