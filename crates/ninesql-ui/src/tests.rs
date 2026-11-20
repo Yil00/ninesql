@@ -97,7 +97,10 @@ fn window_opens_with_one_editor_and_the_navigator(cx: &mut TestAppContext) {
         assert!(ws.navigator().read(cx).is_empty(cx));
         assert_eq!(ws.active_title(cx).as_deref(), Some("Script-1"));
     });
-    assert_eq!(vcx.window_title().as_deref(), Some("Script-1 - NineSQL"));
+    assert_eq!(
+        vcx.window_title(),
+        Some(crate::app::window_title("Script-1 - NineSQL"))
+    );
 }
 
 #[gpui::test]
@@ -131,7 +134,10 @@ fn tabs_through_key_bindings(cx: &mut TestAppContext) {
     vcx.simulate_keystrokes("ctrl-w ctrl-w");
     assert_eq!(tab_count(&ws, &mut vcx), 0);
     assert_eq!(pane_count(&ws, &mut vcx), 1);
-    assert_eq!(vcx.window_title().as_deref(), Some("NineSQL"));
+    assert_eq!(
+        vcx.window_title(),
+        Some(crate::app::window_title("NineSQL"))
+    );
     // The empty workspace keeps focus, so its bindings still work.
     vcx.simulate_keystrokes("ctrl-t");
     assert_eq!(tab_count(&ws, &mut vcx), 1);

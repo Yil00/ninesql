@@ -1163,10 +1163,10 @@ impl Workspace {
 
     fn after_change(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.focus_active(window, cx);
-        let title = match self.active_title(cx) {
+        let title = crate::app::window_title(&match self.active_title(cx) {
             Some(tab) => format!("{tab} - NineSQL"),
             None => "NineSQL".to_owned(),
-        };
+        });
         window.set_window_title(&title);
         cx.notify();
     }

@@ -152,6 +152,45 @@ pub fn start(registry: DriverRegistry, cx: &mut App) -> Entity<ConnectionHub> {
     hub
 }
 
+/// [`start`] for a scenario run (feature `e2e-scenarios`, ADR-0029 §2.5): the same startup off
+/// the UI thread, then the run's vault is created with `master` (a random password generated
+/// per run, never written anywhere) and left unlocked, so new secrets go to the vault in the
+/// run directory. The core's test-build guards must be installed first
+/// (`ninesql_core::e2e::install`); `CoreServices::start` refuses otherwise.
+#[cfg(feature = "e2e-scenarios")]
+pub fn start_for_scenario(
+    registry: DriverRegistry,
+    master: ninesql_core::secrets::SecretString,
+    cx: &mut App,
+) -> Entity<ConnectionHub> {
+    let mut config = HubConfig::empty();
+    config.registry = registry.clone();
+    let hub = install(config, cx);
+    hub.update(cx, |h, _| h.starting = true);
+    let startup = cx.background_spawn(async move {
+        let paths = Paths::from_env()
+            .map_err(|e| format!("No workspace location ({e}): connections are not available."))?;
+        let mut config = CoreConfig::new(paths, ProjectName::default_project(), registry);
+        config.use_secret_service = false;
+        let core = CoreServices::start(config)
+            .await
+            .ok_or_else(|| "The core did not start.".to_owned())?
+            .map_err(|e| format!("The core did not start ({e}): connections are not available."))?;
+        core.create_vault(master)
+            .await
+            .ok_or_else(|| "The run's vault was not created.".to_owned())?
+            .map_err(|e| format!("The run's vault was not created ({e})."))?;
+        Ok::<_, String>(HubConfig::load_from_core(core))
+    });
+    let weak = hub.downgrade();
+    cx.spawn(async move |cx| {
+        let result = startup.await;
+        let _ = weak.update(cx, |h, cx| h.attach(result, cx));
+    })
+    .detach();
+    hub
+}
+
 /// A fresh reference for a secret about to be stored: `<connection>:<slot>:<random>`. Never
 /// reuses the id of another slot or of an earlier value, so writing it can never overwrite a
 /// secret that some field (of this or another connection) still points at.

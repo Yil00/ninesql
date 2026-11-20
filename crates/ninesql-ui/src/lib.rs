@@ -24,6 +24,9 @@ pub mod appearance;
 pub mod browse;
 pub mod connections;
 pub mod dbeaver_export;
+/// The end-to-end scenario runner of the test build (ADR-0029 §2); never in a package.
+#[cfg(feature = "e2e-scenarios")]
+pub mod e2e;
 pub mod editor_tab;
 pub mod import;
 pub mod keymap;

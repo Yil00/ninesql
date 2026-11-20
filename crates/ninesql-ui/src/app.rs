@@ -20,6 +20,20 @@ const WINDOW_SIZE: Size<Pixels> = Size {
     height: px(800.),
 };
 
+/// What a test build (feature `e2e-scenarios`) appends to every window title, so every
+/// screenshot shows which build took it (ADR-0029 §2.2). Empty in every other build.
+#[cfg(feature = "e2e-scenarios")]
+pub const TITLE_SUFFIX: &str = " [E2E TEST BUILD]";
+/// What a test build appends to every window title; empty in this build.
+#[cfg(not(feature = "e2e-scenarios"))]
+pub const TITLE_SUFFIX: &str = "";
+
+/// A window title: `base` with [`TITLE_SUFFIX`].
+#[must_use]
+pub fn window_title(base: &str) -> String {
+    format!("{base}{TITLE_SUFFIX}")
+}
+
 /// Initializes NineSQL on an application context: gpui-component, theme and fonts from the
 /// settings, key bindings (defaults plus overrides) and the application-wide actions. Problems
 /// found while installing the bindings are added to the settings problems.
@@ -84,7 +98,7 @@ pub fn window_options(cx: &App) -> WindowOptions {
         // packaging/linux/).
         app_id: Some("io.github.yil00.NineSQL".to_owned()),
         titlebar: Some(TitlebarOptions {
-            title: Some("NineSQL".into()),
+            title: Some(window_title("NineSQL").into()),
             ..TitleBar::title_bar_options()
         }),
         ..TitleBar::window_options()

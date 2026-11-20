@@ -17,7 +17,7 @@ workspace = true
 # state probe and the core's test-build guards. Test-only and Linux-only: never in `default`, no
 # other crate enables it, and package builds refuse a binary built with it (`make
 # e2e-feature-guard`, packaging/check-no-e2e-marker.sh).
-e2e-scenarios = ["ninesql-core/e2e-scenarios", "dep:nix", "dep:serde_json"]
+e2e-scenarios = ["ninesql-core/e2e-scenarios", "dep:nix", "dep:serde_json", "dep:rusqlite"]
 
 [dependencies]
 ninesql-core.workspace = true
@@ -37,6 +37,9 @@ libc.workspace = true
 # database (`getpwuid_r`, ADR-0029 §2.4) and `results.json`. Both already in the graph.
 nix = { version = "0.31", default-features = false, features = ["user"], optional = true }
 serde_json = { workspace = true, optional = true }
+# Scenario runner only: the "nine" SQLite file of a scenario, from dev/seed/sqlite/nine.sql (same
+# features as the sqlite driver's).
+rusqlite = { workspace = true, optional = true }
 # Fresh ids for saved secrets (`<connection>:<slot>:<uuid>`) and zeroized buffers for typed secrets.
 uuid.workspace = true
 zeroize.workspace = true
