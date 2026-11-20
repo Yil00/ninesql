@@ -106,7 +106,9 @@ Options:
   --scenario-timeout SECS
                        Time limit of each scenario run (default 1200); the run is then stopped
   --no-secret-scan     Write the archive without a gitleaks scan (by default the archive is
-                       written only when gitleaks scanned the report clean)
+                       written only when gitleaks scanned the report clean); a report in
+                       which a scenario run found a secret (scenarios/SECRET-FOUND) is never
+                       archived, with this option or with --check-report
   --keep-temp          Keep gui-smoke's temporary HOME and XDG directories, and the run
                        directories of the scenarios stage (target/e2e-runs/)
   --check-report DIR   Run no stage: scrub and secret-check an existing report directory (one
@@ -160,7 +162,6 @@ for n in "$LOG_LINES" "$CARGO_TIMEOUT" "$DEV_TIMEOUT" "$GUI_WAIT" "$SCENARIO_TIM
     case "$n" in ''|*[!0-9]*) die "not a whole number: $n" ;; esac
 done
 case "$ENGINES" in ''|*[!a-z0-9,]*) die "--engines takes ids like postgresql,mysql" ;; esac
-case "$SCENARIOS" in *[!a-z0-9,-]*) die "--scenario takes scenario names like sqlite-editor-grid,postgresql-editor-safety" ;; esac
 case "$COMPOSE_PROJECT" in ''|*[!a-z0-9_-]*|[!a-z0-9]*) die "--compose-project takes a compose project name (lower-case letters, digits, - and _)" ;; esac
 
 in_list() { # in_list <word> <comma-separated list>
@@ -194,7 +195,11 @@ OUT_BASE="${E2E_TEST_OUTPUT_DIR:-$ROOT/target}"
 # The scenarios to run: --scenario, else every e2e/scenarios/*.toml, in name order.
 SCENARIO_LIST=()
 if [ -n "$SCENARIOS" ]; then
-    for sc in ${SCENARIOS//,/ }; do
+    IFS=, read -ra SCENARIO_ARGS <<<"$SCENARIOS"
+    for sc in "${SCENARIO_ARGS[@]}"; do
+        case "$sc" in
+            ''|*[!a-z0-9-]*) die "--scenario takes scenario names (lower-case letters, digits and -) like sqlite-editor-grid,postgresql-editor-safety: ${sc:-<empty>}" ;;
+        esac
         [ -f "$SCENARIO_DIR/$sc.toml" ] || die "unknown scenario: $sc (no e2e/scenarios/$sc.toml)"
         in_list "$sc" "$(IFS=,; echo "${SCENARIO_LIST[*]}")" || SCENARIO_LIST+=("$sc")
     done
@@ -236,10 +241,13 @@ if [ -n "$CHECK_REPORT" ]; then
     fi
     REPORT="$(cd "$CHECK_REPORT" && pwd -P)"
 else
+    mkdir -p "$OUT_BASE/e2e-reports"
     REPORT="$OUT_BASE/e2e-reports/$STAMP-$GIT_SHA"
     suffix=1
-    while [ -e "$REPORT" ]; do
+    # A new directory, for this user only (mkdir fails when the name exists).
+    until mkdir -m 0700 "$REPORT" 2>/dev/null; do
         suffix=$((suffix + 1))
+        [ "$suffix" -le 100 ] || die "cannot create a report directory under $OUT_BASE/e2e-reports"
         REPORT="$OUT_BASE/e2e-reports/$STAMP-$GIT_SHA-$suffix"
     done
 fi
@@ -248,6 +256,12 @@ mkdir -p "$NOTES"
 TARGET_DIR="${CARGO_TARGET_DIR:-$ROOT/target}"
 SUMMARY="$REPORT/summary.md"
 ARCHIVE="$REPORT/report.tar.gz"
+# Written into the report when a scenario run found a secret (runner exit 3). Its presence,
+# or a "FAIL (SECRET FOUND)" row in summary.md, stops any archive of this report, later
+# --check-report runs and --no-secret-scan included.
+SECRET_MARKER="$REPORT/scenarios/SECRET-FOUND"
+# What stderr.log of such a run holds instead of the runner's standard error.
+STDERR_WITHHELD="stderr withheld: the runner found a secret in a file it wrote (exit 3); its standard error is not copied into the report."
 
 say() { printf '%s\n' "$*"; }
 
@@ -963,11 +977,28 @@ if doc.get("message"):
 EOF
 }
 
+# proc_start <pid>: the start time of process <pid> (field 22 of /proc/<pid>/stat), or nothing.
+proc_start() {
+    local s f
+    s="$(cat "/proc/$1/stat" 2>/dev/null)" || return 0
+    s="${s##*) }"
+    read -ra f <<<"$s"
+    printf '%s' "${f[19]:-}"
+}
+
+# child_alive <pid> <start>: the process is still the one started (same start time), so a
+# signal never reaches another process that reused the pid. With no start time, kill -0 only.
+child_alive() {
+    kill -0 "$1" 2>/dev/null || return 1
+    [ -z "$2" ] && return 0
+    [ "$(proc_start "$1")" = "$2" ]
+}
+
 stage_scenarios() {
     local log=$1 bin="$E2E_TARGET_DIR/release/ninesql" rc=0 v sc fails=() skipped=0 ran=0
     local engines plan kind a b rest busy=() owners started=0 shots_why="" runs_root fifo t0
     local run pid="" code line fd deadline left timed_out n name shot taken r_out r_line extra
-    local dest outcome passed failed reached planned result
+    local dest outcome passed failed reached planned result errf start="" partial
     export COMPOSE_PROJECT_NAME="$COMPOSE_PROJECT"
 
     if [ "${#SCENARIO_LIST[@]}" -eq 0 ]; then
@@ -997,7 +1028,7 @@ stage_scenarios() {
 
     note scenarios "Scenarios: ${SCENARIO_LIST[*]}."
     cleanup_scenarios() {
-        if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then kill -KILL "$pid" 2>/dev/null || true; fi
+        if [ -n "$pid" ] && child_alive "$pid" "$start"; then kill -KILL "$pid" 2>/dev/null || true; fi
         if [ "$started" = 1 ] && [ "$KEEP_ENGINES" = 0 ]; then
             started=0
             say "    scenarios: stopping the containers"
@@ -1102,10 +1133,12 @@ stage_scenarios() {
         rm -rf "$run"
         mkdir -m 0700 "$run"
         mkdir -m 0700 "$run/home" "$run/config" "$run/data" "$run/state" "$run/cache" "$run/out"
-        # The pipe of the runner's standard output lies outside the run directory, which the
-        # runner's I1 scan reads whole.
+        # The pipe of the runner's standard output and the file of its standard error lie outside
+        # the run directory, which the runner's I1 scan reads whole. The standard error reaches
+        # the report only after the run, and only when the runner found no secret (exit 3).
         fifo="$runs_root/.$sc.stdout"
-        rm -f "$fifo"
+        errf="$runs_root/.$sc.stderr"
+        rm -f "$fifo" "$errf"
         mkfifo -m 0600 "$fifo"
         t0=$SECONDS
         timed_out=0
@@ -1117,23 +1150,30 @@ stage_scenarios() {
             XDG_STATE_HOME="$run/state" XDG_CACHE_HOME="$run/cache" NINESQL_LOG="ninesql=debug,info" \
             NINESQL_E2E_COMMIT="$(git rev-parse HEAD 2>/dev/null || echo unknown)" \
             "$bin" --e2e-run "$SCENARIO_DIR/$sc.toml" --e2e-out "$run/out" \
-            </dev/null >"$fifo" 2>"$dest/stderr.log" &
+            </dev/null >"$fifo" 2>"$errf" &
         pid=$!
-        exec {fd}<"$fifo"
+        start="$(proc_start "$pid")"
+        # Opened read-write, so this open never blocks, even when the runner dies before it
+        # opens its end; the end of its output is therefore its exit, not an end of file.
+        exec {fd}<>"$fifo"
         : >"$dest/stdout.log"
         deadline=$((SECONDS + SCENARIO_TIMEOUT))
+        partial=""
         while :; do
             left=$((deadline - SECONDS))
             if [ "$left" -le 0 ]; then timed_out=1; break; fi
             line=""
             r_line=0
-            IFS= read -r -t "$left" -u "$fd" line || r_line=$?
+            IFS= read -r -t 1 -u "$fd" line || r_line=$?
             if [ "$r_line" != 0 ]; then
-                # Over 128: the time limit; otherwise the end of the runner's output.
-                if [ "$r_line" -gt 128 ]; then timed_out=1; break; fi
-                [ -n "$line" ] && printf '%s\n' "$line" >>"$dest/stdout.log"
+                # A timeout keeps any partial line; once the runner has exited, a timeout means
+                # the pipe is drained. Any other status is a read error.
+                partial+="$line"
+                if [ "$r_line" -gt 128 ] && child_alive "$pid" "$start"; then continue; fi
                 break
             fi
+            line="$partial$line"
+            partial=""
             printf '%s\n' "$line" >>"$dest/stdout.log"
             # A checkpoint: the runner holds the UI still for checkpoint_hold_ms (1 500 ms by
             # default) after this line; capture the launched process's window within it.
@@ -1151,18 +1191,19 @@ stage_scenarios() {
             fi
         done
         exec {fd}<&-
-        # Output closed: the process should be ending; it still gets only the time left.
-        while [ "$timed_out" = 0 ] && kill -0 "$pid" 2>/dev/null; do
+        if [ -n "$partial" ]; then printf '%s\n' "$partial" >>"$dest/stdout.log"; fi
+        # The process should be ending; it still gets only the time left.
+        while [ "$timed_out" = 0 ] && child_alive "$pid" "$start"; do
             [ "$SECONDS" -lt "$deadline" ] || timed_out=1
             [ "$timed_out" = 1 ] || sleep 0.2
         done
         if [ "$timed_out" = 1 ]; then
-            kill -TERM "$pid" 2>/dev/null || true
+            if child_alive "$pid" "$start"; then kill -TERM "$pid" 2>/dev/null || true; fi
             for ((n = 0; n < 10; n++)); do
-                kill -0 "$pid" 2>/dev/null || break
+                child_alive "$pid" "$start" || break
                 sleep 1
             done
-            kill -KILL "$pid" 2>/dev/null || true
+            if child_alive "$pid" "$start"; then kill -KILL "$pid" 2>/dev/null || true; fi
         fi
         wait "$pid" 2>/dev/null && code=0 || code=$?
         pid=""
@@ -1174,12 +1215,18 @@ stage_scenarios() {
             cp "$run/out/results.json" "$dest/results.json"
         fi
         if [ "$code" = 3 ]; then
-            # The runner's I1 scan found a password: the run's file log stays out of the report,
-            # and no archive is written (checked at the end of this script).
-            : >"$NOTES/scenarios.secret-found"
-        elif [ -f "$run/state/ninesql/logs/ninesql.log" ] && [ ! -L "$run/state/ninesql/logs/ninesql.log" ]; then
-            cp "$run/state/ninesql/logs/ninesql.log" "$dest/ninesql.log"
+            # The runner's I1 scan found a password: neither its standard error nor the run's
+            # file log reaches the report, and the marker stops any archive of the report, now
+            # and in any later --check-report run (checked at the end of this script).
+            printf '%s\n' "$STDERR_WITHHELD" >"$dest/stderr.log"
+            printf '%s\n' "A scenario run ($sc) found a dev password or its master password in a file it wrote (runner exit 3). scripts/e2e-local.sh never archives this report, with --check-report and --no-secret-scan too." >"$SECRET_MARKER"
+        else
+            if [ -f "$errf" ] && [ ! -L "$errf" ]; then cat "$errf" >"$dest/stderr.log"; else : >"$dest/stderr.log"; fi
+            if [ -f "$run/state/ninesql/logs/ninesql.log" ] && [ ! -L "$run/state/ninesql/logs/ninesql.log" ]; then
+                cp "$run/state/ninesql/logs/ninesql.log" "$dest/ninesql.log"
+            fi
         fi
+        if [ "$KEEP_TEMP" = 0 ]; then rm -f "$errf"; fi
         if [ -f "$dest/results.json" ]; then
             r_out="$(scenario_results "$dest/results.json")"
         else
@@ -1207,10 +1254,11 @@ stage_scenarios() {
         if [ "$code" = 3 ]; then
             say ""
             say "    !!! scenarios: $sc: the runner found a dev password or the run's master password in a file it wrote (I1)."
-            say "    !!! The run's file log is NOT copied into the report, and no archive will be written."
+            say "    !!! Its standard error and the run's file log are NOT copied into the report, and no archive"
+            say "    !!! of this report will be written, now or by a later --check-report (scenarios/SECRET-FOUND)."
             say "    !!! The file names (never the values) are under i1_scan in $dest/results.json."
             say ""
-            note scenarios "**$sc: SECRET FOUND** (exit 3): a dev password or the run's master password appeared in a file of the run directory (I1). The file names are under \`i1_scan\` in \`scenarios/$sc/results.json\`; the file log was not copied and no archive is written. Report it as a bug."
+            note scenarios "**$sc: SECRET FOUND** (exit 3): a dev password or the run's master password appeared in a file of the run directory (I1). The file names are under \`i1_scan\` in \`scenarios/$sc/results.json\`; the runner's standard error and the file log were not copied, and this report is never archived (\`scenarios/SECRET-FOUND\`, also with \`--check-report\` and \`--no-secret-scan\`). Report it as a bug."
         fi
         [ -n "$shots_why" ] && taken="none: $shots_why"
         note scenarios "| $sc | $result | $code | $passed | $failed | $reached / $planned | $taken | $(fmt_dur $((SECONDS - t0))) |"
@@ -1596,7 +1644,9 @@ else
 fi
 scrub
 SCENARIO_SECRET_FOUND=0
-[ -f "$NOTES/scenarios.secret-found" ] && SCENARIO_SECRET_FOUND=1
+if [ -e "$SECRET_MARKER" ] || [ -L "$SECRET_MARKER" ] || grep -qF 'FAIL (SECRET FOUND)' "$SUMMARY" 2>/dev/null; then
+    SCENARIO_SECRET_FOUND=1
+fi
 rm -rf "$NOTES"
 
 # Secret checks of the report, then the archive. The archive is written only when every check
@@ -1606,9 +1656,11 @@ scan_notes=()
 if [ "$SCENARIO_SECRET_FOUND" = 1 ]; then
     archive_ok=0
     failures=$((failures + 1))
-    scan_notes+=("a scenario run found a dev password or its master password in a file it wrote (runner exit 3): no archive, whatever the other checks say")
+    scan_notes+=("a scenario run found a dev password or its master password in a file it wrote (runner exit 3, \`scenarios/SECRET-FOUND\`): this report is never archived, whatever the other checks say and with \`--no-secret-scan\` too")
     say ""
-    say "FAIL: a scenario run found a password in a file it wrote (see the scenarios section of summary.md); no archive was written."
+    say "FAIL: a scenario run found a password in a file it wrote (scenarios/SECRET-FOUND, and the scenarios"
+    say "      section of summary.md): this report is never archived, --check-report and --no-secret-scan included."
+    say "      Report it as a bug; do not send this report."
 fi
 if ! redacted="$(redact_dev_passwords)"; then
     redacted=0

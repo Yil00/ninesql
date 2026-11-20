@@ -75,9 +75,9 @@ scripts/e2e-local.sh --only static,unit --fail-fast
 | `--gui-wait SECS` | How long the window stays open (default 15). |
 | `--screenshot` | Take a screenshot in `gui-smoke` (off by default). On X11, or XWayland, the script looks for the visible windows of the process it started, by its pid (`xdotool search --pid`, or the pid column of `wmctrl -lp`), never by window class, so a NineSQL window of your own is never picked. When exactly one window matches, it raises it (`xdotool windowactivate --sync`) and captures that window only with ImageMagick `import -window`. When none or several match (a Wayland-native window, a window that does not set `_NET_WM_PID`, the tools missing), no screenshot is taken and the summary says why; the script never captures the whole screen instead. |
 | `--no-screenshot` | No screenshot at all: none in `gui-smoke`, and none at the checkpoints of `scenarios`, which still run. |
-| `--scenario LIST` | The scenarios to run (comma-separated names of `e2e/scenarios/<name>.toml`), e.g. `--only scenarios --scenario sqlite-editor-grid,sqlite-safety`. Default: all of them. An unknown name is refused (exit status 2). |
+| `--scenario LIST` | The scenarios to run (comma-separated names of `e2e/scenarios/<name>.toml`), e.g. `--only scenarios --scenario sqlite-editor-grid,sqlite-safety`. Default: all of them. A name with anything but lower-case letters, digits and `-` (such as `../foo`), an empty name or an unknown name is refused (exit status 2). |
 | `--scenario-timeout SECS` | Time limit of each scenario run (default 1200). A run that hits it is stopped (`SIGTERM`, then `SIGKILL` after 10 s) and marked `FAIL (time limit …)`. The runner has its own whole-run limit, 15 minutes unless the scenario sets `timeout_secs`. |
-| `--no-secret-scan` | Write `report.tar.gz` without the gitleaks scan, for example when gitleaks is not installed. Read the report before you send it. |
+| `--no-secret-scan` | Write `report.tar.gz` without the gitleaks scan, for example when gitleaks is not installed. Read the report before you send it. It does not lift the other checks: a report in which a scenario run found a secret is never archived. |
 | `--keep-temp` | Keep the temporary `HOME` and XDG directories of `gui-smoke` and the run directories of `scenarios` (`target/e2e-runs/`), for a closer look. A kept run directory holds the run's encrypted vault and its workspace files. |
 | `--check-report DIR` | Run no stage: scrub and secret-check an existing report directory, then archive it if the checks pass. The directory must be yours and hold a `summary.md` whose first line is `# NineSQL local end-to-end report`; any other directory is refused (exit status 2), as is one where `summary.md`, `credential-uris.txt`, `gitleaks.log` or `report.tar.gz` is a symbolic link or not a regular file. Only regular files are read and rewritten: symbolic links and other special files are skipped, and a rewrite replaces the file rather than writing through a hard link. `scripts/e2e-local-report-test.sh` uses this option to test the scrubber and the secret checks on fake reports. |
 
@@ -96,7 +96,8 @@ The report directory is `target/e2e-reports/<UTC time>-<short commit>/`:
 | `gui-smoke-window.png` | Only with `--screenshot`, and only when the window of the launched process could be captured alone |
 | `scenarios/<name>/results.json` | The runner's results ([section 4.1](#41-scenario-results)) |
 | `scenarios/<name>/checkpoint-<n>-<checkpoint>.png` | The test window at each checkpoint, when it could be captured alone |
-| `scenarios/<name>/stdout.log`, `stderr.log`, `ninesql.log` | The checkpoint lines, what the window printed, and its file log |
+| `scenarios/<name>/stdout.log`, `stderr.log`, `ninesql.log` | The checkpoint lines, what the window printed, and its file log (after a run that found a secret, `stderr.log` holds only a "stderr withheld" line and there is no `ninesql.log`) |
+| `scenarios/SECRET-FOUND` | Only when a scenario run found a secret (exit status 3): this report is never archived |
 | `gitleaks.log` | The secret scan's output (findings redacted) |
 | `credential-uris.txt` | Only when the check found one: the `file:line` of each URI with a user and a password, without the values |
 | `report.tar.gz` | The whole directory, written only when the secret checks passed ([section 6](#6-privacy)) |
@@ -111,7 +112,7 @@ The `scenarios` section of `summary.md` has one row per scenario: its result, th
 | 0 | `PASS` | Every step passed and the runner's I1 scan found nothing |
 | 1 | `FAIL` | A step failed or timed out, or the run hit its whole-run limit |
 | 2 | `FAIL (refused)` | The runner refused to start: the run directory, the scenario file or a core guard (a build with `secret-service` included) |
-| 3 | `FAIL (SECRET FOUND)` | The runner found a password of `dev/engines.json` or the run's master password in a file it wrote. The script prints a warning, does not copy that run's file log, and writes **no archive** whatever the other checks say. `results.json` names the files (`i1_scan`), never the values. Report it: it is a bug |
+| 3 | `FAIL (SECRET FOUND)` | The runner found a password of `dev/engines.json` or the run's master password in a file it wrote. The script prints a warning, copies neither that run's stderr (its `stderr.log` holds a fixed "stderr withheld" line instead) nor its file log, writes a `scenarios/SECRET-FOUND` marker into the report, and writes **no archive** whatever the other checks say, `--no-secret-scan` included. A later `--check-report` refuses to archive that report too. `results.json` names the files (`i1_scan`), never the values. Report it: it is a bug |
 | 4 | `FAIL (setup error)` | The setup failed after the start (the run's files, the core, the vault, a connection, the window) |
 | 5 | `SKIP` | A dev engine the scenario needs did not answer; nothing ran |
 
@@ -124,10 +125,10 @@ A screenshot is taken while the runner holds the UI still (1 500 ms). When the c
 ## 5. What to send back
 Send `summary.md` back to the session. That is usually enough. If the agent asks for more, a failure needs the full logs, or the session is to review the scenario screenshots (P6-F), send `report.tar.gz`: it holds the screenshots. The script's last lines give both paths.
 
-When no archive was written, the last line reads "Do not send anything before fixing the lines listed above." instead of "Next: send summary.md…": the lines above it, and the "Secret checks" section at the end of `summary.md`, say why (a credential URI, a gitleaks finding, gitleaks missing). Fix them, then run `scripts/e2e-local.sh --check-report <report directory>` to check and archive the report again.
+When no archive was written, the last line reads "Do not send anything before fixing the lines listed above." instead of "Next: send summary.md…": the lines above it, and the "Secret checks" section at the end of `summary.md`, say why (a credential URI, a gitleaks finding, gitleaks missing, a scenario run that found a secret). Fix them, then run `scripts/e2e-local.sh --check-report <report directory>` to check and archive the report again. A report with `scenarios/SECRET-FOUND`, or a `FAIL (SECRET FOUND)` row in its `summary.md`, is never archived, with or without `--no-secret-scan`: report the bug and send nothing from it.
 
 ## 6. Privacy
-- Every file the script writes is readable by you only (`umask 077`: directories `0700`, files `0600`).
+- Every file the script writes is readable by you only (`umask 077`: directories `0700`, files `0600`); the report directory is created with mode `0700`.
 - The `env` stage does not record your host name, user name or IP addresses. Before the summary and the archive are written, every text file in the report is scrubbed:
   - the repository path becomes `<repo>` and `$HOME` becomes `~`;
   - your user name becomes `<user>` and your host name becomes `<host>`, as whole words, except generic names such as `root`, `user` or `ubuntu`;
@@ -135,6 +136,7 @@ When no archive was written, the last line reads "Do not send anything before fi
   - global, unique local (`fc00::/7`) and link-local (`fe80::/10`) IPv6 addresses become `<ip>`, with their zone (`%eth0`); `::1` stays readable;
   - MAC addresses become `<mac>`.
 - The summary gives the number of uncommitted paths in your working tree, not their names.
+- Each scenario run's stderr goes first to a `0600` file under `target/e2e-runs/<UTC time>/`, outside the run directory and the report, and is copied into the report only when the runner found no secret. When it found one (exit status 3, [section 4.1](#41-scenario-results)), the report is never archived, whatever the checks below say and with `--no-secret-scan` too; the `scenarios/SECRET-FOUND` marker stays in the report so a later `--check-report` refuses it as well.
 - Then the secret checks, in this order:
   1. every password listed in [`dev/engines.json`](../../dev/README.md#engines-ports-and-dev-credentials) (the dev engines' fake, public credentials) is replaced with `<dev-password>`, and the summary says in how many files;
   2. any other URI with a user and a password (`scheme://user:password@…`) fails the run: no archive, and `credential-uris.txt` lists where, without the values. The scheme is matched in any case (`HTTP://`), the user may be empty (`redis://:password@host`), and the password runs to the next `@` on the same line, spaces included (it never spans another `://`). A line with a URL with a port and, later, an `@` (an e-mail address) can be flagged too; check the line it names;

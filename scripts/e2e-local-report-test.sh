@@ -234,6 +234,7 @@ case "$name" in
     fake-refused) echo "ninesql: scenario run stopped: the run directory must be owned by the current user with mode 0700" >&2; exit 2 ;;
     fake-secret)
         echo "MasterSecretXYZ" >"$XDG_STATE_HOME/ninesql/logs/ninesql.log"
+        echo "found MasterSecretXYZ in state/x" >&2
         results secret-found 3 '[]' "$pass_steps"; exit 3 ;;
     fake-setup) results setup-error 4 '[]' '[]'; exit 4 ;;
     fake-skip) results skipped 5 '[]' '[]'; exit 5 ;;
@@ -284,9 +285,45 @@ expect_in "$REP/scenarios/fake-pass/ninesql.log" "<dev-password>" "scenarios: fi
 check "scenarios: secret run's file log not collected" [ ! -e "$REP/scenarios/fake-secret/ninesql.log" ]
 check "scenarios: secret found: no archive, even with --no-secret-scan" [ ! -e "$REP/report.tar.gz" ]
 expect_in "$WORK/scen-out1.txt" "!!! scenarios: fake-secret" "scenarios: secret found: loud warning"
-expect_in "$S" "runner exit 3): no archive" "scenarios: secret found: noted in the secret checks"
+expect_in "$S" "this report is never archived, whatever the other checks say" "scenarios: secret found: noted in the secret checks"
 check "scenarios: run directories removed" [ -z "$(ls -A "$WORK/s1/e2e-runs" 2>/dev/null)" ]
 expect_not_in "$S" "WAYLAND_DISPLAY must be unset" "scenarios: WAYLAND_DISPLAY unset for the run"
+# M1: a secret run's standard error never reaches the report; a marker stops any archive.
+expect_in "$REP/scenarios/fake-secret/stderr.log" "stderr withheld" "scenarios: secret run's stderr.log is the placeholder"
+check "scenarios: secret run's stderr.log is the placeholder only" [ "$(grep -c . "$REP/scenarios/fake-secret/stderr.log")" = 1 ]
+secret_absent() { ! grep -rqF MasterSecretXYZ "$REP"; }
+check "scenarios: the secret is nowhere in the report" secret_absent
+check "scenarios: SECRET-FOUND marker written" [ -f "$REP/scenarios/SECRET-FOUND" ]
+expect_in "$REP/scenarios/fake-panic/stderr.log" "panicked at" "scenarios: other runs' stderr still collected"
+# L2: the report is for this user only.
+check "scenarios: report directory is 0700" mode_is "$REP" 700
+check "scenarios: scenarios directory is 0700" mode_is "$REP/scenarios" 700
+check "scenarios: scenario directory is 0700" mode_is "$REP/scenarios/fake-pass" 700
+for f in stderr.log stdout.log results.json ninesql.log; do
+    check "scenarios: fake-pass/$f is 0600" mode_is "$REP/scenarios/fake-pass/$f" 600
+done
+check "scenarios: secret run's stderr.log is 0600" mode_is "$REP/scenarios/fake-secret/stderr.log" 600
+check "scenarios: summary.md is 0600" mode_is "$S" 600
+# M1: a later --check-report, even with --no-secret-scan, refuses to archive the report.
+rc=0
+PATH="$NOGL_PATH" "$E2E" --check-report "$REP" --no-secret-scan >"$WORK/out-secret-check.txt" 2>&1 || rc=$?
+check "check-report of a secret report: exit 1 (got $rc)" [ "$rc" = 1 ]
+check "check-report of a secret report: no archive" [ ! -e "$REP/report.tar.gz" ]
+expect_in "$WORK/out-secret-check.txt" "this report is never archived" "check-report of a secret report: clear message"
+# Without the marker, the "FAIL (SECRET FOUND)" row of summary.md still stops the archive.
+rm -f "$REP/scenarios/SECRET-FOUND"
+rc=0
+PATH="$NOGL_PATH" "$E2E" --check-report "$REP" --no-secret-scan >"$WORK/out-secret-check2.txt" 2>&1 || rc=$?
+check "check-report, marker removed: exit 1 (got $rc)" [ "$rc" = 1 ]
+check "check-report, marker removed: no archive" [ ! -e "$REP/report.tar.gz" ]
+# A marker alone (a planted one, or a report whose summary was rewritten) is enough.
+d="$(new_report marker-only)"
+mkdir "$d/scenarios"
+printf 'x\n' >"$d/scenarios/SECRET-FOUND"
+rc=0
+PATH="$NOGL_PATH" "$E2E" --check-report "$d" --no-secret-scan >"$WORK/out-marker.txt" 2>&1 || rc=$?
+check "check-report, marker only: exit 1 (got $rc)" [ "$rc" = 1 ]
+check "check-report, marker only: no archive" [ ! -e "$d/report.tar.gz" ]
 
 # 5b. Pass and skip: stage PASS, archive with the screenshots.
 scenarios 2 --scenario fake-pass,fake-skip
@@ -325,5 +362,13 @@ expect_in "$WORK/scen-out7.txt" "--e2e-run $WORK/scen/fake-pass.toml" "scenarios
 check "scenarios --dry-run: nothing run" [ ! -e "$REP/scenarios" ]
 scenarios 8 --scenario no-such-scenario
 check "scenarios unknown name: exit 2 (got $RC)" [ "$RC" = 2 ]
+# L1: names outside [a-z0-9-] are refused before any file is looked up.
+printf 'schema_version = 1\n' >"$WORK/foo.toml"
+for bad in ../foo 'fake-pass,../foo' 'fake-pass,,fake-skip' 'Fake-pass' 'fake pass'; do
+    scenarios 9 --scenario "$bad"
+    check "scenarios name '$bad': exit 2 (got $RC)" [ "$RC" = 2 ]
+    check "scenarios name '$bad': nothing written" [ ! -e "$WORK/s9" ]
+    expect_in "$WORK/scen-out9.txt" "--scenario takes scenario names" "scenarios name '$bad': refusal message"
+done
 
 if [ "$FAILS" = 0 ]; then echo "All report checks passed."; else echo "$FAILS check(s) failed."; exit 1; fi
