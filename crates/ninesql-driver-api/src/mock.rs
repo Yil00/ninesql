@@ -326,10 +326,10 @@ impl Driver for MockDriver {
         if let Some(expected) = &self.password {
             match &params.auth {
                 Auth::Password {
-                    user,
                     password: Some(given),
+                    ..
                 } if given.expose() == expected.expose() => {
-                    tracing::debug!(user = %user, "mock: authenticated");
+                    tracing::debug!("mock: authenticated");
                 }
                 Auth::Password { user, .. } => {
                     return Err(DriverError::Auth(format!(

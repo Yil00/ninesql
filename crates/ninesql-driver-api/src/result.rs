@@ -67,7 +67,7 @@ use futures_core::Stream;
 use futures_util::StreamExt;
 use tokio::sync::{Notify, oneshot};
 
-use crate::error::{DriverError, DriverResult};
+use crate::error::{DriverError, DriverResult, log_code, log_kind};
 use crate::execution::ExecutionId;
 use crate::statement::{CancelToken, ExecOptions, FetchBudget};
 
@@ -753,7 +753,11 @@ impl ResultStream {
                     Some(Ok(item))
                 }
                 Err(e) => {
-                    tracing::warn!(error = %e, "driver broke the result stream grammar");
+                    tracing::warn!(
+                        driver_error_kind = log_kind(&e),
+                        code = log_code(&e),
+                        "driver broke the result stream grammar"
+                    );
                     self.finish();
                     Some(Err(e))
                 }
@@ -777,7 +781,8 @@ impl ResultStream {
     async fn abort(&mut self, err: DriverError) -> DriverError {
         self.watchdog.take();
         tracing::debug!(
-            reason = ?err,
+            driver_error_kind = log_kind(&err),
+            code = log_code(&err),
             rows = self.rows,
             execution = self.execution.map(ExecutionId::get),
             "result stream aborted, requesting server-side cancel"
@@ -1085,7 +1090,11 @@ async fn bounded<F: std::future::Future>(limit: Duration, fut: F) -> Option<F::O
 async fn send_cancel(canceller: Arc<dyn CancelHandle>, state: Arc<CancelState>) {
     match bounded(SERVER_CANCEL_GRACE, canceller.cancel()).await {
         Some(Ok(())) => {}
-        Some(Err(e)) => tracing::warn!(error = %e, "server-side cancel failed"),
+        Some(Err(e)) => tracing::warn!(
+            driver_error_kind = log_kind(&e),
+            code = log_code(&e),
+            "server-side cancel failed"
+        ),
         None => tracing::warn!("server-side cancel not acknowledged in time"),
     }
     state.done.store(true, Ordering::SeqCst);

@@ -839,7 +839,11 @@ impl Worker {
         }
         self.shared.mark_closed("session closed");
         if let Err((_, e)) = self.conn.close() {
-            tracing::debug!(error = %map_error(&e, false), "closing the SQLite connection failed");
+            tracing::debug!(
+                driver_error_kind = crate::logkind::error_kind(&map_error(&e, false)),
+                code = e.sqlite_error().map(|c| c.extended_code),
+                "closing the SQLite connection failed"
+            );
         }
     }
 

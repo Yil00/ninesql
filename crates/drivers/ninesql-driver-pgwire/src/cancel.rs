@@ -160,7 +160,11 @@ impl ExecCancel {
             return;
         }
         if let Err(e) = send().await {
-            tracing::warn!(error = %e, "cancel request failed");
+            tracing::warn!(
+                driver_error_kind = crate::logkind::error_kind(&e),
+                code = crate::logkind::error_code(&e),
+                "cancel request failed"
+            );
         }
     }
 }

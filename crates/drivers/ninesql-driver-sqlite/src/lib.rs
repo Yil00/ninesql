@@ -28,6 +28,7 @@
 
 mod dialect;
 mod dml;
+mod logkind;
 mod session;
 mod types;
 mod worker;

@@ -41,6 +41,7 @@ mod conn;
 mod dialect;
 mod dml;
 mod engine;
+mod logkind;
 mod metadata;
 mod questdb;
 mod session;
@@ -209,9 +210,9 @@ impl PgWireDriver {
         let outcome = match outcome {
             Ok(Ok(v)) => Ok(v),
             Ok(Err(e)) => Err(redact(e)),
-            Err(_) => Err(DriverError::Connect(format!(
+            Err(_) => Err(redact(DriverError::Connect(format!(
                 "no answer from {host}:{port} within {connect_timeout:?}"
-            ))),
+            )))),
         };
         // The password is not needed any more (`retains_secret_after_connect = false`).
         drop(password);

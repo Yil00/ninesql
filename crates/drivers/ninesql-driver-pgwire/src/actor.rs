@@ -674,7 +674,7 @@ impl Actor {
     }
 
     /// Closes the session: the connection task stops after the current command.
-    fn close_session(&self, reason: &str) {
+    fn close_session(&self, reason: &'static str) {
         tracing::warn!(reason, "pgwire session closed by the driver");
         self.shared.mark_closed(reason);
     }
@@ -719,7 +719,11 @@ impl Actor {
                         == Some("on")
                 }
                 Err(e) => {
-                    tracing::warn!(error = ?std::mem::discriminant(&e), "read-only read-back failed");
+                    tracing::warn!(
+                        driver_error_kind = crate::logkind::error_kind(&e),
+                        code = crate::logkind::error_code(&e),
+                        "read-only read-back failed"
+                    );
                     false
                 }
             },
@@ -739,7 +743,11 @@ impl Actor {
         if self.conn.txn_status == b'T'
             && let Err(e) = self.internal("SET TRANSACTION READ ONLY", &[], 0).await
         {
-            tracing::warn!(error = ?std::mem::discriminant(&e), "read-only re-assert failed");
+            tracing::warn!(
+                driver_error_kind = crate::logkind::error_kind(&e),
+                code = crate::logkind::error_code(&e),
+                "read-only re-assert failed"
+            );
             self.close_session("read-only mode could not be re-asserted");
             return Err(DriverError::Closed(
                 "the read-only mode could not be re-asserted after the statement; the \
@@ -957,7 +965,11 @@ impl Actor {
 
     /// Ends an execution whose connection broke: the session is closed.
     fn broken(&self, ex: &mut Exec, reply: Option<Demand>, e: DriverError) {
-        tracing::debug!(error = %e, "pgwire connection unusable");
+        tracing::debug!(
+            driver_error_kind = crate::logkind::error_kind(&e),
+            code = crate::logkind::error_code(&e),
+            "pgwire connection unusable"
+        );
         self.close_session("connection lost or unresponsive");
         let e = if matches!(e, DriverError::Closed(_)) {
             e
