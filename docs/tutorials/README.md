@@ -16,7 +16,7 @@ NineSQL is **pre-alpha**: nothing is released, and you run it from source. What 
 | [Import from DBeaver](import-from-dbeaver.md) | DBeaver users | Preview and import your DBeaver connections, move their saved passwords to the vault or keyring, enable connections imported disabled |
 | [Secrets: keyring, vault and locking](secrets.md) | Everyone | Understand where passwords go, create and unlock the vault, lock it, and what never reaches the disk |
 | [Run the checks before a PR](checks-before-a-pr.md) | Contributors | Run what CI runs, with and without database engines |
-| [Run the local end-to-end check and send the report](local-e2e.md) | Maintainer, testers on a Linux desktop | Run the checks, the unit tests, the engine tests and a GUI smoke test with `make e2e-local`, read the report, and send its summary back to a cloud agent session |
+| [Run the local end-to-end check and send the report](local-e2e.md) | Maintainer, testers on a Linux desktop | Run the checks, the unit tests, the engine tests, a GUI smoke test and the end-to-end UI scenarios with `make e2e-local`, read the report and its screenshots, and send its summary back to a cloud agent session |
 
 Conventions used in these pages:
 - Key bindings are the defaults; you can change them in `settings.toml` ([build and run](build-and-run.md#settings-and-key-bindings)). Every action is also in the command palette (`Ctrl+Shift+P` or `F1`).
