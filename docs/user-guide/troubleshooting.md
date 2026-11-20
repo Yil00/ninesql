@@ -4,7 +4,21 @@ Two actions list what NineSQL noticed in the background:
 - "Show settings problems" (`Ctrl+K` then `Ctrl+E`): invalid values and key bindings in `settings.toml` (the defaults are used instead).
 - "Show connection problems" (`Ctrl+K` then `Ctrl+L`): what was fixed or refused when loading `connections.json`, saved connections their driver refuses, whether sleep and screen lock are watched, and a workspace or runtime that could not start.
 
-NineSQL writes no log file of its own.
+## Logs
+NineSQL writes warnings and errors to its standard error, one line per event (a session started from the desktop sends them to the user journal, readable with `journalctl --user`). Nothing more is logged by default.
+
+For a bug report you can turn on a **file log**. It is off by default; turn it on in `settings.toml` (`~/.config/ninesql/settings.toml`), then restart NineSQL:
+
+```toml
+[logging]
+file_level = "info"   # "off" (default), "error", "warn", "info" or "debug"
+```
+
+Or for one run only, start NineSQL from a terminal with `NINESQL_LOG`, which takes the usual filter syntax and also applies to standard error, for example `NINESQL_LOG=ninesql_core=debug,warn ninesql`. (`RUST_LOG` is ignored.)
+
+The file is `~/.local/state/ninesql/logs/ninesql.log` (under `$XDG_STATE_HOME` when set). Its folder is private (`0700`) and the file too (`0600`); NineSQL refuses to write it through a symbolic link. Each file holds at most 8 MiB: the log then moves to `ninesql.log.1`, the old `.1` to `.2`, and the old `.2` is deleted, so it never takes more than 24 MiB. Lines are dropped, and counted in the log, rather than slowing NineSQL down.
+
+What the log holds: connection names, host names, file names, error kinds and what NineSQL was doing. What it never holds: passwords, passphrases, tokens, query parameter values and result values. Statement text is never written by a release build (it lives at the `trace` level, which release builds cap at `debug`). Read the file before you attach it to a report, since connection and host names may be private, and turn the setting back to `"off"` when you are done.
 
 ## Starting NineSQL
 | Symptom | What to do |

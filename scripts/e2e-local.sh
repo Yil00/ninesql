@@ -766,7 +766,7 @@ stage_gui_smoke() {
 
     if [ "$DRY_RUN" = 1 ]; then
         say "    [dry-run] mkdir temp HOME / XDG_CONFIG_HOME / XDG_DATA_HOME / XDG_STATE_HOME / XDG_CACHE_HOME (0700)"
-        say "    [dry-run] HOME=<temp> RUST_LOG=ninesql=debug,info $bin &   (alive check after ${GUI_WAIT} s)"
+        say "    [dry-run] HOME=<temp> NINESQL_LOG=ninesql=debug,info $bin &   (alive check after ${GUI_WAIT} s)"
         if [ "$SCREENSHOT" = 1 ]; then
             say "    [dry-run] screenshot of the launched process's window, found by pid (xdotool search --pid / wmctrl -lp, import -window <id>); none when no single window matches, never the whole screen"
         else
@@ -783,9 +783,10 @@ stage_gui_smoke() {
     say "    gui-smoke: starting ninesql for ${GUI_WAIT} s (a window opens; leave it alone)"
     # A temporary HOME too: the first-run DBeaver detection reads known locations under $HOME,
     # so the user's real DBeaver connection names never reach the window (or a screenshot).
-    # RUST_LOG never at trace: trace may carry query text (AGENTS.md).
+    # NINESQL_LOG (ADR-0029 §3.4; RUST_LOG is ignored), never at trace: trace may carry query
+    # text (AGENTS.md). It also turns the file log on, under $tmp/state/ninesql/logs/.
     env HOME="$tmp/home" XDG_CONFIG_HOME="$tmp/config" XDG_DATA_HOME="$tmp/data" \
-        XDG_STATE_HOME="$tmp/state" XDG_CACHE_HOME="$tmp/cache" RUST_LOG="ninesql=debug,info" \
+        XDG_STATE_HOME="$tmp/state" XDG_CACHE_HOME="$tmp/cache" NINESQL_LOG="ninesql=debug,info" \
         "$bin" </dev/null >"$out" 2>"$err" &
     pid=$!
     for ((i = 0; i < GUI_WAIT; i++)); do
@@ -833,15 +834,15 @@ stage_gui_smoke() {
     if grep -qE 'internal error \(panic\)|panicked at' "$err" 2>/dev/null; then
         fails+=("a panic was reported on stderr")
     fi
-    note gui-smoke "stderr: \`gui-smoke-stderr.log\` ($(wc -l <"$err") lines), stdout: \`gui-smoke-stdout.log\`. The binary installs no log subscriber yet, so RUST_LOG adds nothing today."
+    note gui-smoke "stderr: \`gui-smoke-stderr.log\` ($(wc -l <"$err") lines), stdout: \`gui-smoke-stdout.log\`. The file log (NINESQL_LOG) is saved as \`gui-smoke-ninesql.log\` when written."
 
     # What the run wrote (names and sizes, relative to the temp directory), and its log file.
     {
         echo "Files written under the temporary HOME and XDG directories:"
         (cd "$tmp" && find . -type f -printf '  %p (%s bytes, mode %m)\n' | sort)
     } >>"$log"
-    if [ -f "$tmp/state/ninesql/ninesql.log" ]; then
-        cp "$tmp/state/ninesql/ninesql.log" "$REPORT/gui-smoke-ninesql.log"
+    if [ -f "$tmp/state/ninesql/logs/ninesql.log" ]; then
+        cp "$tmp/state/ninesql/logs/ninesql.log" "$REPORT/gui-smoke-ninesql.log"
     fi
 
     # I1 (modest): the run makes no connection, so nothing secret should be on disk. Look for

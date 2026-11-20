@@ -18,6 +18,8 @@ use std::sync::Arc;
 
 use ninesql_core::DriverRegistry;
 
+mod logging;
+
 const USAGE: &str = "\
 Usage: ninesql [OPTION]
 
@@ -164,6 +166,10 @@ fn main() -> ExitCode {
         }
         Command::Run => {}
     }
+
+    // The subscriber (ADR-0029 §3): before GPUI starts, after the panic hook. Its guard flushes
+    // the file log when `main` returns.
+    let _log = logging::install(ninesql_core::storage::Paths::from_env().ok().as_ref());
 
     let mut registry = DriverRegistry::new();
     registry.register(Arc::new(ninesql_driver_pgwire::PgWireDriver::new()));

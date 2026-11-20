@@ -41,6 +41,9 @@ ninesql-editor = { path = "crates/ninesql-editor" }
 # Shared by several crates
 thiserror = "2"
 tracing = "0.1"
+# The `ninesql` binary's subscriber only (ADR-0029 §3.1): stderr and the opt-in file log, no ANSI
+# colours, no `tracing-log`; library crates never install a subscriber.
+tracing-subscriber = { version = "0.3", default-features = false, features = ["std", "fmt", "env-filter", "registry"] }
 zeroize = { version = "1", features = ["std"] }
 proptest = "1"
 
