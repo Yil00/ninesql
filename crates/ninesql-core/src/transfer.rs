@@ -1006,6 +1006,13 @@ impl TransferService {
         let parent = path
             .parent()
             .ok_or_else(|| TransferError::InvalidPath("the path has no directory".into()))?;
+        // Test build (ADR-0029 §2.5): only inside the run directory, named without links.
+        #[cfg(feature = "e2e-scenarios")]
+        crate::e2e::installed()
+            .and_then(|g| g.check_new_file(path, "export file"))
+            .map_err(|e| TransferError::ForbiddenLocation {
+                reason: e.to_string(),
+            })?;
         let parent = fs::canonicalize(parent)
             .map_err(|_| TransferError::InvalidPath("the directory does not exist".into()))?;
         let target = parent.join(name);
@@ -1040,6 +1047,13 @@ impl TransferService {
         limits: &CsvLimits,
     ) -> Result<ImportFile, TransferError> {
         use std::os::unix::fs::MetadataExt;
+        // Test build (ADR-0029 §2.5): only inside the run directory, named without links.
+        #[cfg(feature = "e2e-scenarios")]
+        crate::e2e::installed()
+            .and_then(|g| g.check_existing(path, "import file"))
+            .map_err(|e| TransferError::ForbiddenLocation {
+                reason: e.to_string(),
+            })?;
         let canonical = fs::canonicalize(path)
             .map_err(|_| TransferError::InvalidPath("the file does not exist".into()))?;
         if let Some(reason) = canonical.parent().and_then(|d| self.protected_reason(d)) {

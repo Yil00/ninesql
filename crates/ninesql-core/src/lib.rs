@@ -12,6 +12,8 @@ pub mod connection;
 pub mod connection_type;
 pub mod dbeaver_export;
 pub mod dbeaver_roots;
+#[cfg(feature = "e2e-scenarios")]
+pub mod e2e;
 pub mod edit;
 mod error;
 pub mod execution;

@@ -162,6 +162,12 @@ pub enum StartupError {
     /// The driver runtime could not start.
     #[error(transparent)]
     Core(#[from] CoreError),
+    /// A test-build guard refused the start (feature `e2e-scenarios`, ADR-0029 §2.5): guards
+    /// not installed, a build with `secret-service`, NineSQL directories outside the run
+    /// directory, or no vault.
+    #[cfg(feature = "e2e-scenarios")]
+    #[error(transparent)]
+    TestBuild(#[from] crate::e2e::GuardError),
 }
 
 /// State of the sleep / screen-lock watcher, for the UI (a status line, the settings page).
@@ -324,7 +330,10 @@ impl CoreServices {
     ///
     /// # Errors
     /// [`StartupError::Workspace`] when the workspace cannot be opened,
-    /// [`StartupError::Core`] when the driver runtime cannot start. A missing keyring, a vault
+    /// [`StartupError::Core`] when the driver runtime cannot start. In a test build (feature
+    /// `e2e-scenarios`), `StartupError::TestBuild` unless [`crate::e2e::install`] was called,
+    /// the NineSQL directories and `known_hosts` files lie inside its run directory and the
+    /// vault opens; the Secret Service is never probed there. A missing keyring, a vault
     /// that cannot be opened or a watcher that cannot start are not errors: they are reported
     /// by [`Self::secret_backend`], [`Self::vault_error`] and [`Self::lock_watcher_status`].
     pub fn start_blocking(config: CoreConfig) -> Result<Self, StartupError> {
@@ -339,7 +348,18 @@ impl CoreServices {
             lock_check_interval,
             open_history,
         } = config;
+        // Test build (ADR-0029 §2.5): guards installed, everything inside the run directory,
+        // the keyring never probed nor used.
+        #[cfg(feature = "e2e-scenarios")]
+        let use_secret_service = {
+            crate::e2e::refuse_secret_service()?;
+            crate::e2e::installed()?.check_paths(&paths, &manager_config.known_hosts)?;
+            let _ = use_secret_service;
+            false
+        };
         let workspace = Workspace::open(paths.clone(), project)?;
+        #[cfg(feature = "e2e-scenarios")]
+        crate::e2e::installed()?.check_paths_resolved(&paths)?;
         let project_id = workspace.project_id().to_string();
         let mut stores = SecretStores::new();
 
@@ -380,6 +400,11 @@ impl CoreServices {
             _ => SecretBackend::AskEveryTime,
         };
         tracing::info!(backend = ?backend, "secret backend selected");
+        // Test build: the vault in the run directory or nothing.
+        #[cfg(feature = "e2e-scenarios")]
+        if backend != SecretBackend::Vault {
+            return Err(crate::e2e::GuardError::NoVault.into());
+        }
 
         // 3. The session manager.
         let manager = SessionManager::new(manager_config, registry, stores.clone())?;

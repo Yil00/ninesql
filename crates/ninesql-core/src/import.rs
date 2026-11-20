@@ -473,6 +473,10 @@ pub enum ImportError {
     /// The blocking task failed.
     #[error("import task: {0}")]
     Runtime(String),
+    /// A test-build guard refused the source (feature `e2e-scenarios`, ADR-0029 §2.5).
+    #[cfg(feature = "e2e-scenarios")]
+    #[error(transparent)]
+    TestBuild(#[from] crate::e2e::GuardError),
 }
 
 impl ImportError {
@@ -492,6 +496,8 @@ impl ImportError {
             Self::ListingTruncated => "import-listing-truncated",
             Self::Cancelled => "import-cancelled",
             Self::Runtime(_) => "import-runtime",
+            #[cfg(feature = "e2e-scenarios")]
+            Self::TestBuild(e) => e.kind(),
         }
     }
 }
@@ -887,6 +893,20 @@ impl Importer {
         cancel: &ImportCancel,
     ) -> Result<(ImportPreview, SecretPayload, Connections), ImportError> {
         cancel.check()?;
+        // Test build (ADR-0029 §2.5): DBeaver sources only inside the run directory (copies of
+        // the synthetic fixtures), never the user's own workspaces.
+        #[cfg(feature = "e2e-scenarios")]
+        {
+            let guards = crate::e2e::installed()?;
+            match source {
+                ImportSource::Detect(roots) => {
+                    guards.check_existing(&roots.home, "DBeaver search root")?;
+                }
+                ImportSource::Folder(path) => {
+                    guards.check_existing(path, "DBeaver import folder")?
+                }
+            }
+        }
         // One flag for the whole read: detection, folder listing and project reads stop when
         // the preview is cancelled (P2-D M1).
         let flag = ninesql_dbeaver::CancelFlag::from_shared(cancel.shared());

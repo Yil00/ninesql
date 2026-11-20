@@ -68,6 +68,10 @@ pub enum DbeaverExportError {
     /// The export task failed.
     #[error("the export failed: {0}")]
     Runtime(String),
+    /// A test-build guard refused the target (feature `e2e-scenarios`, ADR-0029 §2.5).
+    #[cfg(feature = "e2e-scenarios")]
+    #[error(transparent)]
+    TestBuild(#[from] crate::e2e::GuardError),
 }
 
 impl DbeaverExportError {
@@ -84,6 +88,8 @@ impl DbeaverExportError {
             Self::Write(ExportWriteError::AlreadyExists { .. }) => "already-exists",
             Self::Write(_) => "write",
             Self::Runtime(_) => "runtime",
+            #[cfg(feature = "e2e-scenarios")]
+            Self::TestBuild(e) => e.kind(),
         }
     }
 }
@@ -288,6 +294,17 @@ pub fn export_dbeaver_blocking(
     ids: &[ConnectionId],
     target: &ExportTarget,
 ) -> Result<DbeaverExportOutcome, DbeaverExportError> {
+    // Test build (ADR-0029 §2.5): the new file or project folder only inside the run directory.
+    #[cfg(feature = "e2e-scenarios")]
+    {
+        let guards = crate::e2e::installed()?;
+        match target {
+            ExportTarget::File(path) => guards.check_new_file(path, "DBeaver export file")?,
+            ExportTarget::ProjectFolder(path) => {
+                guards.check_new_file(path, "DBeaver export folder")?;
+            }
+        }
+    }
     let export = generate_dbeaver_export(workspace, ids)?;
     let written = write_export(&export, target, &|p| roots.forbids_new_file(p)).map_err(|e| {
         let e = DbeaverExportError::from(e);

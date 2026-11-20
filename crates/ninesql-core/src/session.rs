@@ -1443,6 +1443,11 @@ async fn open_session(
     let pre_caps = driver.capabilities(&engine, None)?;
     connection.validate_for_driver(&pre_caps)?;
     let target = connect::target(&connection)?;
+    // Test build (ADR-0029 §2.5): every endpoint resolved and checked to be loopback (files:
+    // inside the run directory) before any secret is read; the checked addresses are the ones
+    // connected to below.
+    #[cfg(feature = "e2e-scenarios")]
+    let pins = crate::e2e::check_connection(&connection, &target).await?;
 
     // The imported init SQL marker is read from `connections.json` too, not only from the
     // request (P1-E review, M2): a UI copy that lost it, or init SQL changed since it was
@@ -1553,7 +1558,10 @@ async fn open_session(
     let timeout = shared.config.connect_timeout;
     let mut tunnel = None;
     if let (Some(ssh), connect::Target::Tcp { host, port, .. }) = (&connection.ssh, &target) {
-        let spec = connect::tunnel_spec(ssh, &mut bag, host, *port, timeout)?;
+        #[cfg_attr(not(feature = "e2e-scenarios"), allow(unused_mut))]
+        let mut spec = connect::tunnel_spec(ssh, &mut bag, host, *port, timeout)?;
+        #[cfg(feature = "e2e-scenarios")]
+        pins.apply_to_tunnel(&mut spec);
         let known_hosts = shared.known_hosts().await?;
         match Tunnel::open(spec, known_hosts).await {
             Ok(t) => tunnel = Some(t),
@@ -1575,6 +1583,8 @@ async fn open_session(
                 return Err(e);
             }
         };
+    #[cfg(feature = "e2e-scenarios")]
+    pins.apply_to_params(&mut params);
     let mut inside_dbeaver_workspace = false;
     if let Endpoint::File { path } = &connection.endpoint {
         // I4: a database file inside a DBeaver workspace is opened read-only by its driver.

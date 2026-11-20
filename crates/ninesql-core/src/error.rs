@@ -214,6 +214,11 @@ pub enum CoreError {
     /// No vault is open in this session (it could not be opened at startup).
     #[error("no vault is available in this session: {0}")]
     NoVault(String),
+    /// A test-build guard refused (feature `e2e-scenarios`, ADR-0029 §2.5): an endpoint that is
+    /// not loopback, a file outside the run directory, or guards not installed.
+    #[cfg(feature = "e2e-scenarios")]
+    #[error(transparent)]
+    TestBuild(#[from] crate::e2e::GuardError),
 }
 
 impl CoreError {
@@ -242,6 +247,8 @@ impl CoreError {
             Self::Runtime(_) => "runtime",
             Self::Vault(e) => vault_error_kind(e),
             Self::NoVault(_) => "no-vault",
+            #[cfg(feature = "e2e-scenarios")]
+            Self::TestBuild(e) => e.kind(),
         }
     }
 
