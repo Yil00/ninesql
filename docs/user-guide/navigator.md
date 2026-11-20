@@ -31,7 +31,7 @@ Details per engine: [docs/08](../08-engine-capabilities.md#feature-capabilities)
 "Open object editor" (`Ctrl+K` then `Enter`) opens a tab with "Properties", "Columns", "Keys / Constraints", "Indexes" and, when the engine can produce it, "DDL". A list the engine does not provide says "Not available for this engine."
 
 ## Generated SQL and DDL
-- "Generate SQL: SELECT / INSERT / UPDATE / DELETE" (`Alt+G` then `S` / `I` / `U` / `D`) opens a template in a **new editor; nothing runs it**. Values and conditions are `<placeholders>` that no engine accepts, so a template run without editing fails instead of writing. `UPDATE` and `DELETE` always have a `WHERE` line. On a read-only session only `SELECT` is offered.
+- "Generate SQL: SELECT / INSERT / UPDATE / DELETE" (`Alt+G` then `S` / `I` / `U` / `D`) opens a template in a **new editor; nothing runs it**. Values and conditions are `<placeholders>` that no engine accepts, so a template run without editing fails instead of writing. `UPDATE` and `DELETE` always have a `WHERE` line. On a read-only session, on a view and on an engine that declares no row editing (QuestDB) only `SELECT` is offered.
 - "Show DDL" (`Alt+G` then `L`) opens an object's DDL in a new editor; "Copy DDL" (`Ctrl+K` then `Ctrl+Shift+C`) copies it. DDL is never cut (over 1 MiB it is an error). Some engines leave parts out: PostgreSQL collations, privileges and identity options; a hypertable's `create_hypertable` call.
 - "Open table data" (`Alt+G` then `O`), "Export table…" (`Alt+G` then `X`) and "Import CSV…" (`Alt+G` then `M`) work on the selected table ([Results, editing and transfer](results-editing-transfer.md)). "Open table data" is also the first entry of a table or view row's context menu.
 

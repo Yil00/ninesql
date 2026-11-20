@@ -71,7 +71,6 @@ What NineSQL does not do yet, or does only partly, as of phase 6. The list is bu
 | One database per PostgreSQL connection: other databases of the server are not browsed | Later |
 | SQLite: no constraints group, foreign keys named `fk_<id>`; MariaDB and TiDB sequences listed without start and increment | Later |
 | DDL leaves parts out on some engines: PostgreSQL collations, privileges and identity options; a hypertable's `create_hypertable` call; PostgreSQL base types and foreign tables have no DDL | Later |
-| "Generate SQL" offers `UPDATE` and `DELETE` templates on QuestDB (which has no `DELETE`) and on views, whatever the engine supports | Later |
 | With very large catalogs, completion is rebuilt on the interface thread after every metadata change (up to 250 000 objects), and one metadata load can hold about 320 MiB briefly | Later |
 | Filters of a deleted connection stay in `navigator.json` (harmless); load limits are not configurable | Later |
 | MySQL, MariaDB, TiDB: a one-shot `SET TRANSACTION …` (next transaction only) is set again after the navigator reads, except when a stored routine ran it, or, in auto-commit mode, when a `SELECT` without a table ran between it and the navigator read; the next transaction may then run without those settings | Later |

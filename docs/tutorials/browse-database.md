@@ -12,7 +12,7 @@ Every action below is in the command palette (`Ctrl+Shift+P` or `F1`, type "navi
 
 ## 1. Expand the tree
 1. Show the navigator (`Ctrl+B`) and move the focus there (`Ctrl+K` then `Ctrl+N`).
-2. Select `nine-pg` and press `Right` (or click it). If the connection is not open, expanding it starts the usual connect flow (vault unlock, "ask every time" password, SSH host key); a closed connection's row says "Not connected ("Connect": Ctrl+K Ctrl+O)".
+2. Select `nine-pg` and press `Right` (or click it). If the connection is not open, expanding it starts the usual connect flow (vault unlock, "ask every time" password, SSH host key); a closed connection's row says "Not connected ("Connect": Ctrl+K Ctrl+O)", with your own binding of "Connect" if you changed it in `[keybindings]` (or "Not connected ("Connect" in the context menu)" when it is unbound).
 3. Under an open connection, the tree shows one group per object kind the driver declares, for example "Schemas", then under `public` "Tables", "Views", "Sequences", "Types", "Routines", and under a table "Columns", "Constraints", "Foreign keys", "Indexes", "Triggers", "Partitions". A kind the engine does not have is not shown (an engine with none says "No objects are listed for this engine"). A connection with a single top-level kind expands that group at once.
 4. Each group loads when you expand it ("Loading…"), then shows its count. Collapsing a group that is still loading cancels the request on the server. A group that failed shows the error, "… (Enter to retry)"; an empty one shows "(empty)".
 
@@ -55,9 +55,11 @@ Select a table or view and run one of:
 | Action | Keys | Offered for |
 |---|---|---|
 | "Generate SQL: SELECT" | `Alt+G` then `S` | tables, views, materialized views |
-| "Generate SQL: INSERT" | `Alt+G` then `I` | tables and views, sessions that are not read-only |
-| "Generate SQL: UPDATE" | `Alt+G` then `U` | tables and views, sessions that are not read-only |
-| "Generate SQL: DELETE" | `Alt+G` then `D` | tables and views, sessions that are not read-only |
+| "Generate SQL: INSERT" | `Alt+G` then `I` | tables, on sessions that are not read-only and whose engine supports inserting rows |
+| "Generate SQL: UPDATE" | `Alt+G` then `U` | tables, on sessions that are not read-only and whose engine supports updating rows |
+| "Generate SQL: DELETE" | `Alt+G` then `D` | tables, on sessions that are not read-only and whose engine supports deleting rows |
+
+Views get the `SELECT` template only, and so does an engine that declares no row editing (QuestDB): the write templates are not in the context menu nor in the object editor's toolbar, and their key bindings say why.
 
 The template opens in a **new SQL editor** on the same connection; **nothing runs it**. Names are quoted for the session's engine; values and conditions are `<placeholders>` that no engine accepts, so a template run without editing fails instead of writing. For `orders` in the dev PostgreSQL, "Generate SQL: UPDATE" gives something like:
 ```sql
