@@ -9,7 +9,8 @@
   </p>
 
 [![License: Apache 2.0](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](LICENSE)
-[![Status: pre-alpha](https://img.shields.io/badge/status-pre--alpha-orange.svg)](docs/ROADMAP.md)
+[![Status: paused](https://img.shields.io/badge/status-paused-lightgrey.svg)](#project-status-paused)
+[![Stage: pre-alpha](https://img.shields.io/badge/stage-pre--alpha-orange.svg)](docs/ROADMAP.md)
 [![Platform](https://img.shields.io/badge/platform-Debian%20%7C%20Ubuntu-lightgrey)](docs/10-supported-platforms.md)
 [![Rust](https://img.shields.io/badge/Rust-stable-000000?logo=rust&logoColor=white)](https://www.rust-lang.org/)
 [![GPUI](https://img.shields.io/badge/UI-GPUI-4b5dff)](https://github.com/zed-industries/zed/tree/main/crates/gpui)
@@ -38,6 +39,23 @@
 </div>
 
 > ⚠️ **Pre-alpha.** Nothing is released yet. A development build can create, test and open connections to PostgreSQL, MySQL, MariaDB and SQLite (directly, over TLS and over SSH), and to TimescaleDB, YugabyteDB, QuestDB and TiDB with per-engine limits, from the connection dialog, and import connections from a DBeaver workspace from the UI (preview, saved passwords moved to the vault, re-import; [tutorial](docs/tutorials/import-from-dbeaver.md)), and run SQL in an editor with a results grid (statements, selections and scripts, parameters, production confirmations, cancel, commit and roll back; [tutorial](docs/tutorials/run-sql.md)). It can also browse schemas and objects in the navigator, with an object editor, DDL, SQL templates and object completion ([tutorial](docs/tutorials/browse-database.md)). It can edit the rows of a table with a key, with a preview of the generated SQL and a confirmation on production ([tutorial](docs/tutorials/edit-data.md)), export results and tables to files, import CSV files, and export connections to a new DBeaver file without passwords ([tutorial](docs/tutorials/export-import.md)); cells are edited through a dialog, not in place. It saves and reopens script files and restores them after a restart, without ever writing unsaved editor text. The interface, navigator, editor and grid included, awaits its visual check and its performance measurements on real desktops, planned with the final MVP tests (P6-F). Saved passwords go to the encrypted vault: the keyring backend is off by default until it is validated on GNOME and KDE. The [user guide](docs/user-guide/README.md) describes what works today and its [known limitations](docs/user-guide/known-limitations.md); see the [roadmap](docs/ROADMAP.md) for the MVP plan.
+
+## Project status: paused
+
+**Development is paused since 2026-11-21.** Nothing is released yet. The code on `dev` is consistent, CI is green, and every accepted decision is recorded (ADR-0001 to ADR-0029). The project can resume from here at any time.
+
+**Where it stopped:** the MVP (phases 0 to 5) is built and tested in CI against the 8 MVP engines. Phase 6 (hardening and v0.1.0) is in progress: packaging, documentation, the end-of-MVP security review, application logging and the automated UI end-to-end tests (`make e2e-local` with its scenarios) have landed. [CONTEXT.md](CONTEXT.md) gives the full state; [docs/ROADMAP.md](docs/ROADMAP.md) the plan.
+
+**To finish v0.1.0**, in this order:
+1. Run `make e2e-local E2E_ARGS="--screenshot"` on a Linux desktop (it has not run on a real display yet) and fix what it reports ([tutorial](docs/tutorials/local-e2e.md)).
+2. Release settings (P6-B): private vulnerability reporting, a tag ruleset on `refs/tags/v*`, the `release` environment with a required reviewer, the `.deb` `Maintainer` address, then a full `.deb` rebuild and the Debian 12 / 13 install tests.
+3. A rehearsal with the tag `v0.1.0-rc.1` (first run of `release.yml`), then the version bump to 0.1.0 in the release PR `dev` → `main` ([RELEASE.md](RELEASE.md)).
+4. The visual review of the scenario screenshots and the manual checks they do not cover (P6-F), the GPU measurements (P6-C) and the Orca accessibility test.
+5. The tag `v0.1.0`: a cosign-signed `.deb` on the GitHub release (APT repository and Flathub later).
+
+**Open decision:** the dated note on [ADR-0029](docs/adr/0029-automated-ui-end-to-end-tests-and-application-logging.md) (implementation choices of the test build) is proposed and awaits the maintainer.
+
+**Development items ready to pick up** (none blocks v0.1.0): sturdier scenarios (dialog fields targeted directly instead of by Tab counts; the DBeaver import applied; production confirmations, "Insert row" and script restore in the scenarios); production confirmations for a trivial `WHERE` (`WHERE 1=1`) and `MERGE … WHEN MATCHED THEN DELETE`; the ADR-0016 re-evaluation against russh 0.65.2; the completion snapshot rebuilt off the UI thread and a per-load byte cap in the metadata service; the remaining items of the [known limitations](docs/user-guide/known-limitations.md).
 
 ## Why NineSQL
 DBeaver is the de facto universal database client, but it runs on the JVM and Eclipse RCP: high memory use, slow cold start, and uneven HiDPI / Wayland behavior on Linux.
